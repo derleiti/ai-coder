@@ -1,6 +1,18 @@
 """QApplication + System Tray mit erweitertem Menue."""
 from __future__ import annotations
 import sys
+import platform
+
+# Windows: Console-Fenster verstecken wenn GUI startet
+if platform.system() == "Windows":
+    try:
+        import ctypes
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
+    except Exception:
+        pass
+
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
 from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QAction
 from PyQt6.QtCore import Qt
