@@ -26,16 +26,32 @@ from .ui import (
 MAX_ITERATIONS = 12
 TOOL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL | re.IGNORECASE)
 
+# MCP-Tools — alle READ-ONLY, laufen auf Backend-Server
 AGENT_TOOLS = {
-    "binary_exec", "shell", "safe_probe", "system_info", "process_control",
-    "code_read", "code_search", "code_tree", "code_edit", "code_patch",
+    "safe_probe", "system_info", "process_control",
+    "code_read", "code_search", "code_tree",
     "file_ops", "git_ops", "git",
     "dev_analyze", "dev_debug", "dev_lint", "dev_refactor", "dev_summarize",
-    "service_control", "service_status", "container_status",
+    "service_status", "container_status",
     "log_viewer", "network_info",
     "web_search", "fetch", "search",
     "memory_search", "memory_store",
     "health",
+}
+
+# Pseudo-Tool: local_exec läuft via subprocess auf dem lokalen Rechner
+LOCAL_EXEC_SCHEMA = {
+    "name": "local_exec",
+    "description": "Execute a shell command LOCALLY on the user's machine (subprocess, not MCP). Use this for ALL system changes: file edits, service restarts, package installs, git commits, etc.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "command": {"type": "string", "description": "Shell command to run locally"},
+            "cwd": {"type": "string", "description": "Working directory (optional)"},
+            "sudo": {"type": "boolean", "description": "Run with sudo (will prompt for password)"},
+        },
+        "required": ["command"]
+    }
 }
 
 SYSTEM = """\
@@ -47,10 +63,14 @@ You are ai-coder, an autonomous terminal coding and DevOps agent on AILinux/TriF
 - Use tools to gather info first, then act.
 - When task is done, start your final reply with: DONE:
 
-## IMPORTANT — Tool Execution Context:
-ALL tools run on the REMOTE TriForce backend server (Hetzner, 64GB RAM, hostname=ailinux).
-NOT on the user's local machine. safe_probe/binary_exec/shell show BACKEND server stats.
-If user asks for LOCAL RAM/disk/CPU: clarify the distinction and show backend stats.
+## Tool Execution Model:
+- **local_exec**: Runs a shell command DIRECTLY on the user's local machine (subprocess).
+  Use this for ALL changes: editing files, installing packages, restarting services, git commits, etc.
+  Always prefer local_exec for any write/execute operations.
+- **MCP tools** (safe_probe, code_read, search, etc.): Run on the REMOTE backend (Hetzner).
+  Use for reading code, searching, memory, system info of the backend server.
+- If user asks about LOCAL system: use local_exec with `free -h`, `df -h`, `uptime` etc.
+- If user asks to edit a file: use local_exec with `cat > file` or `sed` or similar.
 
 ## Tool Call Format (EXACT — prefer one tool per response):
 <tool_call>
@@ -82,24 +102,25 @@ _FALLBACK_TOOLS: list[dict] = [
 ]
 
 def _get_tools(client: TriForceClient) -> list[dict]:
-    # Kurzer Timeout (8s) damit tools/list schnell scheitert statt zu hängen
+    """Holt MCP-Tool-Schemas + fügt local_exec Pseudo-Tool hinzu."""
     from .config import load_session
     from .client import TriForceClient as TFC
     session = load_session()
     short_client = TFC(session.base_url, token=session.token, timeout=8)
+    mcp_tools = []
     try:
         r = short_client._request("POST", "/v1/mcp",
             {"jsonrpc":"2.0","method":"tools/list","params":{},"id":1},
             require_auth=True, _label="tools/list")
-        found = [t for t in r.get("result",{}).get("tools",[]) if t["name"] in AGENT_TOOLS]
-        if found:
-            return found
+        mcp_tools = [t for t in r.get("result",{}).get("tools",[]) if t["name"] in AGENT_TOOLS]
     except Exception:
         pass
-    # Fallback: hardcoded minimal tool set — Agent kann trotzdem arbeiten
-    import sys
-    print("  \033[33m⚠ tools/list timeout — using built-in tool set\033[0m", file=sys.stderr)
-    return _FALLBACK_TOOLS
+    if not mcp_tools:
+        import sys
+        print("  \033[33m⚠ tools/list timeout — using built-in tool set\033[0m", file=sys.stderr)
+        mcp_tools = _FALLBACK_TOOLS
+    # local_exec immer als erstes Tool — wichtigster Baustein für Execution
+    return [LOCAL_EXEC_SCHEMA] + mcp_tools
 
 
 def _tool_desc(tools: list[dict]) -> str:
@@ -115,6 +136,23 @@ def _tool_desc(tools: list[dict]) -> str:
 
 def _run_tool(client: TriForceClient, name: str, args: dict) -> tuple[str, bool]:
     """Returns (result_text, is_error)."""
+    # local_exec: läuft lokal via subprocess, NICHT über MCP
+    if name == "local_exec":
+        import subprocess as _sp
+        cmd = args.get("command","")
+        cwd = args.get("cwd") or None
+        use_sudo = args.get("sudo", False)
+        if use_sudo and not cmd.strip().startswith("sudo "):
+            cmd = "sudo " + cmd
+        try:
+            r = _sp.run(cmd, shell=True, cwd=cwd, capture_output=True,
+                        text=True, timeout=60)
+            out = (r.stdout or "") + (r.stderr or "")
+            return (out[:4000] or "(no output)"), r.returncode != 0
+        except Exception as e:
+            return f"local_exec error: {e}", True
+
+    # MCP-Tools: auf Backend-Server
     try:
         r = client.mcp_call(name, args)
         text = r.get("result",{}).get("content",[{}])[0].get("text","")
