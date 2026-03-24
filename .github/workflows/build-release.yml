@@ -184,14 +184,20 @@ jobs:
         id: sha
         shell: bash
         run: |
-          EXE_SHA=$(sha256sum dist/aicoder.exe | cut -d' ' -f1)
+          EXE_SHA=$(sha256sum aicoder.exe 2>/dev/null || sha256sum dist/aicoder.exe | cut -d' ' -f1)
           echo "exe_sha=$EXE_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare artifacts
+        shell: bash
+        run: |
+          cp dist/aicoder.exe aicoder.exe
+          ls -lh aicoder.exe aicoder-*-setup.exe 2>/dev/null || true
 
       - uses: actions/upload-artifact@v4
         with:
           name: windows-artifacts
           path: |
-            dist/aicoder.exe
+            aicoder.exe
             aicoder-*-setup.exe
 
   # ════════════════════════════════════════════════════════════
