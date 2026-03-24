@@ -255,6 +255,18 @@ def cmd_ask(args: argparse.Namespace) -> int:
         system_prompt = read_agents_md(workspace)
 
     _print_header(state, model)
+
+    # Swarm V2: on|review → parallel Operator + Fallback
+    if swarm in ("on", "review"):
+        from .swarm_runner import run_swarm_ask
+        return run_swarm_ask(
+            message=message,
+            operator_model=model,
+            fallback_model=state.get("fallback_model"),
+            system_prompt=system_prompt,
+            mode=swarm,
+        )
+
     label = phase_label(swarm if swarm != "off" else "work")
 
     with Spinner(label):

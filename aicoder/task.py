@@ -19,6 +19,7 @@ from .client import ClientError, TriForceClient
 from .config import load_session
 from .docs_context import read_agents_md
 from .session_state import get_state
+from .history import record as history_record
 from .status import Spinner, phase_label
 
 TASK_SYSTEM_SUFFIX = """
@@ -127,6 +128,18 @@ def run_task(
     response = result.get("response", "").strip()
     model_used = result.get("model", effective_model or "?")
     latency = result.get("latency_ms")
+
+    # History
+    try:
+        history_record(
+            kind="task", prompt=task,
+            response=response,
+            model=model_used,
+            files=file_paths,
+            latency_ms=latency,
+        )
+    except Exception:
+        pass
 
     # Single-file: show diff + optional apply
     if len(files_content) == 1 and apply:
