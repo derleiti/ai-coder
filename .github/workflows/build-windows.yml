@@ -107,7 +107,7 @@ jobs:
           Write-Host "aicoder.exe size: $([math]::Round($size, 1)) MB"
 
           # Test run — capture stdout+stderr for diagnostics
-          $proc = Start-Process -FilePath $exe -ArgumentList "--help" `
+          $proc = Start-Process -FilePath $exe -ArgumentList "status" `
             -NoNewWindow -Wait -PassThru `
             -RedirectStandardOutput "stdout.txt" `
             -RedirectStandardError "stderr.txt"
@@ -129,22 +129,39 @@ jobs:
         shell: pwsh
         run: |
           choco install nsis -y --no-progress
+          # Verify installation
+          $nsisPath = "C:\Program Files (x86)\NSIS\makensis.exe"
+          if (!(Test-Path $nsisPath)) {
+            Write-Error "makensis.exe not found at expected path"
+            Get-ChildItem "C:\Program Files (x86)\NSIS\" -ErrorAction SilentlyContinue
+            exit 1
+          }
+          Write-Host "NSIS found: $nsisPath"
 
       - name: Build NSIS Installer
         shell: pwsh
         env:
           APP_VERSION: ${{ steps.version.outputs.version }}
         run: |
-          # Version in NSIS-Format (nur Major.Minor.Patch)
+          $makensis = "C:\Program Files (x86)\NSIS\makensis.exe"
+
+          # Version in NSIS-Format (nur Major.Minor.Patch.0)
           $ver = $env:APP_VERSION -replace '[^0-9.]', ''
           $parts = $ver.Split('.')
           while ($parts.Count -lt 4) { $parts += '0' }
           $nsisVer = ($parts[0..3] -join '.')
 
-          makensis /DVERSION="$env:APP_VERSION" `
-                   /DVERSIONINFO="$nsisVer" `
-                   /DEXE_PATH="dist\aicoder.exe" `
-                   packaging\windows\installer.nsi
+          Write-Host "Building installer with NSIS..."
+          & $makensis /V4 /DVERSION="$env:APP_VERSION" `
+                      /DVERSIONINFO="$nsisVer" `
+                      /DEXE_PATH="dist\aicoder.exe" `
+                      packaging\windows\installer.nsi
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::NSIS build failed with exit code $LASTEXITCODE"
+            exit $LASTEXITCODE
+          }
+          Write-Host "Installer built successfully"
+          Get-ChildItem aicoder-*-setup.exe
 
       # ── Artifacts hochladen ───────────────────────────────
       - name: Upload .exe artifact
