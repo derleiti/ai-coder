@@ -97,7 +97,9 @@ class TriForceClient:
         system_prompt: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 4096,
+        fallback_model: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """Call /v1/client/chat. Auto-retries with fallback_model on ClientError."""
         payload: Dict[str, Any] = {
             "message": message,
             "temperature": temperature,
@@ -107,7 +109,18 @@ class TriForceClient:
             payload["model"] = model
         if system_prompt:
             payload["system_prompt"] = system_prompt
-        return self._request(
-            "POST", "/v1/client/chat", payload, require_auth=True,
-            _label=f"chat/{model or 'default'}"
-        )
+        try:
+            return self._request(
+                "POST", "/v1/client/chat", payload, require_auth=True,
+                _label=f"chat/{model or 'default'}"
+            )
+        except ClientError as e:
+            if fallback_model and fallback_model != model:
+                import sys
+                print(f"\n[FALLBACK: {model} failed → {fallback_model}]", file=sys.stderr)
+                payload["model"] = fallback_model
+                return self._request(
+                    "POST", "/v1/client/chat", payload, require_auth=True,
+                    _label=f"chat/{fallback_model}(fallback)"
+                )
+            raise

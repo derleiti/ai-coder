@@ -276,6 +276,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
             system_prompt=system_prompt,
             temperature=getattr(args, "temperature", 0.7),
             max_tokens=getattr(args, "max_tokens", 4096),
+            fallback_model=state.get("fallback_model") or None,
         )
 
     _print_response(result)
@@ -362,6 +363,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
             message = user_input
 
         label = phase_label(swarm if swarm != "off" else "work")
+        fallback = state.get("fallback_model") or None
         with Spinner(label):
             try:
                 result = client.chat(
@@ -370,6 +372,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
                     system_prompt=system_prompt,
                     temperature=0.7,
                     max_tokens=4096,
+                    fallback_model=fallback,
                 )
             except (ClientError, RuntimeError) as e:
                 print(f"\nFehler: {e}", file=sys.stderr)
@@ -390,6 +393,13 @@ def cmd_chat(args: argparse.Namespace) -> int:
         print()
 
         history.append({"user": user_input, "assistant": resp})
+        try:
+            history_record(
+                kind="chat", prompt=user_input,
+                response=resp, model=model_used, latency_ms=latency,
+            )
+        except Exception:
+            pass
 
     return 0
 

@@ -115,6 +115,7 @@ def run_task(
 
     print(f"model={effective_model or '(backend default)'}  files={len(files_content)}  apply={apply}", file=sys.stderr)
 
+    fallback_model = state.get("fallback_model") or None
     label = phase_label(swarm if swarm != "off" else "work")
     with Spinner(label):
         result = client.chat(
@@ -123,6 +124,7 @@ def run_task(
             system_prompt=system_prompt,
             temperature=temperature,
             max_tokens=8192,
+            fallback_model=fallback_model,
         )
 
     response = result.get("response", "").strip()
