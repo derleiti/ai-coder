@@ -1,16 +1,12 @@
 from __future__ import annotations
 """
-agent.py — Autonomer Terminal-Agent für ai-coder (Claude Code / Codex Style).
-
-Loop:
-  User gibt Aufgabe → LLM denkt → ruft Tools via <tool_call> → sieht Ergebnis → weiter
-  Bis LLM "DONE:" schreibt oder kein Tool mehr aufruft.
+agent.py — Autonomer Terminal-Agent (opencode-Style UI).
 """
-
 import json
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -19,7 +15,13 @@ from .config import load_session
 from .docs_context import read_agents_md
 from .history import record as history_record
 from .session_state import get_state
-from .status import Spinner
+from .ui import (
+    AgentSpinner, C,
+    dim, bold, cyan, green, yellow, red, magenta,
+    panel, print_header, print_task, print_thought,
+    print_tool_call, print_tool_result, print_final,
+    print_error, print_interrupted, print_max_iter,
+)
 
 MAX_ITERATIONS = 12
 TOOL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL | re.IGNORECASE)
@@ -45,16 +47,14 @@ You are ai-coder, an autonomous terminal coding and DevOps agent on AILinux/TriF
 - Use tools to gather info first, then act.
 - When task is done, start your final reply with: DONE:
 
-## Tool Call Format
-Use this EXACT format to call a tool (one per message if possible):
-
+## Tool Call Format (EXACT):
 <tool_call>
 {{"name": "tool_name", "arguments": {{...}}}}
 </tool_call>
 
-After each tool result, continue reasoning. When finished: reply normally starting with DONE:
+After each tool result, continue. When done: reply starting with DONE:
 
-## Tools Available
+## Tools
 {tools}
 
 ## Workspace
@@ -67,8 +67,7 @@ def _get_tools(client: TriForceClient) -> list[dict]:
         r = client._request("POST", "/v1/mcp",
             {"jsonrpc":"2.0","method":"tools/list","params":{},"id":1},
             require_auth=True, _label="tools/list")
-        all_tools = r.get("result",{}).get("tools",[])
-        return [t for t in all_tools if t["name"] in AGENT_TOOLS]
+        return [t for t in r.get("result",{}).get("tools",[]) if t["name"] in AGENT_TOOLS]
     except Exception:
         return []
 
@@ -84,15 +83,17 @@ def _tool_desc(tools: list[dict]) -> str:
     return "\n".join(out)
 
 
-def _run_tool(client: TriForceClient, name: str, args: dict) -> str:
+def _run_tool(client: TriForceClient, name: str, args: dict) -> tuple[str, bool]:
+    """Returns (result_text, is_error)."""
     try:
         r = client.mcp_call(name, args)
         text = r.get("result",{}).get("content",[{}])[0].get("text","")
-        if r.get("result",{}).get("isError"):
-            return f"[ERROR] {text}"
-        return text[:4000] + ("…" if len(text)>4000 else "")
+        is_error = r.get("result",{}).get("isError", False)
+        if is_error or text.startswith('{"error"'):
+            return text[:4000], True
+        return text[:4000] + ("…" if len(text)>4000 else ""), False
     except ClientError as e:
-        return f"[TOOL FAILED] {e}"
+        return f"TOOL FAILED: {e}", True
 
 
 def _parse_calls(text: str) -> list[dict]:
@@ -121,10 +122,10 @@ def run_agent(
     state   = get_state()
     client  = TriForceClient(session.base_url, token=session.token, timeout=120)
 
-    ws_path = Path(state.get("workspace_root") or ".").resolve()
+    ws_path   = Path(state.get("workspace_root") or ".").resolve()
     agents_md = read_agents_md(str(ws_path)) or ""
 
-    # Workspace snapshot
+    # Workspace info
     try:
         entries = sorted(
             e.name for e in ws_path.iterdir()
@@ -143,9 +144,9 @@ def run_agent(
     except Exception:
         pass
 
-    print("Loading tools...", end="\r", file=sys.stderr)
-    tools = _get_tools(client)
-    sys.stderr.write("              \r")
+    # Lade Tools
+    with AgentSpinner("loading tools", color=C.DIM):
+        tools = _get_tools(client)
 
     system = SYSTEM.format(
         agents_md=("## AGENTS.md\n" + agents_md) if agents_md else "",
@@ -153,16 +154,24 @@ def run_agent(
         workspace=ws_str,
     )
 
-    print(f"\n\033[1m[agent]\033[0m model={model or 'default'}  "
-          f"tools={len(tools)}  ws={ws_path.name}")
-    print("─"*60)
+    # Header
+    print_header(
+        model=model or "backend-default",
+        fallback=fallback_model or "",
+        tools=len(tools),
+        workspace=ws_path.name,
+    )
+    print_task(initial_prompt)
 
     history: list[dict] = []
     current_input = initial_prompt
     full_response  = ""
+    model_used     = model or "?"
+    total_latency  = 0
+    fallback_used  = False
 
     for i in range(MAX_ITERATIONS):
-        # Kontext aufbauen
+        # Kontext
         if history:
             ctx = "\n\n".join(
                 f"User: {h['user']}\nAssistant: {h['assistant'][:600]}"
@@ -172,8 +181,10 @@ def run_agent(
         else:
             msg = current_input
 
-        label = "thinking..." if i == 0 else "continuing..."
-        with Spinner(label):
+        label = "thinking" if i == 0 else f"step {i+1}"
+
+        with AgentSpinner(label, color=C.CYAN):
+            t0 = time.time()
             try:
                 result = client.chat(
                     message=msg,
@@ -184,58 +195,65 @@ def run_agent(
                     max_tokens=4096,
                 )
             except (ClientError, RuntimeError) as e:
-                print(f"\n[agent error] {e}", file=sys.stderr)
+                print_error(str(e))
                 return 1
+            llm_ms = int((time.time() - t0) * 1000)
 
-        response = result.get("response","").strip()
+        response  = result.get("response","").strip()
         model_used = result.get("model", model or "?")
+        lat        = result.get("latency_ms") or llm_ms
+        total_latency += lat
+        if result.get("fallback_used"):
+            fallback_used = True
         full_response = response
 
-        # Tool calls parsen
-        calls = _parse_calls(response)
+        calls   = _parse_calls(response)
         visible = _strip_calls(response)
 
-        # Gedanken/Text zeigen (vor tool calls)
-        if visible and (calls or verbose):
-            print(f"\n\033[2m{visible}\033[0m")
+        # Gedanken anzeigen (gedimmt, nur wenn Tool folgt)
+        if visible and calls:
+            print_thought(visible)
 
         if not calls:
-            # Kein Tool → finale Antwort
-            print()
-            print(response)
-            print(f"\n\033[2m[{model_used} · {result.get('latency_ms','?')}ms]\033[0m", file=sys.stderr)
+            # Finale Antwort
+            print_final(
+                response=response,
+                model=model_used,
+                latency_ms=total_latency,
+                total_iters=i + 1,
+                fallback_used=fallback_used,
+            )
             break
 
-        # Tool calls ausführen
+        # Tool-Loop
         tool_results = []
         for call in calls:
             tname = call.get("name","?")
             targs = call.get("arguments",{})
-            print(f"\n\033[33m▶ {tname}\033[0m  {json.dumps(targs, ensure_ascii=False)[:120]}")
-            with Spinner(f"  running {tname}..."):
-                tr = _run_tool(client, tname, targs)
-            # Ergebnis zeigen (erste 40 Zeilen)
-            tr_lines = tr.splitlines()
-            preview = "\n".join(tr_lines[:40])
-            if len(tr_lines) > 40:
-                preview += f"\n\033[2m... +{len(tr_lines)-40} more lines\033[0m"
-            print(f"\033[32m{preview}\033[0m")
+
+            print_tool_call(tname, targs, i)
+
+            with AgentSpinner(tname, tool=tname) as sp:
+                t_start = time.time()
+                tr, is_err = _run_tool(client, tname, targs)
+                t_elapsed = time.time() - t_start
+
+            print_tool_result(tname, tr, t_elapsed, error=is_err)
             tool_results.append(f"Tool {tname} result:\n{tr}")
 
-        # Tool-Ergebnis als nächsten Input
         history.append({"user": current_input, "assistant": response})
         current_input = "\n\n".join(tool_results)
 
-        # DONE-Check
-        if response.upper().startswith("DONE:") or "DONE:" in response[:200]:
+        if "DONE:" in response[:200].upper():
+            print_final(response, model_used, total_latency, i+1, fallback_used)
             break
     else:
-        print(f"\n[agent] Maximale Iterationen ({MAX_ITERATIONS}) erreicht.", file=sys.stderr)
+        print_max_iter(MAX_ITERATIONS)
 
-    # History speichern
     try:
         history_record(kind="ask", prompt=initial_prompt,
-                       response=full_response, model=model_used)
+                       response=full_response, model=model_used,
+                       latency_ms=total_latency)
     except Exception:
         pass
     return 0

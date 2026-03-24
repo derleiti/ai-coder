@@ -19,15 +19,14 @@ from .session_state import (
     SWARM_MODES, get_state,
     set_fallback, set_model, set_swarm, set_workspace,
 )
-
-# ── Hilfsfunktionen ──────────────────────────────────────────────────────────
+from .ui import C, bold, dim, cyan, green, yellow, red, magenta, white, panel, term_width
 
 def _c(code: str, text: str) -> str:
-    """ANSI-Farbe."""
-    colors = {"bold":"\033[1m","dim":"\033[2m","green":"\033[32m",
-              "yellow":"\033[33m","cyan":"\033[36m","reset":"\033[0m",
-              "red":"\033[31m","blue":"\033[34m"}
-    return colors.get(code,"") + text + "\033[0m"
+    """Compat-Wrapper — nutzt ui.py."""
+    m = {"bold": C.BOLD, "dim": C.DIM, "green": C.BGREEN,
+         "yellow": C.BYELLOW, "cyan": C.CYAN, "reset": C.RESET,
+         "red": C.BRED, "blue": C.BBLUE, "white": C.BWHITE}
+    return m.get(code, "") + text + C.RESET
 
 def _ask(prompt: str, default: str = "") -> str:
     hint = f" [{default}]" if default else ""
@@ -194,20 +193,24 @@ def run_repl(skip_setup: bool = False) -> int:
     swarm    = state.get("swarm_mode","off")
     ws       = state.get("workspace_root") or str(Path.cwd())
 
-    print(f"\n{_c('bold', '── Agent-REPL ─────────────────────────────')}")
-    print(f"  model    : {_c('cyan', model or '(backend default)')}")
-    print(f"  fallback : {_c('dim', fallback or '(nicht gesetzt)')}")
-    print(f"  swarm    : {_c('dim', swarm)}")
-    print(f"  workspace: {_c('dim', ws)}")
-    print(_c("dim", "\n  Befehle: /exit  /setup  /status  /model <n>  /shell <cmd>"))
-    print(_c("dim", "  Aufgabe eingeben → Agent führt sie autonom aus"))
-    print("─"*60)
+    w = min(term_width(), 80)
+    print()
+    print(f"  {C.BOLD}{C.BCYAN}◆ ai-coder{C.RESET}  {C.DIM}Agent REPL{C.RESET}")
+    print(f"  {C.DIM}{'─' * (w-4)}{C.RESET}")
+    print(f"  {dim('model    ')} {cyan(model or '(backend default)')}")
+    print(f"  {dim('fallback ')} {dim(fallback or '—')}")
+    print(f"  {dim('swarm    ')} {dim(swarm)}")
+    print(f"  {dim('workspace')} {dim(ws)}")
+    print(f"  {C.DIM}{'─' * (w-4)}{C.RESET}")
+    print(f"  {dim('/model <n>  /fallback <n>  /swarm <m>  /setup  /shell <cmd>  /exit')}")
+    print(f"  {dim('Aufgabe eingeben → Agent führt sie autonom durch')}")
+    print(f"  {C.DIM}{'─' * (w-4)}{C.RESET}")
 
     from .agent import run_agent
 
     while True:
         try:
-            prompt = input(f"\n{_c('bold','agent>')} ").strip()
+            prompt = input(f"\n  {C.BOLD}{C.BCYAN}◆{C.RESET} ").strip()
         except (EOFError, KeyboardInterrupt):
             print(f"\n{_c('dim','Session beendet.')}")
             break
