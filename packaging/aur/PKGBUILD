@@ -1,0 +1,58 @@
+# Maintainer: Markus Leitermann <admin@ailinux.me>
+pkgname=aicoder
+pkgver=0.3.0
+pkgrel=1
+pkgdesc="Terminal Coding & DevOps Agent for AILinux/TriForce — ask/chat/task/agent/shell/sudo/sysinfo"
+arch=('x86_64')
+url="https://github.com/derleiti/ai-coder"
+license=('MIT')
+depends=('glibc')
+optdepends=('git: for git_ops tool support')
+# Für AUR-Release: Binary von GitHub Releases holen
+# source=("https://github.com/derleiti/ai-coder/releases/download/v${pkgver}/aicoder-${pkgver}-x86_64-linux")
+# sha256sums=('SKIP')
+
+# Lokaler Build (für Entwicklung):
+source=("git+https://github.com/derleiti/ai-coder.git#tag=v${pkgver}")
+sha256sums=('SKIP')
+
+build() {
+    cd "$srcdir/$pkgname"
+    python -m venv .build-venv
+    .build-venv/bin/pip install --quiet pyinstaller .
+    .build-venv/bin/pyinstaller \
+        --onefile \
+        --strip \
+        --name aicoder \
+        --hidden-import aicoder.cli \
+        --hidden-import aicoder.client \
+        --hidden-import aicoder.config \
+        --hidden-import aicoder.session_state \
+        --hidden-import aicoder.docs_context \
+        --hidden-import aicoder.history \
+        --hidden-import aicoder.status \
+        --hidden-import aicoder.workspace \
+        --hidden-import aicoder.task \
+        --hidden-import aicoder.swarm_runner \
+        --hidden-import aicoder.agent \
+        --hidden-import aicoder.setup \
+        --hidden-import aicoder.ui \
+        --exclude-module tkinter \
+        --exclude-module PyQt5 \
+        --exclude-module PyQt6 \
+        aicoder_main.py
+}
+
+package() {
+    cd "$srcdir/$pkgname"
+    install -Dm755 dist/aicoder "$pkgdir/usr/bin/aicoder"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+    if [ -f AGENTS.md ]; then
+        install -Dm644 AGENTS.md "$pkgdir/usr/share/doc/$pkgname/AGENTS.md"
+    fi
+    # Lizenz
+    cat > /tmp/LICENSE << 'EOF'
+MIT License - Copyright (c) 2026 Markus Leitermann
+EOF
+    install -Dm644 /tmp/LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

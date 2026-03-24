@@ -1,0 +1,4 @@
+#!/bin/sh
+set -e
+echo "aicoder installed. Run: aicoder --help"
+echo "First time setup: aicoder  (no args)"

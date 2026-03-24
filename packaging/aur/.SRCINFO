@@ -1,0 +1,13 @@
+pkgbase = aicoder
+	pkgdesc = Terminal Coding & DevOps Agent for AILinux/TriForce
+	pkgver = 0.3.0
+	pkgrel = 1
+	url = https://github.com/derleiti/ai-coder
+	arch = x86_64
+	license = MIT
+	depends = glibc
+	optdepends = git: for git_ops tool support
+	source = git+https://github.com/derleiti/ai-coder.git#tag=v0.3.0
+	sha256sums = SKIP
+
+pkgname = aicoder
