@@ -936,19 +936,6 @@ def cmd_agent(args: argparse.Namespace) -> int:
     else:
         return run_repl(skip_setup=getattr(args, "setup", False))
 
-    # debug/demo
-    p = sub.add_parser("status-demo", help="Nur Statusphasen lokal testen")
-    p.add_argument("--mode", default="swarm")
-    p.add_argument("--seconds", type=float, default=2.0)
-    p.set_defaults(func=cmd_status_demo)
-
-    # GUI
-    p = sub.add_parser("gui", help="GUI-Fenster starten (PyQt6)")
-    p.set_defaults(func=lambda _: _run_gui())
-
-    return parser
-
-
 def cmd_models(args: argparse.Namespace) -> int:
     """Liste verfügbare Modelle vom Backend."""
     session, client = session_client()
@@ -1117,44 +1104,6 @@ def cmd_hist(args: argparse.Namespace) -> int:
     p.add_argument("service", nargs="?", default=None)
     p.add_argument("--lines", type=int, default=50)
     p.set_defaults(func=cmd_service)
-
-
-def cmd_agent(args: argparse.Namespace) -> int:
-    """Agent-REPL starten (optional: direkter Prompt als Argument)."""
-    from .setup import run_repl, run_setup
-    from .agent import run_agent
-
-    # --setup Flag: nur Wizard, dann REPL
-    if getattr(args, "setup", False):
-        run_setup(force=True)
-
-    prompt_parts = getattr(args, "prompt", []) or []
-    if prompt_parts:
-        # Direkt-Prompt: kein REPL, einmaliger Agent-Run
-        from .session_state import get_state
-        state = get_state()
-        return run_agent(
-            initial_prompt=" ".join(prompt_parts),
-            model=getattr(args, "model", None) or state.get("selected_model"),
-            fallback_model=state.get("fallback_model"),
-            verbose=getattr(args, "verbose", False),
-        )
-    else:
-        return run_repl(skip_setup=getattr(args, "setup", False))
-
-    # debug/demo
-    p = sub.add_parser("status-demo", help="Nur Statusphasen lokal testen")
-    p.add_argument("--mode", default="swarm")
-    p.add_argument("--seconds", type=float, default=2.0)
-    p.set_defaults(func=cmd_status_demo)
-
-    # GUI
-    p = sub.add_parser("gui", help="GUI-Fenster starten (PyQt6)")
-    p.set_defaults(func=lambda _: _run_gui())
-
-    return parser
-
-
 def _run_gui() -> int:
     """Startet die PyQt6 GUI."""
     try:
