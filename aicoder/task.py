@@ -169,8 +169,13 @@ def run_task(
                 print(f"✓ {orig_path} aktualisiert")
             else:
                 print("Abgebrochen.")
+    elif len(files_content) > 1 and apply:
+        # Multi-file apply via FILE-block parsing
+        print()
+        _apply_multifile(files_content, response, dry_run)
+        print()
     else:
-        # Analysis / multi-file: just print
+        # Analysis / read-only
         print()
         print(response)
         print()
@@ -189,3 +194,42 @@ def run_task(
         )
 
     return 0
+
+
+def _apply_multifile(
+    files_content: list,
+    response: str,
+    dry_run: bool,
+) -> None:
+    """Parse FILE-blocks from LLM response and apply per-file with diff+confirm."""
+    import re
+    pattern = re.compile(
+        r"--- FILE: (.+?) ---\n(.*?)\n--- END: .+? ---",
+        re.DOTALL,
+    )
+    blocks = pattern.findall(response)
+    if not blocks:
+        print(response)
+        return
+    for fname, content in blocks:
+        fname = fname.strip()
+        new_content = content.strip()
+        match_content = next(
+            (c for n, c in files_content if n == fname or n.endswith(fname)),
+            None,
+        )
+        if match_content is None:
+            print(f"WARN: {fname} nicht in Eingabedateien — übersprungen")
+            continue
+        p = Path(fname)
+        print(f"\n── diff: {p.name} ──────────────────────────")
+        _show_diff(match_content, new_content, p.name)
+        if dry_run:
+            print("(dry-run)")
+            continue
+        confirm = input(f"Schreiben? {p.name} [y/N] ").strip().lower()
+        if confirm == "y":
+            p.write_text(new_content, encoding="utf-8")
+            print(f"✓ {p} aktualisiert")
+        else:
+            print("Übersprungen.")

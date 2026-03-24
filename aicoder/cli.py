@@ -351,6 +351,12 @@ def cmd_chat(args: argparse.Namespace) -> int:
                     print(f"Fehler: {e}")
             elif cmd == "/status":
                 print(f"model={model or 'backend default'}  swarm={swarm}  turns={len(history)}")
+            elif cmd == "/fallback" and val:
+                state["fallback_model"] = val
+                set_fallback(val)
+                print(f"fallback → {val}")
+            elif cmd == "/help":
+                print("  /model <n>  /fallback <n>  /swarm <mode>  /status  /clear  /exit")
             elif cmd == "/clear":
                 history.clear()
                 print("History gecleart.")
@@ -371,7 +377,13 @@ def cmd_chat(args: argparse.Namespace) -> int:
         else:
             message = user_input
 
-        label = phase_label(swarm if swarm != "off" else "work")
+        # Auto-swarm heuristik
+        _cs = swarm
+        if swarm == "auto":
+            from .swarm_runner import should_auto_swarm
+            if should_auto_swarm(user_input):
+                _cs = "on"
+        label = phase_label(_cs if _cs != "off" else "work")
         fallback = state.get("fallback_model") or None
         with Spinner(label):
             try:
