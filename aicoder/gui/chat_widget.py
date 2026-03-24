@@ -14,7 +14,10 @@ from PyQt6.QtGui import QTextCursor
 
 from ..config import load_session
 from ..session_state import get_state
+import platform
 from ..client import TriForceClient, ClientError
+
+IS_WINDOWS = platform.system() == 'Windows'
 
 TOOL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL | re.IGNORECASE)
 
@@ -114,21 +117,29 @@ class _AgentWorker(QThread):
         self.finished.emit(f"(Max {self.MAX_ITER} Iterationen erreicht)\n{visible or response}", model_used)
 
     def _run_tool(self, name: str, args: dict) -> tuple[str, bool]:
-        # local_exec: lokal via subprocess
+        # local_exec: lokal via subprocess (OS-aware)
         if name == "local_exec":
             import subprocess as _sp
             cmd = args.get("command", "")
             cwd = args.get("cwd") or None
-            use_sudo = args.get("sudo", False)
-            if use_sudo and not cmd.strip().startswith("sudo "):
-                cmd = "sudo " + cmd
-            try:
-                r = _sp.run(cmd, shell=True, cwd=cwd, capture_output=True,
-                            text=True, timeout=60)
-                out = (r.stdout or "") + (r.stderr or "")
-                return (out[:4000] or "(no output)"), r.returncode != 0
-            except Exception as e:
-                return f"local_exec error: {e}", True
+            if IS_WINDOWS:
+                run_args = ["powershell", "-NoProfile", "-Command", cmd]
+                try:
+                    r = _sp.run(run_args, cwd=cwd, capture_output=True, text=True, timeout=60)
+                    out = (r.stdout or "") + (r.stderr or "")
+                    return (out[:4000] or "(no output)"), r.returncode != 0
+                except Exception as e:
+                    return f"local_exec error: {e}", True
+            else:
+                use_sudo = args.get("sudo", False)
+                if use_sudo and not cmd.strip().startswith("sudo "):
+                    cmd = "sudo " + cmd
+                try:
+                    r = _sp.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True, timeout=60)
+                    out = (r.stdout or "") + (r.stderr or "")
+                    return (out[:4000] or "(no output)"), r.returncode != 0
+                except Exception as e:
+                    return f"local_exec error: {e}", True
 
         # MCP-Tools: Backend
         try:
@@ -184,7 +195,8 @@ def _load_tools_and_system(client: TriForceClient) -> tuple[list, str]:
     except Exception:
         ws_str = f"path: {ws_path}"
 
-    system = SYSTEM.format(agents_md="", tools=tool_str, workspace=ws_str[:300])
+    from ..agent import OS_NAME, OS_INSTRUCTIONS
+    system = SYSTEM.format(agents_md="", tools=tool_str, workspace=ws_str[:300], os_name=OS_NAME, os_instructions=OS_INSTRUCTIONS)
     return tools, system
 
 

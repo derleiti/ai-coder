@@ -6,6 +6,7 @@ import json
 import re
 import subprocess
 import sys
+import platform
 import time
 from pathlib import Path
 from typing import Optional
@@ -24,6 +25,30 @@ from .ui import (
 )
 
 MAX_ITERATIONS = 12
+
+# OS-Detection
+IS_WINDOWS = platform.system() == "Windows"
+IS_LINUX = platform.system() == "Linux"
+OS_NAME = platform.system()
+
+# OS-spezifische Instruktionen fuer den Agent
+if IS_WINDOWS:
+    OS_INSTRUCTIONS = """- local_exec uses PowerShell. Use PowerShell commands:
+  System info: Get-ComputerInfo, systeminfo, Get-Process, Get-Service
+  Files: Get-Content, Set-Content, New-Item, Copy-Item, Remove-Item, dir
+  Disk: Get-PSDrive, Get-Volume
+  RAM: Get-Process | Sort WorkingSet -Desc | Select -First 10
+  Network: ipconfig, Test-NetConnection, Get-NetAdapter
+  Install: winget install ..., choco install ...
+  NO sudo. NO bash syntax. NO apt/systemctl/cat/sed."""
+else:
+    OS_INSTRUCTIONS = """- local_exec uses bash. Use standard Linux/macOS commands:
+  System info: free -h, df -h, uptime, top -bn1, ps aux
+  Files: cat, sed, tee, cp, mv, rm, ls -la, find
+  Services: systemctl status/start/stop/restart
+  Install: apt install, pip install, etc.
+  Use sudo for privileged operations."""
+
 TOOL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL | re.IGNORECASE)
 
 # MCP-Tools — alle READ-ONLY, laufen auf Backend-Server
@@ -42,13 +67,19 @@ AGENT_TOOLS = {
 # Pseudo-Tool: local_exec läuft via subprocess auf dem lokalen Rechner
 LOCAL_EXEC_SCHEMA = {
     "name": "local_exec",
-    "description": "Execute a shell command LOCALLY on the user's machine (subprocess, not MCP). Use this for ALL system changes: file edits, service restarts, package installs, git commits, etc.",
+    "description": (
+        "Execute a command LOCALLY on the user's machine (subprocess, not MCP). "
+        "Use for ALL system changes: file edits, installs, git, etc. "
+        + ("Windows: use PowerShell syntax. " if IS_WINDOWS else "Linux: use bash syntax. ")
+    ),
     "inputSchema": {
         "type": "object",
         "properties": {
-            "command": {"type": "string", "description": "Shell command to run locally"},
+            "command": {"type": "string", "description": (
+                "PowerShell command" if IS_WINDOWS else "bash command")},
             "cwd": {"type": "string", "description": "Working directory (optional)"},
-            "sudo": {"type": "boolean", "description": "Run with sudo (will prompt for password)"},
+            **({"sudo": {"type": "boolean", "description": "Run with sudo"}}
+               if not IS_WINDOWS else {}),
         },
         "required": ["command"]
     }
@@ -64,13 +95,13 @@ You are ai-coder, an autonomous terminal coding and DevOps agent on AILinux/TriF
 - When task is done, start your final reply with: DONE:
 
 ## Tool Execution Model:
-- **local_exec**: Runs a shell command DIRECTLY on the user's local machine (subprocess).
-  Use this for ALL changes: editing files, installing packages, restarting services, git commits, etc.
-  Always prefer local_exec for any write/execute operations.
+- **local_exec**: Runs a command DIRECTLY on the user's local machine (subprocess).
+  Use this for ALL changes: editing files, installing packages, git commits, etc.
 - **MCP tools** (safe_probe, code_read, search, etc.): Run on the REMOTE backend (Hetzner).
   Use for reading code, searching, memory, system info of the backend server.
-- If user asks about LOCAL system: use local_exec with `free -h`, `df -h`, `uptime` etc.
-- If user asks to edit a file: use local_exec with `cat > file` or `sed` or similar.
+
+## Operating System: {os_name}
+{os_instructions}
 
 ## Tool Call Format (EXACT — prefer one tool per response):
 <tool_call>
@@ -141,16 +172,24 @@ def _run_tool(client: TriForceClient, name: str, args: dict) -> tuple[str, bool]
         import subprocess as _sp
         cmd = args.get("command","")
         cwd = args.get("cwd") or None
-        use_sudo = args.get("sudo", False)
-        if use_sudo and not cmd.strip().startswith("sudo "):
-            cmd = "sudo " + cmd
-        try:
-            r = _sp.run(cmd, shell=True, cwd=cwd, capture_output=True,
-                        text=True, timeout=60)
-            out = (r.stdout or "") + (r.stderr or "")
-            return (out[:4000] or "(no output)"), r.returncode != 0
-        except Exception as e:
-            return f"local_exec error: {e}", True
+        if IS_WINDOWS:
+            run_args = ["powershell", "-NoProfile", "-Command", cmd]
+            try:
+                r = _sp.run(run_args, cwd=cwd, capture_output=True, text=True, timeout=60)
+                out = (r.stdout or "") + (r.stderr or "")
+                return (out[:4000] or "(no output)"), r.returncode != 0
+            except Exception as e:
+                return f"local_exec error: {e}", True
+        else:
+            use_sudo = args.get("sudo", False)
+            if use_sudo and not cmd.strip().startswith("sudo "):
+                cmd = "sudo " + cmd
+            try:
+                r = _sp.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True, timeout=60)
+                out = (r.stdout or "") + (r.stderr or "")
+                return (out[:4000] or "(no output)"), r.returncode != 0
+            except Exception as e:
+                return f"local_exec error: {e}", True
 
     # MCP-Tools: auf Backend-Server
     try:
@@ -222,6 +261,8 @@ def run_agent(
         agents_md=("## AGENTS.md\n" + agents_short) if agents_short else "",
         tools=tool_str,
         workspace=ws_str[:300],
+        os_name=OS_NAME,
+        os_instructions=OS_INSTRUCTIONS,
     )
 
     # Header
