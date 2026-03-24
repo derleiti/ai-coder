@@ -25,5 +25,6 @@ aicoder/docs_context.py
 aicoder/history.py
 aicoder/session_state.py
 aicoder/status.py
+aicoder/swarm_runner.py
 aicoder/task.py
 aicoder/workspace.py
