@@ -13,6 +13,13 @@ from ..config import load_session
 from ..session_state import get_state
 from ..client import TriForceClient, ClientError
 
+DEFAULT_SYSTEM_PROMPT = (
+    "Du bist ai-coder, ein hilfreicher Coding- und DevOps-Assistent von AILinux. "
+    "Antworte praezise und direkt. Bei Code-Fragen: gib lauffaehigen Code. "
+    "Bei DevOps: konkrete Befehle. Kein Smalltalk, keine Wiederholungen. "
+    "Sprache: Deutsch, ausser der User schreibt Englisch."
+)
+
 
 class _ChatWorker(QThread):
     """Background-Thread fuer API-Call."""
@@ -167,7 +174,7 @@ class ChatWidget(QWidget):
         if not fallback:
             fallback = state.get("fallback_model", "")
 
-        self._worker = _ChatWorker(client, text, model, fallback, None)
+        self._worker = _ChatWorker(client, text, model, fallback, DEFAULT_SYSTEM_PROMPT)
         self._worker.finished.connect(self._on_response)
         self._worker.error.connect(self._on_error)
         self._worker.start()
