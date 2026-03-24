@@ -6,8 +6,8 @@ pkgbase = aicoder
 	arch = x86_64
 	license = MIT
 	depends = glibc
-	optdepends = git: for git_ops tool support
-	source = git+https://github.com/derleiti/ai-coder.git#tag=v0.3.0
-	sha256sums = SKIP
+	optdepends = git: git_ops support
+	source = aicoder-0.3.0::https://github.com/derleiti/ai-coder/releases/download/v0.3.0/aicoder-0.3.0-x86_64-linux
+	sha256sums = 70987016f4dde7d07d249d82ff714d38ee469437033553fb8cce5576a819171b
 
 pkgname = aicoder
