@@ -906,6 +906,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--verbose", "-v", action="store_true")
     p.set_defaults(func=cmd_agent)
 
+
+    # GUI
+    p = sub.add_parser("gui", help="GUI-Fenster starten (PyQt6)")
+    p.set_defaults(func=lambda _: _run_gui())
     return parser
 
 
