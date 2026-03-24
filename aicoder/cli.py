@@ -938,6 +938,10 @@ def cmd_agent(args: argparse.Namespace) -> int:
     p.add_argument("--seconds", type=float, default=2.0)
     p.set_defaults(func=cmd_status_demo)
 
+    # GUI
+    p = sub.add_parser("gui", help="GUI-Fenster starten (PyQt6)")
+    p.set_defaults(func=lambda _: _run_gui())
+
     return parser
 
 
@@ -1140,7 +1144,22 @@ def cmd_agent(args: argparse.Namespace) -> int:
     p.add_argument("--seconds", type=float, default=2.0)
     p.set_defaults(func=cmd_status_demo)
 
+    # GUI
+    p = sub.add_parser("gui", help="GUI-Fenster starten (PyQt6)")
+    p.set_defaults(func=lambda _: _run_gui())
+
     return parser
+
+
+def _run_gui() -> int:
+    """Startet die PyQt6 GUI."""
+    try:
+        from .gui.app import run_gui
+        return run_gui()
+    except ImportError as e:
+        print(f"PyQt6 nicht installiert: {e}", file=sys.stderr)
+        print("Installation: pip install PyQt6", file=sys.stderr)
+        return 1
 
 
 def main() -> int:
