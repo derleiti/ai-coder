@@ -178,11 +178,55 @@ def run_setup(force: bool = False) -> bool:
 
 # ── Agent-REPL ────────────────────────────────────────────────────────────────
 
+def _setup_readline():
+    """Readline konfigurieren: History, Cursor, Tab-Completion."""
+    try:
+        import readline
+    except ImportError:
+        return  # Windows ohne pyreadline — input() funktioniert trotzdem
+
+    histfile = CONFIG_DIR / "history"
+    histfile.parent.mkdir(parents=True, exist_ok=True)
+
+    readline.set_history_length(500)
+    try:
+        readline.read_history_file(str(histfile))
+    except (FileNotFoundError, OSError):
+        pass
+
+    import atexit
+    atexit.register(readline.write_history_file, str(histfile))
+
+    # Keybindings: Ctrl+J = literal newline wird zu " && " (Multiline-Hack)
+    try:
+        readline.parse_and_bind("set editing-mode emacs")
+        readline.parse_and_bind("set show-all-if-ambiguous on")
+        readline.parse_and_bind("set colored-completion-prefix on")
+    except Exception:
+        pass
+
+    # Tab-Completion fuer Slash-Kommandos
+    _commands = ["/model", "/fallback", "/swarm", "/status", "/shell",
+                 "/setup", "/exit", "/quit", "/help", "/models"]
+
+    def _completer(text, state):
+        if text.startswith("/"):
+            matches = [c for c in _commands if c.startswith(text)]
+        else:
+            matches = []
+        return matches[state] if state < len(matches) else None
+
+    readline.set_completer(_completer)
+    readline.parse_and_bind("tab: complete")
+
+
 def run_repl(skip_setup: bool = False) -> int:
     """
     Interaktiver Agent-REPL.
     Startet Setup-Wizard wenn nötig, dann Agent-Loop.
     """
+    _setup_readline()
+
     if not skip_setup:
         ok = run_setup()
         if not ok:
@@ -203,7 +247,7 @@ def run_repl(skip_setup: bool = False) -> int:
     print(f"  {dim('swarm    ')} {dim(swarm)}")
     print(f"  {dim('workspace')} {dim(ws)}")
     print(f"  {C.DIM}{'─' * (w-4)}{C.RESET}")
-    print(f"  {dim('/model <n>  /fallback <n>  /swarm <m>  /setup  /shell <cmd>  /exit')}")
+    print(f"  {dim('/model <n>  /fallback <n>  /swarm <m>  /models  /shell <cmd>  /exit')}")
     print(f"  {dim('Aufgabe eingeben → Agent führt sie autonom durch')}")
     print(f"  {C.DIM}{'─' * (w-4)}{C.RESET}")
 
@@ -259,8 +303,26 @@ def run_repl(skip_setup: bool = False) -> int:
                     if r.stderr: print(r.stderr.rstrip(), file=sys.stderr)
                 else:
                     print("  Bsp: /shell uptime")
+            elif cmd == "/models":
+                try:
+                    from .client import TriForceClient
+                    from .config import load_session
+                    s = load_session()
+                    c = TriForceClient(s.base_url, token=s.token, timeout=10)
+                    data = c._request("GET", "/v1/client/models", require_auth=True, _label="models")
+                    models = sorted(data.get("models", []))
+                    tier = data.get("tier", "?")
+                    groups: dict = {}
+                    for m in models:
+                        p = m.split("/")[0] if "/" in m else "other"
+                        groups.setdefault(p, []).append(m)
+                    print(f"  {tier} — {len(models)} Modelle, {len(groups)} Provider")
+                    for provider, mlist in sorted(groups.items()):
+                        print(f"    [{provider}] {len(mlist)}: {', '.join(mlist[:3])}{'...' if len(mlist) > 3 else ''}")
+                except Exception as e:
+                    print(f"  Fehler: {e}")
             elif cmd == "/help":
-                print("  /model <n>  /fallback <n>  /swarm <m>  /status  /shell <cmd>  /setup  /exit")
+                print("  /model <n>  /fallback <n>  /swarm <m>  /models  /status  /shell <cmd>  /setup  /exit")
             else:
                 print(f"  Unbekannt: {cmd}  — /help für Hilfe")
             continue
