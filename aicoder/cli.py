@@ -527,6 +527,165 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
         pass
     return 0
 
+
+def cmd_shell(args: argparse.Namespace) -> int:
+    """Shell-Befehl ueber MCP binary_exec/shell ausfuehren.
+
+    Kurzbefehle: aicoder shell uptime
+                 aicoder shell df -h
+                 aicoder shell systemctl status triforce
+                 aicoder shell --raw "ps aux | grep python"  (via shell tool)
+    """
+    _, client = session_client()
+    cmd_parts = list(args.cmd) if args.cmd else []
+    if not cmd_parts:
+        # Ohne Argumente: liste verfuegbare Programme
+        with Spinner("working..."):
+            raw = client.mcp_call("binary_exec", {"action": "list"})
+        content = raw.get("result", {}).get("content", [{}])[0].get("text", "")
+        try:
+            data = json.loads(content)
+            bins = sorted(data.get("binaries", {}).keys())
+            print(f"{len(bins)} verfuegbare Programme:")
+            print("  ".join(bins))
+        except Exception:
+            print(content)
+        return 0
+
+    use_raw = getattr(args, "raw", False)
+
+    if use_raw:
+        # Rohe Shell-Ausführung via shell-Tool
+        cmd_str = " ".join(cmd_parts)
+        print(f"$ {cmd_str}", file=sys.stderr)
+        with Spinner("working..."):
+            try:
+                raw = client.mcp_call("shell", {"command": cmd_str})
+            except ClientError as e:
+                print(f"Fehler: {e}", file=sys.stderr)
+                return 1
+    else:
+        # binary_exec: erstes Token = Programm, Rest = Argumente
+        program = cmd_parts[0]
+        arguments = cmd_parts[1:]
+        params: dict = {
+            "action": "run",
+            "program": program,
+            "arguments": arguments,
+            "elevated": getattr(args, "elevated", False),
+            "timeout": getattr(args, "timeout", 30),
+        }
+        wd = getattr(args, "cwd", None)
+        if wd:
+            params["work_dir"] = wd
+        print(f"$ {program} {' '.join(arguments)}", file=sys.stderr)
+        with Spinner("working..."):
+            try:
+                raw = client.mcp_call("binary_exec", params)
+            except ClientError as e:
+                print(f"Fehler: {e}", file=sys.stderr)
+                return 1
+
+    content = raw.get("result", {}).get("content", [{}])[0].get("text", "")
+    try:
+        data = json.loads(content)
+        out = data.get("stdout", "") or data.get("output", "") or data.get("result", "") or content
+        err = data.get("stderr", "")
+        rc = int(data.get("returncode", data.get("exit_code", data.get("rc", 0))) or 0)
+    except Exception:
+        out, err, rc = content, "", 0
+    if out:
+        print(out)
+    if err:
+        print(err, file=sys.stderr)
+    return rc
+
+
+def cmd_sudo(args: argparse.Namespace) -> int:
+    """Sudo-Befehl: fragt Passwort lokal ab, wird nie gespeichert."""
+    _, client = session_client()
+    cmd_str = " ".join(args.cmd) if args.cmd else ""
+    if not cmd_str:
+        print("Fehler: Befehl angeben.", file=sys.stderr)
+        return 1
+    password = __import__("getpass").getpass(f"[sudo] Passwort: ")
+    if not password:
+        print("Abgebrochen.", file=sys.stderr)
+        return 1
+    # sudo -S liest von stdin; Passwort via echo pipen
+    # Nutze shell-Tool: sudo -S liest Passwort von stdin
+    full_cmd = "echo " + repr(password) + " | sudo -S " + cmd_str
+    params: dict = {"command": full_cmd}
+    print(f"sudo {cmd_str}", file=sys.stderr)
+    with Spinner("working..."):
+        try:
+            raw = client.mcp_call("shell", params)
+        except ClientError as e:
+            print(f"Fehler: {e}", file=sys.stderr)
+            return 1
+    content = raw.get("result", {}).get("content", [{}])[0].get("text", "")
+    try:
+        data = json.loads(content)
+        out = data.get("stdout", "") or data.get("output", "") or data.get("result","") or content
+        err = (data.get("stderr", "") or "").replace(password, "***")
+        rc = int(data.get("returncode", data.get("exit_code", 0)) or 0)
+    except Exception:
+        out, err, rc = content, "", 0
+    if out:
+        print(out)
+    if err and not err.strip().startswith("[sudo]"):
+        print(err, file=sys.stderr)
+    return rc
+
+
+def cmd_sysinfo(args: argparse.Namespace) -> int:
+    """System-Uebersicht: CPU, RAM, Disk, Docker, Services via safe_probe."""
+    _, client = session_client()
+    action = getattr(args, "action", "overview")
+    params: dict = {"action": action}
+    probe = getattr(args, "probe", None)
+    if probe:
+        params["probe"] = probe
+    service = getattr(args, "service", None)
+    if service:
+        params["service"] = service
+    with Spinner("working..."):
+        try:
+            raw = client.mcp_call("safe_probe", params)
+        except ClientError as e:
+            print(f"Fehler: {e}", file=sys.stderr)
+            return 1
+    content = raw.get("result", {}).get("content", [{}])[0].get("text", "")
+    try:
+        print_json(json.loads(content))
+    except Exception:
+        print(content)
+    return 0
+
+
+def cmd_service(args: argparse.Namespace) -> int:
+    """Systemd-Service verwalten: status/start/stop/restart/logs."""
+    _, client = session_client()
+    action = args.action
+    service = getattr(args, "service", None)
+    params: dict = {"action": action}
+    if service:
+        params["service"] = service
+    if action in ("logs", "journal"):
+        params["lines"] = getattr(args, "lines", 50)
+    with Spinner("working..."):
+        try:
+            raw = client.mcp_call("service_control", params)
+        except ClientError as e:
+            print(f"Fehler: {e}", file=sys.stderr)
+            return 1
+    content = raw.get("result", {}).get("content", [{}])[0].get("text", "")
+    try:
+        print_json(json.loads(content))
+    except Exception:
+        print(content)
+    return 0
+
 # ── Parser ───────────────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
@@ -662,6 +821,32 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--top-n", dest="top_n", type=int, default=5)
     p.add_argument("--max-tokens", dest="max_tokens", type=int, default=200)
     p.set_defaults(func=cmd_broadcast)
+
+    p = sub.add_parser("shell", help="Befehl via MCP binary_exec ausfuehren (ohne Args: Liste)")
+    p.add_argument("cmd", nargs="*")
+    p.add_argument("--raw", "-r", action="store_true", help="Shell-Tool statt binary_exec (pipes etc.)")
+    p.add_argument("--elevated", "-e", action="store_true")
+    p.add_argument("--cwd", default=None)
+    p.add_argument("--timeout", type=int, default=30)
+    p.set_defaults(func=cmd_shell)
+
+    p = sub.add_parser("sudo", help="Sudo-Befehl - fragt Passwort lokal ab")
+    p.add_argument("cmd", nargs="*")
+    p.add_argument("--timeout", type=int, default=60)
+    p.set_defaults(func=cmd_sudo)
+
+    p = sub.add_parser("sysinfo", help="System-Uebersicht via safe_probe")
+    p.add_argument("action", nargs="?", default="overview",
+                   choices=["overview","run","service_status","journal","list"])
+    p.add_argument("--probe", default=None)
+    p.add_argument("--service", default=None)
+    p.set_defaults(func=cmd_sysinfo)
+
+    p = sub.add_parser("service", help="Systemd-Service verwalten")
+    p.add_argument("action", choices=["status","start","stop","restart","logs","list"])
+    p.add_argument("service", nargs="?", default=None)
+    p.add_argument("--lines", type=int, default=50)
+    p.set_defaults(func=cmd_service)
 
     # debug/demo
     p = sub.add_parser("status-demo", help="Nur Statusphasen lokal testen")
@@ -813,6 +998,32 @@ def cmd_hist(args: argparse.Namespace) -> int:
     p.add_argument("--top-n", dest="top_n", type=int, default=5)
     p.add_argument("--max-tokens", dest="max_tokens", type=int, default=200)
     p.set_defaults(func=cmd_broadcast)
+
+    p = sub.add_parser("shell", help="Befehl via MCP binary_exec ausfuehren (ohne Args: Liste)")
+    p.add_argument("cmd", nargs="*")
+    p.add_argument("--raw", "-r", action="store_true", help="Shell-Tool statt binary_exec (pipes etc.)")
+    p.add_argument("--elevated", "-e", action="store_true")
+    p.add_argument("--cwd", default=None)
+    p.add_argument("--timeout", type=int, default=30)
+    p.set_defaults(func=cmd_shell)
+
+    p = sub.add_parser("sudo", help="Sudo-Befehl - fragt Passwort lokal ab")
+    p.add_argument("cmd", nargs="*")
+    p.add_argument("--timeout", type=int, default=60)
+    p.set_defaults(func=cmd_sudo)
+
+    p = sub.add_parser("sysinfo", help="System-Uebersicht via safe_probe")
+    p.add_argument("action", nargs="?", default="overview",
+                   choices=["overview","run","service_status","journal","list"])
+    p.add_argument("--probe", default=None)
+    p.add_argument("--service", default=None)
+    p.set_defaults(func=cmd_sysinfo)
+
+    p = sub.add_parser("service", help="Systemd-Service verwalten")
+    p.add_argument("action", choices=["status","start","stop","restart","logs","list"])
+    p.add_argument("service", nargs="?", default=None)
+    p.add_argument("--lines", type=int, default=50)
+    p.set_defaults(func=cmd_service)
 
     # debug/demo
     p = sub.add_parser("status-demo", help="Nur Statusphasen lokal testen")
