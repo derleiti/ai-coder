@@ -74,8 +74,6 @@ jobs:
             --console `
             --noconfirm `
             --clean `
-            --strip `
-            --add-data "aicoder;aicoder" `
             --hidden-import=httpx `
             --hidden-import=rich `
             --hidden-import=typer `
@@ -83,7 +81,16 @@ jobs:
             --hidden-import=aicoder.cli `
             --hidden-import=aicoder.client `
             --hidden-import=aicoder.config `
-            --hidden-import=aicoder.repl `
+            --hidden-import=aicoder.agent `
+            --hidden-import=aicoder.docs_context `
+            --hidden-import=aicoder.history `
+            --hidden-import=aicoder.session_state `
+            --hidden-import=aicoder.setup `
+            --hidden-import=aicoder.status `
+            --hidden-import=aicoder.swarm_runner `
+            --hidden-import=aicoder.task `
+            --hidden-import=aicoder.ui `
+            --hidden-import=aicoder.workspace `
             --collect-submodules=aicoder `
             aicoder_main.py
 
