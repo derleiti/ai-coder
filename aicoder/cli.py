@@ -895,6 +895,39 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lines", type=int, default=50)
     p.set_defaults(func=cmd_service)
 
+    p = sub.add_parser("agent", help="Agent-REPL / autonomer Terminal-Agent")
+    p.add_argument("prompt", nargs="*", help="Direkt-Prompt (kein REPL)")
+    p.add_argument("--model", default=None)
+    p.add_argument("--setup", action="store_true")
+    p.add_argument("--verbose", "-v", action="store_true")
+    p.set_defaults(func=cmd_agent)
+
+    return parser
+
+
+def cmd_agent(args: argparse.Namespace) -> int:
+    """Agent-REPL starten (optional: direkter Prompt als Argument)."""
+    from .setup import run_repl, run_setup
+    from .agent import run_agent
+
+    # --setup Flag: nur Wizard, dann REPL
+    if getattr(args, "setup", False):
+        run_setup(force=True)
+
+    prompt_parts = getattr(args, "prompt", []) or []
+    if prompt_parts:
+        # Direkt-Prompt: kein REPL, einmaliger Agent-Run
+        from .session_state import get_state
+        state = get_state()
+        return run_agent(
+            initial_prompt=" ".join(prompt_parts),
+            model=getattr(args, "model", None) or state.get("selected_model"),
+            fallback_model=state.get("fallback_model"),
+            verbose=getattr(args, "verbose", False),
+        )
+    else:
+        return run_repl(skip_setup=getattr(args, "setup", False))
+
     # debug/demo
     p = sub.add_parser("status-demo", help="Nur Statusphasen lokal testen")
     p.add_argument("--mode", default="swarm")
@@ -1072,6 +1105,30 @@ def cmd_hist(args: argparse.Namespace) -> int:
     p.add_argument("--lines", type=int, default=50)
     p.set_defaults(func=cmd_service)
 
+
+def cmd_agent(args: argparse.Namespace) -> int:
+    """Agent-REPL starten (optional: direkter Prompt als Argument)."""
+    from .setup import run_repl, run_setup
+    from .agent import run_agent
+
+    # --setup Flag: nur Wizard, dann REPL
+    if getattr(args, "setup", False):
+        run_setup(force=True)
+
+    prompt_parts = getattr(args, "prompt", []) or []
+    if prompt_parts:
+        # Direkt-Prompt: kein REPL, einmaliger Agent-Run
+        from .session_state import get_state
+        state = get_state()
+        return run_agent(
+            initial_prompt=" ".join(prompt_parts),
+            model=getattr(args, "model", None) or state.get("selected_model"),
+            fallback_model=state.get("fallback_model"),
+            verbose=getattr(args, "verbose", False),
+        )
+    else:
+        return run_repl(skip_setup=getattr(args, "setup", False))
+
     # debug/demo
     p = sub.add_parser("status-demo", help="Nur Statusphasen lokal testen")
     p.add_argument("--mode", default="swarm")
@@ -1082,6 +1139,11 @@ def cmd_hist(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    # Kein Argument → Setup-Wizard + Agent-REPL starten
+    if len(sys.argv) == 1:
+        from .setup import run_repl
+        return run_repl()
+
     parser = build_parser()
     args = parser.parse_args()
     try:
