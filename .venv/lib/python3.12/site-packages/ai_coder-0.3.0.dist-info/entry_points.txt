@@ -1,0 +1,2 @@
+[console_scripts]
+aicoder = aicoder.cli:main

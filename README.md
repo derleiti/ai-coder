@@ -1,0 +1,43 @@
+# ai-coder
+
+Terminalbasierter Coding-Agent für AILinux / TriForce.
+
+**Prinzip:** Dünner lokaler CLI-Client — Intelligenz sitzt im Backend.
+
+## Schnellstart
+
+```bash
+cd ~/ai-coder
+source .venv/bin/activate
+pip install -e .
+
+aicoder login --base-url http://127.0.0.1:9000
+aicoder model anthropic/claude-sonnet-4
+aicoder fallback gemini/gemini-2.0-flash
+aicoder swarm auto
+aicoder status
+```
+
+## Commands
+
+| Command | Beschreibung |
+|---|---|
+| `login` | Login gegen /v1/auth/login |
+| `logout` | Lokale Session löschen |
+| `whoami` | Token verifizieren |
+| `handshake` | Client-Handshake (Tools-Liste) |
+| `model [value]` | Aktives Modell anzeigen / setzen |
+| `fallback [value]` | Fallback-Modell anzeigen / setzen |
+| `swarm [value]` | Swarm-Modus: off / auto / on / review |
+| `status` | Übersicht: model, fallback, swarm, workspace, docs |
+| `workspace [path]` | Lokalen Repo-Snapshot erstellen |
+| `mcp <tool> [key=val...]` | MCP-Tool-Call gegen /v1/mcp |
+
+## Architektur
+
+Siehe `docs/architecture.md`.
+
+## AGENTS.md
+
+`ai-coder` liest `AGENTS.md` im Projekt-Root für operative Anweisungen.  
+Format und Inhalt: `docs/models.md`.
