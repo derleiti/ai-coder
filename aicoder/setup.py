@@ -14,7 +14,7 @@ from getpass import getpass
 from pathlib import Path
 from typing import Optional
 
-from .config import DEFAULT_BASE_URL, Session, load_session, save_session
+from .config import CONFIG_DIR, DEFAULT_BASE_URL, Session, load_session, save_session
 from .session_state import (
     SWARM_MODES, get_state,
     set_fallback, set_model, set_swarm, set_workspace,
