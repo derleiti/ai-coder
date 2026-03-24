@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse, json, sys, textwrap, time
+import argparse, json, os, sys, textwrap, time
 from getpass import getpass
 from typing import Any, Dict
 from .client import ClientError, TriForceClient
@@ -445,6 +445,88 @@ def cmd_task(args: argparse.Namespace) -> int:
     )
     return rc
 
+
+def cmd_init(args: argparse.Namespace) -> int:
+    """Workspace initialisieren: AGENTS.md anlegen, workspace_root setzen."""
+    import subprocess
+    from pathlib import Path as _P
+    target = _P(getattr(args, "path", None) or os.getcwd()).resolve()
+    target.mkdir(parents=True, exist_ok=True)
+    set_workspace(str(target))
+    print(f"workspace -> {target}")
+    if not (target / ".git").exists() and not getattr(args, "no_git", False):
+        subprocess.run(["git", "init", str(target)], capture_output=True)
+        print("git init OK")
+    agents_path = target / "AGENTS.md"
+    if agents_path.exists() and not getattr(args, "force", False):
+        print("AGENTS.md bereits vorhanden -- skip (--force zum Ueberschreiben)")
+    else:
+        proj_name = target.name
+        lines_t = [
+            "# AGENTS.md -- " + proj_name, "",
+            "Operative Anweisungen fuer ai-coder.", "",
+            "## Regeln", "",
+            "1. Ursache vor Fix.",
+            "2. Kleine robuste Aenderungen.",
+            "3. Read-first.",
+            "4. Unsicherheit benennen.", "",
+            "## Stack", "", "- TODO: Technologien eintragen", "",
+            "## Konventionen", "", "- TODO: Code-Style eintragen", "",
+        ]
+        agents_path.write_text("\n".join(lines_t), encoding="utf-8")
+        print(f"AGENTS.md OK ({agents_path})")
+    gi = target / ".gitignore"
+    if not gi.exists():
+        gi_lines = ["__pycache__/", "*.pyc", ".venv/", ".env", "*.egg-info/", ""]
+        gi.write_text("\n".join(gi_lines), encoding="utf-8")
+        print(".gitignore OK")
+    print("\nDone. Next: aicoder status")
+    return 0
+
+
+def cmd_broadcast(args: argparse.Namespace) -> int:
+    """Swarm-Broadcast: Frage an alle Backend-Modelle via swarm_broadcast MCP."""
+    _, client = session_client()
+    question = " ".join(args.question) if args.question else ""
+    if not question:
+        print("Fehler: Frage angeben.", file=sys.stderr)
+        return 1
+    providers = getattr(args, "providers", None) or None
+    skip = getattr(args, "skip", None) or None
+    top_n = getattr(args, "top_n", 5)
+    max_tokens = getattr(args, "max_tokens", 200)
+    params: dict = {"question": question, "max_tokens": max_tokens, "top_n": top_n}
+    if providers:
+        params["only_providers"] = [p.strip() for p in providers.split(",")]
+    if skip:
+        params["skip_providers"] = [p.strip() for p in skip.split(",")]
+    print(f"Broadcasting (top_n={top_n}, providers={params.get('only_providers','all')})...", file=sys.stderr)
+    with Spinner("swarming..."):
+        try:
+            raw = client.mcp_call("swarm_broadcast", params)
+        except ClientError as e:
+            print(f"Fehler: {e}", file=sys.stderr)
+            return 1
+    content = raw.get("result", {}).get("content", [{}])[0].get("text", "{}")
+    try:
+        data = json.loads(content)
+    except Exception:
+        print(content)
+        return 0
+    s = data.get("session", {})
+    print(f"\nSwarm {s.get('id','?')} -- {s.get('responses_count',0)} Antworten in {s.get('elapsed_ms',0)}ms")
+    print("-" * 60)
+    for i, r in enumerate(data.get("top_results", []), 1):
+        print(f"\n#{i} [{r.get('model_id','?')}  score={r.get('quality_score',0):.3f}  {r.get('latency_ms','?')}ms]")
+        print(r.get("response", "").strip())
+    try:
+        best = data.get("top_results", [{}])[0].get("response", "")
+        history_record(kind="ask", prompt=question, response=best,
+                       model="swarm/" + s.get("id","?"), latency_ms=s.get("elapsed_ms"))
+    except Exception:
+        pass
+    return 0
+
 # ── Parser ───────────────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
@@ -553,6 +635,8 @@ def build_parser() -> argparse.ArgumentParser:
     # models / mcp-list
     p = sub.add_parser("models", help="Verfügbare Modelle vom Backend auflisten")
     p.add_argument("--filter", default=None, help="Filter by substring")
+    p.add_argument("--group", action="store_true", help="Nach Provider gruppieren")
+    p.add_argument("--verbose", "-v", action="store_true")
     p.add_argument("--json", dest="json_out", action="store_true")
     p.set_defaults(func=cmd_models)
 
@@ -564,6 +648,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-n", type=int, default=10)
     p.add_argument("--clear", action="store_true")
     p.set_defaults(func=cmd_hist)
+
+    p = sub.add_parser("init", help="Workspace initialisieren + AGENTS.md anlegen")
+    p.add_argument("path", nargs="?")
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--no-git", dest="no_git", action="store_true")
+    p.set_defaults(func=cmd_init)
+
+    p = sub.add_parser("broadcast", help="Swarm-Broadcast an alle Backend-Modelle")
+    p.add_argument("question", nargs="*")
+    p.add_argument("--providers", default=None, help="Kommagetrennt: groq,mistral")
+    p.add_argument("--skip", default=None)
+    p.add_argument("--top-n", dest="top_n", type=int, default=5)
+    p.add_argument("--max-tokens", dest="max_tokens", type=int, default=200)
+    p.set_defaults(func=cmd_broadcast)
 
     # debug/demo
     p = sub.add_parser("status-demo", help="Nur Statusphasen lokal testen")
@@ -591,8 +689,22 @@ def cmd_models(args: argparse.Namespace) -> int:
         print_json({"tier": tier, "count": len(models), "models": models})
         return 0
 
+    if getattr(args, "group", False):
+        groups: dict = {}
+        for m in models:
+            prefix = m.split("/")[0] if "/" in m else "other"
+            groups.setdefault(prefix, []).append(m)
+        print(f"tier={tier}  total={count}  providers={len(groups)}")
+        print("-" * 50)
+        for provider, mlist in sorted(groups.items()):
+            print(f"  [{provider}]  {len(mlist)} models")
+            if getattr(args, "verbose", False):
+                for mm in mlist:
+                    print(f"    {mm}")
+        return 0
+
     print(f"tier={tier}  models={count}  showing={len(models)}")
-    print("─" * 50)
+    print("-" * 50)
     for m in models:
         print(f"  {m}")
     return 0
@@ -669,6 +781,8 @@ def cmd_hist(args: argparse.Namespace) -> int:
 
     p = sub.add_parser("models", help="Verfügbare Modelle vom Backend auflisten")
     p.add_argument("--filter", default=None, help="Filter by substring")
+    p.add_argument("--group", action="store_true", help="Nach Provider gruppieren")
+    p.add_argument("--verbose", "-v", action="store_true")
     p.add_argument("--json", dest="json_out", action="store_true")
     p.set_defaults(func=cmd_models)
 
@@ -685,6 +799,20 @@ def cmd_hist(args: argparse.Namespace) -> int:
     p.add_argument("-n", type=int, default=10, help="Anzahl Einträge")
     p.add_argument("--clear", action="store_true", help="History löschen")
     p.set_defaults(func=cmd_hist)
+
+    p = sub.add_parser("init", help="Workspace initialisieren + AGENTS.md anlegen")
+    p.add_argument("path", nargs="?")
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--no-git", dest="no_git", action="store_true")
+    p.set_defaults(func=cmd_init)
+
+    p = sub.add_parser("broadcast", help="Swarm-Broadcast an alle Backend-Modelle")
+    p.add_argument("question", nargs="*")
+    p.add_argument("--providers", default=None, help="Kommagetrennt: groq,mistral")
+    p.add_argument("--skip", default=None)
+    p.add_argument("--top-n", dest="top_n", type=int, default=5)
+    p.add_argument("--max-tokens", dest="max_tokens", type=int, default=200)
+    p.set_defaults(func=cmd_broadcast)
 
     # debug/demo
     p = sub.add_parser("status-demo", help="Nur Statusphasen lokal testen")
