@@ -1,0 +1,284 @@
+# Combined Release: Linux .deb + Binary, Windows .exe + NSIS, AUR PKGBUILD
+name: Build Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version override'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+env:
+  PYTHON_VERSION: '3.12'
+
+jobs:
+  # ════════════════════════════════════════════════════════════
+  # LINUX — Binary + .deb
+  # ════════════════════════════════════════════════════════════
+  build-linux:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      linux_sha: ${{ steps.sha.outputs.linux_sha }}
+      deb_sha: ${{ steps.sha.outputs.deb_sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VER="${{ github.event.inputs.version }}"
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VER="${GITHUB_REF#refs/tags/v}"
+          else
+            VER=$(python3 -c "import re; m=re.search(r'version\s*=\s*\"([^\"]+)\"', open('pyproject.toml').read()); print(m.group(1))")
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "::notice::Building version $VER"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip setuptools wheel pyinstaller
+          pip install -e .
+
+      - name: Build Linux binary
+        run: |
+          pyinstaller \
+            --onefile \
+            --name aicoder \
+            --console \
+            --noconfirm \
+            --clean \
+            --strip \
+            --collect-submodules=aicoder \
+            aicoder_main.py
+          chmod +x dist/aicoder
+          echo "Binary size: $(du -h dist/aicoder | cut -f1)"
+
+      - name: Verify binary
+        run: dist/aicoder status 2>&1 || true
+
+      - name: Build .deb package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p pkg/usr/bin pkg/DEBIAN
+          cp dist/aicoder pkg/usr/bin/aicoder
+          chmod 755 pkg/usr/bin/aicoder
+          SIZE=$(du -s pkg/usr | cut -f1)
+          cat > pkg/DEBIAN/control << EOF
+          Package: aicoder
+          Version: ${VERSION}
+          Section: utils
+          Priority: optional
+          Architecture: amd64
+          Installed-Size: ${SIZE}
+          Maintainer: Markus Leitermann <admin@ailinux.me>
+          Homepage: https://ailinux.me/ai-coder/
+          Description: ai-coder — Terminal Coding & DevOps Agent
+           Autonomer Terminal-Agent fuer AILinux / TriForce Backend.
+           659+ KI-Modelle, 134 MCP-Tools, Swarm-Modus, PyQt6 GUI.
+          EOF
+          # control muss linksbündig sein
+          sed -i 's/^          //' pkg/DEBIAN/control
+          dpkg-deb --build --root-owner-group pkg "aicoder_${VERSION}_amd64.deb"
+
+      - name: Rename binary with version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: cp dist/aicoder "aicoder-${VERSION}-x86_64-linux"
+
+      - name: Compute SHA256
+        id: sha
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          LINUX_SHA=$(sha256sum "aicoder-${VERSION}-x86_64-linux" | cut -d' ' -f1)
+          DEB_SHA=$(sha256sum "aicoder_${VERSION}_amd64.deb" | cut -d' ' -f1)
+          echo "linux_sha=$LINUX_SHA" >> "$GITHUB_OUTPUT"
+          echo "deb_sha=$DEB_SHA" >> "$GITHUB_OUTPUT"
+          echo "Linux SHA: $LINUX_SHA"
+          echo "Deb SHA:   $DEB_SHA"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-artifacts
+          path: |
+            aicoder-*-x86_64-linux
+            aicoder_*_amd64.deb
+
+  # ════════════════════════════════════════════════════════════
+  # WINDOWS — .exe + NSIS Installer
+  # ════════════════════════════════════════════════════════════
+  build-windows:
+    runs-on: windows-latest
+    outputs:
+      exe_sha: ${{ steps.sha.outputs.exe_sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VER="${{ github.event.inputs.version }}"
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VER="${GITHUB_REF#refs/tags/v}"
+          else
+            VER=$(python -c "import re; m=re.search(r'version\s*=\s*\"([^\"]+)\"', open('pyproject.toml').read()); print(m.group(1))")
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip setuptools wheel pyinstaller
+          pip install -e .
+
+      - name: Build .exe
+        shell: pwsh
+        run: |
+          pyinstaller `
+            --onefile --name aicoder --console --noconfirm --clean `
+            --collect-submodules=aicoder `
+            aicoder_main.py
+          $size = (Get-Item dist\aicoder.exe).Length / 1MB
+          Write-Host "aicoder.exe: $([math]::Round($size,1)) MB"
+
+      - name: Build NSIS Installer
+        continue-on-error: true
+        id: nsis
+        shell: pwsh
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          choco install nsis -y --no-progress
+          $ver = $env:APP_VERSION -replace '[^0-9.]', ''
+          $parts = $ver.Split('.'); while ($parts.Count -lt 4) { $parts += '0' }
+          $nsisVer = ($parts[0..3] -join '.')
+          $makensis = "C:\Program Files (x86)\NSIS\makensis.exe"
+          & $makensis /V2 /DVERSION="$env:APP_VERSION" `
+            /DVERSIONINFO="$nsisVer" `
+            /DEXE_PATH="dist\aicoder.exe" `
+            packaging\windows\installer.nsi
+
+      - name: Compute SHA256
+        id: sha
+        shell: bash
+        run: |
+          EXE_SHA=$(sha256sum dist/aicoder.exe | cut -d' ' -f1)
+          echo "exe_sha=$EXE_SHA" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-artifacts
+          path: |
+            dist/aicoder.exe
+            aicoder-*-setup.exe
+
+  # ════════════════════════════════════════════════════════════
+  # RELEASE — Upload + AUR PKGBUILD
+  # ════════════════════════════════════════════════════════════
+  release:
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-artifacts
+          path: artifacts/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-artifacts
+          path: artifacts/
+
+      - name: List artifacts
+        run: ls -lh artifacts/
+
+      - name: Generate AUR PKGBUILD
+        env:
+          VERSION: ${{ needs.build-linux.outputs.version }}
+          LINUX_SHA: ${{ needs.build-linux.outputs.linux_sha }}
+        run: |
+          cat > artifacts/PKGBUILD << PKGEOF
+          # Maintainer: Markus Leitermann <admin@ailinux.me>
+          pkgname=aicoder
+          pkgver=${VERSION}
+          pkgrel=1
+          pkgdesc="Terminal Coding & DevOps Agent for AILinux/TriForce — 659+ models, GUI, System Tray"
+          arch=('x86_64')
+          url="https://github.com/derleiti/ai-coder"
+          license=('MIT')
+          depends=('glibc')
+          optdepends=('git: workspace support' 'python-pyqt6: GUI mode (aicoder gui)')
+          source=("aicoder-\${pkgver}::https://github.com/derleiti/ai-coder/releases/download/v\${pkgver}/aicoder-\${pkgver}-x86_64-linux")
+          sha256sums=('${LINUX_SHA}')
+
+          package() {
+              install -Dm755 "\$srcdir/aicoder-\${pkgver}" "\$pkgdir/usr/bin/aicoder"
+              install -Dm644 /dev/stdin "\$pkgdir/usr/share/licenses/\$pkgname/LICENSE" << 'EOF'
+          MIT License — Copyright (c) 2026 Markus Leitermann / AILinux
+          EOF
+          }
+          PKGEOF
+          sed -i 's/^          //' artifacts/PKGBUILD
+          echo "PKGBUILD generated for v${VERSION}"
+          cat artifacts/PKGBUILD
+
+      - name: Upload to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/aicoder-*-x86_64-linux
+            artifacts/aicoder_*_amd64.deb
+            artifacts/aicoder.exe
+            artifacts/aicoder-*-setup.exe
+            artifacts/PKGBUILD
+          generate_release_notes: true
+          body: |
+            ## ai-coder ${{ needs.build-linux.outputs.version }}
+
+            ### Downloads
+            | Platform | File | SHA256 |
+            |---|---|---|
+            | 🐧 Linux Binary | `aicoder-${{ needs.build-linux.outputs.version }}-x86_64-linux` | `${{ needs.build-linux.outputs.linux_sha }}` |
+            | 📦 Debian/Ubuntu | `aicoder_${{ needs.build-linux.outputs.version }}_amd64.deb` | `${{ needs.build-linux.outputs.deb_sha }}` |
+            | 🪟 Windows | `aicoder.exe` | `${{ needs.build-windows.outputs.exe_sha }}` |
+            | 🏗️ Arch/AUR | `PKGBUILD` | — |
+
+            ### Install
+            ```bash
+            # Linux Binary
+            sudo wget -O /usr/bin/aicoder https://github.com/derleiti/ai-coder/releases/download/v${{ needs.build-linux.outputs.version }}/aicoder-${{ needs.build-linux.outputs.version }}-x86_64-linux
+            sudo chmod +x /usr/bin/aicoder
+
+            # Debian/Ubuntu
+            wget aicoder_${{ needs.build-linux.outputs.version }}_amd64.deb && sudo dpkg -i aicoder_*.deb
+
+            # Arch/AUR
+            yay -S aicoder
+
+            # Windows: Download aicoder.exe, add to PATH
+            ```
