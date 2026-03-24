@@ -74,6 +74,7 @@ jobs:
             --hidden-import=aicoder.gui.chat_widget \
             --hidden-import=aicoder.gui.settings_widget \
             --hidden-import=aicoder.gui.autostart \
+            --hidden-import=certifi \
             aicoder_main.py
           chmod +x dist/aicoder
           echo "Binary size: $(du -h dist/aicoder | cut -f1)"
@@ -179,6 +180,7 @@ jobs:
             --hidden-import=aicoder.gui.chat_widget `
             --hidden-import=aicoder.gui.settings_widget `
             --hidden-import=aicoder.gui.autostart `
+            --hidden-import=certifi `
             aicoder_main.py
           $size = (Get-Item dist\aicoder.exe).Length / 1MB
           Write-Host "aicoder.exe: $([math]::Round($size,1)) MB"
