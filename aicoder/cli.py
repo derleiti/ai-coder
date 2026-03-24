@@ -639,7 +639,49 @@ def cmd_sudo(args: argparse.Namespace) -> int:
 
 
 def cmd_sysinfo(args: argparse.Namespace) -> int:
-    """System-Uebersicht: CPU, RAM, Disk, Docker, Services via safe_probe."""
+    """System-Uebersicht: lokal (--local) oder Backend via safe_probe."""
+    import shutil, subprocess as sp
+
+    if getattr(args, "local", False):
+        # Lokale System-Info via subprocess — laeuft auf DIESEM Rechner
+        print(f"\033[1m\033[96mLocal system info\033[0m  \033[2m({os.uname().nodename})\033[0m")
+        print("\033[2m" + "─" * 50 + "\033[0m")
+        cmds = {
+            "uptime":   ["uptime"],
+            "ram":      ["free", "-h"],
+            "disk":     ["df", "-h", "--total", "-x", "tmpfs", "-x", "devtmpfs"],
+            "cpu":      ["cat", "/proc/cpuinfo"],
+            "load":     ["cat", "/proc/loadavg"],
+        }
+        if getattr(args, "probe", None):
+            p = args.probe
+            if p in cmds:
+                cmds = {p: cmds[p]}
+            else:
+                cmds = {"cmd": [p]}
+        for label, cmd in cmds.items():
+            if label == "cpu":
+                # CPU kompakt
+                try:
+                    out = sp.check_output(["grep", "-m1", "model name", "/proc/cpuinfo"],
+                                          text=True, timeout=3).strip().split(":")[1].strip()
+                    cores = sp.check_output(["nproc"], text=True, timeout=3).strip()
+                    print(f"  \033[36mcpu\033[0m       {out} ({cores} cores)")
+                except Exception:
+                    pass
+                continue
+            try:
+                out = sp.check_output(cmd, text=True, timeout=5).strip()
+                print(f"  \033[36m{label}\033[0m")
+                for line in out.splitlines()[:15]:
+                    print(f"    {line}")
+            except FileNotFoundError:
+                print(f"  {label}: command not found")
+            except Exception as e:
+                print(f"  {label}: {e}")
+        return 0
+
+    # Remote: safe_probe via MCP
     _, client = session_client()
     action = getattr(args, "action", "overview")
     params: dict = {"action": action}
@@ -649,6 +691,7 @@ def cmd_sysinfo(args: argparse.Namespace) -> int:
     service = getattr(args, "service", None)
     if service:
         params["service"] = service
+    print("\033[2m(Backend-Server: Hetzner/ailinux — nicht lokaler Rechner)\033[0m", file=sys.stderr)
     with Spinner("working..."):
         try:
             raw = client.mcp_call("safe_probe", params)
@@ -882,11 +925,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=int, default=60)
     p.set_defaults(func=cmd_sudo)
 
-    p = sub.add_parser("sysinfo", help="System-Uebersicht via safe_probe")
+    p = sub.add_parser("sysinfo", help="System-Uebersicht: --local = dieser Rechner, sonst Backend-Server")
     p.add_argument("action", nargs="?", default="overview",
                    choices=["overview","run","service_status","journal","list"])
     p.add_argument("--probe", default=None)
     p.add_argument("--service", default=None)
+    p.add_argument("--local", "-l", action="store_true", help="Lokale Stats (dieser Rechner, kein MCP)")
     p.set_defaults(func=cmd_sysinfo)
 
     p = sub.add_parser("service", help="Systemd-Service verwalten")
@@ -1092,11 +1136,12 @@ def cmd_hist(args: argparse.Namespace) -> int:
     p.add_argument("--timeout", type=int, default=60)
     p.set_defaults(func=cmd_sudo)
 
-    p = sub.add_parser("sysinfo", help="System-Uebersicht via safe_probe")
+    p = sub.add_parser("sysinfo", help="System-Uebersicht: --local = dieser Rechner, sonst Backend-Server")
     p.add_argument("action", nargs="?", default="overview",
                    choices=["overview","run","service_status","journal","list"])
     p.add_argument("--probe", default=None)
     p.add_argument("--service", default=None)
+    p.add_argument("--local", "-l", action="store_true", help="Lokale Stats (dieser Rechner, kein MCP)")
     p.set_defaults(func=cmd_sysinfo)
 
     p = sub.add_parser("service", help="Systemd-Service verwalten")

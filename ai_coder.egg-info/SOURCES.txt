@@ -32,4 +32,5 @@ aicoder/setup.py
 aicoder/status.py
 aicoder/swarm_runner.py
 aicoder/task.py
+aicoder/ui.py
 aicoder/workspace.py
