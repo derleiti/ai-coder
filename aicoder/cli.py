@@ -226,7 +226,9 @@ def _print_response(result: dict) -> None:
 
 def cmd_ask(args: argparse.Namespace) -> int:
     """Single-shot prompt. Reads AGENTS.md as system_prompt if present."""
-    _, client = session_client()
+    session = load_session()
+    _timeout = getattr(args, "timeout", 90)
+    client = TriForceClient(session.base_url, token=session.token, timeout=_timeout)
     state = get_state()
     model = _resolve_model(state, getattr(args, "model", None))
     swarm = state.get("swarm_mode", "off")
@@ -256,15 +258,22 @@ def cmd_ask(args: argparse.Namespace) -> int:
 
     _print_header(state, model)
 
-    # Swarm V2: on|review → parallel Operator + Fallback
-    if swarm in ("on", "review"):
+    # Swarm V2: on|review → parallel; auto → Heuristik
+    _effective_swarm = swarm
+    if swarm == "auto":
+        from .swarm_runner import should_auto_swarm
+        if should_auto_swarm(message):
+            _effective_swarm = "on"
+            print("swarm: auto-triggered (complex prompt)", file=sys.stderr)
+
+    if _effective_swarm in ("on", "review"):
         from .swarm_runner import run_swarm_ask
         return run_swarm_ask(
             message=message,
             operator_model=model,
             fallback_model=state.get("fallback_model"),
             system_prompt=system_prompt,
-            mode=swarm,
+            mode=_effective_swarm,
         )
 
     label = phase_label(swarm if swarm != "off" else "work")
@@ -504,6 +513,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-agents", dest="no_agents", action="store_true")
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--max-tokens", dest="max_tokens", type=int, default=4096)
+    p.add_argument("--timeout", type=int, default=90, help="HTTP-Timeout in Sekunden")
     p.set_defaults(func=cmd_ask)
 
     p = sub.add_parser("chat", help="Interaktive Multi-Turn-Chat-Session")
@@ -519,6 +529,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", default=None)
     p.add_argument("--no-agents", dest="no_agents", action="store_true")
     p.add_argument("--temperature", type=float, default=0.3)
+    p.add_argument("--timeout", type=int, default=90, help="HTTP-Timeout in Sekunden")
     p.set_defaults(func=cmd_task)
 
     p = sub.add_parser("review", help="Strukturiertes Code-Review einer Datei")

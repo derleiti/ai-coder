@@ -116,7 +116,15 @@ def run_task(
     print(f"model={effective_model or '(backend default)'}  files={len(files_content)}  apply={apply}", file=sys.stderr)
 
     fallback_model = state.get("fallback_model") or None
-    label = phase_label(swarm if swarm != "off" else "work")
+    # Auto-Swarm Heuristik
+    _effective_swarm = swarm
+    if swarm == "auto":
+        from .swarm_runner import should_auto_swarm
+        if should_auto_swarm(task):
+            _effective_swarm = "on"
+            print("swarm: auto-triggered", file=sys.stderr)
+
+    label = phase_label(_effective_swarm if _effective_swarm != "off" else "work")
     with Spinner(label):
         result = client.chat(
             message=prompt,
@@ -168,4 +176,16 @@ def run_task(
         print()
 
     print(f"[{model_used} · {latency or '?'}ms]", file=sys.stderr)
+
+    # Swarm Review: Fallback bewertet den Output
+    if _effective_swarm == "review" and not apply:
+        from .swarm_runner import run_swarm_review
+        run_swarm_review(
+            original_task=task,
+            operator_response=response,
+            operator_model=effective_model,
+            fallback_model=state.get("fallback_model"),
+            system_prompt=system_prompt if not no_agents else None,
+        )
+
     return 0

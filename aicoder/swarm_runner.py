@@ -93,3 +93,73 @@ def run_swarm_ask(
 
     print()
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Auto-Swarm Heuristik
+# ---------------------------------------------------------------------------
+
+_AUTO_KEYWORDS = {
+    "refactor", "design", "architect", "strategy", "compare", "analyse",
+    "analyze", "review", "tradeoff", "trade-off", "alternative", "approach",
+    "best practice", "optimize", "optimise", "security", "risk", "migrate",
+    "migration", "restructure", "rewrite",
+}
+
+
+def should_auto_swarm(message: str) -> bool:
+    """
+    Heuristik: Swarm bei komplexen Tasks automatisch aktivieren.
+    Trigger: Prompt >150 Zeichen ODER enthält Komplexitäts-Keywords.
+    """
+    lower = message.lower()
+    if len(message) > 150:
+        return True
+    return any(kw in lower for kw in _AUTO_KEYWORDS)
+
+
+# ---------------------------------------------------------------------------
+# Task Review via Swarm (nach LLM-Output)
+# ---------------------------------------------------------------------------
+
+def run_swarm_review(
+    original_task: str,
+    operator_response: str,
+    operator_model: Optional[str],
+    fallback_model: Optional[str],
+    system_prompt: Optional[str],
+) -> None:
+    """
+    Schickt den Operator-Output als Review-Prompt ans Fallback-Modell.
+    Gibt das Review auf stderr aus (non-blocking: ignored on error).
+    """
+    if not fallback_model:
+        return
+
+    review_prompt = (
+        f"Review the following code/solution for bugs, risks, and improvements. "
+        f"Be concise. Original task: {original_task[:200]}\n\n"
+        f"Solution to review:\n{operator_response[:3000]}"
+    )
+
+    session = load_session()
+    client  = TriForceClient(session.base_url, token=session.token)
+    box: list = []
+
+    try:
+        t = threading.Thread(
+            target=_call,
+            args=(client, review_prompt, fallback_model, system_prompt, box),
+            daemon=True,
+        )
+        t.start()
+        t.join(timeout=60)
+    except Exception:
+        return
+
+    if box and not isinstance(box[0], Exception):
+        review = box[0].get("response", "").strip()
+        if review:
+            print("\n── Swarm Review (" + (fallback_model or "?") + ") " + "─" * 20, file=sys.stderr)
+            print(review, file=sys.stderr)
+            print("─" * 50, file=sys.stderr)
