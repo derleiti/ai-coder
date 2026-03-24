@@ -664,24 +664,71 @@ def cmd_sysinfo(args: argparse.Namespace) -> int:
 
 
 def cmd_service(args: argparse.Namespace) -> int:
-    """Systemd-Service verwalten: status/start/stop/restart/logs."""
+    """Systemd-Service verwalten: status/start/stop/restart/logs/list."""
     _, client = session_client()
     action = args.action
     service = getattr(args, "service", None)
     params: dict = {"action": action}
-    if service:
+
+    if action == "list":
+        # Backend service_control list gibt Fehler bei leerem service — zeige Hardcoded-Liste
+        print("Verwaltete Services (Backend-Allowlist):")
+        for s in ["triforce","apache2","nginx","docker","wireguard","redis-server","ollama","mesh-guardian","federation-node"]:
+            print(f"  · {s}")
+        print("\nBsp: aicoder service status triforce")
+        return 0
+    elif service:
         params["service"] = service
+    else:
+        # Kein Service angegeben bei nicht-list Action
+        if action != "list":
+            print(f"Fehler: service angeben. Bsp: aicoder service {action} triforce", file=sys.stderr)
+            print("Verfuegbare Services: triforce apache2 nginx docker redis-server ollama wireguard", file=sys.stderr)
+            return 1
+
     if action in ("logs", "journal"):
         params["lines"] = getattr(args, "lines", 50)
+
     with Spinner("working..."):
         try:
             raw = client.mcp_call("service_control", params)
         except ClientError as e:
             print(f"Fehler: {e}", file=sys.stderr)
             return 1
+
     content = raw.get("result", {}).get("content", [{}])[0].get("text", "")
     try:
-        print_json(json.loads(content))
+        data = json.loads(content)
+        if action == "list":
+            # Zeige erlaubte Services
+            allowed = data.get("allowed", data.get("services", data))
+            if isinstance(allowed, list):
+                print("Verwaltete Services:")
+                for s in allowed: print(f"  · {s}")
+            elif isinstance(allowed, dict):
+                for s, info in allowed.items():
+                    active = info.get("active", "?") if isinstance(info, dict) else info
+                    print(f"  · {s:<25} {active}")
+            else:
+                print_json(data)
+        elif action == "status":
+            # Kompakte Status-Ausgabe
+            output = data.get("output", "")
+            if output:
+                # Erste 10 Zeilen
+                lines = output.split("\n")[:10]
+                print("\n".join(lines))
+            else:
+                print_json(data)
+        elif action == "logs":
+            output = data.get("output", data.get("logs", ""))
+            print(output if output else json.dumps(data, indent=2, ensure_ascii=False))
+        else:
+            # start/stop/restart
+            success = data.get("success", data.get("ok", False))
+            msg = data.get("output", data.get("message", ""))
+            status = "OK" if success else "FEHLER"
+            print(f"[{status}] {action} {service}: {msg[:200]}")
     except Exception:
         print(content)
     return 0
