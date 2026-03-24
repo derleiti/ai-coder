@@ -126,6 +126,8 @@ jobs:
 
       # ── NSIS Installer ────────────────────────────────────
       - name: Install NSIS
+        continue-on-error: true
+        id: nsis_install
         shell: pwsh
         run: |
           choco install nsis -y --no-progress
@@ -139,6 +141,8 @@ jobs:
           Write-Host "NSIS found: $nsisPath"
 
       - name: Build NSIS Installer
+        continue-on-error: true
+        id: nsis_build
         shell: pwsh
         env:
           APP_VERSION: ${{ steps.version.outputs.version }}
@@ -172,6 +176,7 @@ jobs:
           retention-days: 30
 
       - name: Upload installer artifact
+        if: steps.nsis_build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: aicoder-${{ steps.version.outputs.version }}-windows-setup
