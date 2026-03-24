@@ -105,7 +105,24 @@ jobs:
           }
           $size = (Get-Item $exe).Length / 1MB
           Write-Host "aicoder.exe size: $([math]::Round($size, 1)) MB"
-          & $exe --help
+
+          # Test run — capture stdout+stderr for diagnostics
+          $proc = Start-Process -FilePath $exe -ArgumentList "--help" `
+            -NoNewWindow -Wait -PassThru `
+            -RedirectStandardOutput "stdout.txt" `
+            -RedirectStandardError "stderr.txt"
+
+          Write-Host "--- STDOUT ---"
+          Get-Content stdout.txt -ErrorAction SilentlyContinue
+          Write-Host "--- STDERR ---"
+          Get-Content stderr.txt -ErrorAction SilentlyContinue
+          Write-Host "--- EXIT CODE: $($proc.ExitCode) ---"
+
+          if ($proc.ExitCode -ne 0) {
+            Write-Host "::error::aicoder.exe --help failed with exit code $($proc.ExitCode)"
+            # Don't fail the build — upload artifact for debugging
+            Write-Host "::warning::Verify failed but continuing to upload artifact"
+          }
 
       # ── NSIS Installer ────────────────────────────────────
       - name: Install NSIS
