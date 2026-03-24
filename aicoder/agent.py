@@ -62,14 +62,39 @@ After each tool result, continue. When done: reply starting with DONE:
 """
 
 
+# Minimale Tool-Definitionen als Fallback wenn tools/list scheitert
+_FALLBACK_TOOLS: list[dict] = [
+    {"name": "binary_exec",  "description": "Run system programs (uptime, df, git, docker, ps, systemctl...)", "inputSchema": {"type":"object","properties":{"action":{"type":"string"},"program":{"type":"string"},"arguments":{"type":"array","items":{"type":"string"}}},"required":["action"]}},
+    {"name": "shell",        "description": "Execute shell command string", "inputSchema": {"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}},
+    {"name": "safe_probe",   "description": "Read-only system diagnostics (overview, run, service_status, journal)", "inputSchema": {"type":"object","properties":{"action":{"type":"string"},"probe":{"type":"string"}},"required":["action"]}},
+    {"name": "code_read",    "description": "Read source file", "inputSchema": {"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
+    {"name": "code_tree",    "description": "Show directory structure", "inputSchema": {"type":"object","properties":{"path":{"type":"string"}}}},
+    {"name": "git_ops",      "description": "Git operations: log, status, diff, branch", "inputSchema": {"type":"object","properties":{"action":{"type":"string"},"lines":{"type":"integer"}},"required":["action"]}},
+    {"name": "dev_analyze",  "description": "Analyze code quality", "inputSchema": {"type":"object","properties":{"path":{"type":"string"}}}},
+    {"name": "web_search",   "description": "Search the web", "inputSchema": {"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}},
+    {"name": "file_ops",     "description": "File operations: read, write, list, find", "inputSchema": {"type":"object","properties":{"action":{"type":"string"},"path":{"type":"string"}},"required":["action","path"]}},
+    {"name": "health",       "description": "Backend health check", "inputSchema": {"type":"object","properties":{}}},
+]
+
 def _get_tools(client: TriForceClient) -> list[dict]:
+    # Kurzer Timeout (8s) damit tools/list schnell scheitert statt zu hängen
+    from .config import load_session
+    from .client import TriForceClient as TFC
+    session = load_session()
+    short_client = TFC(session.base_url, token=session.token, timeout=8)
     try:
-        r = client._request("POST", "/v1/mcp",
+        r = short_client._request("POST", "/v1/mcp",
             {"jsonrpc":"2.0","method":"tools/list","params":{},"id":1},
             require_auth=True, _label="tools/list")
-        return [t for t in r.get("result",{}).get("tools",[]) if t["name"] in AGENT_TOOLS]
+        found = [t for t in r.get("result",{}).get("tools",[]) if t["name"] in AGENT_TOOLS]
+        if found:
+            return found
     except Exception:
-        return []
+        pass
+    # Fallback: hardcoded minimal tool set — Agent kann trotzdem arbeiten
+    import sys
+    print("  \033[33m⚠ tools/list timeout — using built-in tool set\033[0m", file=sys.stderr)
+    return _FALLBACK_TOOLS
 
 
 def _tool_desc(tools: list[dict]) -> str:
@@ -148,10 +173,12 @@ def run_agent(
     with AgentSpinner("loading tools", color=C.DIM):
         tools = _get_tools(client)
 
+    tool_str = _tool_desc(tools)[:4000]  # Cap: verhindert zu langen system_prompt
+    agents_short = agents_md[:1500] if agents_md else ""
     system = SYSTEM.format(
-        agents_md=("## AGENTS.md\n" + agents_md) if agents_md else "",
-        tools=_tool_desc(tools),
-        workspace=ws_str,
+        agents_md=("## AGENTS.md\n" + agents_short) if agents_short else "",
+        tools=tool_str,
+        workspace=ws_str[:300],
     )
 
     # Header

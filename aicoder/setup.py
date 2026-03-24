@@ -167,7 +167,8 @@ def run_setup(force: bool = False) -> bool:
     print("\n── Workspace ──────────────────────────────")
     ws_default = state.get("workspace_root") or str(Path.cwd())
     workspace = _ask("Projekt-Verzeichnis", ws_default)
-    if workspace and Path(workspace).exists():
+    if workspace:
+        Path(workspace).mkdir(parents=True, exist_ok=True)
         set_workspace(workspace)
         print(f"  workspace → {_c('green', workspace)}")
 
