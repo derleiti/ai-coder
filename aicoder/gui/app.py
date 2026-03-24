@@ -1,13 +1,14 @@
-"""QApplication + System Tray fuer ai-coder GUI."""
+"""QApplication + System Tray mit erweitertem Menue."""
 from __future__ import annotations
 import sys
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
 from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QAction
 from PyQt6.QtCore import Qt
 
+from .autostart import is_autostart_enabled, toggle_autostart
+
 
 def _make_icon() -> QIcon:
-    """Generiert ein einfaches App-Icon."""
     px = QPixmap(64, 64)
     px.fill(QColor(0, 0, 0, 0))
     p = QPainter(px)
@@ -26,7 +27,6 @@ def _make_icon() -> QIcon:
 
 
 def run_gui() -> int:
-    """Startet die GUI-Applikation."""
     app = QApplication(sys.argv)
     app.setApplicationName("ai-coder")
     app.setOrganizationName("AILinux")
@@ -36,20 +36,43 @@ def run_gui() -> int:
     app.setWindowIcon(icon)
 
     from .main_window import MainWindow
-
     window = MainWindow()
     window.setWindowIcon(icon)
 
-    # System Tray
+    # ── System Tray ─────────────────────────────────────
     tray = QSystemTrayIcon(icon, app)
     tray_menu = QMenu()
 
-    show_action = QAction("Oeffnen", tray)
-    show_action.triggered.connect(window.show_and_raise)
-    tray_menu.addAction(show_action)
+    # Open
+    open_action = QAction("Oeffnen", tray)
+    open_action.triggered.connect(window.show_and_raise)
+    tray_menu.addAction(open_action)
+
+    # Close (minimize to tray)
+    close_action = QAction("Minimieren", tray)
+    close_action.triggered.connect(window.hide)
+    tray_menu.addAction(close_action)
 
     tray_menu.addSeparator()
 
+    # Start with OS (toggle)
+    autostart_action = QAction("Mit System starten", tray)
+    autostart_action.setCheckable(True)
+    autostart_action.setChecked(is_autostart_enabled())
+    def _toggle_autostart():
+        new_state = toggle_autostart()
+        autostart_action.setChecked(new_state)
+        tray.showMessage(
+            "ai-coder",
+            "Autostart aktiviert" if new_state else "Autostart deaktiviert",
+            tray.MessageIcon.Information, 2000,
+        )
+    autostart_action.triggered.connect(_toggle_autostart)
+    tray_menu.addAction(autostart_action)
+
+    tray_menu.addSeparator()
+
+    # Quit
     quit_action = QAction("Beenden", tray)
     quit_action.triggered.connect(app.quit)
     tray_menu.addAction(quit_action)
@@ -60,7 +83,7 @@ def run_gui() -> int:
         if reason == QSystemTrayIcon.ActivationReason.Trigger
         else None
     ))
-    tray.setToolTip("ai-coder")
+    tray.setToolTip("ai-coder — Terminal Coding & DevOps Agent")
     tray.show()
 
     window.tray = tray

@@ -64,6 +64,16 @@ jobs:
             --clean \
             --strip \
             --collect-submodules=aicoder \
+            --collect-submodules=PyQt6 \
+            --hidden-import=PyQt6.QtWidgets \
+            --hidden-import=PyQt6.QtGui \
+            --hidden-import=PyQt6.QtCore \
+            --hidden-import=aicoder.gui \
+            --hidden-import=aicoder.gui.app \
+            --hidden-import=aicoder.gui.main_window \
+            --hidden-import=aicoder.gui.chat_widget \
+            --hidden-import=aicoder.gui.settings_widget \
+            --hidden-import=aicoder.gui.autostart \
             aicoder_main.py
           chmod +x dist/aicoder
           echo "Binary size: $(du -h dist/aicoder | cut -f1)"
@@ -159,6 +169,16 @@ jobs:
           pyinstaller `
             --onefile --name aicoder --console --noconfirm --clean `
             --collect-submodules=aicoder `
+            --collect-submodules=PyQt6 `
+            --hidden-import=PyQt6.QtWidgets `
+            --hidden-import=PyQt6.QtGui `
+            --hidden-import=PyQt6.QtCore `
+            --hidden-import=aicoder.gui `
+            --hidden-import=aicoder.gui.app `
+            --hidden-import=aicoder.gui.main_window `
+            --hidden-import=aicoder.gui.chat_widget `
+            --hidden-import=aicoder.gui.settings_widget `
+            --hidden-import=aicoder.gui.autostart `
             aicoder_main.py
           $size = (Get-Item dist\aicoder.exe).Length / 1MB
           Write-Host "aicoder.exe: $([math]::Round($size,1)) MB"
