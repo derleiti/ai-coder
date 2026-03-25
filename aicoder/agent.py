@@ -158,10 +158,10 @@ def _get_tools(client: TriForceClient) -> list[dict]:
     mcp_tools = []
     err_msg = ""
     try:
-        r = short_client._request("POST", "/v1/mcp",
-            {"jsonrpc":"2.0","method":"tools/list","params":{},"id":1},
-            require_auth=True, _label="tools/list")
-        mcp_tools = [t for t in r.get("result",{}).get("tools",[]) if t["name"] in AGENT_TOOLS]
+        # Neuer Endpoint: akzeptiert Client-JWT, gibt volle Schemas zurück
+        r = short_client._request("GET", "/v1/client/mcp/tools/schemas",
+            require_auth=True, _label="tools/schemas")
+        mcp_tools = r.get("tools", [])
     except Exception as e:
         err_msg = str(e)
     if not mcp_tools:
@@ -224,10 +224,27 @@ def _run_tool(client: TriForceClient, name: str, args: dict) -> tuple[str, bool]
 def _parse_calls(text: str) -> list[dict]:
     calls = []
     for m in TOOL_RE.finditer(text):
+        raw = m.group(1).strip()
+        # Format 1: JSON {"name": ..., "arguments": {...}}
         try:
-            c = json.loads(m.group(1).strip())
+            c = json.loads(raw)
             if "name" in c:
                 calls.append(c)
+                continue
+        except Exception:
+            pass
+        # Format 2: XML <name>...</name><arguments><key>val</key></arguments>
+        try:
+            import re as _re
+            name_m = _re.search(r"<name>(.*?)</name>", raw, _re.DOTALL)
+            args_m = _re.search(r"<arguments>(.*?)</arguments>", raw, _re.DOTALL)
+            if name_m:
+                name = name_m.group(1).strip()
+                args = {}
+                if args_m:
+                    for km in _re.finditer(r"<(\w+)>(.*?)</>", args_m.group(1), _re.DOTALL):
+                        args[km.group(1)] = km.group(2).strip()
+                calls.append({"name": name, "arguments": args})
         except Exception:
             pass
     return calls
