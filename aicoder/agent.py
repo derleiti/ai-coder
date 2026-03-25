@@ -29,10 +29,17 @@ MAX_ITERATIONS = 12
 # OS-Detection
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX = platform.system() == "Linux"
-OS_NAME = platform.system()
+IS_TERMUX = bool(os.environ.get("TERMUX_VERSION") or os.path.exists("/data/data/com.termux"))
+OS_NAME = "Android/Termux" if IS_TERMUX else platform.system()
 
 # OS-spezifische Instruktionen fuer den Agent
-if IS_WINDOWS:
+if IS_TERMUX:
+    OS_INSTRUCTIONS = """- local_exec uses sh/bash in Termux (Android).
+- No sudo. Use 'pkg install <pkg>' for packages.
+- Home: /data/data/com.termux/files/home
+- No systemctl. Use 'sv start/stop <service>' if termux-services installed.
+- Prefer: pkg, pip, git, curl, python3, termux-* commands."""
+elif IS_WINDOWS:
     OS_INSTRUCTIONS = """- local_exec uses PowerShell. Use PowerShell commands:
   System info: Get-ComputerInfo, systeminfo, Get-Process, Get-Service
   Files: Get-Content, Set-Content, New-Item, Copy-Item, Remove-Item, dir
