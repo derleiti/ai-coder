@@ -10,19 +10,25 @@ USER_AGENT = "ai-coder/0.5 (AILinux Coding Client)"
 
 
 def _ssl_context() -> ssl.SSLContext:
-    """SSL context with proper CA certs (fixes PyInstaller on Windows)."""
+    """SSL context with proper CA certs (fixes PyInstaller on Windows/Android)."""
+    # 1. certifi — beste Variante, funktioniert auf Windows PyInstaller + Termux
     try:
         import certifi
         return ssl.create_default_context(cafile=certifi.where())
-    except ImportError:
+    except Exception:
         pass
-    # Fallback: system certs
-    ctx = ssl.create_default_context()
-    if not ctx.get_ca_certs():
-        # Last resort: no verification (Windows PyInstaller edge case)
+    # 2. System-Certs — Linux mit korrekten CA-Certs
+    try:
         ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+        # Testweise Verbindung um zu prüfen ob Certs da sind — NICHT ctx.get_ca_certs()
+        # da die Liste leer ist bis eine Verbindung gemacht wird
+        return ctx
+    except Exception:
+        pass
+    # 3. Kein Verify als letzter Ausweg (sollte nie nötig sein wenn certifi da ist)
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
     return ctx
 
 

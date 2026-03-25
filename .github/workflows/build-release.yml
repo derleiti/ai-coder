@@ -298,6 +298,7 @@ jobs:
             | 📦 Debian/Ubuntu | `aicoder_${{ needs.build-linux.outputs.version }}_amd64.deb` | `${{ needs.build-linux.outputs.deb_sha }}` |
             | 🪟 Windows | `aicoder.exe` | `${{ needs.build-windows.outputs.exe_sha }}` |
             | 🏗️ Arch/AUR | `PKGBUILD` | — |
+            | 🤖 Android/Termux | One-liner Installer | — |
 
             ### Install
             ```bash
@@ -312,4 +313,10 @@ jobs:
             yay -S aicoder
 
             # Windows: Download aicoder.exe, add to PATH
+
+            # Android/Termux
+            curl -sL https://ailinux.me/ai-coder-termux | bash
+
+            # Termux Update
+            cd ~/.local/lib/aicoder-src && git pull
             ```
