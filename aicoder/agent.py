@@ -150,7 +150,7 @@ def _get_tools(client: TriForceClient) -> list[dict]:
     from .config import load_session
     from .client import TriForceClient as TFC
     session = load_session()
-    short_client = TFC(session.base_url, token=session.token, timeout=8)
+    short_client = TFC(session.base_url, token=session.token, timeout=20)
     mcp_tools = []
     try:
         r = short_client._request("POST", "/v1/mcp",
