@@ -18,13 +18,12 @@ echo -e "${CYAN}[1/4] Pakete installieren...${NC}"
 pkg update -y -q
 pkg install -y python git curl openssl-tool 2>/dev/null | grep -E "install|upgrade" || true
 
-# pip upgrade
-echo -e "${CYAN}[2/4] pip aktualisieren...${NC}"
-pip install --upgrade pip --quiet
+# ai-coder deps (kein pip upgrade — kaputt in Termux)
+echo -e "${CYAN}[2/4] Python-Deps installieren...${NC}"
+pip3 install --quiet httpx rich typer certifi 2>/dev/null || \
+  pip install --quiet httpx rich typer certifi
 
-# ai-coder installieren
-echo -e "${CYAN}[3/4] ai-coder installieren...${NC}"
-pip install --quiet httpx rich typer certifi
+echo -e "${CYAN}[3/4] ai-coder holen...${NC}" 
 
 # Source von GitHub holen
 INSTALL_DIR="$HOME/.local/lib/aicoder-src"
