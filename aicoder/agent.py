@@ -147,21 +147,26 @@ _FALLBACK_TOOLS: list[dict] = [
 
 def _get_tools(client: TriForceClient) -> list[dict]:
     """Holt MCP-Tool-Schemas + fügt local_exec Pseudo-Tool hinzu."""
+    import sys
     from .config import load_session
     from .client import TriForceClient as TFC
     session = load_session()
+    # /v1/mcp braucht Basic-Auth oder MCP-Bearer, nicht den Client-JWT.
+    # Wir nutzen den Client-JWT als Bearer — das Backend akzeptiert das
+    # wenn /v1/client/ exempt ist. Alternativ: User-Credentials als Basic.
     short_client = TFC(session.base_url, token=session.token, timeout=20)
     mcp_tools = []
+    err_msg = ""
     try:
         r = short_client._request("POST", "/v1/mcp",
             {"jsonrpc":"2.0","method":"tools/list","params":{},"id":1},
             require_auth=True, _label="tools/list")
         mcp_tools = [t for t in r.get("result",{}).get("tools",[]) if t["name"] in AGENT_TOOLS]
-    except Exception:
-        pass
+    except Exception as e:
+        err_msg = str(e)
     if not mcp_tools:
-        import sys
-        print("  \033[33m⚠ tools/list timeout — using built-in tool set\033[0m", file=sys.stderr)
+        hint = f" ({err_msg[:80]})" if err_msg else ""
+        print(f"  \033[33m⚠ tools/list fehlgeschlagen{hint} — Fallback\033[0m", file=sys.stderr)
         mcp_tools = _FALLBACK_TOOLS
     # local_exec immer als erstes Tool — wichtigster Baustein für Execution
     return [LOCAL_EXEC_SCHEMA] + mcp_tools
