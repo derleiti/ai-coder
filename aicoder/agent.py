@@ -3,6 +3,7 @@ from __future__ import annotations
 agent.py — Autonomer Terminal-Agent (opencode-Style UI).
 """
 import json
+import os
 import re
 import subprocess
 import sys
