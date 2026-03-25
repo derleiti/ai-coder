@@ -12,7 +12,19 @@ Terminalbasierter Coding & DevOps Agent für AILinux / TriForce.
 | **Linux (Binary)** | [aicoder-x86_64-linux](https://github.com/derleiti/ai-coder/releases/latest/download/aicoder-x86_64-linux) | Standalone, ~8 MB |
 | **Debian/Ubuntu** | [aicoder_amd64.deb](https://github.com/derleiti/ai-coder/releases/latest/download/aicoder_amd64.deb) | `sudo dpkg -i aicoder_*.deb` |
 | **Arch / AILinux** | `yay -S aicoder` | AUR-Paket |
+| **Android / Termux** | `curl -sL https://ailinux.me/ai-coder-termux \| bash` | ARM64, kein GUI |
 | **pip** | `pip install -e .` | Aus Quellcode |
+
+### Android / Termux-Installation
+```bash
+# Install
+curl -sL https://ailinux.me/ai-coder-termux | bash
+source ~/.bashrc
+aicoder
+
+# Update
+cd ~/.local/lib/aicoder-src && git pull
+```
 
 ### Windows-Installation
 
@@ -77,6 +89,7 @@ Siehe `docs/architecture.md`.
 
 - **Linux:** PyInstaller Build auf Push (GitHub Actions)
 - **Windows:** PyInstaller Build + NSIS Installer auf Tag-Push (`v*`)
+- **Android/Termux:** Source-Install via Git Clone, kein Build-Schritt nötig
 - Automatische GitHub Releases mit Binaries
 
 ## Links
