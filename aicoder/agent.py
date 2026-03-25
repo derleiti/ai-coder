@@ -159,9 +159,10 @@ def _get_tools(client: TriForceClient) -> list[dict]:
     err_msg = ""
     try:
         # Neuer Endpoint: akzeptiert Client-JWT, gibt volle Schemas zurück
-        r = short_client._request("GET", "/v1/client/mcp/tools/schemas",
-            require_auth=True, _label="tools/schemas")
-        mcp_tools = r.get("tools", [])
+        r = short_client._request("POST", "/v1/mcp",
+            {"jsonrpc":"2.0","method":"tools/list","params":{},"id":1},
+            require_auth=True, _label="tools/list")
+        mcp_tools = [t for t in r.get("result",{}).get("tools",[]) if t["name"] in AGENT_TOOLS]
     except Exception as e:
         err_msg = str(e)
     if not mcp_tools:
