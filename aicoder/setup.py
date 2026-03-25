@@ -24,6 +24,43 @@ from .ui import C, bold, dim, cyan, green, yellow, red, magenta, white, panel, t
 
 
 
+def _is_token_expired(token: str) -> bool:
+    try:
+        import base64, json as _j, time
+        p = token.split(".")
+        payload = _j.loads(base64.b64decode(p[1] + "==").decode())
+        return payload.get("exp", 0) < time.time()
+    except Exception:
+        return False
+
+
+def _ensure_valid_session() -> None:
+    """Re-Login wenn Token abgelaufen."""
+    try:
+        from .config import load_session, save_session, Session
+        from .client import TriForceClient
+        session = load_session()
+        if not _is_token_expired(session.token):
+            return
+        print(f"  \033[33mToken abgelaufen — Re-Login erforderlich\033[0m")
+        from getpass import getpass
+        password = getpass(f"  Passwort für {session.user_id}: ")
+        client = TriForceClient(session.base_url)
+        result = client.login(email=session.user_id, password=password)
+        new_session = Session(
+            base_url=session.base_url,
+            token=result["token"],
+            client_id=result.get("client_id", session.client_id),
+            user_id=result.get("user_id", session.user_id),
+            tier=result.get("tier", session.tier),
+            account_role=result.get("account_role", session.account_role),
+        )
+        save_session(new_session)
+        print(f"  \033[32m✓ Re-Login OK\033[0m")
+    except Exception:
+        pass
+
+
 # ── Interaktiver Model-Picker ──────────────────────────────────────────────
 PROVIDER_ORDER = ["anthropic","gemini","mistral","groq","cerebras",
                   "openrouter","cloudflare","github","ollama","other"]
@@ -363,6 +400,7 @@ def _setup_readline():
 
 
 def run_repl(skip_setup: bool = False) -> int:
+    _ensure_valid_session()
     """
     Interaktiver Agent-REPL.
     Startet Setup-Wizard wenn nötig, dann Agent-Loop.
