@@ -9,12 +9,13 @@ Wird gestartet wenn:
 """
 
 import json
+import os
 import sys
 from getpass import getpass
 from pathlib import Path
 from typing import Optional
 
-from .config import DEFAULT_BASE_URL, Session, load_session, save_session
+from .config import CONFIG_DIR, DEFAULT_BASE_URL, Session, load_session, save_session
 from .session_state import (
     SWARM_MODES, get_state,
     set_fallback, set_model, set_swarm, set_workspace,
@@ -22,29 +23,21 @@ from .session_state import (
 from .ui import C, bold, dim, cyan, green, yellow, red, magenta, white, panel, term_width
 
 
-# ── Interaktiver Model-Picker ────────────────────────────────────────────────
-# Links/Rechts: Provider wechseln | Hoch/Runter: Modell wählen | Enter: OK | q: Abbruch
 
-PROVIDER_ORDER = [
-    "anthropic","gemini","mistral","groq","cerebras",
-    "openrouter","cloudflare","github","ollama","other"
-]
+# ── Interaktiver Model-Picker ──────────────────────────────────────────────
+PROVIDER_ORDER = ["anthropic","gemini","mistral","groq","cerebras",
+                  "openrouter","cloudflare","github","ollama","other"]
 
 def _read_key() -> str:
-    """Liest einen einzelnen Keypress. Unix: termios/tty. Windows: msvcrt."""
     import platform
     if platform.system() == "Windows":
         try:
             import msvcrt
             ch = msvcrt.getwch()
-            if ch in ("\x00", "\xe0"):  # Sondertaste (Pfeile etc.)
+            if ch in ("\x00", "\xe0"):
                 ch2 = msvcrt.getwch()
-                return {"H": "UP", "P": "DOWN", "M": "RIGHT", "K": "LEFT"}.get(ch2, "?")
-            if ch == "\r":
-                return "\n"
-            if ch == "\x03":
-                return "q"
-            return ch
+                return {"H":"UP","P":"DOWN","M":"RIGHT","K":"LEFT"}.get(ch2, "?")
+            return "\n" if ch == "\r" else ("q" if ch == "\x03" else ch)
         except Exception:
             return input() or "\n"
     else:
@@ -54,12 +47,12 @@ def _read_key() -> str:
             old = termios.tcgetattr(fd)
             try:
                 tty.setraw(fd)
-                ch = os.read(fd, 1)
+                ch = sys.stdin.buffer.read(1)
                 if ch == b"\x1b":
-                    ch2 = os.read(fd, 1)
+                    ch2 = sys.stdin.buffer.read(1)
                     if ch2 == b"[":
-                        ch3 = os.read(fd, 1)
-                        return {b"A": "UP", b"B": "DOWN", b"C": "RIGHT", b"D": "LEFT"}.get(ch3, "?")
+                        ch3 = sys.stdin.buffer.read(1)
+                        return {b"A":"UP",b"B":"DOWN",b"C":"RIGHT",b"D":"LEFT"}.get(ch3,"?")
                     return "ESC"
                 return ch.decode("utf-8", errors="replace")
             finally:
@@ -69,16 +62,12 @@ def _read_key() -> str:
 
 
 def _group_models(models: list) -> dict:
-    """Gruppiert Model-Liste nach Provider, sortiert nach PROVIDER_ORDER."""
     groups: dict = {}
     for m in models:
-        p = m.get("provider", "other")
-        # nur chat-fähige
-        cats = m.get("categories", [])
         if m.get("media_image") or m.get("media_video"):
             continue
-        (groups.setdefault(p, [])).append(m)
-    # sortieren
+        p = m.get("provider", "other")
+        groups.setdefault(p, []).append(m)
     ordered = {}
     for p in PROVIDER_ORDER:
         if p in groups:
@@ -90,27 +79,16 @@ def _group_models(models: list) -> dict:
 
 
 def model_picker_interactive(current_model: str = "") -> str:
-    """
-    Interaktiver TUI-Picker.
-    ← → : Provider wechseln
-    ↑ ↓ : Modell wählen
-    Enter: bestätigen
-    q/ESC: abbrechen (gibt current_model zurück)
-    """
-    from .config import load_session
-    from .client import TriForceClient
-
-    # Modelle laden
+    """TUI Model-Picker: ←→ Provider, ↑↓ Modell, Enter=OK, q=Abbruch."""
     try:
+        from .config import load_session
+        from .client import TriForceClient
         session = load_session()
-        client  = TriForceClient(session.base_url, session.token)
-        all_models = client.list_models()
+        all_models = TriForceClient(session.base_url, session.token).list_models()
     except Exception:
         all_models = []
 
-    # Fallback: hartcodierte Provider-Liste
     if not all_models:
-        print("  (Keine Verbindung — manuelle Eingabe)")
         val = input(f"  Modell-ID [{current_model}]: ").strip()
         return val or current_model
 
@@ -119,89 +97,68 @@ def model_picker_interactive(current_model: str = "") -> str:
     if not providers:
         return current_model
 
-    # Startposition: provider und modell des aktuellen Modells finden
-    cur_prov_idx = 0
-    cur_mod_idx  = 0
+    cur_prov, cur_mod = 0, 0
     for pi, p in enumerate(providers):
         for mi, m in enumerate(groups[p]):
-            mid = m.get("id", m.get("model", ""))
-            if mid == current_model:
-                cur_prov_idx = pi
-                cur_mod_idx  = mi
-                break
+            if m.get("id", m.get("model", "")) == current_model:
+                cur_prov, cur_mod = pi, mi
 
-    VISIBLE = 12  # sichtbare Modelle gleichzeitig
+    VISIBLE = 12
 
-    def _render(prov_idx: int, mod_idx: int):
-        os.system("cls" if __import__("platform").system() == "Windows" else "clear")
-        w = min(os.get_terminal_size().columns, 100)
-        prov = providers[prov_idx]
-        mods = groups[prov]
-        total_mods = len(mods)
+    def _cls():
+        os.system("cls" if os.name == "nt" else "clear")
 
-        # Provider-Leiste
-        prov_bar = ""
+    def _render(pi, mi):
+        _cls()
+        mods = groups[providers[pi]]
+        bar = ""
         for i, p in enumerate(providers):
             cnt = len(groups[p])
-            if i == prov_idx:
-                prov_bar += f"\033[1;36m[ {p} ({cnt}) ]\033[0m "
-            else:
-                prov_bar += f"\033[2m{p} ({cnt})\033[0m  "
-        print(f"\n  {prov_bar}")
-        print(f"  \033[2m{'─' * (w-4)}\033[0m")
+            bar += (f"\033[1;36m[ {p} ({cnt}) ]\033[0m " if i == pi
+                    else f"\033[2m{p} ({cnt})\033[0m  ")
+        print(f"\n  {bar}")
+        try:
+            w = min(os.get_terminal_size().columns - 4, 96)
+        except Exception:
+            w = 76
+        print(f"  \033[2m{'─'*w}\033[0m")
         print(f"  \033[2m← → Provider  ↑ ↓ Modell  Enter=OK  q=Abbruch\033[0m")
-        print(f"  \033[2m{'─' * (w-4)}\033[0m")
-
-        # Scroll-Fenster
-        start = max(0, mod_idx - VISIBLE // 2)
-        end   = min(total_mods, start + VISIBLE)
-        start = max(0, end - VISIBLE)
-
-        for i in range(start, end):
+        print(f"  \033[2m{'─'*w}\033[0m")
+        total = len(mods)
+        start = max(0, min(mi - VISIBLE//2, total - VISIBLE))
+        for i in range(start, min(start + VISIBLE, total)):
             m = mods[i]
-            mid  = m.get("id", m.get("model", ""))
+            mid = m.get("id", m.get("model", ""))
             name = m.get("name", mid)
-            caps = m.get("capabilities", [])
-            cap_str = " ".join(f"\033[2m[{c}]\033[0m" for c in caps if c != "chat")
-            if i == mod_idx:
-                print(f"  \033[1;32m▶ {name:<55}\033[0m {cap_str}")
+            caps = " ".join(f"\033[2m[{c}]\033[0m" for c in m.get("capabilities",[]) if c != "chat")
+            if i == mi:
+                print(f"  \033[1;32m▶ {name:<55}\033[0m {caps}")
             else:
-                print(f"    \033[2m{name:<55}\033[0m {cap_str}")
-
-        if total_mods > VISIBLE:
-            print(f"\n  \033[2m{mod_idx+1}/{total_mods} Modelle\033[0m")
-
-        # Aktuell gewähltes
-        cur = groups[prov][mod_idx]
-        cur_id = cur.get("id", cur.get("model", ""))
+                print(f"    \033[2m{name:<55}\033[0m {caps}")
+        if total > VISIBLE:
+            print(f"\n  \033[2m{mi+1}/{total}\033[0m")
+        cur_id = mods[mi].get("id", mods[mi].get("model", ""))
         print(f"\n  \033[1mAuswahl:\033[0m \033[36m{cur_id}\033[0m")
 
     while True:
-        _render(cur_prov_idx, cur_mod_idx)
+        _render(cur_prov, cur_mod)
         key = _read_key()
-
-        prov = providers[cur_prov_idx]
-        mods = groups[prov]
-
+        mods = groups[providers[cur_prov]]
         if key == "RIGHT":
-            cur_prov_idx = (cur_prov_idx + 1) % len(providers)
-            cur_mod_idx  = 0
+            cur_prov = (cur_prov + 1) % len(providers); cur_mod = 0
         elif key == "LEFT":
-            cur_prov_idx = (cur_prov_idx - 1) % len(providers)
-            cur_mod_idx  = 0
+            cur_prov = (cur_prov - 1) % len(providers); cur_mod = 0
         elif key == "DOWN":
-            cur_mod_idx = min(cur_mod_idx + 1, len(mods) - 1)
+            cur_mod = min(cur_mod + 1, len(mods) - 1)
         elif key == "UP":
-            cur_mod_idx = max(cur_mod_idx - 1, 0)
+            cur_mod = max(cur_mod - 1, 0)
         elif key in ("\r", "\n", " "):
-            # Bestätigen
-            selected = mods[cur_mod_idx].get("id", mods[cur_mod_idx].get("model", ""))
-            os.system("cls" if __import__("platform").system() == "Windows" else "clear")
-            return selected
+            sel = mods[cur_mod].get("id", mods[cur_mod].get("model", ""))
+            _cls()
+            return sel
         elif key in ("q", "Q", "ESC", "\x03"):
-            os.system("cls" if __import__("platform").system() == "Windows" else "clear")
+            _cls()
             return current_model
-
 
 def _c(code: str, text: str) -> str:
     """Compat-Wrapper — nutzt ui.py."""
@@ -306,14 +263,14 @@ def run_setup(force: bool = False) -> bool:
         "mistral/mistral-large-latest",
         "(andere eingeben)",
     ]
-    print(_c("dim", "  Tip: aicoder models --group  zeigt alle 659 Modelle"))
+    print(_c("dim", "  Tip: aicoder models --group  zeigt alle 625+ Modelle"))
     print(_c("dim", "  Öffne interaktiven Modell-Picker..."))
-    model = model_picker_interactive(current_model=state.get("selected_model") or "")
-    if not model:
-        model = _pick("Operator-Modell wählen:", popular,
-                      default=state.get("selected_model") or "groq/llama-3.3-70b-versatile")
-    if model == "(andere eingeben)":
-        model = _ask("Modell-ID eingeben", "groq/llama-3.3-70b-versatile")
+    _picked = model_picker_interactive(current_model=state.get("selected_model") or "")
+    if _picked:
+        model = _picked
+    else:
+        model = "groq/llama-3.3-70b-versatile"  # fallback
+
     set_model(model)
     print(f"  model → {_c('green', model)}")
 
@@ -352,7 +309,8 @@ def run_setup(force: bool = False) -> bool:
     print("\n── Workspace ──────────────────────────────")
     ws_default = state.get("workspace_root") or str(Path.cwd())
     workspace = _ask("Projekt-Verzeichnis", ws_default)
-    if workspace and Path(workspace).exists():
+    if workspace:
+        Path(workspace).mkdir(parents=True, exist_ok=True)
         set_workspace(workspace)
         print(f"  workspace → {_c('green', workspace)}")
 
@@ -362,11 +320,55 @@ def run_setup(force: bool = False) -> bool:
 
 # ── Agent-REPL ────────────────────────────────────────────────────────────────
 
+def _setup_readline():
+    """Readline konfigurieren: History, Cursor, Tab-Completion."""
+    try:
+        import readline
+    except ImportError:
+        return  # Windows ohne pyreadline — input() funktioniert trotzdem
+
+    histfile = CONFIG_DIR / "history"
+    histfile.parent.mkdir(parents=True, exist_ok=True)
+
+    readline.set_history_length(500)
+    try:
+        readline.read_history_file(str(histfile))
+    except (FileNotFoundError, OSError):
+        pass
+
+    import atexit
+    atexit.register(readline.write_history_file, str(histfile))
+
+    # Keybindings: Ctrl+J = literal newline wird zu " && " (Multiline-Hack)
+    try:
+        readline.parse_and_bind("set editing-mode emacs")
+        readline.parse_and_bind("set show-all-if-ambiguous on")
+        readline.parse_and_bind("set colored-completion-prefix on")
+    except Exception:
+        pass
+
+    # Tab-Completion fuer Slash-Kommandos
+    _commands = ["/model", "/fallback", "/swarm", "/status", "/shell",
+                 "/setup", "/exit", "/quit", "/help", "/models"]
+
+    def _completer(text, state):
+        if text.startswith("/"):
+            matches = [c for c in _commands if c.startswith(text)]
+        else:
+            matches = []
+        return matches[state] if state < len(matches) else None
+
+    readline.set_completer(_completer)
+    readline.parse_and_bind("tab: complete")
+
+
 def run_repl(skip_setup: bool = False) -> int:
     """
     Interaktiver Agent-REPL.
     Startet Setup-Wizard wenn nötig, dann Agent-Loop.
     """
+    _setup_readline()
+
     if not skip_setup:
         ok = run_setup()
         if not ok:
@@ -387,7 +389,7 @@ def run_repl(skip_setup: bool = False) -> int:
     print(f"  {dim('swarm    ')} {dim(swarm)}")
     print(f"  {dim('workspace')} {dim(ws)}")
     print(f"  {C.DIM}{'─' * (w-4)}{C.RESET}")
-    print(f"  {dim('/model <n>  /fallback <n>  /swarm <m>  /setup  /shell <cmd>  /exit')}")
+    print(f"  {dim('/model <n>  /fallback <n>  /swarm <m>  /models  /shell <cmd>  /exit')}")
     print(f"  {dim('Aufgabe eingeben → Agent führt sie autonom durch')}")
     print(f"  {C.DIM}{'─' * (w-4)}{C.RESET}")
 
@@ -424,10 +426,10 @@ def run_repl(skip_setup: bool = False) -> int:
                     model = val
                     print(f"  model → {val}")
                 else:
-                    new_model = model_picker_interactive(current_model=model or "")
-                    if new_model and new_model != model:
-                        set_model(new_model)
-                        model = new_model
+                    new = model_picker_interactive(current_model=model or "")
+                    if new and new != model:
+                        set_model(new)
+                        model = new
                         print(f"  model → {cyan(model)}")
             elif cmd == "/fallback" and val:
                 set_fallback(val)
@@ -450,8 +452,26 @@ def run_repl(skip_setup: bool = False) -> int:
                     if r.stderr: print(r.stderr.rstrip(), file=sys.stderr)
                 else:
                     print("  Bsp: /shell uptime")
+            elif cmd == "/models":
+                try:
+                    from .client import TriForceClient
+                    from .config import load_session
+                    s = load_session()
+                    c = TriForceClient(s.base_url, token=s.token, timeout=10)
+                    data = c._request("GET", "/v1/client/models", require_auth=True, _label="models")
+                    models = sorted(data.get("models", []))
+                    tier = data.get("tier", "?")
+                    groups: dict = {}
+                    for m in models:
+                        p = m.split("/")[0] if "/" in m else "other"
+                        groups.setdefault(p, []).append(m)
+                    print(f"  {tier} — {len(models)} Modelle, {len(groups)} Provider")
+                    for provider, mlist in sorted(groups.items()):
+                        print(f"    [{provider}] {len(mlist)}: {', '.join(mlist[:3])}{'...' if len(mlist) > 3 else ''}")
+                except Exception as e:
+                    print(f"  Fehler: {e}")
             elif cmd == "/help":
-                print("  /model <n>  /fallback <n>  /swarm <m>  /status  /shell <cmd>  /setup  /exit")
+                print("  /model <n>  /fallback <n>  /swarm <m>  /models  /status  /shell <cmd>  /setup  /exit")
             else:
                 print(f"  Unbekannt: {cmd}  — /help für Hilfe")
             continue
