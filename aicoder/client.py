@@ -1,29 +1,11 @@
 from __future__ import annotations
 import json
-import ssl
 from typing import Any, Dict, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
-USER_AGENT = "ai-coder/0.5 (AILinux Coding Client)"
-
-
-def _ssl_context() -> ssl.SSLContext:
-    """SSL context with proper CA certs (fixes PyInstaller on Windows)."""
-    try:
-        import certifi
-        return ssl.create_default_context(cafile=certifi.where())
-    except ImportError:
-        pass
-    # Fallback: system certs
-    ctx = ssl.create_default_context()
-    if not ctx.get_ca_certs():
-        # Last resort: no verification (Windows PyInstaller edge case)
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-    return ctx
+USER_AGENT = "ai-coder/0.2 (AILinux Coding Client)"
 
 
 class ClientError(RuntimeError):
@@ -59,7 +41,7 @@ class TriForceClient:
             data = json.dumps(payload).encode("utf-8")
         req = Request(url=url, data=data, headers=headers, method=method.upper())
         try:
-            with urlopen(req, timeout=self.timeout, context=_ssl_context()) as resp:
+            with urlopen(req, timeout=self.timeout) as resp:
                 raw = resp.read().decode("utf-8")
                 return json.loads(raw) if raw else {}
         except HTTPError as e:
@@ -142,3 +124,11 @@ class TriForceClient:
                     _label=f"chat/{fallback_model}(fallback)"
                 )
             raise
+
+    def list_models(self) -> list:
+        # Fetch /v1/models from backend, return list of model dicts
+        try:
+            data = self._request("GET", "/v1/models", require_auth=True, _label="list_models")
+            return data.get("data", [])
+        except Exception:
+            return []

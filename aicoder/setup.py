@@ -14,12 +14,194 @@ from getpass import getpass
 from pathlib import Path
 from typing import Optional
 
-from .config import CONFIG_DIR, DEFAULT_BASE_URL, Session, load_session, save_session
+from .config import DEFAULT_BASE_URL, Session, load_session, save_session
 from .session_state import (
     SWARM_MODES, get_state,
     set_fallback, set_model, set_swarm, set_workspace,
 )
 from .ui import C, bold, dim, cyan, green, yellow, red, magenta, white, panel, term_width
+
+
+# ── Interaktiver Model-Picker ────────────────────────────────────────────────
+# Links/Rechts: Provider wechseln | Hoch/Runter: Modell wählen | Enter: OK | q: Abbruch
+
+PROVIDER_ORDER = [
+    "anthropic","gemini","mistral","groq","cerebras",
+    "openrouter","cloudflare","github","ollama","other"
+]
+
+def _read_key() -> str:
+    """Liest einen einzelnen Keypress. Unix: termios/tty. Windows: msvcrt."""
+    import platform
+    if platform.system() == "Windows":
+        try:
+            import msvcrt
+            ch = msvcrt.getwch()
+            if ch in ("\x00", "\xe0"):  # Sondertaste (Pfeile etc.)
+                ch2 = msvcrt.getwch()
+                return {"H": "UP", "P": "DOWN", "M": "RIGHT", "K": "LEFT"}.get(ch2, "?")
+            if ch == "\r":
+                return "\n"
+            if ch == "\x03":
+                return "q"
+            return ch
+        except Exception:
+            return input() or "\n"
+    else:
+        try:
+            import termios, tty
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                ch = os.read(fd, 1)
+                if ch == b"\x1b":
+                    ch2 = os.read(fd, 1)
+                    if ch2 == b"[":
+                        ch3 = os.read(fd, 1)
+                        return {b"A": "UP", b"B": "DOWN", b"C": "RIGHT", b"D": "LEFT"}.get(ch3, "?")
+                    return "ESC"
+                return ch.decode("utf-8", errors="replace")
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        except Exception:
+            return input() or "\n"
+
+
+def _group_models(models: list) -> dict:
+    """Gruppiert Model-Liste nach Provider, sortiert nach PROVIDER_ORDER."""
+    groups: dict = {}
+    for m in models:
+        p = m.get("provider", "other")
+        # nur chat-fähige
+        cats = m.get("categories", [])
+        if m.get("media_image") or m.get("media_video"):
+            continue
+        (groups.setdefault(p, [])).append(m)
+    # sortieren
+    ordered = {}
+    for p in PROVIDER_ORDER:
+        if p in groups:
+            ordered[p] = groups[p]
+    for p in groups:
+        if p not in ordered:
+            ordered[p] = groups[p]
+    return ordered
+
+
+def model_picker_interactive(current_model: str = "") -> str:
+    """
+    Interaktiver TUI-Picker.
+    ← → : Provider wechseln
+    ↑ ↓ : Modell wählen
+    Enter: bestätigen
+    q/ESC: abbrechen (gibt current_model zurück)
+    """
+    from .config import load_session
+    from .client import TriForceClient
+
+    # Modelle laden
+    try:
+        session = load_session()
+        client  = TriForceClient(session.base_url, session.token)
+        all_models = client.list_models()
+    except Exception:
+        all_models = []
+
+    # Fallback: hartcodierte Provider-Liste
+    if not all_models:
+        print("  (Keine Verbindung — manuelle Eingabe)")
+        val = input(f"  Modell-ID [{current_model}]: ").strip()
+        return val or current_model
+
+    groups = _group_models(all_models)
+    providers = list(groups.keys())
+    if not providers:
+        return current_model
+
+    # Startposition: provider und modell des aktuellen Modells finden
+    cur_prov_idx = 0
+    cur_mod_idx  = 0
+    for pi, p in enumerate(providers):
+        for mi, m in enumerate(groups[p]):
+            mid = m.get("id", m.get("model", ""))
+            if mid == current_model:
+                cur_prov_idx = pi
+                cur_mod_idx  = mi
+                break
+
+    VISIBLE = 12  # sichtbare Modelle gleichzeitig
+
+    def _render(prov_idx: int, mod_idx: int):
+        os.system("cls" if __import__("platform").system() == "Windows" else "clear")
+        w = min(os.get_terminal_size().columns, 100)
+        prov = providers[prov_idx]
+        mods = groups[prov]
+        total_mods = len(mods)
+
+        # Provider-Leiste
+        prov_bar = ""
+        for i, p in enumerate(providers):
+            cnt = len(groups[p])
+            if i == prov_idx:
+                prov_bar += f"\033[1;36m[ {p} ({cnt}) ]\033[0m "
+            else:
+                prov_bar += f"\033[2m{p} ({cnt})\033[0m  "
+        print(f"\n  {prov_bar}")
+        print(f"  \033[2m{'─' * (w-4)}\033[0m")
+        print(f"  \033[2m← → Provider  ↑ ↓ Modell  Enter=OK  q=Abbruch\033[0m")
+        print(f"  \033[2m{'─' * (w-4)}\033[0m")
+
+        # Scroll-Fenster
+        start = max(0, mod_idx - VISIBLE // 2)
+        end   = min(total_mods, start + VISIBLE)
+        start = max(0, end - VISIBLE)
+
+        for i in range(start, end):
+            m = mods[i]
+            mid  = m.get("id", m.get("model", ""))
+            name = m.get("name", mid)
+            caps = m.get("capabilities", [])
+            cap_str = " ".join(f"\033[2m[{c}]\033[0m" for c in caps if c != "chat")
+            if i == mod_idx:
+                print(f"  \033[1;32m▶ {name:<55}\033[0m {cap_str}")
+            else:
+                print(f"    \033[2m{name:<55}\033[0m {cap_str}")
+
+        if total_mods > VISIBLE:
+            print(f"\n  \033[2m{mod_idx+1}/{total_mods} Modelle\033[0m")
+
+        # Aktuell gewähltes
+        cur = groups[prov][mod_idx]
+        cur_id = cur.get("id", cur.get("model", ""))
+        print(f"\n  \033[1mAuswahl:\033[0m \033[36m{cur_id}\033[0m")
+
+    while True:
+        _render(cur_prov_idx, cur_mod_idx)
+        key = _read_key()
+
+        prov = providers[cur_prov_idx]
+        mods = groups[prov]
+
+        if key == "RIGHT":
+            cur_prov_idx = (cur_prov_idx + 1) % len(providers)
+            cur_mod_idx  = 0
+        elif key == "LEFT":
+            cur_prov_idx = (cur_prov_idx - 1) % len(providers)
+            cur_mod_idx  = 0
+        elif key == "DOWN":
+            cur_mod_idx = min(cur_mod_idx + 1, len(mods) - 1)
+        elif key == "UP":
+            cur_mod_idx = max(cur_mod_idx - 1, 0)
+        elif key in ("\r", "\n", " "):
+            # Bestätigen
+            selected = mods[cur_mod_idx].get("id", mods[cur_mod_idx].get("model", ""))
+            os.system("cls" if __import__("platform").system() == "Windows" else "clear")
+            return selected
+        elif key in ("q", "Q", "ESC", "\x03"):
+            os.system("cls" if __import__("platform").system() == "Windows" else "clear")
+            return current_model
+
 
 def _c(code: str, text: str) -> str:
     """Compat-Wrapper — nutzt ui.py."""
@@ -125,8 +307,11 @@ def run_setup(force: bool = False) -> bool:
         "(andere eingeben)",
     ]
     print(_c("dim", "  Tip: aicoder models --group  zeigt alle 659 Modelle"))
-    model = _pick("Operator-Modell wählen:", popular,
-                  default=state.get("selected_model") or "groq/llama-3.3-70b-versatile")
+    print(_c("dim", "  Öffne interaktiven Modell-Picker..."))
+    model = model_picker_interactive(current_model=state.get("selected_model") or "")
+    if not model:
+        model = _pick("Operator-Modell wählen:", popular,
+                      default=state.get("selected_model") or "groq/llama-3.3-70b-versatile")
     if model == "(andere eingeben)":
         model = _ask("Modell-ID eingeben", "groq/llama-3.3-70b-versatile")
     set_model(model)
@@ -167,8 +352,7 @@ def run_setup(force: bool = False) -> bool:
     print("\n── Workspace ──────────────────────────────")
     ws_default = state.get("workspace_root") or str(Path.cwd())
     workspace = _ask("Projekt-Verzeichnis", ws_default)
-    if workspace:
-        Path(workspace).mkdir(parents=True, exist_ok=True)
+    if workspace and Path(workspace).exists():
         set_workspace(workspace)
         print(f"  workspace → {_c('green', workspace)}")
 
@@ -178,55 +362,11 @@ def run_setup(force: bool = False) -> bool:
 
 # ── Agent-REPL ────────────────────────────────────────────────────────────────
 
-def _setup_readline():
-    """Readline konfigurieren: History, Cursor, Tab-Completion."""
-    try:
-        import readline
-    except ImportError:
-        return  # Windows ohne pyreadline — input() funktioniert trotzdem
-
-    histfile = CONFIG_DIR / "history"
-    histfile.parent.mkdir(parents=True, exist_ok=True)
-
-    readline.set_history_length(500)
-    try:
-        readline.read_history_file(str(histfile))
-    except (FileNotFoundError, OSError):
-        pass
-
-    import atexit
-    atexit.register(readline.write_history_file, str(histfile))
-
-    # Keybindings: Ctrl+J = literal newline wird zu " && " (Multiline-Hack)
-    try:
-        readline.parse_and_bind("set editing-mode emacs")
-        readline.parse_and_bind("set show-all-if-ambiguous on")
-        readline.parse_and_bind("set colored-completion-prefix on")
-    except Exception:
-        pass
-
-    # Tab-Completion fuer Slash-Kommandos
-    _commands = ["/model", "/fallback", "/swarm", "/status", "/shell",
-                 "/setup", "/exit", "/quit", "/help", "/models"]
-
-    def _completer(text, state):
-        if text.startswith("/"):
-            matches = [c for c in _commands if c.startswith(text)]
-        else:
-            matches = []
-        return matches[state] if state < len(matches) else None
-
-    readline.set_completer(_completer)
-    readline.parse_and_bind("tab: complete")
-
-
 def run_repl(skip_setup: bool = False) -> int:
     """
     Interaktiver Agent-REPL.
     Startet Setup-Wizard wenn nötig, dann Agent-Loop.
     """
-    _setup_readline()
-
     if not skip_setup:
         ok = run_setup()
         if not ok:
@@ -247,7 +387,7 @@ def run_repl(skip_setup: bool = False) -> int:
     print(f"  {dim('swarm    ')} {dim(swarm)}")
     print(f"  {dim('workspace')} {dim(ws)}")
     print(f"  {C.DIM}{'─' * (w-4)}{C.RESET}")
-    print(f"  {dim('/model <n>  /fallback <n>  /swarm <m>  /models  /shell <cmd>  /exit')}")
+    print(f"  {dim('/model <n>  /fallback <n>  /swarm <m>  /setup  /shell <cmd>  /exit')}")
     print(f"  {dim('Aufgabe eingeben → Agent führt sie autonom durch')}")
     print(f"  {C.DIM}{'─' * (w-4)}{C.RESET}")
 
@@ -278,10 +418,17 @@ def run_repl(skip_setup: bool = False) -> int:
                 model    = state.get("selected_model")
                 fallback = state.get("fallback_model")
                 swarm    = state.get("swarm_mode","off")
-            elif cmd == "/model" and val:
-                set_model(val)
-                model = val
-                print(f"  model → {val}")
+            elif cmd == "/model":
+                if val:
+                    set_model(val)
+                    model = val
+                    print(f"  model → {val}")
+                else:
+                    new_model = model_picker_interactive(current_model=model or "")
+                    if new_model and new_model != model:
+                        set_model(new_model)
+                        model = new_model
+                        print(f"  model → {cyan(model)}")
             elif cmd == "/fallback" and val:
                 set_fallback(val)
                 fallback = val
@@ -303,26 +450,8 @@ def run_repl(skip_setup: bool = False) -> int:
                     if r.stderr: print(r.stderr.rstrip(), file=sys.stderr)
                 else:
                     print("  Bsp: /shell uptime")
-            elif cmd == "/models":
-                try:
-                    from .client import TriForceClient
-                    from .config import load_session
-                    s = load_session()
-                    c = TriForceClient(s.base_url, token=s.token, timeout=10)
-                    data = c._request("GET", "/v1/client/models", require_auth=True, _label="models")
-                    models = sorted(data.get("models", []))
-                    tier = data.get("tier", "?")
-                    groups: dict = {}
-                    for m in models:
-                        p = m.split("/")[0] if "/" in m else "other"
-                        groups.setdefault(p, []).append(m)
-                    print(f"  {tier} — {len(models)} Modelle, {len(groups)} Provider")
-                    for provider, mlist in sorted(groups.items()):
-                        print(f"    [{provider}] {len(mlist)}: {', '.join(mlist[:3])}{'...' if len(mlist) > 3 else ''}")
-                except Exception as e:
-                    print(f"  Fehler: {e}")
             elif cmd == "/help":
-                print("  /model <n>  /fallback <n>  /swarm <m>  /models  /status  /shell <cmd>  /setup  /exit")
+                print("  /model <n>  /fallback <n>  /swarm <m>  /status  /shell <cmd>  /setup  /exit")
             else:
                 print(f"  Unbekannt: {cmd}  — /help für Hilfe")
             continue
