@@ -53,15 +53,20 @@ TOOL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL | re.IGNOR
 
 # MCP-Tools — alle READ-ONLY, laufen auf Backend-Server
 AGENT_TOOLS = {
-    "safe_probe", "system_info", "process_control",
+    # System
+    "safe_probe", "system_info", "process_control", "health",
+    # Code
     "code_read", "code_search", "code_tree",
     "file_ops", "git_ops", "git",
+    # Dev
     "dev_analyze", "dev_debug", "dev_lint", "dev_refactor", "dev_summarize",
-    "service_status", "container_status",
-    "log_viewer", "network_info",
-    "web_search", "fetch", "search",
+    "dev_links",
+    # Services
+    "service_status", "container_status", "log_viewer", "network_info",
+    # Search / Web
+    "web_search", "browser_search", "search", "fetch", "crawl",
+    # Memory
     "memory_search", "memory_store",
-    "health",
 }
 
 # Pseudo-Tool: local_exec läuft via subprocess auf dem lokalen Rechner

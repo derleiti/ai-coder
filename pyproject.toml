@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-coder"
-version = "0.5.8"
+version = "0.5.9"
 description = "Terminalbasierter Coding-Agent für AILinux / TriForce Backend"
 readme = "README.md"
 requires-python = ">=3.10"
