@@ -87,8 +87,11 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           mkdir -p pkg/usr/bin pkg/DEBIAN
+          mkdir -p pkg/usr/share/applications
           cp dist/aicoder pkg/usr/bin/aicoder
           chmod 755 pkg/usr/bin/aicoder
+          cp packaging/linux/ai-coder-gui.desktop pkg/usr/share/applications/
+          cp packaging/linux/ai-coder.desktop pkg/usr/share/applications/
           SIZE=$(du -s pkg/usr | cut -f1)
           cat > pkg/DEBIAN/control << EOF
           Package: aicoder
@@ -192,7 +195,7 @@ jobs:
         env:
           APP_VERSION: ${{ steps.version.outputs.version }}
         run: |
-          choco install nsis -y --no-progress
+          choco install nsis nsis-envar -y --no-progress
           $ver = $env:APP_VERSION -replace '[^0-9.]', ''
           $parts = $ver.Split('.'); while ($parts.Count -lt 4) { $parts += '0' }
           $nsisVer = ($parts[0..3] -join '.')
