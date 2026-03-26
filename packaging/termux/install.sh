@@ -37,6 +37,8 @@ git clone --depth=1 -q https://github.com/derleiti/ai-coder.git "$INSTALL_DIR"
 mkdir -p "$HOME/.local/bin"
 cat > "$HOME/.local/bin/aicoder" << 'WRAPPER'
 #!/data/data/com.termux/files/usr/bin/bash
+# CWD fix — Python crasht wenn getcwd() fehlschlägt
+cd "${HOME:-/data/data/com.termux/files/home}" 2>/dev/null || cd /tmp
 export PYTHONPATH="$HOME/.local/lib/aicoder-src:$PYTHONPATH"
 exec python3 -m aicoder "$@"
 WRAPPER
