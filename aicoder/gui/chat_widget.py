@@ -1,6 +1,11 @@
 """Chat-Widget mit vollem Agent-Loop (MCP-Tools + local_exec)."""
 from __future__ import annotations
 import html
+try:
+    import markdown as _md
+    _HAS_MD = True
+except ImportError:
+    _HAS_MD = False
 import json
 import re
 import time
@@ -266,7 +271,6 @@ class ChatWidget(QWidget):
 
     def _append_msg(self, role: str, text: str, meta: str = ""):
         ts = datetime.now().strftime("%H:%M:%S")
-        esc = html.escape(text)
         colors = {
             "user": ("#00d4ff", "Du"),
             "assistant": ("#00ff88", "AI"),
@@ -278,11 +282,17 @@ class ChatWidget(QWidget):
         }
         color, label = colors.get(role, ("#ccc", role))
         meta_html = f' <span style="color:#666;">({html.escape(meta)})</span>' if meta else ""
+        if role in ("assistant", "thought") and _HAS_MD:
+            body = _md.markdown(text, extensions=["fenced_code", "nl2br"])
+            content_html = f'<div style="color:#e0e0e0;">{body}</div>'
+        else:
+            esc = html.escape(text)
+            content_html = f'<span style="color:#e0e0e0; white-space:pre-wrap;">{esc}</span>'
         block = (
             f'<div style="margin:4px 0;">'
             f'<span style="color:#666;">[{ts}]</span> '
             f'<span style="color:{color};font-weight:bold;">{label}</span>{meta_html}<br>'
-            f'<span style="color:#e0e0e0; white-space:pre-wrap;">{esc}</span>'
+            f'{content_html}'
             f'</div><hr style="border-color:#222;">'
         )
         self.log.append(block)
