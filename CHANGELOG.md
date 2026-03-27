@@ -1,3 +1,18 @@
+## [0.6.0] - 2026-03-27
+
+### Security
+- **KRITISCH**: `cmd_sudo` auf rein lokale subprocess-Ausführung umgestellt — Passwort verlässt nie das lokale System (vorher: Passwort im Klartext via Netzwerk an Backend-Server)
+- **HOCH**: SSL-Fallback zu `CERT_NONE` entfernt — TLS-Verifikation wird nie mehr deaktiviert
+- **HOCH**: `--password` CLI-Argument aus `login` entfernt — verhindert Passwort-Leak in Shell-History
+
+### Fixed
+- Duplizierten Subparser-Block in `build_parser()` entfernt (Dead Code, 14 doppelte Parser-Registrierungen)
+- Package-Name von `ai-coder` auf `aicoder` vereinheitlicht (pyproject.toml, egg-info, AUR)
+
+### Improved
+- `session_state.py`: In-memory Cache für State-Reads — reduziert Disk-I/O im Agent-Loop erheblich
+- `httpx` aus Dependencies entfernt (war nie genutzt, `urllib` ist ausreichend)
+
 ## v0.6.0
 
 ### Security
