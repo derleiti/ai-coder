@@ -1,19 +1,20 @@
-"""Hauptfenster fuer ai-coder GUI — Tabs: Chat + Settings."""
+"""Hauptfenster fuer ai-coder GUI — Chat (oben) + Bash-Terminal (unten) + Settings."""
 from __future__ import annotations
-from PyQt6.QtWidgets import QMainWindow, QTabWidget
+from PyQt6.QtWidgets import QMainWindow, QTabWidget, QSplitter, QWidget, QVBoxLayout
 from PyQt6.QtCore import Qt, QSize
 
 from .chat_widget import ChatWidget
 from .settings_widget import SettingsWidget
+from .terminal_widget import TerminalWidget
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.tray = None  # wird von app.py gesetzt
+        self.tray = None
         self.setWindowTitle("ai-coder")
-        self.setMinimumSize(QSize(600, 450))
-        self.resize(800, 600)
+        self.setMinimumSize(QSize(700, 500))
+        self.resize(900, 680)
 
         self._apply_style()
 
@@ -22,7 +23,34 @@ class MainWindow(QMainWindow):
         self.settings_tab = SettingsWidget()
         self.chat_tab = ChatWidget(settings_ref=self.settings_tab)
 
-        self.tabs.addTab(self.chat_tab, "Chat")
+        # Chat-Tab: QSplitter → Chat oben, Terminal unten
+        self.terminal = TerminalWidget()
+        chat_container = QWidget()
+        chat_layout = QVBoxLayout(chat_container)
+        chat_layout.setContentsMargins(0, 0, 0, 0)
+        chat_layout.setSpacing(0)
+
+        self.center_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.center_splitter.setChildrenCollapsible(False)
+        self.center_splitter.addWidget(self.chat_tab)
+        self.center_splitter.addWidget(self.terminal)
+        # Chat bekommt ~65%, Terminal ~35%
+        self.center_splitter.setStretchFactor(0, 65)
+        self.center_splitter.setStretchFactor(1, 35)
+        self.center_splitter.setSizes([440, 240])
+        self.center_splitter.setHandleWidth(4)
+        self.center_splitter.setStyleSheet("""
+            QSplitter::handle {
+                background: #333;
+            }
+            QSplitter::handle:hover {
+                background: #00d4ff;
+            }
+        """)
+
+        chat_layout.addWidget(self.center_splitter)
+
+        self.tabs.addTab(chat_container, "Chat")
         self.tabs.addTab(self.settings_tab, "Settings")
 
         self.setCentralWidget(self.tabs)
@@ -90,7 +118,9 @@ class MainWindow(QMainWindow):
         """)
 
     def closeEvent(self, event):
-        """Minimize to tray statt schliessen."""
+        """Minimize to tray oder sauber beenden."""
+        # Terminal aufräumen
+        self.terminal._cleanup()
         if self.tray and self.tray.isVisible():
             self.hide()
             self.tray.showMessage(
