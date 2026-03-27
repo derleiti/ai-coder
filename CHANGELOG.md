@@ -1,3 +1,37 @@
+## v0.6.0
+
+### Security
+- **ENTFERNT: `aicoder sudo`** — Passwort wurde im Klartext über das Netzwerk an den Backend-Server übertragen. Command komplett entfernt, da Remote-sudo via MCP kein sinnvolles Modell ist.
+- **`--password` Flag entfernt** aus `aicoder login` — Passwort wird jetzt ausschließlich über `getpass()` abgefragt, nie aus CLI-Args (kein Shell-History-Leak).
+- **SSL: CERT_NONE Fallback entfernt** — TLS-Verifikation ist jetzt immer aktiv. Kein stiller MITM-Angriffspfad mehr.
+
+### Fixes
+- **Duplikate Subparser-Registrierungen entfernt** aus `cli.py` (Dead-Code-Block nach `cmd_hist`)
+- **`httpx` aus Dependencies entfernt** — wurde nie genutzt, `urllib` ist der tatsächliche HTTP-Client
+- **Package-Name vereinheitlicht** auf `aicoder` (war `ai-coder` in pyproject.toml)
+
+### Performance
+- **Session-State: Atomic Write** via tmp-file + replace in `_save_raw()` — kein partiell geschriebenes state.json mehr
+- README: NSIS-Installer-Hinweis auf v0.4.0 entfernt (ist seit v0.5.x live)
+
+## [0.6.0] - 2026-03-27
+
+### Security
+- **KRITISCH**: `cmd_sudo` überträgt Passwort nicht mehr über Netzwerk — läuft jetzt lokal via subprocess
+- **HOCH**: `--password` CLI-Argument bei `login` entfernt — verhindert Credential-Leak in Shell-History
+- **HOCH**: SSL-Fallback zu `CERT_NONE` entfernt — kein stilles MITM-Risiko mehr
+
+### Fixed
+- `build_parser()`: Duplikat-Subparser-Block entfernt (Dead Code nach cmd_hist)
+- `agent.py` / `local_exec`: Destructive-Pattern-Guard eingebaut (rm -rf, dd, mkfs → User-Confirmation)
+
+### Performance
+- `session_state.py`: In-memory Cache für State-File — vermeidet Disk-Reads im Agent-Loop
+
+### Packaging
+- Package-Name vereinheitlicht auf `aicoder` (war: `ai-coder` in pyproject.toml)
+- README: Veralteten NSIS v0.4.0-Hinweis entfernt
+
 # CHANGELOG — ai-coder
 
 ## v0.3.1 (2026-03-25)

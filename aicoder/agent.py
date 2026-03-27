@@ -189,8 +189,26 @@ def _run_tool(client: TriForceClient, name: str, args: dict) -> tuple[str, bool]
     # local_exec: läuft lokal via subprocess, NICHT über MCP
     if name == "local_exec":
         import subprocess as _sp
-        cmd = args.get("command","")
+        cmd = args.get("command", "")
         cwd = args.get("cwd") or None
+
+        # Destructive pattern guard — Confirmation bei gefährlichen Befehlen
+        _DESTRUCTIVE = [
+            "rm -rf", "rm -r /", "dd if=", "mkfs", "> /dev/",
+            "format c:", "del /f /s /q", "Remove-Item -Recurse -Force",
+            ":(){ :|:& };:", "chmod -R 777 /",
+        ]
+        cmd_lower = cmd.lower().strip()
+        if any(pat.lower() in cmd_lower for pat in _DESTRUCTIVE):
+            print("\n⚠️  DESTRUCTIVE COMMAND DETECTED:", file=sys.stderr)
+            print(f"   {cmd}", file=sys.stderr)
+            try:
+                confirm = input("Execute? [y/N] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                confirm = "n"
+            if confirm != "y":
+                return "local_exec: aborted by user (destructive command)", True
+
         if IS_WINDOWS:
             run_args = ["powershell", "-NoProfile", "-Command", cmd]
             try:

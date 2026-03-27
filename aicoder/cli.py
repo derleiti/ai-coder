@@ -42,7 +42,7 @@ def print_json(data: Dict[str, Any]) -> None:
 
 def cmd_login(args: argparse.Namespace) -> int:
     email = args.email or input("E-Mail: ").strip()
-    password = args.password or getpass("Passwort: ")
+    password = getpass("Passwort: ")  # kein --password Flag (Security: Shell-History)
     client = TriForceClient(args.base_url)
     result = client.login(email=email, password=password)
     session = Session(
@@ -601,42 +601,6 @@ def cmd_shell(args: argparse.Namespace) -> int:
     return rc
 
 
-def cmd_sudo(args: argparse.Namespace) -> int:
-    """Sudo-Befehl: fragt Passwort lokal ab, wird nie gespeichert."""
-    _, client = session_client()
-    cmd_str = " ".join(args.cmd) if args.cmd else ""
-    if not cmd_str:
-        print("Fehler: Befehl angeben.", file=sys.stderr)
-        return 1
-    password = __import__("getpass").getpass(f"[sudo] Passwort: ")
-    if not password:
-        print("Abgebrochen.", file=sys.stderr)
-        return 1
-    # sudo -S liest von stdin; Passwort via echo pipen
-    # Nutze shell-Tool: sudo -S liest Passwort von stdin
-    full_cmd = "echo " + repr(password) + " | sudo -S " + cmd_str
-    params: dict = {"command": full_cmd}
-    print(f"sudo {cmd_str}", file=sys.stderr)
-    with Spinner("working..."):
-        try:
-            raw = client.mcp_call("shell", params)
-        except ClientError as e:
-            print(f"Fehler: {e}", file=sys.stderr)
-            return 1
-    content = raw.get("result", {}).get("content", [{}])[0].get("text", "")
-    try:
-        data = json.loads(content)
-        out = data.get("stdout", "") or data.get("output", "") or data.get("result","") or content
-        err = (data.get("stderr", "") or "").replace(password, "***")
-        rc = int(data.get("returncode", data.get("exit_code", 0)) or 0)
-    except Exception:
-        out, err, rc = content, "", 0
-    if out:
-        print(out)
-    if err and not err.strip().startswith("[sudo]"):
-        print(err, file=sys.stderr)
-    return rc
-
 
 def cmd_sysinfo(args: argparse.Namespace) -> int:
     """System-Uebersicht: lokal (--local) oder Backend via safe_probe."""
@@ -763,7 +727,6 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("login", help="Login → /v1/auth/login")
     p.add_argument("--base-url", default=DEFAULT_BASE_URL)
     p.add_argument("--email")
-    p.add_argument("--password")
     p.set_defaults(func=cmd_login)
 
     p = sub.add_parser("logout", help="Lokale Session löschen")
@@ -880,10 +843,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=int, default=30)
     p.set_defaults(func=cmd_shell)
 
-    p = sub.add_parser("sudo", help="Sudo-Befehl - fragt Passwort lokal ab")
-    p.add_argument("cmd", nargs="*")
-    p.add_argument("--timeout", type=int, default=60)
-    p.set_defaults(func=cmd_sudo)
 
     p = sub.add_parser("sysinfo", help="System-Uebersicht: --local = dieser Rechner, sonst Backend-Server")
     p.add_argument("action", nargs="?", default="overview",
@@ -1043,67 +1002,7 @@ def cmd_hist(args: argparse.Namespace) -> int:
     return 0
 
 
-    p = sub.add_parser("models", help="Verfügbare Modelle vom Backend auflisten")
-    p.add_argument("--filter", default=None, help="Filter by substring")
-    p.add_argument("--group", action="store_true", help="Nach Provider gruppieren")
-    p.add_argument("--verbose", "-v", action="store_true")
-    p.add_argument("--json", dest="json_out", action="store_true")
-    p.set_defaults(func=cmd_models)
 
-    p = sub.add_parser("mcp-list", help="Alle MCP-Tools tabellarisch anzeigen")
-    p.set_defaults(func=cmd_mcp_list)
-
-    p = sub.add_parser("review", help="Strukturiertes Code-Review einer Datei")
-    p.add_argument("-f", "--file", dest="files", action="append", metavar="FILE")
-    p.add_argument("--model", default=None)
-    p.add_argument("--no-agents", dest="no_agents", action="store_true")
-    p.set_defaults(func=cmd_review)
-
-    p = sub.add_parser("hist", help="Call-History anzeigen")
-    p.add_argument("-n", type=int, default=10, help="Anzahl Einträge")
-    p.add_argument("--clear", action="store_true", help="History löschen")
-    p.set_defaults(func=cmd_hist)
-
-    p = sub.add_parser("init", help="Workspace initialisieren + AGENTS.md anlegen")
-    p.add_argument("path", nargs="?")
-    p.add_argument("--force", action="store_true")
-    p.add_argument("--no-git", dest="no_git", action="store_true")
-    p.set_defaults(func=cmd_init)
-
-    p = sub.add_parser("broadcast", help="Swarm-Broadcast an alle Backend-Modelle")
-    p.add_argument("question", nargs="*")
-    p.add_argument("--providers", default=None, help="Kommagetrennt: groq,mistral")
-    p.add_argument("--skip", default=None)
-    p.add_argument("--top-n", dest="top_n", type=int, default=5)
-    p.add_argument("--max-tokens", dest="max_tokens", type=int, default=200)
-    p.set_defaults(func=cmd_broadcast)
-
-    p = sub.add_parser("shell", help="Befehl via MCP binary_exec ausfuehren (ohne Args: Liste)")
-    p.add_argument("cmd", nargs="*")
-    p.add_argument("--raw", "-r", action="store_true", help="Shell-Tool statt binary_exec (pipes etc.)")
-    p.add_argument("--elevated", "-e", action="store_true")
-    p.add_argument("--cwd", default=None)
-    p.add_argument("--timeout", type=int, default=30)
-    p.set_defaults(func=cmd_shell)
-
-    p = sub.add_parser("sudo", help="Sudo-Befehl - fragt Passwort lokal ab")
-    p.add_argument("cmd", nargs="*")
-    p.add_argument("--timeout", type=int, default=60)
-    p.set_defaults(func=cmd_sudo)
-
-    p = sub.add_parser("sysinfo", help="System-Uebersicht: --local = dieser Rechner, sonst Backend-Server")
-    p.add_argument("action", nargs="?", default="overview",
-                   choices=["overview","run","service_status","journal","list"])
-    p.add_argument("--probe", default=None)
-    p.add_argument("--service", default=None)
-    p.add_argument("--local", "-l", action="store_true", help="Lokale Stats (dieser Rechner, kein MCP)")
-    p.set_defaults(func=cmd_sysinfo)
-
-    p = sub.add_parser("service", help="Systemd-Service verwalten")
-    p.add_argument("action", choices=["status","start","stop","restart","logs","list"])
-    p.add_argument("service", nargs="?", default=None)
-    p.add_argument("--lines", type=int, default=50)
-    p.set_defaults(func=cmd_service)
 def _run_gui() -> int:
     """Startet die PyQt6 GUI."""
     try:
