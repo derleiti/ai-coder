@@ -15,19 +15,32 @@ _DEFAULTS: Dict[str, Any] = {
     "workspace_root": None,
 }
 
+# In-memory cache — vermeidet wiederholte Disk-Reads im Agent-Loop
+_cache: Optional[Dict[str, Any]] = None
+
+
 def _load_raw() -> Dict[str, Any]:
+    global _cache
+    if _cache is not None:
+        return _cache
     if not STATE_FILE.exists():
-        return dict(_DEFAULTS)
+        _cache = dict(_DEFAULTS)
+        return _cache
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        return {**_DEFAULTS, **data}
+        _cache = {**_DEFAULTS, **data}
+        return _cache
     except Exception:
-        return dict(_DEFAULTS)
+        _cache = dict(_DEFAULTS)
+        return _cache
+
 
 def _save_raw(data: Dict[str, Any]) -> None:
+    global _cache
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
     os.chmod(STATE_FILE, 0o600)
+    _cache = dict(data)  # Cache synchron halten
 
 def get_state() -> Dict[str, Any]:
     return _load_raw()

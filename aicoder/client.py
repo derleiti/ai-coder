@@ -17,19 +17,8 @@ def _ssl_context() -> ssl.SSLContext:
         return ssl.create_default_context(cafile=certifi.where())
     except Exception:
         pass
-    # 2. System-Certs — Linux mit korrekten CA-Certs
-    try:
-        ctx = ssl.create_default_context()
-        # Testweise Verbindung um zu prüfen ob Certs da sind — NICHT ctx.get_ca_certs()
-        # da die Liste leer ist bis eine Verbindung gemacht wird
-        return ctx
-    except Exception:
-        pass
-    # 3. Kein Verify als letzter Ausweg (sollte nie nötig sein wenn certifi da ist)
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    return ctx
+    # 2. System-Certs
+    return ssl.create_default_context()
 
 
 class ClientError(RuntimeError):

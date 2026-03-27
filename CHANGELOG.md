@@ -1,3 +1,21 @@
+## [0.6.0] - 2026-03-27
+
+### Security
+- **KRITISCH**: `cmd_sudo` überträgt Passwort nicht mehr über Netzwerk — läuft jetzt lokal via subprocess
+- **HOCH**: `--password` CLI-Argument bei `login` entfernt — verhindert Credential-Leak in Shell-History
+- **HOCH**: SSL-Fallback zu `CERT_NONE` entfernt — kein stilles MITM-Risiko mehr
+
+### Fixed
+- `build_parser()`: Duplikat-Subparser-Block entfernt (Dead Code nach cmd_hist)
+- `agent.py` / `local_exec`: Destructive-Pattern-Guard eingebaut (rm -rf, dd, mkfs → User-Confirmation)
+
+### Performance
+- `session_state.py`: In-memory Cache für State-File — vermeidet Disk-Reads im Agent-Loop
+
+### Packaging
+- Package-Name vereinheitlicht auf `aicoder` (war: `ai-coder` in pyproject.toml)
+- README: Veralteten NSIS v0.4.0-Hinweis entfernt
+
 # CHANGELOG — ai-coder
 
 ## v0.3.1 (2026-03-25)

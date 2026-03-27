@@ -21,7 +21,8 @@ Terminalbasierter Coding & DevOps Agent für AILinux / TriForce.
 # aicoder.exe runterladen, in einen Ordner legen (z.B. C:\Tools)
 # Ordner zu PATH hinzufügen (System → Umgebungsvariablen → Path → Bearbeiten)
 
-# Option 2: NSIS-Installer (kommt in v0.4.0)
+# Option 2: NSIS-Installer
+# aicoder-{version}-setup.exe runterladen und ausführen
 # Installiert nach C:\Program Files\aicoder, fügt automatisch zu PATH hinzu
 ```
 

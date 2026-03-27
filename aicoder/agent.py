@@ -159,9 +159,10 @@ def _get_tools(client: TriForceClient) -> list[dict]:
     err_msg = ""
     try:
         # Neuer Endpoint: akzeptiert Client-JWT, gibt volle Schemas zurück
-        r = short_client._request("GET", "/v1/client/mcp/tools/schemas",
-            require_auth=True, _label="tools/schemas")
-        mcp_tools = r.get("tools", [])
+        r = short_client._request("POST", "/v1/mcp",
+            {"jsonrpc":"2.0","method":"tools/list","params":{},"id":1},
+            require_auth=True, _label="tools/list")
+        mcp_tools = [t for t in r.get("result",{}).get("tools",[]) if t["name"] in AGENT_TOOLS]
     except Exception as e:
         err_msg = str(e)
     if not mcp_tools:
@@ -188,8 +189,26 @@ def _run_tool(client: TriForceClient, name: str, args: dict) -> tuple[str, bool]
     # local_exec: läuft lokal via subprocess, NICHT über MCP
     if name == "local_exec":
         import subprocess as _sp
-        cmd = args.get("command","")
+        cmd = args.get("command", "")
         cwd = args.get("cwd") or None
+
+        # Destructive pattern guard — Confirmation bei gefährlichen Befehlen
+        _DESTRUCTIVE = [
+            "rm -rf", "rm -r /", "dd if=", "mkfs", "> /dev/",
+            "format c:", "del /f /s /q", "Remove-Item -Recurse -Force",
+            ":(){ :|:& };:", "chmod -R 777 /",
+        ]
+        cmd_lower = cmd.lower().strip()
+        if any(pat.lower() in cmd_lower for pat in _DESTRUCTIVE):
+            print("\n⚠️  DESTRUCTIVE COMMAND DETECTED:", file=sys.stderr)
+            print(f"   {cmd}", file=sys.stderr)
+            try:
+                confirm = input("Execute? [y/N] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                confirm = "n"
+            if confirm != "y":
+                return "local_exec: aborted by user (destructive command)", True
+
         if IS_WINDOWS:
             run_args = ["powershell", "-NoProfile", "-Command", cmd]
             try:

@@ -602,40 +602,28 @@ def cmd_shell(args: argparse.Namespace) -> int:
 
 
 def cmd_sudo(args: argparse.Namespace) -> int:
-    """Sudo-Befehl: fragt Passwort lokal ab, wird nie gespeichert."""
-    _, client = session_client()
+    """Sudo-Befehl lokal ausführen — Passwort wird nie über Netzwerk übertragen."""
+    import subprocess as _sp
     cmd_str = " ".join(args.cmd) if args.cmd else ""
     if not cmd_str:
         print("Fehler: Befehl angeben.", file=sys.stderr)
         return 1
-    password = __import__("getpass").getpass(f"[sudo] Passwort: ")
-    if not password:
-        print("Abgebrochen.", file=sys.stderr)
-        return 1
-    # sudo -S liest von stdin; Passwort via echo pipen
-    # Nutze shell-Tool: sudo -S liest Passwort von stdin
-    full_cmd = "echo " + repr(password) + " | sudo -S " + cmd_str
-    params: dict = {"command": full_cmd}
     print(f"sudo {cmd_str}", file=sys.stderr)
-    with Spinner("working..."):
-        try:
-            raw = client.mcp_call("shell", params)
-        except ClientError as e:
-            print(f"Fehler: {e}", file=sys.stderr)
-            return 1
-    content = raw.get("result", {}).get("content", [{}])[0].get("text", "")
     try:
-        data = json.loads(content)
-        out = data.get("stdout", "") or data.get("output", "") or data.get("result","") or content
-        err = (data.get("stderr", "") or "").replace(password, "***")
-        rc = int(data.get("returncode", data.get("exit_code", 0)) or 0)
-    except Exception:
-        out, err, rc = content, "", 0
-    if out:
-        print(out)
-    if err and not err.strip().startswith("[sudo]"):
-        print(err, file=sys.stderr)
-    return rc
+        r = _sp.run(
+            ["sudo", "--"] + cmd_str.split(),
+            capture_output=False,   # direktes Terminal-I/O inkl. sudo-Passwort-Prompt
+            timeout=getattr(args, "timeout", 60),
+        )
+        return r.returncode
+    except FileNotFoundError:
+        print("Fehler: sudo nicht gefunden.", file=sys.stderr)
+        return 1
+    except _sp.TimeoutExpired:
+        print("Fehler: Timeout.", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
 
 
 def cmd_sysinfo(args: argparse.Namespace) -> int:
@@ -763,7 +751,6 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("login", help="Login → /v1/auth/login")
     p.add_argument("--base-url", default=DEFAULT_BASE_URL)
     p.add_argument("--email")
-    p.add_argument("--password")
     p.set_defaults(func=cmd_login)
 
     p = sub.add_parser("logout", help="Lokale Session löschen")
@@ -1099,11 +1086,7 @@ def cmd_hist(args: argparse.Namespace) -> int:
     p.add_argument("--local", "-l", action="store_true", help="Lokale Stats (dieser Rechner, kein MCP)")
     p.set_defaults(func=cmd_sysinfo)
 
-    p = sub.add_parser("service", help="Systemd-Service verwalten")
-    p.add_argument("action", choices=["status","start","stop","restart","logs","list"])
-    p.add_argument("service", nargs="?", default=None)
-    p.add_argument("--lines", type=int, default=50)
-    p.set_defaults(func=cmd_service)
+
 def _run_gui() -> int:
     """Startet die PyQt6 GUI."""
     try:
