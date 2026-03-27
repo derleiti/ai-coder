@@ -295,7 +295,8 @@ class ChatWidget(QWidget):
             f'{content_html}'
             f'</div><hr style="border-color:#222;">'
         )
-        self.log.append(block)
+        self.log.moveCursor(QTextCursor.MoveOperation.End)
+        self.log.insertHtml(block)
         self.log.moveCursor(QTextCursor.MoveOperation.End)
 
     def _send(self):
