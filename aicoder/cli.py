@@ -364,18 +364,13 @@ def cmd_chat(args: argparse.Namespace) -> int:
                 print(f"Unbekannter Command: {cmd}")
             continue
 
-        # Build context-aware message: include last N turns
-        context = ""
+        # Build proper messages array for multi-turn context
+        chat_messages = []
         if history:
-            recent = history[-4:]  # last 4 turns max
-            context_parts = []
-            for turn in recent:
-                context_parts.append(f"User: {turn['user']}")
-                context_parts.append(f"Assistant: {turn['assistant']}")
-            context = "\n".join(context_parts) + "\n\n"
-            message = context + f"User: {user_input}"
-        else:
-            message = user_input
+            for turn in history[-6:]:
+                chat_messages.append({"role": "user", "content": turn["user"]})
+                chat_messages.append({"role": "assistant", "content": turn["assistant"]})
+        chat_messages.append({"role": "user", "content": user_input})
 
         # Auto-swarm heuristik
         _cs = swarm
@@ -388,7 +383,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
         with Spinner(label):
             try:
                 result = client.chat(
-                    message=message,
+                    messages=chat_messages,
                     model=model,
                     system_prompt=system_prompt,
                     temperature=0.7,
