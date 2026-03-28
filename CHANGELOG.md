@@ -1,3 +1,10 @@
+## [0.6.2] - 2026-03-27
+
+### Added
+- GUI: Clear-Button (↺) neben Send — leert Chat-Log und setzt Kontext/Tools zurück
+  - Hover-Effekt orange, Tooltip "Chat & Kontext neu starten"
+  - Tools werden beim nächsten Request automatisch neu geladen
+
 ## [0.6.0] - 2026-03-27
 
 ### Security

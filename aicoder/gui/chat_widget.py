@@ -267,6 +267,21 @@ class ChatWidget(QWidget):
         self.send_btn.clicked.connect(self._send)
         input_row.addWidget(self.send_btn)
 
+        # Clear-Button — leert Chat + Kontext
+        self.clear_btn = QPushButton("↺")
+        self.clear_btn.setToolTip("Chat & Kontext neu starten")
+        self.clear_btn.setFixedWidth(38)
+        self.clear_btn.setStyleSheet("""
+            QPushButton {
+                background: #1a1a2e; color: #888;
+                border: 1px solid #444; border-radius: 4px;
+                font-size: 16px; padding: 4px;
+            }
+            QPushButton:hover { background: #2a2a3e; color: #ff9800; border-color: #ff9800; }
+        """)
+        self.clear_btn.clicked.connect(self._clear_chat)
+        input_row.addWidget(self.clear_btn)
+
         layout.addLayout(input_row)
 
     def _append_msg(self, role: str, text: str, meta: str = ""):
@@ -298,6 +313,15 @@ class ChatWidget(QWidget):
         self.log.moveCursor(QTextCursor.MoveOperation.End)
         self.log.insertHtml(block)
         self.log.moveCursor(QTextCursor.MoveOperation.End)
+
+    def _clear_chat(self):
+        """Chat-Log leeren + Kontext (Tools/System-Prompt) zurücksetzen."""
+        self.log.clear()
+        self._tools = None
+        self._system = None
+        self.status.setText("Chat & Kontext zurückgesetzt.")
+        self.status.setStyleSheet("color: #ff9800; font-size: 11px;")
+        self._append_msg("system", "Chat und Kontext wurden zurückgesetzt. Tools werden beim nächsten Request neu geladen.", "")
 
     def _send(self):
         text = self.input.text().strip()
