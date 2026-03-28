@@ -42,7 +42,7 @@ def print_json(data: Dict[str, Any]) -> None:
 
 def cmd_login(args: argparse.Namespace) -> int:
     email = args.email or input("E-Mail: ").strip()
-    password = args.password or getpass("Passwort: ")
+    password = getpass("Passwort: ")  # kein --password Flag (Security: Shell-History)
     client = TriForceClient(args.base_url)
     result = client.login(email=email, password=password)
     session = Session(
@@ -364,18 +364,13 @@ def cmd_chat(args: argparse.Namespace) -> int:
                 print(f"Unbekannter Command: {cmd}")
             continue
 
-        # Build context-aware message: include last N turns
-        context = ""
+        # Build proper messages array for multi-turn context
+        chat_messages = []
         if history:
-            recent = history[-4:]  # last 4 turns max
-            context_parts = []
-            for turn in recent:
-                context_parts.append(f"User: {turn['user']}")
-                context_parts.append(f"Assistant: {turn['assistant']}")
-            context = "\n".join(context_parts) + "\n\n"
-            message = context + f"User: {user_input}"
-        else:
-            message = user_input
+            for turn in history[-6:]:
+                chat_messages.append({"role": "user", "content": turn["user"]})
+                chat_messages.append({"role": "assistant", "content": turn["assistant"]})
+        chat_messages.append({"role": "user", "content": user_input})
 
         # Auto-swarm heuristik
         _cs = swarm
@@ -388,7 +383,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
         with Spinner(label):
             try:
                 result = client.chat(
-                    message=message,
+                    messages=chat_messages,
                     model=model,
                     system_prompt=system_prompt,
                     temperature=0.7,
@@ -600,30 +595,6 @@ def cmd_shell(args: argparse.Namespace) -> int:
         print(err, file=sys.stderr)
     return rc
 
-
-def cmd_sudo(args: argparse.Namespace) -> int:
-    """Sudo-Befehl lokal ausführen — Passwort wird nie über Netzwerk übertragen."""
-    import subprocess as _sp
-    cmd_str = " ".join(args.cmd) if args.cmd else ""
-    if not cmd_str:
-        print("Fehler: Befehl angeben.", file=sys.stderr)
-        return 1
-    print(f"sudo {cmd_str}", file=sys.stderr)
-    try:
-        r = _sp.run(
-            ["sudo", "--"] + cmd_str.split(),
-            capture_output=False,   # direktes Terminal-I/O inkl. sudo-Passwort-Prompt
-            timeout=getattr(args, "timeout", 60),
-        )
-        return r.returncode
-    except FileNotFoundError:
-        print("Fehler: sudo nicht gefunden.", file=sys.stderr)
-        return 1
-    except _sp.TimeoutExpired:
-        print("Fehler: Timeout.", file=sys.stderr)
-        return 1
-    except KeyboardInterrupt:
-        return 130
 
 
 def cmd_sysinfo(args: argparse.Namespace) -> int:
@@ -867,10 +838,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=int, default=30)
     p.set_defaults(func=cmd_shell)
 
-    p = sub.add_parser("sudo", help="Sudo-Befehl - fragt Passwort lokal ab")
-    p.add_argument("cmd", nargs="*")
-    p.add_argument("--timeout", type=int, default=60)
-    p.set_defaults(func=cmd_sudo)
 
     p = sub.add_parser("sysinfo", help="System-Uebersicht: --local = dieser Rechner, sonst Backend-Server")
     p.add_argument("action", nargs="?", default="overview",
@@ -1029,62 +996,6 @@ def cmd_hist(args: argparse.Namespace) -> int:
         print(f"    └ {prompt}{fstr}")
     return 0
 
-
-    p = sub.add_parser("models", help="Verfügbare Modelle vom Backend auflisten")
-    p.add_argument("--filter", default=None, help="Filter by substring")
-    p.add_argument("--group", action="store_true", help="Nach Provider gruppieren")
-    p.add_argument("--verbose", "-v", action="store_true")
-    p.add_argument("--json", dest="json_out", action="store_true")
-    p.set_defaults(func=cmd_models)
-
-    p = sub.add_parser("mcp-list", help="Alle MCP-Tools tabellarisch anzeigen")
-    p.set_defaults(func=cmd_mcp_list)
-
-    p = sub.add_parser("review", help="Strukturiertes Code-Review einer Datei")
-    p.add_argument("-f", "--file", dest="files", action="append", metavar="FILE")
-    p.add_argument("--model", default=None)
-    p.add_argument("--no-agents", dest="no_agents", action="store_true")
-    p.set_defaults(func=cmd_review)
-
-    p = sub.add_parser("hist", help="Call-History anzeigen")
-    p.add_argument("-n", type=int, default=10, help="Anzahl Einträge")
-    p.add_argument("--clear", action="store_true", help="History löschen")
-    p.set_defaults(func=cmd_hist)
-
-    p = sub.add_parser("init", help="Workspace initialisieren + AGENTS.md anlegen")
-    p.add_argument("path", nargs="?")
-    p.add_argument("--force", action="store_true")
-    p.add_argument("--no-git", dest="no_git", action="store_true")
-    p.set_defaults(func=cmd_init)
-
-    p = sub.add_parser("broadcast", help="Swarm-Broadcast an alle Backend-Modelle")
-    p.add_argument("question", nargs="*")
-    p.add_argument("--providers", default=None, help="Kommagetrennt: groq,mistral")
-    p.add_argument("--skip", default=None)
-    p.add_argument("--top-n", dest="top_n", type=int, default=5)
-    p.add_argument("--max-tokens", dest="max_tokens", type=int, default=200)
-    p.set_defaults(func=cmd_broadcast)
-
-    p = sub.add_parser("shell", help="Befehl via MCP binary_exec ausfuehren (ohne Args: Liste)")
-    p.add_argument("cmd", nargs="*")
-    p.add_argument("--raw", "-r", action="store_true", help="Shell-Tool statt binary_exec (pipes etc.)")
-    p.add_argument("--elevated", "-e", action="store_true")
-    p.add_argument("--cwd", default=None)
-    p.add_argument("--timeout", type=int, default=30)
-    p.set_defaults(func=cmd_shell)
-
-    p = sub.add_parser("sudo", help="Sudo-Befehl - fragt Passwort lokal ab")
-    p.add_argument("cmd", nargs="*")
-    p.add_argument("--timeout", type=int, default=60)
-    p.set_defaults(func=cmd_sudo)
-
-    p = sub.add_parser("sysinfo", help="System-Uebersicht: --local = dieser Rechner, sonst Backend-Server")
-    p.add_argument("action", nargs="?", default="overview",
-                   choices=["overview","run","service_status","journal","list"])
-    p.add_argument("--probe", default=None)
-    p.add_argument("--service", default=None)
-    p.add_argument("--local", "-l", action="store_true", help="Lokale Stats (dieser Rechner, kein MCP)")
-    p.set_defaults(func=cmd_sysinfo)
 
 
 def _run_gui() -> int:

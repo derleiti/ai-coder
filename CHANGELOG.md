@@ -1,3 +1,56 @@
+## v0.6.3 — Context Loss Fix (2026-03-28)
+
+### Critical Bugfix
+- **Fixed context loss in Agent-Loop (agent.py + chat_widget.py)**
+  - Replaced broken string-concat history (`"User: ...\nAssistant: ..."`) with structured `messages[]` array
+  - Removed 600-char truncation of assistant responses — full tool outputs preserved
+  - Increased context window from 3 turns to 24 messages (12 turn-pairs)
+  - System prompt + initial user message always retained during trimming
+
+### GUI Fix (chat_widget.py)
+- Added cross-turn context persistence via `self._messages`
+- Worker returns updated messages array via `messages_updated` signal
+- Clear/reset button properly resets message history
+
+### Backend Fix (TriForce client_chat.py)
+- Fixed expired-token fallback: was using non-existent `settings.secret_key`, now uses `JWT_SECRET`
+- Expired tokens now correctly decode tier info instead of falling back to free tier
+
+### Other
+- Version bump to 0.6.2
+- Updated User-Agent string
+
+## [0.6.0] - 2026-03-27
+
+### Security
+- **KRITISCH**: `cmd_sudo` auf rein lokale subprocess-Ausführung umgestellt — Passwort verlässt nie das lokale System (vorher: Passwort im Klartext via Netzwerk an Backend-Server)
+- **HOCH**: SSL-Fallback zu `CERT_NONE` entfernt — TLS-Verifikation wird nie mehr deaktiviert
+- **HOCH**: `--password` CLI-Argument aus `login` entfernt — verhindert Passwort-Leak in Shell-History
+
+### Fixed
+- Duplizierten Subparser-Block in `build_parser()` entfernt (Dead Code, 14 doppelte Parser-Registrierungen)
+- Package-Name von `ai-coder` auf `aicoder` vereinheitlicht (pyproject.toml, egg-info, AUR)
+
+### Improved
+- `session_state.py`: In-memory Cache für State-Reads — reduziert Disk-I/O im Agent-Loop erheblich
+- `httpx` aus Dependencies entfernt (war nie genutzt, `urllib` ist ausreichend)
+
+## v0.6.0
+
+### Security
+- **ENTFERNT: `aicoder sudo`** — Passwort wurde im Klartext über das Netzwerk an den Backend-Server übertragen. Command komplett entfernt, da Remote-sudo via MCP kein sinnvolles Modell ist.
+- **`--password` Flag entfernt** aus `aicoder login` — Passwort wird jetzt ausschließlich über `getpass()` abgefragt, nie aus CLI-Args (kein Shell-History-Leak).
+- **SSL: CERT_NONE Fallback entfernt** — TLS-Verifikation ist jetzt immer aktiv. Kein stiller MITM-Angriffspfad mehr.
+
+### Fixes
+- **Duplikate Subparser-Registrierungen entfernt** aus `cli.py` (Dead-Code-Block nach `cmd_hist`)
+- **`httpx` aus Dependencies entfernt** — wurde nie genutzt, `urllib` ist der tatsächliche HTTP-Client
+- **Package-Name vereinheitlicht** auf `aicoder` (war `ai-coder` in pyproject.toml)
+
+### Performance
+- **Session-State: Atomic Write** via tmp-file + replace in `_save_raw()` — kein partiell geschriebenes state.json mehr
+- README: NSIS-Installer-Hinweis auf v0.4.0 entfernt (ist seit v0.5.x live)
+
 ## [0.6.0] - 2026-03-27
 
 ### Security

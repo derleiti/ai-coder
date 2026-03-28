@@ -6,7 +6,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
-USER_AGENT = "ai-coder/0.5 (AILinux Coding Client)"
+USER_AGENT = "ai-coder/0.6.3 (AILinux Coding Client)"
 
 
 def _ssl_context() -> ssl.SSLContext:
@@ -105,19 +105,23 @@ class TriForceClient:
 
     def chat(
         self,
-        message: str,
+        message: str = "",
         model: Optional[str] = None,
         system_prompt: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 4096,
         fallback_model: Optional[str] = None,
+        messages: Optional[list] = None,
     ) -> Dict[str, Any]:
-        """Call /v1/client/chat. Auto-retries with fallback_model on ClientError."""
+        """Call /v1/client/chat. Supports messages array for multi-turn context."""
         payload: Dict[str, Any] = {
-            "message": message,
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        if messages:
+            payload["messages"] = messages
+        else:
+            payload["message"] = message
         if model:
             payload["model"] = model
         if system_prompt:

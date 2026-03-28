@@ -8,3 +8,5 @@ build/
 ~/.config/ai-coder/
 *.log
 .env
+packaging/debian/aicoder/usr/bin/aicoder
+packaging/*.deb
