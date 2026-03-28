@@ -35,37 +35,37 @@ class _AgentWorker(QThread):
 
     MAX_ITER = 12
 
-    def __init__(self, client, message, model, fallback, tools, system_prompt):
+    # Signal to return updated messages array back to ChatWidget
+    messages_updated = pyqtSignal(list)
+
+    def __init__(self, client, messages_array, model, fallback, tools, system_prompt):
         super().__init__()
         self.client = client
-        self.message = message
+        self.messages = list(messages_array)  # copy to avoid mutation issues
         self.model = model
         self.fallback = fallback
         self.tools = tools
         self.system = system_prompt
 
     def run(self):
-        history = []
-        current_input = self.message
+        messages = self.messages  # Already contains system + prior history
         model_used = self.model or "default"
 
+        MAX_CTX = 30  # Max conversation messages (excl. system)
+
+        def _trim(msgs):
+            if len(msgs) <= 1 + MAX_CTX:
+                return msgs
+            return [msgs[0], msgs[1]] + msgs[-(MAX_CTX - 1):]
+
         for i in range(self.MAX_ITER):
-            # Kontext aufbauen
-            if history:
-                ctx = "\n\n".join(
-                    f"User: {h['user']}\nAssistant: {h['assistant'][:600]}"
-                    for h in history[-3:]
-                )
-                msg = ctx + f"\n\nUser: {current_input}"
-            else:
-                msg = current_input
+            messages = _trim(messages)
 
             try:
                 result = self.client.chat(
-                    message=msg,
+                    messages=messages,
                     model=self.model or None,
                     fallback_model=self.fallback or None,
-                    system_prompt=self.system,
                     temperature=0.3,
                     max_tokens=4096,
                 )
@@ -90,6 +90,8 @@ class _AgentWorker(QThread):
 
             if not calls:
                 # Finale Antwort — kein Tool-Call
+                messages.append({"role": "assistant", "content": response})
+                self.messages_updated.emit(messages)
                 self.finished.emit(response, model_used)
                 return
 
@@ -112,13 +114,17 @@ class _AgentWorker(QThread):
                 self.msg.emit("tool_result", tr[:2000], f"{tname} {status}")
                 tool_results.append(f"Tool {tname} result:\n{tr}")
 
-            history.append({"user": current_input, "assistant": response})
+            # Add assistant response + tool results as next user turn
+            messages.append({"role": "assistant", "content": response})
             current_input = "\n\n".join(tool_results)
+            messages.append({"role": "user", "content": current_input})
 
             if "DONE:" in response[:200].upper():
+                self.messages_updated.emit(messages)
                 self.finished.emit(visible or response, model_used)
                 return
 
+        self.messages_updated.emit(messages)
         self.finished.emit(f"(Max {self.MAX_ITER} Iterationen erreicht)\n{visible or response}", model_used)
 
     def _run_tool(self, name: str, args: dict) -> tuple[str, bool]:
@@ -212,6 +218,7 @@ class ChatWidget(QWidget):
         self._worker = None
         self._tools = None
         self._system = None
+        self._messages = []  # Persistent messages array for multi-turn context
         self._build_ui()
 
     def _build_ui(self):
@@ -319,6 +326,7 @@ class ChatWidget(QWidget):
         self.log.clear()
         self._tools = None
         self._system = None
+        self._messages = []
         self.status.setText("Chat & Kontext zurückgesetzt.")
         self.status.setStyleSheet("color: #ff9800; font-size: 11px;")
         self._append_msg("system", "Chat und Kontext wurden zurückgesetzt. Tools werden beim nächsten Request neu geladen.", "")
@@ -371,9 +379,15 @@ class ChatWidget(QWidget):
         if not fallback:
             fallback = state.get("fallback_model", "")
 
-        self._worker = _AgentWorker(client, text, model, fallback, self._tools, self._system)
+        # Build/extend messages array for multi-turn context
+        if not self._messages:
+            self._messages = [{"role": "system", "content": self._system}]
+        self._messages.append({"role": "user", "content": text})
+
+        self._worker = _AgentWorker(client, self._messages, model, fallback, self._tools, self._system)
         self._worker.msg.connect(self._on_agent_msg)
         self._worker.finished.connect(self._on_response)
+        self._worker.messages_updated.connect(self._on_messages_updated)
         self._worker.error.connect(self._on_error)
         self._worker.start()
 
@@ -385,6 +399,10 @@ class ChatWidget(QWidget):
         self.send_btn.setEnabled(True)
         self.status.setText(f"Fertig ({model_used})")
         self.status.setStyleSheet("color: #00ff88; font-size: 11px;")
+
+    def _on_messages_updated(self, messages: list):
+        """Receive updated messages array from worker for cross-turn persistence."""
+        self._messages = messages
 
     def _on_error(self, err: str):
         self._append_msg("error", err)

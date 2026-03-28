@@ -1,6 +1,6 @@
 # Maintainer: Markus Leitermann <admin@ailinux.me>
 pkgname=aicoder
-pkgver=0.5.14
+pkgver=0.6.3
 pkgrel=1
 pkgdesc="Terminal Coding & DevOps Agent for AILinux/TriForce — 659+ models, GUI, System Tray"
 arch=('x86_64')

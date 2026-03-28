@@ -328,23 +328,29 @@ def run_agent(
     )
     print_task(initial_prompt)
 
-    history: list[dict] = []
+    # === Structured messages array for proper multi-turn context ===
+    messages: list[dict] = [{"role": "system", "content": system}]
     current_input = initial_prompt
     full_response  = ""
     model_used     = model or "?"
     total_latency  = 0
     fallback_used  = False
 
+    # Token budget: keep last N messages to avoid exceeding context window
+    # System prompt ~2k tokens, leave ~28k for conversation history
+    MAX_CONTEXT_MESSAGES = 24  # 12 turn pairs (user+assistant)
+
+    def _trim_messages(msgs: list[dict]) -> list[dict]:
+        """Keep system prompt + last MAX_CONTEXT_MESSAGES conversation messages."""
+        if len(msgs) <= 1 + MAX_CONTEXT_MESSAGES:
+            return msgs
+        # Always keep system prompt (index 0) + initial user message (index 1)
+        return [msgs[0], msgs[1]] + msgs[-(MAX_CONTEXT_MESSAGES - 1):]
+
     for i in range(MAX_ITERATIONS):
-        # Kontext
-        if history:
-            ctx = "\n\n".join(
-                f"User: {h['user']}\nAssistant: {h['assistant'][:600]}"
-                for h in history[-3:]
-            )
-            msg = ctx + f"\n\nUser: {current_input}"
-        else:
-            msg = current_input
+        # Add current user input to messages array
+        messages.append({"role": "user", "content": current_input})
+        messages = _trim_messages(messages)
 
         label = "thinking" if i == 0 else f"step {i+1}"
 
@@ -352,10 +358,9 @@ def run_agent(
             t0 = time.time()
             try:
                 result = client.chat(
-                    message=msg,
+                    messages=messages,
                     model=model,
                     fallback_model=fallback_model,
-                    system_prompt=system,
                     temperature=0.3,
                     max_tokens=4096,
                 )
@@ -381,6 +386,7 @@ def run_agent(
 
         if not calls:
             # Finale Antwort
+            messages.append({"role": "assistant", "content": response})
             print_final(
                 response=response,
                 model=model_used,
@@ -406,7 +412,9 @@ def run_agent(
             print_tool_result(tname, tr, t_elapsed, error=is_err)
             tool_results.append(f"Tool {tname} result:\n{tr}")
 
-        history.append({"user": current_input, "assistant": response})
+        # Add assistant response to messages array (keeps full context)
+        messages.append({"role": "assistant", "content": response})
+        # Tool results become the next user message
         current_input = "\n\n".join(tool_results)
 
         if "DONE:" in response[:200].upper():

@@ -1,3 +1,19 @@
+## v0.6.3 — Context Loss Fix (2026-03-28)
+
+### Critical Bugfix
+- **Fixed context loss in Agent-Loop (agent.py + chat_widget.py)**
+  - Replaced broken string-concat history with structured `messages[]` array
+  - Removed 600-char truncation — full tool outputs preserved
+  - Context window: 24 messages (12 turn-pairs), system+initial always retained
+
+### GUI Fix (chat_widget.py)
+- Cross-turn context persistence via `self._messages` + `messages_updated` signal
+- Clear/reset button properly resets message history
+
+### Other
+- Version bump to 0.6.3
+- Updated User-Agent string
+
 ## [0.6.2] - 2026-03-27
 
 ### Added
