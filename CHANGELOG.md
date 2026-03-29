@@ -1,3 +1,29 @@
+## v0.6.5 — Security Hardening + Shared Executor (2026-03-29)
+
+### Security Fixes (Critical)
+- **GUI Command Approval**: Every `local_exec` call now shows a confirmation dialog before execution. Destructive commands default to "No".
+- **Stop Button**: Agent loop can be interrupted at any point between iterations or tool calls.
+- **Audit Log**: All tool executions (local_exec + MCP) are logged to `~/.config/ai-coder/audit.jsonl` with timestamp, command, result, duration, and model.
+- **Token Expiry Handling**: Pre-flight JWT expiry check prevents requests with expired tokens. New `TokenExpiredError` gives clear guidance ("aicoder setup").
+- **Destructive Pattern Detection**: Extended pattern list (15 patterns) including `wipefs`, `shred`, `truncate`, `mv /`.
+
+### Architecture Refactor
+- **New: `executor.py`** — Shared execution engine used by both CLI and GUI. Eliminates code duplication for: tool parsing, local/MCP execution, message management, destructive guards, audit logging.
+- **New: `audit.py`** — Persistent JSONL audit log for all tool calls. Includes `get_recent()` and `get_local_exec_history()` for programmatic access.
+- **Refactored: `agent.py`** — Now a thin CLI wrapper around executor. Re-exports constants for backwards compatibility.
+- **Refactored: `chat_widget.py`** — Complete rewrite using executor, with approval dialog, stop button, and model selector.
+
+### GUI Features
+- **Model Selector Dropdown**: Editable combo boxes for primary model and fallback directly in chat tab. Priority: combo > settings > state file.
+- **Enhanced Status Bar**: Shows user, tier, token expiry countdown, workspace name, tool count. Color changes based on token status (green/orange/red).
+- **XML Tool-Call Parsing**: Fixed parsing for models that return `<n>tool</n><arguments>` format (DeepSeek, etc.).
+
+### Client Improvements
+- `client.py`: New `token_expires_in()`, `is_token_expired()`, `token_status()` methods.
+- Pre-flight expiry check saves round-trip on expired tokens.
+- HTTP 401/403 with token keywords detected as `TokenExpiredError`.
+- Version bump to 0.6.5.
+
 ## v0.6.3 — Context Loss Fix (2026-03-28)
 
 ### Critical Bugfix
