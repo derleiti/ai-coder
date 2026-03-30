@@ -237,6 +237,7 @@ class SettingsWidget(QWidget):
         set_swarm(swarm)
         self.model_status.setText("Gespeichert.")
         self.model_status.setStyleSheet("color: #00ff88; font-size: 11px;")
+        self.selection_changed.emit(model, fallback)
 
     def get_current_model(self) -> str:
         return self.model_combo.currentText().strip()

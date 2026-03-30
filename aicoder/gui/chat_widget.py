@@ -155,15 +155,18 @@ class ChatWidget(QWidget):
         self._tools = None
         self._system = None
         self._messages = []
+        self._syncing = False
         self._build_ui()
-        # Connect to settings model list
-        if self.settings_ref and hasattr(self.settings_ref, "models_loaded"):
-            self.settings_ref.models_loaded.connect(self._on_models_updated)
+        # Connect to settings model list + selection changes
+        if self.settings_ref:
+            if hasattr(self.settings_ref, "models_loaded"):
+                self.settings_ref.models_loaded.connect(self._on_models_updated)
+            if hasattr(self.settings_ref, "selection_changed"):
+                self.settings_ref.selection_changed.connect(self._on_settings_selection_changed)
 
     def _on_models_updated(self, models: list):
         """Aktualisiert Model-Dropdowns mit Liste vom Backend."""
-        cur_m = self.model_combo.currentText()
-        cur_f = self.fallback_combo.currentText()
+        self._syncing = True
         self.model_combo.clear()
         self.fallback_combo.clear()
         self.model_combo.addItem("")    # Backend-Default
@@ -171,10 +174,18 @@ class ChatWidget(QWidget):
         for m in models:
             self.model_combo.addItem(m)
             self.fallback_combo.addItem(m)
-        if cur_m:
-            self.model_combo.setCurrentText(cur_m)
-        if cur_f:
-            self.fallback_combo.setCurrentText(cur_f)
+        # Sync selection from settings (if user hasn't overridden)
+        if self.settings_ref:
+            self.model_combo.setCurrentText(self.settings_ref.get_current_model())
+            self.fallback_combo.setCurrentText(self.settings_ref.get_current_fallback())
+        self._syncing = False
+
+    def _on_settings_selection_changed(self, model: str, fallback: str):
+        """Settings-Tab Auswahl hat sich geaendert — Chat-Tab synchronisieren."""
+        self._syncing = True
+        self.model_combo.setCurrentText(model)
+        self.fallback_combo.setCurrentText(fallback)
+        self._syncing = False
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
