@@ -34,6 +34,8 @@ class _ModelLoader(QThread):
 
 
 class SettingsWidget(QWidget):
+    models_loaded = pyqtSignal(list)  # emitted with sorted model list
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._loader = None
@@ -183,6 +185,7 @@ class SettingsWidget(QWidget):
 
         self.model_status.setText(f"{len(models)} Modelle ({tier})")
         self.model_status.setStyleSheet("color: #00ff88; font-size: 11px;")
+        self.models_loaded.emit(self._models)
 
     def _on_models_error(self, err: str):
         self.model_status.setText(f"Fehler: {err[:60]}")

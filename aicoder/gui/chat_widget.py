@@ -156,6 +156,25 @@ class ChatWidget(QWidget):
         self._system = None
         self._messages = []
         self._build_ui()
+        # Connect to settings model list
+        if self.settings_ref and hasattr(self.settings_ref, "models_loaded"):
+            self.settings_ref.models_loaded.connect(self._on_models_updated)
+
+    def _on_models_updated(self, models: list):
+        """Aktualisiert Model-Dropdowns mit Liste vom Backend."""
+        cur_m = self.model_combo.currentText()
+        cur_f = self.fallback_combo.currentText()
+        self.model_combo.clear()
+        self.fallback_combo.clear()
+        self.model_combo.addItem("")    # Backend-Default
+        self.fallback_combo.addItem("")  # kein Fallback
+        for m in models:
+            self.model_combo.addItem(m)
+            self.fallback_combo.addItem(m)
+        if cur_m:
+            self.model_combo.setCurrentText(cur_m)
+        if cur_f:
+            self.fallback_combo.setCurrentText(cur_f)
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -196,14 +215,7 @@ class ChatWidget(QWidget):
                 background: #111; color: #ccc; selection-background-color: #1a3a5e;
             }
         """)
-        self.model_combo.addItems([
-            "",  # Backend-Default
-            "groq/moonshotai/kimi-k2-instruct",
-            "ollama/deepseek-v3.2:cloud",
-            "openrouter/anthropic/claude-sonnet-4",
-            "openrouter/google/gemini-2.5-flash",
-            "groq/meta-llama/llama-4-scout-17b-16e-instruct",
-        ])
+        self.model_combo.addItem("")  # Backend-Default (liste wird dynamisch geladen)
         self.model_combo.setCurrentText("")
         self.model_combo.setToolTip("Modell auswählen (leer = Backend-Default)")
         model_row.addWidget(self.model_combo, stretch=1)
@@ -224,11 +236,7 @@ class ChatWidget(QWidget):
                 background: #111; color: #ccc; selection-background-color: #1a3a5e;
             }
         """)
-        self.fallback_combo.addItems([
-            "",
-            "groq/moonshotai/kimi-k2-instruct",
-            "ollama/deepseek-v3.2:cloud",
-        ])
+        self.fallback_combo.addItem("")  # (liste wird dynamisch geladen)
         self.fallback_combo.setCurrentText("")
         self.fallback_combo.setToolTip("Fallback-Modell (optional)")
         model_row.addWidget(self.fallback_combo, stretch=1)
