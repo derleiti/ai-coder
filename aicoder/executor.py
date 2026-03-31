@@ -54,16 +54,17 @@ else:
     OS_INSTRUCTIONS = """- local_exec uses bash. Use standard Linux/macOS commands.
   Use sudo for privileged operations."""
 
-# MCP-Tools whitelist — READ-ONLY, run on backend
+# MCP-Tools whitelist — READONLY only, run on backend (never write to server)
+# file_ops/git_ops/git/memory_store removed: clients must not write to server
 AGENT_TOOLS = {
     "safe_probe", "system_info", "process_control", "health",
     "code_read", "code_search", "code_tree",
-    "file_ops", "git_ops", "git",
     "dev_analyze", "dev_debug", "dev_lint", "dev_refactor", "dev_summarize",
     "dev_links",
     "service_status", "container_status", "log_viewer", "network_info",
     "web_search", "browser_search", "search", "fetch", "crawl",
-    "memory_search", "memory_store",
+    "memory_search",
+    "current_time", "hive_recall", "hive_stats",
 }
 
 LOCAL_EXEC_SCHEMA = {
