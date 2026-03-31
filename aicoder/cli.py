@@ -18,7 +18,7 @@ def parse_kv_pairs(pairs: list[str]) -> Dict[str, Any]:
     result: Dict[str, Any] = {}
     for item in pairs:
         if "=" not in item:
-            raise ClientError(f"Ungültiges Argument '{item}'. Erwartet key=value")
+            raise ClientError(f"Invalid argument '{item}'. Expected key=value")
         key, value = item.split("=", 1)
         key = key.strip()
         value = value.strip()
@@ -42,7 +42,7 @@ def print_json(data: Dict[str, Any]) -> None:
 
 def cmd_login(args: argparse.Namespace) -> int:
     email = args.email or input("E-Mail: ").strip()
-    password = args.password or getpass("Passwort: ")
+    password = getpass("Passwort: ")  # kein --password Flag (Security: Shell-History)
     client = TriForceClient(args.base_url)
     result = client.login(email=email, password=password)
     session = Session(
@@ -61,7 +61,7 @@ def cmd_login(args: argparse.Namespace) -> int:
 
 def cmd_logout(_: argparse.Namespace) -> int:
     delete_session()
-    print("Session gelöscht.")
+    print("Session deleted.")
     return 0
 
 
@@ -81,7 +81,7 @@ def cmd_tools(_: argparse.Namespace) -> int:
     _, client = session_client()
     data = client.handshake()
     tools = data.get("tools", [])
-    print(f"{len(tools)} Tools erlaubt")
+    print(f"{len(tools)} tools allowed")
     for t in tools:
         print(t)
     return 0
@@ -154,7 +154,7 @@ def cmd_swarm(args: argparse.Namespace) -> int:
             set_swarm(args.value)
             print(f"swarm → {args.value}")
         except ValueError as e:
-            print(f"Fehler: {e}", file=sys.stderr)
+            print(f"Error: {e}", file=sys.stderr)
             return 1
     else:
         state = get_state()
@@ -324,7 +324,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
         try:
             user_input = input("you> ").strip()
         except (EOFError, KeyboardInterrupt):
-            print("\nSession beendet.")
+            print("\nSession ended.")
             break
 
         if not user_input:
@@ -336,7 +336,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
             cmd = parts[0].lower()
             val = parts[1] if len(parts) > 1 else None
             if cmd in ("/exit", "/quit", "/q"):
-                print("Session beendet.")
+                print("Session ended.")
                 break
             elif cmd == "/model" and val:
                 model = val
@@ -348,7 +348,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
                     swarm = val
                     print(f"swarm → {val}")
                 except ValueError as e:
-                    print(f"Fehler: {e}")
+                    print(f"Error: {e}")
             elif cmd == "/status":
                 print(f"model={model or 'backend default'}  swarm={swarm}  turns={len(history)}")
             elif cmd == "/fallback" and val:
@@ -359,23 +359,18 @@ def cmd_chat(args: argparse.Namespace) -> int:
                 print("  /model <n>  /fallback <n>  /swarm <mode>  /status  /clear  /exit")
             elif cmd == "/clear":
                 history.clear()
-                print("History gecleart.")
+                print("History cleared.")
             else:
-                print(f"Unbekannter Command: {cmd}")
+                print(f"Unknown command: {cmd}")
             continue
 
-        # Build context-aware message: include last N turns
-        context = ""
+        # Build proper messages array for multi-turn context
+        chat_messages = []
         if history:
-            recent = history[-4:]  # last 4 turns max
-            context_parts = []
-            for turn in recent:
-                context_parts.append(f"User: {turn['user']}")
-                context_parts.append(f"Assistant: {turn['assistant']}")
-            context = "\n".join(context_parts) + "\n\n"
-            message = context + f"User: {user_input}"
-        else:
-            message = user_input
+            for turn in history[-6:]:
+                chat_messages.append({"role": "user", "content": turn["user"]})
+                chat_messages.append({"role": "assistant", "content": turn["assistant"]})
+        chat_messages.append({"role": "user", "content": user_input})
 
         # Auto-swarm heuristik
         _cs = swarm
@@ -388,7 +383,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
         with Spinner(label):
             try:
                 result = client.chat(
-                    message=message,
+                    messages=chat_messages,
                     model=model,
                     system_prompt=system_prompt,
                     temperature=0.7,
@@ -428,7 +423,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
 # ── Task ─────────────────────────────────────────────────────────────────────
 
 def cmd_task(args: argparse.Namespace) -> int:
-    """File-aware coding task: Datei lesen → LLM → Diff → optional apply."""
+    """File-aware coding task: read file → LLM → diff → optional apply."""
     from .task import run_task
     task = " ".join(args.task) if args.task else ""
     if not task:
@@ -447,7 +442,7 @@ def cmd_task(args: argparse.Namespace) -> int:
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    """Workspace initialisieren: AGENTS.md anlegen, workspace_root setzen."""
+    """Initialize workspace: create AGENTS.md, set workspace_root."""
     import subprocess
     from pathlib import Path as _P
     target = _P(getattr(args, "path", None) or os.getcwd()).resolve()
@@ -459,19 +454,19 @@ def cmd_init(args: argparse.Namespace) -> int:
         print("git init OK")
     agents_path = target / "AGENTS.md"
     if agents_path.exists() and not getattr(args, "force", False):
-        print("AGENTS.md bereits vorhanden -- skip (--force zum Ueberschreiben)")
+        print("AGENTS.md already exists -- skip (--force to overwrite)")
     else:
         proj_name = target.name
         lines_t = [
             "# AGENTS.md -- " + proj_name, "",
-            "Operative Anweisungen fuer ai-coder.", "",
-            "## Regeln", "",
-            "1. Ursache vor Fix.",
-            "2. Kleine robuste Aenderungen.",
+            "Operational instructions for ai-coder.", "",
+            "## Rules", "",
+            "1. Root cause before fix.",
+            "2. Small robust changes.",
             "3. Read-first.",
-            "4. Unsicherheit benennen.", "",
-            "## Stack", "", "- TODO: Technologien eintragen", "",
-            "## Konventionen", "", "- TODO: Code-Style eintragen", "",
+            "4. State uncertainty.", "",
+            "## Stack", "", "- TODO: Add technologies", "",
+            "## Conventions", "", "- TODO: Add code style", "",
         ]
         agents_path.write_text("\n".join(lines_t), encoding="utf-8")
         print(f"AGENTS.md OK ({agents_path})")
@@ -485,11 +480,11 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 
 def cmd_broadcast(args: argparse.Namespace) -> int:
-    """Swarm-Broadcast: Frage an alle Backend-Modelle via swarm_broadcast MCP."""
+    """Swarm broadcast: send question to all backend models via swarm_broadcast MCP."""
     _, client = session_client()
     question = " ".join(args.question) if args.question else ""
     if not question:
-        print("Fehler: Frage angeben.", file=sys.stderr)
+        print("Error: provide a question.", file=sys.stderr)
         return 1
     providers = getattr(args, "providers", None) or None
     skip = getattr(args, "skip", None) or None
@@ -505,7 +500,7 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
         try:
             raw = client.mcp_call("swarm_broadcast", params)
         except ClientError as e:
-            print(f"Fehler: {e}", file=sys.stderr)
+            print(f"Error: {e}", file=sys.stderr)
             return 1
     content = raw.get("result", {}).get("content", [{}])[0].get("text", "{}")
     try:
@@ -514,7 +509,7 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
         print(content)
         return 0
     s = data.get("session", {})
-    print(f"\nSwarm {s.get('id','?')} -- {s.get('responses_count',0)} Antworten in {s.get('elapsed_ms',0)}ms")
+    print(f"\nSwarm {s.get('id','?')} -- {s.get('responses_count',0)} responses in {s.get('elapsed_ms',0)}ms")
     print("-" * 60)
     for i, r in enumerate(data.get("top_results", []), 1):
         print(f"\n#{i} [{r.get('model_id','?')}  score={r.get('quality_score',0):.3f}  {r.get('latency_ms','?')}ms]")
@@ -529,7 +524,7 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
 
 
 def cmd_shell(args: argparse.Namespace) -> int:
-    """Shell-Befehl ueber MCP binary_exec/shell ausfuehren.
+    """Run shell command via MCP binary_exec/shell.
 
     Kurzbefehle: aicoder shell uptime
                  aicoder shell df -h
@@ -546,7 +541,7 @@ def cmd_shell(args: argparse.Namespace) -> int:
         try:
             data = json.loads(content)
             bins = sorted(data.get("binaries", {}).keys())
-            print(f"{len(bins)} verfuegbare Programme:")
+            print(f"{len(bins)} available programs:")
             print("  ".join(bins))
         except Exception:
             print(content)
@@ -555,14 +550,14 @@ def cmd_shell(args: argparse.Namespace) -> int:
     use_raw = getattr(args, "raw", False)
 
     if use_raw:
-        # Rohe Shell-Ausführung via shell-Tool
+        # Raw shell execution via shell tool
         cmd_str = " ".join(cmd_parts)
         print(f"$ {cmd_str}", file=sys.stderr)
         with Spinner("working..."):
             try:
                 raw = client.mcp_call("shell", {"command": cmd_str})
             except ClientError as e:
-                print(f"Fehler: {e}", file=sys.stderr)
+                print(f"Error: {e}", file=sys.stderr)
                 return 1
     else:
         # binary_exec: erstes Token = Programm, Rest = Argumente
@@ -583,7 +578,7 @@ def cmd_shell(args: argparse.Namespace) -> int:
             try:
                 raw = client.mcp_call("binary_exec", params)
             except ClientError as e:
-                print(f"Fehler: {e}", file=sys.stderr)
+                print(f"Error: {e}", file=sys.stderr)
                 return 1
 
     content = raw.get("result", {}).get("content", [{}])[0].get("text", "")
@@ -601,33 +596,9 @@ def cmd_shell(args: argparse.Namespace) -> int:
     return rc
 
 
-def cmd_sudo(args: argparse.Namespace) -> int:
-    """Sudo-Befehl lokal ausführen — Passwort wird nie über Netzwerk übertragen."""
-    import subprocess as _sp
-    cmd_str = " ".join(args.cmd) if args.cmd else ""
-    if not cmd_str:
-        print("Fehler: Befehl angeben.", file=sys.stderr)
-        return 1
-    print(f"sudo {cmd_str}", file=sys.stderr)
-    try:
-        r = _sp.run(
-            ["sudo", "--"] + cmd_str.split(),
-            capture_output=False,   # direktes Terminal-I/O inkl. sudo-Passwort-Prompt
-            timeout=getattr(args, "timeout", 60),
-        )
-        return r.returncode
-    except FileNotFoundError:
-        print("Fehler: sudo nicht gefunden.", file=sys.stderr)
-        return 1
-    except _sp.TimeoutExpired:
-        print("Fehler: Timeout.", file=sys.stderr)
-        return 1
-    except KeyboardInterrupt:
-        return 130
-
 
 def cmd_sysinfo(args: argparse.Namespace) -> int:
-    """System-Uebersicht: lokal (--local) oder Backend via safe_probe."""
+    """System overview: local (--local) or backend via safe_probe."""
     import shutil, subprocess as sp
 
     if getattr(args, "local", False):
@@ -684,7 +655,7 @@ def cmd_sysinfo(args: argparse.Namespace) -> int:
         try:
             raw = client.mcp_call("safe_probe", params)
         except ClientError as e:
-            print(f"Fehler: {e}", file=sys.stderr)
+            print(f"Error: {e}", file=sys.stderr)
             return 1
     content = raw.get("result", {}).get("content", [{}])[0].get("text", "")
     try:
@@ -695,7 +666,7 @@ def cmd_sysinfo(args: argparse.Namespace) -> int:
 
 
 def cmd_service(args: argparse.Namespace) -> int:
-    """Systemd-Service LOKAL verwalten (subprocess, nicht MCP)."""
+    """Manage systemd service locally (subprocess, not MCP)."""
     import subprocess as _sp
     action = args.action
     service = getattr(args, "service", None)
@@ -708,7 +679,7 @@ def cmd_service(args: argparse.Namespace) -> int:
         return r.returncode
 
     if not service:
-        print(f"Fehler: service angeben. Bsp: aicoder service {action} triforce",
+        print(f"Error: specify service. Example: aicoder service {action} triforce",
               file=sys.stderr)
         return 1
 
@@ -729,16 +700,16 @@ def cmd_service(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="aicoder",
-        description="ai-coder — terminalbasierter Coding-Agent für AILinux / TriForce",
+        description="ai-coder — terminal-based coding agent for AILinux / TriForce",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=textwrap.dedent("""        Beispiele:
+        epilog=textwrap.dedent("""        Examples:
           aicoder login --base-url http://127.0.0.1:9000
           aicoder model anthropic/claude-sonnet-4
           aicoder fallback gemini/gemini-2.0-flash
           aicoder swarm auto
           aicoder status
           aicoder ask "Was macht diese Funktion?"
-          aicoder task "Füge Docstrings hinzu" -f datei.py --dry-run
+          aicoder task "Add docstrings" -f datei.py --dry-run
           aicoder review -f datei.py
           aicoder models --filter groq
           aicoder mcp-list
@@ -753,23 +724,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--email")
     p.set_defaults(func=cmd_login)
 
-    p = sub.add_parser("logout", help="Lokale Session löschen")
+    p = sub.add_parser("logout", help="Delete local session")
     p.set_defaults(func=cmd_logout)
 
-    p = sub.add_parser("whoami", help="Token prüfen → /v1/auth/verify")
+    p = sub.add_parser("whoami", help="Verify token → /v1/auth/verify")
     p.set_defaults(func=cmd_whoami)
 
-    p = sub.add_parser("handshake", help="Client-Handshake abfragen")
+    p = sub.add_parser("handshake", help="Query client handshake")
     p.set_defaults(func=cmd_handshake)
 
-    p = sub.add_parser("tools", help="Erlaubte Tools aus Handshake anzeigen")
+    p = sub.add_parser("tools", help="Show allowed tools from handshake")
     p.set_defaults(func=cmd_tools)
 
-    p = sub.add_parser("profile", help="Lokale Sessiondaten (masked) anzeigen")
+    p = sub.add_parser("profile", help="Show local session data (masked)")
     p.set_defaults(func=cmd_profile)
 
     # workspace
-    p = sub.add_parser("workspace", help="Lokalen Workspace/Repo analysieren")
+    p = sub.add_parser("workspace", help="Analyze local workspace/repo")
     p.add_argument("path", nargs="?")
     p.set_defaults(func=cmd_workspace)
 
@@ -781,11 +752,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_mcp)
 
     # session state
-    p = sub.add_parser("model", help="Aktives Coding-Modell anzeigen oder setzen")
+    p = sub.add_parser("model", help="Show or set active coding model")
     p.add_argument("value", nargs="?")
     p.set_defaults(func=cmd_model)
 
-    p = sub.add_parser("fallback", help="Fallback-Modell anzeigen oder setzen")
+    p = sub.add_parser("fallback", help="Show or set fallback model")
     p.add_argument("value", nargs="?")
     p.set_defaults(func=cmd_fallback)
 
@@ -793,101 +764,97 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("value", nargs="?")
     p.set_defaults(func=cmd_swarm)
 
-    p = sub.add_parser("status", help="Aktiven Status ausgeben (model, fallback, swarm, workspace, docs)")
+    p = sub.add_parser("status", help="Show active status (model, fallback, swarm, workspace, docs)")
     p.set_defaults(func=cmd_status)
 
     # ask / chat / task
-    p = sub.add_parser("ask", help="Single-shot Prompt ans LLM senden")
-    p.add_argument("prompt", nargs="*", help="Prompt-Text (oder stdin wenn leer)")
+    p = sub.add_parser("ask", help="Send single-shot prompt to LLM")
+    p.add_argument("prompt", nargs="*", help="Prompt text (or stdin if empty)")
     p.add_argument("--model", default=None)
     p.add_argument("--no-agents", dest="no_agents", action="store_true")
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--max-tokens", dest="max_tokens", type=int, default=4096)
-    p.add_argument("--timeout", type=int, default=90, help="HTTP-Timeout in Sekunden")
+    p.add_argument("--timeout", type=int, default=90, help="HTTP timeout in seconds")
     p.set_defaults(func=cmd_ask)
 
-    p = sub.add_parser("chat", help="Interaktive Multi-Turn-Chat-Session")
+    p = sub.add_parser("chat", help="Interactive multi-turn chat session")
     p.add_argument("--model", default=None)
     p.add_argument("--no-agents", dest="no_agents", action="store_true")
     p.set_defaults(func=cmd_chat)
 
-    p = sub.add_parser("task", help="File-aware Coding-Task: Datei → LLM → Diff → apply")
-    p.add_argument("task", nargs="*", help="Task-Beschreibung")
+    p = sub.add_parser("task", help="File-aware coding task: file → LLM → diff → apply")
+    p.add_argument("task", nargs="*", help="Task description")
     p.add_argument("-f", "--file", dest="files", action="append", metavar="FILE")
     p.add_argument("--apply", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--model", default=None)
     p.add_argument("--no-agents", dest="no_agents", action="store_true")
     p.add_argument("--temperature", type=float, default=0.3)
-    p.add_argument("--timeout", type=int, default=90, help="HTTP-Timeout in Sekunden")
+    p.add_argument("--timeout", type=int, default=90, help="HTTP timeout in seconds")
     p.set_defaults(func=cmd_task)
 
-    p = sub.add_parser("review", help="Strukturiertes Code-Review einer Datei")
+    p = sub.add_parser("review", help="Structured code review of a file")
     p.add_argument("-f", "--file", dest="files", action="append", metavar="FILE")
     p.add_argument("--model", default=None)
     p.add_argument("--no-agents", dest="no_agents", action="store_true")
     p.set_defaults(func=cmd_review)
 
     # models / mcp-list
-    p = sub.add_parser("models", help="Verfügbare Modelle vom Backend auflisten")
+    p = sub.add_parser("models", help="List available models from backend")
     p.add_argument("--filter", default=None, help="Filter by substring")
     p.add_argument("--group", action="store_true", help="Nach Provider gruppieren")
     p.add_argument("--verbose", "-v", action="store_true")
     p.add_argument("--json", dest="json_out", action="store_true")
     p.set_defaults(func=cmd_models)
 
-    p = sub.add_parser("mcp-list", help="Alle MCP-Tools tabellarisch anzeigen")
+    p = sub.add_parser("mcp-list", help="List all MCP tools in table format")
     p.set_defaults(func=cmd_mcp_list)
 
     # history
-    p = sub.add_parser("hist", help="Call-History anzeigen")
+    p = sub.add_parser("hist", help="Show call history")
     p.add_argument("-n", type=int, default=10)
     p.add_argument("--clear", action="store_true")
     p.set_defaults(func=cmd_hist)
 
-    p = sub.add_parser("init", help="Workspace initialisieren + AGENTS.md anlegen")
+    p = sub.add_parser("init", help="Initialize workspace + create AGENTS.md")
     p.add_argument("path", nargs="?")
     p.add_argument("--force", action="store_true")
     p.add_argument("--no-git", dest="no_git", action="store_true")
     p.set_defaults(func=cmd_init)
 
-    p = sub.add_parser("broadcast", help="Swarm-Broadcast an alle Backend-Modelle")
+    p = sub.add_parser("broadcast", help="Swarm broadcast to all backend models")
     p.add_argument("question", nargs="*")
-    p.add_argument("--providers", default=None, help="Kommagetrennt: groq,mistral")
+    p.add_argument("--providers", default=None, help="Comma-separated: groq,mistral")
     p.add_argument("--skip", default=None)
     p.add_argument("--top-n", dest="top_n", type=int, default=5)
     p.add_argument("--max-tokens", dest="max_tokens", type=int, default=200)
     p.set_defaults(func=cmd_broadcast)
 
-    p = sub.add_parser("shell", help="Befehl via MCP binary_exec ausfuehren (ohne Args: Liste)")
+    p = sub.add_parser("shell", help="Run command via MCP binary_exec (no args: list)")
     p.add_argument("cmd", nargs="*")
-    p.add_argument("--raw", "-r", action="store_true", help="Shell-Tool statt binary_exec (pipes etc.)")
+    p.add_argument("--raw", "-r", action="store_true", help="Shell tool instead of binary_exec (pipes etc.)")
     p.add_argument("--elevated", "-e", action="store_true")
     p.add_argument("--cwd", default=None)
     p.add_argument("--timeout", type=int, default=30)
     p.set_defaults(func=cmd_shell)
 
-    p = sub.add_parser("sudo", help="Sudo-Befehl - fragt Passwort lokal ab")
-    p.add_argument("cmd", nargs="*")
-    p.add_argument("--timeout", type=int, default=60)
-    p.set_defaults(func=cmd_sudo)
 
-    p = sub.add_parser("sysinfo", help="System-Uebersicht: --local = dieser Rechner, sonst Backend-Server")
+    p = sub.add_parser("sysinfo", help="System overview: --local = this machine, else backend server")
     p.add_argument("action", nargs="?", default="overview",
                    choices=["overview","run","service_status","journal","list"])
     p.add_argument("--probe", default=None)
     p.add_argument("--service", default=None)
-    p.add_argument("--local", "-l", action="store_true", help="Lokale Stats (dieser Rechner, kein MCP)")
+    p.add_argument("--local", "-l", action="store_true", help="Local stats (this machine, no MCP)")
     p.set_defaults(func=cmd_sysinfo)
 
-    p = sub.add_parser("service", help="Systemd-Service verwalten")
+    p = sub.add_parser("service", help="Manage systemd service")
     p.add_argument("action", choices=["status","start","stop","restart","logs","list"])
     p.add_argument("service", nargs="?", default=None)
     p.add_argument("--lines", type=int, default=50)
     p.set_defaults(func=cmd_service)
 
-    p = sub.add_parser("agent", help="Agent-REPL / autonomer Terminal-Agent")
-    p.add_argument("prompt", nargs="*", help="Direkt-Prompt (kein REPL)")
+    p = sub.add_parser("agent", help="Agent REPL / autonomous terminal agent")
+    p.add_argument("prompt", nargs="*", help="Direct prompt (no REPL)")
     p.add_argument("--model", default=None)
     p.add_argument("--setup", action="store_true")
     p.add_argument("--verbose", "-v", action="store_true")
@@ -895,13 +862,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
     # GUI
-    p = sub.add_parser("gui", help="GUI-Fenster starten (PyQt6)")
+    p = sub.add_parser("gui", help="Start GUI window (PyQt6)")
     p.set_defaults(func=lambda _: _run_gui())
     return parser
 
 
 def cmd_agent(args: argparse.Namespace) -> int:
-    """Agent-REPL starten (optional: direkter Prompt als Argument)."""
+    """Start agent REPL (optional: direct prompt as argument)."""
     from .setup import run_repl, run_setup
     from .agent import run_agent
 
@@ -924,7 +891,7 @@ def cmd_agent(args: argparse.Namespace) -> int:
         return run_repl(skip_setup=getattr(args, "setup", False))
 
 def cmd_models(args: argparse.Namespace) -> int:
-    """Liste verfügbare Modelle vom Backend."""
+    """List available models from backend."""
     session, client = session_client()
     with Spinner("working..."):
         data = client._request("GET", "/v1/client/models", require_auth=True, _label="models")
@@ -980,11 +947,11 @@ def cmd_mcp_list(_: argparse.Namespace) -> int:
 
 
 def cmd_review(args: argparse.Namespace) -> int:
-    """Code review: Datei analysieren → strukturiertes Review."""
+    """Code review: analyze file → structured review."""
     from .task import run_task
     files = args.files or []
     if not files:
-        print("Fehler: Mindestens eine Datei mit -f angeben.", file=sys.stderr)
+        print("Error: specify at least one file with -f.", file=sys.stderr)
         return 1
     review_prompt = (
         "Perform a structured code review. Cover: "
@@ -1010,12 +977,12 @@ def cmd_hist(args: argparse.Namespace) -> int:
     """Show call history."""
     if getattr(args, "clear", False):
         clear_history()
-        print("History gelöscht.")
+        print("History cleared.")
         return 0
     n = getattr(args, "n", 10)
     entries = get_history(n)
     if not entries:
-        print("Keine History vorhanden.")
+        print("No history found.")
         return 0
     for e in entries:
         ts = e.get("ts","")[:16].replace("T"," ")
@@ -1030,71 +997,15 @@ def cmd_hist(args: argparse.Namespace) -> int:
     return 0
 
 
-    p = sub.add_parser("models", help="Verfügbare Modelle vom Backend auflisten")
-    p.add_argument("--filter", default=None, help="Filter by substring")
-    p.add_argument("--group", action="store_true", help="Nach Provider gruppieren")
-    p.add_argument("--verbose", "-v", action="store_true")
-    p.add_argument("--json", dest="json_out", action="store_true")
-    p.set_defaults(func=cmd_models)
-
-    p = sub.add_parser("mcp-list", help="Alle MCP-Tools tabellarisch anzeigen")
-    p.set_defaults(func=cmd_mcp_list)
-
-    p = sub.add_parser("review", help="Strukturiertes Code-Review einer Datei")
-    p.add_argument("-f", "--file", dest="files", action="append", metavar="FILE")
-    p.add_argument("--model", default=None)
-    p.add_argument("--no-agents", dest="no_agents", action="store_true")
-    p.set_defaults(func=cmd_review)
-
-    p = sub.add_parser("hist", help="Call-History anzeigen")
-    p.add_argument("-n", type=int, default=10, help="Anzahl Einträge")
-    p.add_argument("--clear", action="store_true", help="History löschen")
-    p.set_defaults(func=cmd_hist)
-
-    p = sub.add_parser("init", help="Workspace initialisieren + AGENTS.md anlegen")
-    p.add_argument("path", nargs="?")
-    p.add_argument("--force", action="store_true")
-    p.add_argument("--no-git", dest="no_git", action="store_true")
-    p.set_defaults(func=cmd_init)
-
-    p = sub.add_parser("broadcast", help="Swarm-Broadcast an alle Backend-Modelle")
-    p.add_argument("question", nargs="*")
-    p.add_argument("--providers", default=None, help="Kommagetrennt: groq,mistral")
-    p.add_argument("--skip", default=None)
-    p.add_argument("--top-n", dest="top_n", type=int, default=5)
-    p.add_argument("--max-tokens", dest="max_tokens", type=int, default=200)
-    p.set_defaults(func=cmd_broadcast)
-
-    p = sub.add_parser("shell", help="Befehl via MCP binary_exec ausfuehren (ohne Args: Liste)")
-    p.add_argument("cmd", nargs="*")
-    p.add_argument("--raw", "-r", action="store_true", help="Shell-Tool statt binary_exec (pipes etc.)")
-    p.add_argument("--elevated", "-e", action="store_true")
-    p.add_argument("--cwd", default=None)
-    p.add_argument("--timeout", type=int, default=30)
-    p.set_defaults(func=cmd_shell)
-
-    p = sub.add_parser("sudo", help="Sudo-Befehl - fragt Passwort lokal ab")
-    p.add_argument("cmd", nargs="*")
-    p.add_argument("--timeout", type=int, default=60)
-    p.set_defaults(func=cmd_sudo)
-
-    p = sub.add_parser("sysinfo", help="System-Uebersicht: --local = dieser Rechner, sonst Backend-Server")
-    p.add_argument("action", nargs="?", default="overview",
-                   choices=["overview","run","service_status","journal","list"])
-    p.add_argument("--probe", default=None)
-    p.add_argument("--service", default=None)
-    p.add_argument("--local", "-l", action="store_true", help="Lokale Stats (dieser Rechner, kein MCP)")
-    p.set_defaults(func=cmd_sysinfo)
-
 
 def _run_gui() -> int:
-    """Startet die PyQt6 GUI."""
+    """Start the PyQt6 GUI."""
     try:
         from .gui.app import run_gui
         return run_gui()
     except ImportError as e:
-        print(f"PyQt6 nicht installiert: {e}", file=sys.stderr)
-        print("Installation: pip install PyQt6", file=sys.stderr)
+        print(f"PyQt6 not installed: {e}", file=sys.stderr)
+        print("Install with: pip install PyQt6", file=sys.stderr)
         return 1
 
 
@@ -1109,10 +1020,10 @@ def main() -> int:
     try:
         return int(args.func(args) or 0)
     except (ClientError, RuntimeError) as e:
-        print(f"Fehler: {e}", file=sys.stderr)
+        print(f"Error: {e}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
-        print("Abgebrochen.")
+        print("Aborted.")
         return 130
 
 

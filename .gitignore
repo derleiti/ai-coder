@@ -8,3 +8,9 @@ build/
 ~/.config/ai-coder/
 *.log
 .env
+-e 
+*.bak
+*.bak.*
+__pycache__/
+*.pyc
+packaging/*.deb

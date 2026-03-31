@@ -16,23 +16,23 @@ _DEFAULTS: Dict[str, Any] = {
 }
 
 # In-memory cache — vermeidet wiederholte Disk-Reads im Agent-Loop
-_cache: Optional[Dict[str, Any]] = None
+_cache: Dict[str, Any] | None = None
 
 
 def _load_raw() -> Dict[str, Any]:
     global _cache
     if _cache is not None:
-        return _cache
+        return dict(_cache)
     if not STATE_FILE.exists():
         _cache = dict(_DEFAULTS)
-        return _cache
+        return dict(_cache)
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         _cache = {**_DEFAULTS, **data}
-        return _cache
+        return dict(_cache)
     except Exception:
         _cache = dict(_DEFAULTS)
-        return _cache
+        return dict(_cache)
 
 
 def _save_raw(data: Dict[str, Any]) -> None:
@@ -40,20 +40,24 @@ def _save_raw(data: Dict[str, Any]) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
     os.chmod(STATE_FILE, 0o600)
-    _cache = dict(data)  # Cache synchron halten
+    _cache = dict(data)
+
 
 def get_state() -> Dict[str, Any]:
     return _load_raw()
+
 
 def set_model(model: str) -> None:
     d = _load_raw()
     d["selected_model"] = model
     _save_raw(d)
 
+
 def set_fallback(model: str) -> None:
     d = _load_raw()
     d["fallback_model"] = model
     _save_raw(d)
+
 
 def set_swarm(mode: str) -> None:
     if mode not in SWARM_MODES:
@@ -61,6 +65,7 @@ def set_swarm(mode: str) -> None:
     d = _load_raw()
     d["swarm_mode"] = mode
     _save_raw(d)
+
 
 def set_workspace(path: Optional[str]) -> None:
     d = _load_raw()

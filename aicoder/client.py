@@ -1,27 +1,46 @@
 from __future__ import annotations
+import base64
 import json
 import ssl
+import time
 from typing import Any, Dict, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
-USER_AGENT = "ai-coder/0.5 (AILinux Coding Client)"
+USER_AGENT = "ai-coder/0.6.8 (AILinux Coding Client)"
 
 
 def _ssl_context() -> ssl.SSLContext:
     """SSL context with proper CA certs (fixes PyInstaller on Windows/Android)."""
-    # 1. certifi — beste Variante, funktioniert auf Windows PyInstaller + Termux
     try:
         import certifi
         return ssl.create_default_context(cafile=certifi.where())
     except Exception:
         pass
-    # 2. System-Certs
     return ssl.create_default_context()
 
 
+def _decode_jwt_exp(token: str) -> Optional[int]:
+    """Decode JWT expiry timestamp without verification (offline check only)."""
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return None
+        # Decode payload (part 1), add padding
+        payload_b64 = parts[1] + "=" * (4 - len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        return payload.get("exp")
+    except Exception:
+        return None
+
+
 class ClientError(RuntimeError):
+    pass
+
+
+class TokenExpiredError(ClientError):
+    """Raised when JWT token is expired and no auto-refresh is possible."""
     pass
 
 
@@ -30,6 +49,37 @@ class TriForceClient:
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.timeout = timeout
+
+    def token_expires_in(self) -> Optional[float]:
+        """Seconds until token expires. None if unknown, negative if expired."""
+        if not self.token:
+            return None
+        exp = _decode_jwt_exp(self.token)
+        if exp is None:
+            return None
+        return exp - time.time()
+
+    def is_token_expired(self) -> bool:
+        """Check if token is expired (with 30s grace period)."""
+        remaining = self.token_expires_in()
+        if remaining is None:
+            return False  # Can't check — assume valid
+        return remaining < 30  # Expired or expires within 30s
+
+    def token_status(self) -> str:
+        """Human-readable token status for UI display."""
+        remaining = self.token_expires_in()
+        if remaining is None:
+            return "unbekannt"
+        if remaining < 0:
+            return "expired"
+        if remaining < 300:
+            m = int(remaining / 60)
+            return f"expires in {m}min"
+        hours = int(remaining / 3600)
+        if hours > 0:
+            return f"valid ({hours}h)"
+        return f"valid ({int(remaining/60)}min)"
 
     def _request(
         self,
@@ -49,6 +99,11 @@ class TriForceClient:
         if require_auth:
             if not self.token:
                 raise ClientError("Kein Token vorhanden. Erst einloggen.")
+            # Pre-flight expiry check (saves a round-trip)
+            if self.is_token_expired():
+                raise TokenExpiredError(
+                    "Token expired. Please re-login: aicoder setup"
+                )
             headers["Authorization"] = f"Bearer {self.token}"
         if payload is not None:
             data = json.dumps(payload).encode("utf-8")
@@ -64,12 +119,19 @@ class TriForceClient:
             except Exception:
                 parsed = {"raw": body}
             label = f" [{_label}]" if _label else ""
+            # Detect 401/403 from expired token specifically
+            if e.code in (401, 403):
+                detail = parsed.get("detail", "") or parsed.get("raw", "")
+                if "expire" in str(detail).lower() or "token" in str(detail).lower():
+                    raise TokenExpiredError(
+                        f"Token expired (HTTP {e.code}). Please re-login: aicoder setup"
+                    ) from e
             raise ClientError(f"HTTP {e.code}{label} bei {path}: {parsed}") from e
         except TimeoutError:
             label = f" [{_label}]" if _label else ""
             raise ClientError(
                 f"Timeout nach {self.timeout}s{label} bei {path}. "
-                "Backend erreichbar? Timeout via --timeout erhöhen."
+                "Backend reachable? Increase timeout via --timeout."
             )
         except URLError as e:
             raise ClientError(f"Verbindung fehlgeschlagen zu {url}: {e}") from e
@@ -105,19 +167,23 @@ class TriForceClient:
 
     def chat(
         self,
-        message: str,
+        message: str = "",
         model: Optional[str] = None,
         system_prompt: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 4096,
         fallback_model: Optional[str] = None,
+        messages: Optional[list] = None,
     ) -> Dict[str, Any]:
-        """Call /v1/client/chat. Auto-retries with fallback_model on ClientError."""
+        """Call /v1/client/chat. Supports messages array for multi-turn context."""
         payload: Dict[str, Any] = {
-            "message": message,
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        if messages:
+            payload["messages"] = messages
+        else:
+            payload["message"] = message
         if model:
             payload["model"] = model
         if system_prompt:

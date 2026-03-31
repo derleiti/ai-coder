@@ -1,4 +1,4 @@
-"""Settings-Tab — Login, Model-Dropdown, Fallback-Dropdown, Swarm."""
+"""Settings tab — Login, model dropdown, fallback dropdown, swarm."""
 from __future__ import annotations
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
@@ -12,7 +12,7 @@ from ..client import TriForceClient, ClientError
 
 
 class _ModelLoader(QThread):
-    """Laedt Modell-Liste vom Backend im Hintergrund."""
+    """Loads model list from backend in background."""
     loaded = pyqtSignal(list, str)   # (models, tier)
     error = pyqtSignal(str)
 
@@ -34,6 +34,9 @@ class _ModelLoader(QThread):
 
 
 class SettingsWidget(QWidget):
+    models_loaded = pyqtSignal(list)  # emitted with sorted model list
+    selection_changed = pyqtSignal(str, str)  # (model, fallback)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._loader = None
@@ -53,10 +56,10 @@ class SettingsWidget(QWidget):
         self.email_edit.setPlaceholderText("user@example.com")
         self.password_edit = QLineEdit()
         self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.password_edit.setPlaceholderText("Passwort")
+        self.password_edit.setPlaceholderText("Password")
         login_form.addRow("Base URL:", self.base_url_edit)
         login_form.addRow("E-Mail:", self.email_edit)
-        login_form.addRow("Passwort:", self.password_edit)
+        login_form.addRow("Password:", self.password_edit)
 
         btn_row = QHBoxLayout()
         self.login_btn = QPushButton("Login")
@@ -73,29 +76,29 @@ class SettingsWidget(QWidget):
         layout.addWidget(login_group)
 
         # --- Model Group ---
-        model_group = QGroupBox("Modell-Konfiguration")
+        model_group = QGroupBox("Model Configuration")
         model_form = QFormLayout()
 
         # Model Dropdown (editable — user can type custom model too)
         self.model_combo = QComboBox()
         self.model_combo.setEditable(True)
         self.model_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        self.model_combo.lineEdit().setPlaceholderText("Modell waehlen oder eingeben...")
+        self.model_combo.lineEdit().setPlaceholderText("Select or enter model...")
 
         # Fallback Dropdown
         self.fallback_combo = QComboBox()
         self.fallback_combo.setEditable(True)
         self.fallback_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        self.fallback_combo.lineEdit().setPlaceholderText("Fallback waehlen...")
+        self.fallback_combo.lineEdit().setPlaceholderText("Select fallback...")
 
         # Refresh button
-        refresh_btn = QPushButton("Modelle laden")
+        refresh_btn = QPushButton("Load Models")
         refresh_btn.clicked.connect(self._load_models)
 
         self.model_status = QLabel("")
         self.model_status.setStyleSheet("color: #888; font-size: 11px;")
 
-        model_form.addRow("Modell:", self.model_combo)
+        model_form.addRow("Model:", self.model_combo)
         model_form.addRow("Fallback:", self.fallback_combo)
 
         # Swarm
@@ -105,7 +108,7 @@ class SettingsWidget(QWidget):
 
         # Buttons row
         model_btn_row = QHBoxLayout()
-        save_btn = QPushButton("Speichern")
+        save_btn = QPushButton("Save")
         save_btn.clicked.connect(self._save_model_config)
         model_btn_row.addWidget(refresh_btn)
         model_btn_row.addWidget(save_btn)
@@ -123,12 +126,12 @@ class SettingsWidget(QWidget):
         try:
             session = load_session()
             self.base_url_edit.setText(session.base_url)
-            self.status_label.setText(f"Eingeloggt als {session.user_id} ({session.tier})")
+            self.status_label.setText(f"Logged in as {session.user_id} ({session.tier})")
             self.status_label.setStyleSheet("color: #00d4ff;")
             # Auto-load models on startup if logged in
             self._load_models()
         except Exception:
-            self.status_label.setText("Nicht eingeloggt")
+            self.status_label.setText("Not logged in")
             self.status_label.setStyleSheet("color: #ff6b6b;")
 
         # State
@@ -142,16 +145,16 @@ class SettingsWidget(QWidget):
             self.swarm_combo.setCurrentIndex(idx)
 
     def _load_models(self):
-        """Lade Modell-Liste vom Backend."""
+        """Load model list from backend."""
         try:
             session = load_session()
             client = TriForceClient(session.base_url, token=session.token, timeout=10)
         except Exception:
-            self.model_status.setText("Nicht eingeloggt")
+            self.model_status.setText("Not logged in")
             self.model_status.setStyleSheet("color: #ff6b6b; font-size: 11px;")
             return
 
-        self.model_status.setText("Lade Modelle...")
+        self.model_status.setText("Loading models...")
         self.model_status.setStyleSheet("color: #00d4ff; font-size: 11px;")
 
         self._loader = _ModelLoader(client)
@@ -181,11 +184,12 @@ class SettingsWidget(QWidget):
         if cur_fallback:
             self.fallback_combo.setCurrentText(cur_fallback)
 
-        self.model_status.setText(f"{len(models)} Modelle ({tier})")
+        self.model_status.setText(f"{len(models)} models ({tier})")
         self.model_status.setStyleSheet("color: #00ff88; font-size: 11px;")
+        self.models_loaded.emit(self._models)
 
     def _on_models_error(self, err: str):
-        self.model_status.setText(f"Fehler: {err[:60]}")
+        self.model_status.setText(f"Error: {err[:60]}")
         self.model_status.setStyleSheet("color: #ff6b6b; font-size: 11px;")
 
     def _do_login(self):
@@ -193,7 +197,7 @@ class SettingsWidget(QWidget):
         email = self.email_edit.text().strip()
         password = self.password_edit.text()
         if not email or not password:
-            QMessageBox.warning(self, "Login", "E-Mail und Passwort eingeben.")
+            QMessageBox.warning(self, "Login", "Enter email and password.")
             return
         try:
             client = TriForceClient(base_url)
@@ -208,16 +212,16 @@ class SettingsWidget(QWidget):
             )
             save_session(session)
             self.password_edit.clear()
-            self.status_label.setText(f"Eingeloggt als {session.user_id} ({session.tier})")
+            self.status_label.setText(f"Logged in as {session.user_id} ({session.tier})")
             self.status_label.setStyleSheet("color: #00d4ff;")
             # Auto-load models after login
             self._load_models()
         except (ClientError, Exception) as e:
-            QMessageBox.critical(self, "Login fehlgeschlagen", str(e))
+            QMessageBox.critical(self, "Login failed", str(e))
 
     def _do_logout(self):
         delete_session()
-        self.status_label.setText("Nicht eingeloggt")
+        self.status_label.setText("Not logged in")
         self.status_label.setStyleSheet("color: #ff6b6b;")
         self.model_combo.clear()
         self.fallback_combo.clear()
@@ -232,8 +236,9 @@ class SettingsWidget(QWidget):
         if fallback:
             set_fallback(fallback)
         set_swarm(swarm)
-        self.model_status.setText("Gespeichert.")
+        self.model_status.setText("Saved.")
         self.model_status.setStyleSheet("color: #00ff88; font-size: 11px;")
+        self.selection_changed.emit(model, fallback)
 
     def get_current_model(self) -> str:
         return self.model_combo.currentText().strip()

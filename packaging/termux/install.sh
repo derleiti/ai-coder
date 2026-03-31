@@ -2,6 +2,9 @@
 # ai-coder Termux Installer
 # curl -sL https://ailinux.me/ai-coder-termux | bash
 
+# CWD fix — curl|bash hat kein gültiges Verzeichnis (Termux-Bug)
+cd "${HOME:-/data/data/com.termux/files/home}" 2>/dev/null || cd /tmp
+
 set -e
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -20,8 +23,8 @@ pkg install -y python git curl openssl-tool 2>/dev/null | grep -E "install|upgra
 
 # ai-coder deps (kein pip upgrade — kaputt in Termux)
 echo -e "${CYAN}[2/4] Python-Deps installieren...${NC}"
-pip3 install --quiet httpx rich typer certifi 2>/dev/null || \
-  pip install --quiet httpx rich typer certifi
+PYTHONPATH="" pip3 install --quiet httpx rich typer certifi 2>/dev/null || \
+  PYTHONPATH="" pip install --quiet httpx rich typer certifi
 
 echo -e "${CYAN}[3/4] ai-coder holen...${NC}" 
 
@@ -34,6 +37,8 @@ git clone --depth=1 -q https://github.com/derleiti/ai-coder.git "$INSTALL_DIR"
 mkdir -p "$HOME/.local/bin"
 cat > "$HOME/.local/bin/aicoder" << 'WRAPPER'
 #!/data/data/com.termux/files/usr/bin/bash
+# CWD fix — Python crasht wenn getcwd() fehlschlägt
+cd "${HOME:-/data/data/com.termux/files/home}" 2>/dev/null || cd /tmp
 export PYTHONPATH="$HOME/.local/lib/aicoder-src:$PYTHONPATH"
 exec python3 -m aicoder "$@"
 WRAPPER

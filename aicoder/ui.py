@@ -1,7 +1,7 @@
 from __future__ import annotations
 """
-ui.py — Terminal UI primitives für ai-coder.
-opencode-inspiriertes Design: Braille-Spinner, Box-Drawing, ANSI-Colors, Panels.
+ui.py — Terminal UI primitives for ai-coder.
+opencode-inspired design: Braille spinner, box drawing, ANSI colors, panels.
 """
 import itertools
 import json
@@ -93,7 +93,7 @@ def _spinner_for(tool_name: str) -> tuple[str, str]:
 
 
 class AgentSpinner:
-    """Stilvoller Spinner der auf stderr läuft."""
+    """Styled spinner running on stderr."""
     def __init__(self, label: str, tool: str = "", color: str = C.CYAN):
         self.label = label
         self.color = color
@@ -217,7 +217,7 @@ def print_header(model: str, fallback: str, tools: int, workspace: str, iteratio
 
 
 def print_task(prompt: str) -> None:
-    """User-Aufgabe stylisch anzeigen."""
+    """Display user task with style."""
     print()
     print(f"  {C.BOLD}{C.BWHITE}▸ Task{C.RESET}")
     for line in prompt.splitlines():
@@ -226,13 +226,13 @@ def print_task(prompt: str) -> None:
 
 
 def print_thinking(iteration: int, model: str) -> None:
-    """'Thinking...' Marker."""
+    """'Thinking...' marker."""
     iter_str = f"  step {iteration}" if iteration > 0 else ""
     print(f"  {C.DIM}{C.CYAN}◉{C.RESET}  {dim('thinking'+ iter_str + '…')}", end="\r", flush=True)
 
 
 def print_thought(text: str) -> None:
-    """LLM-Gedanken (vor Tool-Call) — gedimmt."""
+    """LLM thoughts (before tool call) — dimmed."""
     if not text.strip():
         return
     print(f"  {C.DIM}│{C.RESET}")
@@ -242,7 +242,7 @@ def print_thought(text: str) -> None:
 
 
 def print_tool_call(name: str, args: dict, iteration: int) -> None:
-    """Tool-Call Header — opencode-Style."""
+    """Tool call header — opencode style."""
     _, col = _spinner_for(name)
     # Args als kompakte key=val string
     def fmt_arg(k: str, v: Any) -> str:
@@ -257,7 +257,7 @@ def print_tool_call(name: str, args: dict, iteration: int) -> None:
 
 
 def print_tool_result(name: str, result: str, elapsed: float, error: bool = False) -> None:
-    """Tool-Ergebnis in einem Panel."""
+    """Tool result in a panel."""
     _, col = _spinner_for(name)
 
     if error:
@@ -269,7 +269,7 @@ def print_tool_result(name: str, result: str, elapsed: float, error: bool = Fals
         border_color = C.DIM
         prefix = ""
 
-    # JSON pretty-print wenn möglich
+    # JSON pretty-print if possible
     try:
         data = json.loads(result)
         if isinstance(data, dict) and len(result) < 3000:
@@ -290,7 +290,7 @@ def print_tool_result(name: str, result: str, elapsed: float, error: bool = Fals
 
 def print_final(response: str, model: str, latency_ms: Any, total_iters: int,
                 fallback_used: bool = False) -> None:
-    """Finale Antwort des Agents."""
+    """Final agent response."""
     # DONE: prefix entfernen
     import re
     text = re.sub(r'^DONE:\s*', '', response.strip(), flags=re.IGNORECASE)
@@ -303,7 +303,7 @@ def print_final(response: str, model: str, latency_ms: Any, total_iters: int,
 
     # Response rendern
     for line in text.splitlines():
-        # Code-Blöcke minimal highlighten
+        # Minimal code block highlighting
         if line.startswith("```"):
             print(f"  {C.DIM}{'─'*50}{C.RESET}")
         elif line.startswith("#"):
