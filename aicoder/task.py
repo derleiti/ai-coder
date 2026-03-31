@@ -117,7 +117,7 @@ def run_task(
         except Exception:
             pass
 
-    prompt = _build_prompt(task, files_content, "")
+    prompt = _build_prompt(task, files_content, context)
 
     print(f"model={effective_model or '(backend default)'}  files={len(files_content)}  apply={apply}", file=sys.stderr)
 
@@ -220,15 +220,19 @@ def _apply_multifile(
     for fname, content in blocks:
         fname = fname.strip()
         new_content = content.strip()
-        match_content = next(
-            (c for n, c in files_content if n == fname or n.endswith(fname)),
+        # Match original path — prefer exact, then suffix (sep-safe)
+        match_pair = next(
+            ((n, c) for n, c in files_content
+             if n == fname or n.endswith(os.sep + fname) or n.endswith("/" + fname)),
             None,
         )
-        if match_content is None:
+        if match_pair is None:
             print(f"WARN: {fname} nicht in Eingabedateien — übersprungen")
             continue
-        p = Path(fname)
-        print(f"\n── diff: {p.name} ──────────────────────────")
+        orig_path_str, match_content = match_pair
+        # Write to original resolved path, never to LLM-supplied fname
+        p = Path(orig_path_str)
+        print(f"\n── diff: {p.name} ──────────────────────────────")
         _show_diff(match_content, new_content, p.name)
         if dry_run:
             print("(dry-run)")

@@ -16,6 +16,25 @@ AUDIT_DIR = Path.home() / ".config/ai-coder"
 AUDIT_FILE = AUDIT_DIR / "audit.jsonl"
 MAX_RESULT_LEN = 2000  # Truncate results in log
 
+# Patterns that indicate sensitive data in command output / results
+_SECRET_PATTERNS = (
+    "password", "passwd", "token", "bearer", "secret", "api_key",
+    "authorization", "private_key", "client_secret", "access_token",
+)
+
+def _redact_result(result: str) -> str:
+    """Redact lines that likely contain secrets from logged output."""
+    out = []
+    for line in result.split("\n"):
+        ll = line.lower()
+        if any(pat in ll for pat in _SECRET_PATTERNS) and ("=" in line or ":" in line):
+            # Keep key name, redact value
+            idx = max(line.find("="), line.find(":"))
+            out.append(line[:idx+1] + " [REDACTED]")
+        else:
+            out.append(line)
+    return "\n".join(out)
+
 
 def log_tool(
     tool_name: str,
@@ -34,15 +53,21 @@ def log_tool(
             "ts": datetime.utcnow().isoformat() + "Z",
             "tool": tool_name,
             "args": _sanitize_args(tool_name, arguments),
-            "result": result[:MAX_RESULT_LEN],
+            "result": _redact_result(result[:MAX_RESULT_LEN]),
             "duration_s": round(duration_s, 3),
             "error": is_error,
             "model": model,
             "iteration": iteration,
             "session": session_id,
         }
+        audit_existed = AUDIT_FILE.exists()
         with open(AUDIT_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        if not audit_existed:
+            try:
+                os.chmod(AUDIT_FILE, 0o600)
+            except OSError:
+                pass
     except Exception:
         pass  # Audit logging must never crash the agent
 

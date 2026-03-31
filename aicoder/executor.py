@@ -310,9 +310,17 @@ def run_tool(
       If None, all commands run without approval (legacy behavior).
     """
     # Approval check for local_exec
-    if name == "local_exec" and approval_fn is not None:
-        if not approval_fn(name, args):
-            return "local_exec: aborted by user", True
+    if name == "local_exec":
+        cmd = args.get("command", "")
+        if approval_fn is not None:
+            if not approval_fn(name, args):
+                return "local_exec: aborted by user", True
+        elif is_destructive(cmd):
+            # No approval_fn set but command is destructive — block it
+            import sys as _sys
+            print(f"\033[31m⚠ BLOCKED (destructive, no approval_fn): {cmd[:120]}\033[0m",
+                  file=_sys.stderr)
+            return f"local_exec: blocked — destructive command requires explicit approval: {cmd[:120]}", True
 
     t_start = time.time()
 

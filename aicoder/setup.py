@@ -57,8 +57,10 @@ def _ensure_valid_session() -> None:
         )
         save_session(new_session)
         print(f"  \033[32m✓ Re-Login OK\033[0m")
-    except Exception:
-        pass
+    except KeyboardInterrupt:
+        print("\n  Re-Login abgebrochen.")
+    except Exception as e:
+        print(f"  \033[31m✗ Re-Login fehlgeschlagen: {e}\033[0m", file=__import__("sys").stderr)
 
 
 # ── Interaktiver Model-Picker ──────────────────────────────────────────────
