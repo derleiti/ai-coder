@@ -8,7 +8,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
-USER_AGENT = "ai-coder/0.6.9 (AILinux Coding Client)"
+USER_AGENT = "ai-coder/0.7.0 (AILinux Coding Client)"
 
 
 def _ssl_context() -> ssl.SSLContext:

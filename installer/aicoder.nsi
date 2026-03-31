@@ -6,7 +6,7 @@
 Unicode True
 
 !define APPNAME    "aicoder"
-!define APPVERSION "0.6.9"
+!define APPVERSION "0.7.0"
 !define PUBLISHER  "Markus Leitermann / AILinux"
 !define APPDIR     "$PROGRAMFILES64\${APPNAME}"
 !define REGKEY     "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APPNAME}"
