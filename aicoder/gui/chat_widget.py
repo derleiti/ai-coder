@@ -60,14 +60,18 @@ class _AgentWorker(QThread):
         self._approval_event.set()
 
     def _gui_approval(self, tool_name: str, args: dict) -> bool:
-        """Approval callback for local_exec — blocks until user decides."""
+        """Approval callback for local_exec — blocks until user decides or stop."""
         cmd = args.get("command", "")
         # Emit signal to main thread, then wait
         self._approval_event.clear()
         self._approval_result = False
         self.approval_needed.emit(tool_name, cmd)
-        # Block worker thread until main thread responds
-        self._approval_event.wait(timeout=120)
+        # Poll every 2s so stop() is respected during pending approval
+        for _ in range(60):  # max 120s total
+            if self._approval_event.wait(timeout=2):
+                break
+            if self._stopped:
+                return False  # Agent stopped — reject command
         return self._approval_result
 
     def run(self):

@@ -107,9 +107,9 @@ def run_task(
         print("Fehler: Keine lesbaren Dateien.", file=sys.stderr)
         return 1
 
-    # Project context (short workspace summary)
+    # Project context: nur wenn kein AGENTS.md im System-Prompt (verhindert Dopplung)
     context = ""
-    if workspace:
+    if workspace and no_agents:
         try:
             ctx_path = Path(workspace) / "AGENTS.md"
             if ctx_path.exists():

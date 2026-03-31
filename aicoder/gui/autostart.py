@@ -28,12 +28,20 @@ def _linux_exec_path() -> str:
             return p
     return sys.executable + " -m aicoder.cli"
 
-def _win_registry_key():
+def _win_registry_key_read():
     import winreg
     return winreg.OpenKey(
         winreg.HKEY_CURRENT_USER,
         r"Software\Microsoft\Windows\CurrentVersion\Run",
-        0, winreg.KEY_ALL_ACCESS,
+        0, winreg.KEY_READ,
+    )
+
+def _win_registry_key_write():
+    import winreg
+    return winreg.OpenKey(
+        winreg.HKEY_CURRENT_USER,
+        r"Software\Microsoft\Windows\CurrentVersion\Run",
+        0, winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE,
     )
 
 def is_autostart_enabled() -> bool:
@@ -42,7 +50,7 @@ def is_autostart_enabled() -> bool:
     elif platform.system() == "Windows":
         try:
             import winreg
-            key = _win_registry_key()
+            key = _win_registry_key_read()
             winreg.QueryValueEx(key, APP_NAME)
             winreg.CloseKey(key)
             return True
@@ -61,7 +69,7 @@ def enable_autostart() -> None:
         # If running as PyInstaller bundle
         if getattr(sys, 'frozen', False):
             exe = sys.executable
-        key = _win_registry_key()
+        key = _win_registry_key_write()
         winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, f'"{exe}" gui')
         winreg.CloseKey(key)
 
@@ -73,7 +81,7 @@ def disable_autostart() -> None:
     elif platform.system() == "Windows":
         try:
             import winreg
-            key = _win_registry_key()
+            key = _win_registry_key_write()
             winreg.DeleteValue(key, APP_NAME)
             winreg.CloseKey(key)
         except (FileNotFoundError, OSError):

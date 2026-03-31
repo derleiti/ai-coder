@@ -3,7 +3,7 @@ from __future__ import annotations
 history.py — Persistent call history for ask/task results.
 Saves last N entries to ~/.config/ai-coder/history.json
 """
-import json, os
+import json, os, re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -28,6 +28,17 @@ def _save(entries: List[Dict[str, Any]]) -> None:
     os.chmod(HISTORY_FILE, 0o600)
 
 
+_SECRET_RE = re.compile(
+    r"(?i)(password|token|bearer|secret|api.?key|authorization"
+    r"|private.?key|client.?secret|access.?token)[\s=:]+\S+",
+    re.IGNORECASE,
+)
+
+def _redact(text: str) -> str:
+    """Redact secret-looking patterns from text before storing in history."""
+    return _SECRET_RE.sub(lambda m: m.group(1) + "=[REDACTED]", text)
+
+
 def record(
     kind: str,          # "ask" | "task"
     prompt: str,
@@ -41,8 +52,8 @@ def record(
         "ts": datetime.now(timezone.utc).isoformat(),
         "kind": kind,
         "model": model,
-        "prompt": prompt[:500],
-        "response": response[:2000],
+        "prompt": _redact(prompt[:500]),
+        "response": _redact(response[:2000]),
         "files": files or [],
         "latency_ms": latency_ms,
     })

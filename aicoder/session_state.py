@@ -1,5 +1,5 @@
 from __future__ import annotations
-import json, os
+import json, os, threading
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -17,30 +17,33 @@ _DEFAULTS: Dict[str, Any] = {
 
 # In-memory cache — vermeidet wiederholte Disk-Reads im Agent-Loop
 _cache: Dict[str, Any] | None = None
+_lock = threading.Lock()  # thread-safe cache access (GUI + Worker threads)
 
 
 def _load_raw() -> Dict[str, Any]:
     global _cache
-    if _cache is not None:
-        return dict(_cache)
-    if not STATE_FILE.exists():
-        _cache = dict(_DEFAULTS)
-        return dict(_cache)
-    try:
-        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        _cache = {**_DEFAULTS, **data}
-        return dict(_cache)
-    except Exception:
-        _cache = dict(_DEFAULTS)
-        return dict(_cache)
+    with _lock:
+        if _cache is not None:
+            return dict(_cache)
+        if not STATE_FILE.exists():
+            _cache = dict(_DEFAULTS)
+            return dict(_cache)
+        try:
+            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            _cache = {**_DEFAULTS, **data}
+            return dict(_cache)
+        except Exception:
+            _cache = dict(_DEFAULTS)
+            return dict(_cache)
 
 
 def _save_raw(data: Dict[str, Any]) -> None:
     global _cache
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    os.chmod(STATE_FILE, 0o600)
-    _cache = dict(data)
+    with _lock:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        STATE_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        os.chmod(STATE_FILE, 0o600)
+        _cache = dict(data)
 
 
 def get_state() -> Dict[str, Any]:

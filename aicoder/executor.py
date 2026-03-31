@@ -35,10 +35,26 @@ TOOL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL | re.IGNOR
 
 # Destructive patterns for local_exec approval
 DESTRUCTIVE_PATTERNS = [
-    "rm -rf", "rm -r /", "dd if=", "mkfs", "> /dev/",
-    "format c:", "del /f /s /q", "remove-item -recurse -force",
-    ":(){ :|:& };:", "chmod -r 777 /", "truncate -s 0",
-    "wipefs", "shred", "> /etc/", "mv / ",
+    # Linux/Mac destructive
+    "rm -rf", "rm -r /", "rm -f /",
+    "dd if=", "mkfs", "> /dev/",
+    "wipefs", "shred",
+    "truncate -s 0",
+    "chmod -r 777 /", "chmod 777 /",
+    "> /etc/", "> /boot/", "> /usr/", "> /bin/",
+    "mv / ",
+    ":(){ :|:& };:",       # fork bomb
+    # Pipe-to-shell (supply chain / remote exec)
+    "| bash", "| sh", "| zsh", "| python",
+    "|bash", "|sh", "|zsh",
+    "curl | ", "wget | ",
+    # Windows destructive
+    "format c:", "format d:",
+    "del /f /s /q",
+    "remove-item -recurse -force",
+    "rd /s /q c:",
+    # Registry wipes
+    "reg delete hklm", "reg delete hkcu",
 ]
 
 # OS-specific instructions
