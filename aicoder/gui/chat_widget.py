@@ -451,8 +451,9 @@ class ChatWidget(QWidget):
                 self._append_msg("error", f"Tool-Loading: {e}")
                 self._tools = []
                 self._system = (
-                    "Du bist ai-coder, ein Coding- und DevOps-Assistent von AILinux. "
-                    "Antworte praezise. Sprache: Deutsch."
+                    "Du bist ai-coder, autonomer Coding- und DevOps-Agent auf AILinux/TriForce (api.ailinux.me). "
+                    "INIT: current_time pruefen, memory_search, dann handeln. "
+                    "Lesen vor Schreiben. Diagnose vor Patch. Kleinste Aenderung zuerst. Sprache: Deutsch."
                 )
 
         # Priority: combo box > settings tab > state file
