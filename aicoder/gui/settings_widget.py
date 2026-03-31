@@ -11,6 +11,27 @@ from ..session_state import SWARM_MODES, get_state, set_model, set_fallback, set
 from ..client import TriForceClient, ClientError
 
 
+
+class _LoginWorker(QThread):
+    """Runs login request in background thread — keeps GUI responsive."""
+    success = pyqtSignal(dict)   # result dict from backend
+    error = pyqtSignal(str)
+
+    def __init__(self, base_url, email, password):
+        super().__init__()
+        self._base_url = base_url
+        self._email = email
+        self._password = password
+
+    def run(self):
+        try:
+            client = TriForceClient(self._base_url, timeout=15)
+            result = client.login(self._email, self._password)
+            self.success.emit(result)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
 class _ModelLoader(QThread):
     """Loads model list from backend in background."""
     loaded = pyqtSignal(list, str)   # (models, tier)
@@ -199,25 +220,35 @@ class SettingsWidget(QWidget):
         if not email or not password:
             QMessageBox.warning(self, "Login", "Enter email and password.")
             return
-        try:
-            client = TriForceClient(base_url)
-            result = client.login(email, password)
-            session = Session(
-                base_url=base_url,
-                token=result["token"],
-                client_id=result.get("client_id", ""),
-                user_id=result.get("user_id", email),
-                tier=result.get("tier", "unknown"),
-                account_role=result.get("account_role", "unknown"),
-            )
-            save_session(session)
-            self.password_edit.clear()
-            self.status_label.setText(f"Logged in as {session.user_id} ({session.tier})")
-            self.status_label.setStyleSheet("color: #00d4ff;")
-            # Auto-load models after login
-            self._load_models()
-        except (ClientError, Exception) as e:
-            QMessageBox.critical(self, "Login failed", str(e))
+        self.login_btn.setEnabled(False)
+        self.status_label.setText("Logging in...")
+        self.status_label.setStyleSheet("color: #888; font-size: 11px;")
+        self._login_worker = _LoginWorker(base_url, email, password)
+        self._login_worker.success.connect(lambda r: self._on_login_success(r, base_url, email))
+        self._login_worker.error.connect(self._on_login_error)
+        self._login_worker.start()
+
+    def _on_login_success(self, result, base_url, email):
+        self.login_btn.setEnabled(True)
+        session = Session(
+            base_url=base_url,
+            token=result["token"],
+            client_id=result.get("client_id", ""),
+            user_id=result.get("user_id", email),
+            tier=result.get("tier", "unknown"),
+            account_role=result.get("account_role", "unknown"),
+        )
+        save_session(session)
+        self.password_edit.clear()
+        self.status_label.setText(f"Logged in as {session.user_id} ({session.tier})")
+        self.status_label.setStyleSheet("color: #00d4ff;")
+        self._load_models()
+
+    def _on_login_error(self, msg):
+        self.login_btn.setEnabled(True)
+        self.status_label.setText("Login failed")
+        self.status_label.setStyleSheet("color: #ff6b6b; font-size: 11px;")
+        QMessageBox.critical(self, "Login failed", msg)
 
     def _do_logout(self):
         delete_session()
