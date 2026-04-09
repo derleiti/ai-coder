@@ -220,10 +220,13 @@ def _apply_multifile(
     for fname, content in blocks:
         fname = fname.strip()
         new_content = content.strip()
+        safe_fname = Path(fname).name
+        if ".." in fname or fname.startswith("/"):
+            print(f"WARN: suspicious path {fname!r} -- using basename {safe_fname!r}")
         # Match original path — prefer exact, then suffix (sep-safe)
         match_pair = next(
             ((n, c) for n, c in files_content
-             if n == fname or n.endswith(os.sep + fname) or n.endswith("/" + fname)),
+             if n == fname or n.endswith(os.sep + fname) or n.endswith("/" + fname) or Path(n).name == safe_fname),
             None,
         )
         if match_pair is None:

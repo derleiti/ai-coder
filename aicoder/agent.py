@@ -146,7 +146,7 @@ def run_agent(
         messages.append({"role": "assistant", "content": response})
         current_input = "\n\n".join(tool_results)
 
-        if "DONE:" in response[:200].upper():
+        if response.strip().upper().startswith("DONE:"):
             print_final(response, model_used, total_latency, i+1, fallback_used)
             break
     else:

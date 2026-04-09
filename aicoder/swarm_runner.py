@@ -110,10 +110,10 @@ _AUTO_KEYWORDS = {
 def should_auto_swarm(message: str) -> bool:
     """
     Heuristik: Swarm bei komplexen Tasks automatisch aktivieren.
-    Trigger: Prompt >150 Zeichen ODER enthält Komplexitäts-Keywords.
+    Trigger: Prompt >300 Zeichen ODER enthält Komplexitäts-Keywords.
     """
     lower = message.lower()
-    if len(message) > 150:
+    if len(message) > 300:
         return True
     return any(kw in lower for kw in _AUTO_KEYWORDS)
 

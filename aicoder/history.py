@@ -8,7 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-CONFIG_DIR = Path.home() / ".config/ai-coder"
+from .config import CONFIG_DIR
+
 HISTORY_FILE = CONFIG_DIR / "history.json"
 MAX_ENTRIES = 50
 

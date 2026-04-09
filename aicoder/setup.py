@@ -25,11 +25,13 @@ from .ui import C, bold, dim, cyan, green, yellow, red, magenta, white, panel, t
 
 
 def _is_token_expired(token: str) -> bool:
+    """Check JWT expiry using correct urlsafe base64 padding."""
     try:
-        import base64, json as _j, time
-        p = token.split(".")
-        payload = _j.loads(base64.b64decode(p[1] + "==").decode())
-        return payload.get("exp", 0) < time.time()
+        from .client import _decode_jwt_exp
+        exp = _decode_jwt_exp(token)
+        if exp is None: return False
+        import time
+        return exp < time.time()
     except Exception:
         return False
 
@@ -486,10 +488,17 @@ def run_repl(skip_setup: bool = False) -> int:
                 print(f"  model={model}  fallback={fallback}  swarm={swarm}")
             elif cmd == "/shell":
                 if val:
-                    import subprocess
-                    r = subprocess.run(val, shell=True, capture_output=True, text=True)
+                    import subprocess, time as _t
+                    _t0 = _t.time()
+                    r = subprocess.run(val, shell=True, capture_output=True, text=True, timeout=60)
+                    _dur = _t.time() - _t0
+                    out = (r.stdout or "") + (r.stderr or "")
                     if r.stdout: print(r.stdout.rstrip())
                     if r.stderr: print(r.stderr.rstrip(), file=sys.stderr)
+                    try:
+                        from . import audit
+                        audit.log_tool(tool_name="repl_shell", arguments={"command": val}, result=out[:2000], duration_s=_dur, is_error=r.returncode != 0, model="user/repl")
+                    except Exception: pass
                 else:
                     print("  Bsp: /shell uptime")
             elif cmd == "/models":

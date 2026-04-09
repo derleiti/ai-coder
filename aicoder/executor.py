@@ -145,23 +145,36 @@ You are ai-coder — autonomous coding and DevOps agent on AILinux/TriForce (api
 """
 
 # Fallback tool definitions if tools/list fails
+# Fallback: READ-ONLY only -- must match AGENT_TOOLS whitelist
 FALLBACK_TOOLS: list[dict] = [
     {"name": "safe_probe",  "description": "Read-only system diagnostics", "inputSchema": {"type":"object","properties":{"action":{"type":"string"},"probe":{"type":"string"}},"required":["action"]}},
     {"name": "code_read",   "description": "Read source file", "inputSchema": {"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
     {"name": "code_tree",   "description": "Show directory structure", "inputSchema": {"type":"object","properties":{"path":{"type":"string"}}}},
-    {"name": "git_ops",     "description": "Git operations", "inputSchema": {"type":"object","properties":{"action":{"type":"string"}},"required":["action"]}},
+    {"name": "code_search", "description": "Search codebase", "inputSchema": {"type":"object","properties":{"pattern":{"type":"string"}},"required":["pattern"]}},
     {"name": "dev_analyze",  "description": "Analyze code quality", "inputSchema": {"type":"object","properties":{"path":{"type":"string"}}}},
-    {"name": "web_search",   "description": "Search the web", "inputSchema": {"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}},
-    {"name": "file_ops",     "description": "File operations", "inputSchema": {"type":"object","properties":{"action":{"type":"string"},"path":{"type":"string"}},"required":["action","path"]}},
+    {"name": "search",       "description": "Web search", "inputSchema": {"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}},
+    {"name": "memory_search","description": "Search persistent memory", "inputSchema": {"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}},
     {"name": "health",       "description": "Backend health check", "inputSchema": {"type":"object","properties":{}}},
-    {"name": "shell",        "description": "Execute shell command", "inputSchema": {"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}},
+    {"name": "dev_lint",     "description": "Lint code", "inputSchema": {"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
 ]
 
 
+_OBFUSCATION_PATTERNS = [
+    "base64 -d", "base64 --decode", "eval ", "eval(",
+    "exec(", "exec (", "python -c", "python3 -c",
+    "perl -e", "ruby -e", "bash -c", "sh -c", "zsh -c",
+]
+
 def is_destructive(cmd: str) -> bool:
-    """Check if a command matches known destructive patterns."""
+    """Check if a command matches known destructive or obfuscation patterns."""
     cmd_lower = cmd.lower().strip()
-    return any(pat.lower() in cmd_lower for pat in DESTRUCTIVE_PATTERNS)
+    if any(pat.lower() in cmd_lower for pat in DESTRUCTIVE_PATTERNS):
+        return True
+    if any(pat in cmd_lower for pat in _OBFUSCATION_PATTERNS):
+        return True
+    if "|" in cmd_lower and any(sh in cmd_lower for sh in ("bash", "sh", "python", "perl", "ruby")):
+        return True
+    return False
 
 
 def load_tools(client: TriForceClient) -> list[dict]:
@@ -266,10 +279,10 @@ def strip_tool_calls(text: str) -> str:
 
 
 def trim_messages(msgs: list[dict]) -> list[dict]:
-    """Keep system prompt + last MAX_CONTEXT_MESSAGES conversation messages."""
+    """Keep system prompt (msgs[0]) + last MAX_CONTEXT_MESSAGES conversation messages."""
     if len(msgs) <= 1 + MAX_CONTEXT_MESSAGES:
         return msgs
-    return [msgs[0], msgs[1]] + msgs[-(MAX_CONTEXT_MESSAGES - 1):]
+    return [msgs[0]] + msgs[-(MAX_CONTEXT_MESSAGES):]
 
 
 def run_local_exec(args: dict) -> Tuple[str, bool]:

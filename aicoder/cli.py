@@ -303,7 +303,8 @@ def cmd_ask(args: argparse.Namespace) -> int:
 
 def cmd_chat(args: argparse.Namespace) -> int:
     """Interactive multi-turn chat session. Type /exit or /quit to stop."""
-    _, client = session_client()
+    session = load_session()
+    client = TriForceClient(session.base_url, token=session.token, timeout=120)
     state = get_state()
     model = _resolve_model(state, getattr(args, "model", None))
     swarm = state.get("swarm_mode", "off")

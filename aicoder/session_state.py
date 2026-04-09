@@ -3,7 +3,8 @@ import json, os, threading
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-CONFIG_DIR = Path.home() / ".config/ai-coder"
+from .config import CONFIG_DIR
+
 STATE_FILE = CONFIG_DIR / "state.json"
 
 SWARM_MODES = {"off", "auto", "on", "review"}

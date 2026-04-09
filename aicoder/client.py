@@ -8,17 +8,21 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
-USER_AGENT = "ai-coder/0.7.0 (AILinux Coding Client)"
+USER_AGENT = "ai-coder/0.7.1 (AILinux Coding Client)"
 
+
+_SSL_CTX = None
 
 def _ssl_context() -> ssl.SSLContext:
-    """SSL context with proper CA certs (fixes PyInstaller on Windows/Android)."""
+    """SSL context with proper CA certs. Cached at module level."""
+    global _SSL_CTX
+    if _SSL_CTX is not None: return _SSL_CTX
     try:
         import certifi
-        return ssl.create_default_context(cafile=certifi.where())
+        _SSL_CTX = ssl.create_default_context(cafile=certifi.where())
     except Exception:
-        pass
-    return ssl.create_default_context()
+        _SSL_CTX = ssl.create_default_context()
+    return _SSL_CTX
 
 
 def _decode_jwt_exp(token: str) -> Optional[int]:
@@ -164,6 +168,22 @@ class TriForceClient:
             "id": 1,
         }
         return self._request("POST", "/v1/mcp", payload, require_auth=True, _label=tool_name)
+
+    def list_models(self) -> list:
+        """Fetch available models from /v1/client/models."""
+        try:
+            data = self._request("GET", "/v1/client/models", require_auth=True, _label="models")
+            models = data.get("models", [])
+            result = []
+            for m in models:
+                if isinstance(m, str):
+                    prov = m.split("/")[0] if "/" in m else "other"
+                    result.append({"id": m, "model": m, "name": m, "provider": prov, "capabilities": ["chat"]})
+                elif isinstance(m, dict):
+                    result.append(m)
+            return result
+        except Exception:
+            return []
 
     def chat(
         self,

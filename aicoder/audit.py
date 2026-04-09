@@ -8,7 +8,7 @@ Storage: ~/.config/ai-coder/audit.jsonl (append-only, one JSON per line)
 from __future__ import annotations
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -50,7 +50,7 @@ def log_tool(
     try:
         AUDIT_DIR.mkdir(parents=True, exist_ok=True)
         entry = {
-            "ts": datetime.utcnow().isoformat() + "Z",
+            "ts": datetime.now(timezone.utc).isoformat(),
             "tool": tool_name,
             "args": _sanitize_args(tool_name, arguments),
             "result": _redact_result(result[:MAX_RESULT_LEN]),
