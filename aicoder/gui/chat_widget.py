@@ -15,13 +15,15 @@ except ImportError:
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
     QTextEdit, QLineEdit, QPushButton, QLabel, QMessageBox, QComboBox,
+    QMenu, QInputDialog,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QMetaObject, Q_ARG
-from PyQt6.QtGui import QTextCursor
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QMetaObject, Q_ARG, QMimeData, QUrl
+from PyQt6.QtGui import QTextCursor, QDragEnterEvent, QDropEvent
 
 from ..config import load_session
 from ..session_state import get_state
 from ..client import TriForceClient, ClientError
+from .. import chat_history
 from ..executor import (
     load_tools, build_system_prompt, build_tool_desc,
     parse_tool_calls, strip_tool_calls, trim_messages, run_tool,
@@ -160,7 +162,10 @@ class ChatWidget(QWidget):
         self._system = None
         self._messages = []
         self._syncing = False
+        self._session_id = None
+        self._dropped_files = []
         self._build_ui()
+        self.setAcceptDrops(True)
         # Connect to settings model list + selection changes
         if self.settings_ref:
             if hasattr(self.settings_ref, "models_loaded"):
@@ -190,6 +195,83 @@ class ChatWidget(QWidget):
         self.model_combo.setCurrentText(model)
         self.fallback_combo.setCurrentText(fallback)
         self._syncing = False
+
+    # ── Drag & Drop ──────────────────────────────────────────────
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if event.mimeData().hasUrls() or event.mimeData().hasText():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event: QDropEvent):
+        mime = event.mimeData()
+        if mime.hasUrls():
+            for url in mime.urls():
+                path = url.toLocalFile()
+                if path:
+                    self._handle_dropped_file(path)
+        elif mime.hasText():
+            text = mime.text().strip()
+            if text:
+                self.input.setText(text)
+        event.acceptProposedAction()
+
+    def _handle_dropped_file(self, path: str):
+        """Load dropped file as context for next message."""
+        import os
+        name = os.path.basename(path)
+        try:
+            size = os.path.getsize(path)
+            if size > 500_000:
+                self._append_msg("system", f"File too large: {name} ({size//1024}KB, max 500KB)")
+                return
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read(100_000)
+            self._dropped_files.append({"name": name, "path": path, "content": content})
+            self._append_msg("system", f"📎 {name} ({size//1024}KB) — wird als Context mitgesendet")
+        except Exception as e:
+            self._append_msg("error", f"Konnte {name} nicht laden: {e}")
+
+    # ── History ──────────────────────────────────────────────────
+    def _show_history_menu(self):
+        """Show recent sessions as context menu."""
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            "QMenu { background: #1a1a2e; color: #ccc; border: 1px solid #444; }"
+            "QMenu::item:selected { background: #2a2a4e; }"
+        )
+        sessions = chat_history.list_sessions(limit=15)
+        if not sessions:
+            menu.addAction("(keine Sessions)").setEnabled(False)
+        else:
+            for s in sessions:
+                title = s["title"][:40]
+                ts = s["updated_at"][:10] if s.get("updated_at") else ""
+                action = menu.addAction(f"{title}  ({ts})")
+                action.setData(s["id"])
+        menu.addSeparator()
+        new_action = menu.addAction("➕ Neue Session")
+        chosen = menu.exec(self.history_btn.mapToGlobal(self.history_btn.rect().bottomLeft()))
+        if chosen == new_action:
+            self._new_session()
+        elif chosen and chosen.data():
+            self._load_session(chosen.data())
+
+    def _new_session(self):
+        self._clear_chat()
+        self._session_id = None
+
+    def _load_session(self, session_id: str):
+        """Restore a previous chat session."""
+        self.log.clear()
+        self._messages = []
+        self._session_id = session_id
+        msgs = chat_history.load_messages(session_id)
+        for m in msgs:
+            role = m["role"]
+            if role == "system":
+                continue
+            self._append_msg(role, m["content"], m.get("meta", ""))
+            self._messages.append({"role": role, "content": m["content"]})
+        self._update_status_idle("Session geladen")
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -322,6 +404,21 @@ class ChatWidget(QWidget):
         self.clear_btn.clicked.connect(self._clear_chat)
         input_row.addWidget(self.clear_btn)
 
+        # History-Button
+        self.history_btn = QPushButton("📋")
+        self.history_btn.setToolTip("Chat-Verlauf")
+        self.history_btn.setFixedWidth(38)
+        self.history_btn.setStyleSheet("""
+            QPushButton {
+                background: #1a1a2e; color: #888;
+                border: 1px solid #444; border-radius: 4px;
+                font-size: 14px; padding: 4px;
+            }
+            QPushButton:hover { background: #2a2a3e; color: #00d4ff; border-color: #00d4ff; }
+        """)
+        self.history_btn.clicked.connect(self._show_history_menu)
+        input_row.addWidget(self.history_btn)
+
         layout.addLayout(input_row)
 
     def _append_msg(self, role: str, text: str, meta: str = ""):
@@ -338,7 +435,17 @@ class ChatWidget(QWidget):
         color, label = colors.get(role, ("#ccc", role))
         meta_html = f' <span style="color:#666;">({html.escape(meta)})</span>' if meta else ""
         if role in ("assistant", "thought") and _HAS_MD:
-            body = _md.markdown(text, extensions=["fenced_code", "nl2br"])
+            body = _md.markdown(text, extensions=["fenced_code", "nl2br", "tables"])
+            # Style code blocks
+            body = body.replace(
+                "<code>",
+                '<code style="background:#1a1a3e;color:#ff9800;padding:1px 4px;border-radius:3px;font-size:12px;">'
+            )
+            body = body.replace(
+                "<pre>",
+                '<pre style="background:#0d0d2a;border:1px solid #333;border-radius:6px;'
+                'padding:10px;overflow-x:auto;font-size:12px;line-height:1.4;">'
+            )
             content_html = f'<div style="color:#e0e0e0;">{body}</div>'
         else:
             esc = html.escape(text)
@@ -475,7 +582,23 @@ class ChatWidget(QWidget):
 
         if not self._messages:
             self._messages = [{"role": "system", "content": self._system}]
-        self._messages.append({"role": "user", "content": text})
+
+        # Attach dropped files as context
+        user_content = text
+        if self._dropped_files:
+            file_ctx = []
+            for f in self._dropped_files:
+                file_ctx.append(f"--- FILE: {f['name']} ---\n{f['content'][:50000]}\n--- END ---")
+            user_content = "\n\n".join(file_ctx) + "\n\nUser message: " + text
+            self._dropped_files.clear()
+
+        self._messages.append({"role": "user", "content": user_content})
+
+        # Save to history
+        if not self._session_id:
+            title = text[:50].strip() or "New Chat"
+            self._session_id = chat_history.create_session(title=title)
+        chat_history.save_message(self._session_id, "user", text)
 
         self._worker = _AgentWorker(client, self._messages, model, fallback, self._tools, self._system)
         self._worker.msg.connect(self._on_agent_msg)
@@ -490,6 +613,8 @@ class ChatWidget(QWidget):
 
     def _on_response(self, text: str, model_used: str):
         self._append_msg("assistant", text, model_used)
+        if self._session_id:
+            chat_history.save_message(self._session_id, "assistant", text, model_used)
         self.send_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self._update_status_idle(f"Done ({model_used})")

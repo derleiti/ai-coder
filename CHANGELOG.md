@@ -1,3 +1,49 @@
+## v0.8.0 — Desktop Integration + Web + History (2026-04-13)
+
+### New Features
+
+#### Clipboard Tools
+- **clipboard_read**: Agent can read clipboard content from user's desktop
+- **clipboard_write**: Agent can copy code/text to clipboard — no more manual copy-paste
+- Cross-platform: xclip/xsel/wl-clipboard (Linux), pbcopy/pbpaste (macOS), PowerShell (Windows)
+
+#### Local Web Access
+- **web_search_local**: DuckDuckGo search directly from client (no API key, no MCP dependency)
+- **web_fetch_local**: Fetch and extract text from any URL locally
+- Works as fallback when MCP backend `search`/`crawl` are unavailable
+
+#### Drag & Drop
+- Drop files directly into the chat window → loaded as context for next message
+- Text content drag & drop into input field
+- File size limit: 500KB, UTF-8 auto-detection
+
+#### Chat History (SQLite)
+- All chat sessions persisted to `~/.config/ai-coder/chat_history.db`
+- History button (📋) shows recent sessions with date
+- Load any previous session to continue conversation
+- New session on chat reset
+- WAL mode for concurrent read performance
+
+#### Improved Markdown Rendering
+- Code blocks with styled background, border, and monospace font
+- Inline code with distinct orange highlighting
+- Table support via markdown `tables` extension
+- Better visual separation between code and prose
+
+### Tool Changes
+- 4 new local tools: `clipboard_read`, `clipboard_write`, `web_search_local`, `web_fetch_local`
+- Safe tools (clipboard, web) skip approval dialog — no unnecessary confirmation
+- Total local tools: 13 (was 9)
+
+### Files Added
+- `aicoder/clipboard.py` — Cross-platform clipboard read/write
+- `aicoder/web_search.py` — Local DuckDuckGo search + URL fetch (stdlib only)
+- `aicoder/chat_history.py` — SQLite session persistence
+
+### Version
+- Bumped to 0.8.0
+
+
 ## v0.6.5 — Security Hardening + Shared Executor (2026-03-29)
 
 ### Security Fixes (Critical)
