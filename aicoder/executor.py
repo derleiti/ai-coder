@@ -23,8 +23,8 @@ from .docs_context import read_agents_md
 from .session_state import get_state
 from . import audit
 
-MAX_ITERATIONS = 12
-MAX_CONTEXT_MESSAGES = 24
+MAX_ITERATIONS = int(os.environ.get("AICODER_MAX_ITERATIONS", "30"))
+MAX_CONTEXT_MESSAGES = int(os.environ.get("AICODER_MAX_CONTEXT", "50"))
 
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX = platform.system() == "Linux"
