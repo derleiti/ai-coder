@@ -8,7 +8,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
-USER_AGENT = "ai-coder/0.7.1 (AILinux Coding Client)"
+from . import __version__
+USER_AGENT = f"ai-coder/{__version__} (AILinux Coding Client)"
 
 
 _SSL_CTX = None

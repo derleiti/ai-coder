@@ -1,6 +1,7 @@
 """web_search.py — Local web search + fetch for ai-coder when MCP is unavailable."""
 from __future__ import annotations
 import json
+from . import __version__
 import re
 from typing import Tuple
 from urllib.parse import quote_plus
@@ -11,7 +12,7 @@ from urllib.error import URLError, HTTPError
 
 
 _HEADERS = {
-    "User-Agent": "ai-coder/0.8.0 (AILinux; +https://ailinux.me)",
+    "User-Agent": f"ai-coder/{__version__} (AILinux; +https://ailinux.me)",
     "Accept": "text/html,application/json,text/plain;q=0.9",
 }
 _TIMEOUT = 15

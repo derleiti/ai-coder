@@ -490,6 +490,8 @@ def run_repl(skip_setup: bool = False) -> int:
                 if val:
                     import subprocess, time as _t
                     _t0 = _t.time()
+                    # NOTE: shell=True is intentional here — this is an explicit user-shell mode
+                    # (not model-generated commands). User types commands directly in /shell.
                     r = subprocess.run(val, shell=True, capture_output=True, text=True, timeout=60)
                     _dur = _t.time() - _t0
                     out = (r.stdout or "") + (r.stderr or "")

@@ -4,7 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aicoder"
-version = "0.8.1"
+version = "0.8.2"
+version = "0.8.2"
 description = "Terminalbasierter Coding-Agent für AILinux / TriForce Backend"
 readme = "README.md"
 requires-python = ">=3.10"

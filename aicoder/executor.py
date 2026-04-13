@@ -23,8 +23,15 @@ from .docs_context import read_agents_md
 from .session_state import get_state
 from . import audit
 
-MAX_ITERATIONS = int(os.environ.get("AICODER_MAX_ITERATIONS", "30"))
-MAX_CONTEXT_MESSAGES = int(os.environ.get("AICODER_MAX_CONTEXT", "50"))
+def _safe_int_env(key: str, default: int, lo: int = 1, hi: int = 200) -> int:
+    try:
+        v = int(os.environ.get(key, str(default)))
+        return max(lo, min(hi, v))
+    except (ValueError, TypeError):
+        return default
+
+MAX_ITERATIONS = _safe_int_env("AICODER_MAX_ITERATIONS", 30, 1, 100)
+MAX_CONTEXT_MESSAGES = _safe_int_env("AICODER_MAX_CONTEXT", 50, 5, 200)
 
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX = platform.system() == "Linux"
@@ -516,7 +523,15 @@ def run_local_exec(args: dict) -> Tuple[str, bool]:
         if use_sudo and not cmd.strip().startswith("sudo "):
             cmd = "sudo " + cmd
         try:
-            r = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True, timeout=60)
+            import shlex
+            # Security: avoid shell=True for model-generated commands
+            # Use shell only for commands with shell operators (pipes, redirects)
+            _SHELL_CHARS = {'|', '>', '<', '&', ';', '`', '$', '(', ')'}
+            needs_shell = bool(set(cmd) & _SHELL_CHARS)
+            if needs_shell:
+                r = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True, timeout=60)
+            else:
+                r = subprocess.run(shlex.split(cmd), shell=False, cwd=cwd, capture_output=True, text=True, timeout=60)
             out = (r.stdout or "") + (r.stderr or "")
             return (out[:4000] or "(no output)"), r.returncode != 0
         except Exception as e:

@@ -81,6 +81,26 @@ class _AgentWorker(QThread):
         model_used = self.model or "default"
         MAX_CTX = 30
 
+        # Load tools in background thread (not GUI thread)
+        if not self.tools:
+            try:
+                self.tools = load_tools(self.client)
+                from ..session_state import get_state
+                state = get_state()
+                self.system = build_system_prompt(
+                    self.tools,
+                    state.get("workspace_root"),
+                )
+                self.msg.emit("system", f"{len(self.tools)} tools loaded", "")
+            except Exception as e:
+                self.msg.emit("error", f"Tool-Loading: {e}", "")
+                self.tools = []
+                self.system = (
+                    "Du bist ai-coder, autonomer Coding- und DevOps-Agent auf AILinux/TriForce (api.ailinux.me). "
+                    "INIT: current_time pruefen, memory_search, dann handeln. "
+                    "Lesen vor Schreiben. Diagnose vor Patch. Kleinste Aenderung zuerst. Sprache: Deutsch."
+                )
+
         for i in range(MAX_ITERATIONS):
             if self._stopped:
                 self.finished.emit("(Agent stopped)", model_used)
@@ -547,25 +567,9 @@ class ChatWidget(QWidget):
             self.stop_btn.setEnabled(False)
             return
 
-        # Load tools once per session
+        # Tools loaded lazily in worker thread (not here — would block GUI)
         if self._tools is None:
             self._append_msg("system", "Loading MCP tools...", "")
-            try:
-                self._tools = load_tools(client)
-                state = get_state()
-                self._system = build_system_prompt(
-                    self._tools,
-                    state.get("workspace_root"),
-                )
-                self._append_msg("system", f"{len(self._tools)} tools loaded", "")
-            except Exception as e:
-                self._append_msg("error", f"Tool-Loading: {e}")
-                self._tools = []
-                self._system = (
-                    "Du bist ai-coder, autonomer Coding- und DevOps-Agent auf AILinux/TriForce (api.ailinux.me). "
-                    "INIT: current_time pruefen, memory_search, dann handeln. "
-                    "Lesen vor Schreiben. Diagnose vor Patch. Kleinste Aenderung zuerst. Sprache: Deutsch."
-                )
 
         # Priority: combo box > settings tab > state file
         model = self.model_combo.currentText().strip()
@@ -600,7 +604,7 @@ class ChatWidget(QWidget):
             self._session_id = chat_history.create_session(title=title)
         chat_history.save_message(self._session_id, "user", text)
 
-        self._worker = _AgentWorker(client, self._messages, model, fallback, self._tools, self._system)
+        self._worker = _AgentWorker(client, self._messages, model, fallback, self._tools or [], self._system or "")
         self._worker.msg.connect(self._on_agent_msg)
         self._worker.finished.connect(self._on_response)
         self._worker.messages_updated.connect(self._on_messages_updated)
@@ -612,6 +616,10 @@ class ChatWidget(QWidget):
         self._append_msg(role, text, meta)
 
     def _on_response(self, text: str, model_used: str):
+        # Cache tools loaded by worker for next message
+        if self._worker and self._worker.tools:
+            self._tools = self._worker.tools
+            self._system = self._worker.system
         self._append_msg("assistant", text, model_used)
         if self._session_id:
             chat_history.save_message(self._session_id, "assistant", text, model_used)
