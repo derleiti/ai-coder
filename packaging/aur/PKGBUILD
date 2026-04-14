@@ -1,0 +1,19 @@
+# Maintainer: Markus Leitermann <admin@ailinux.me>
+pkgname=aicoder
+pkgver=0.8.3
+pkgrel=1
+pkgdesc="Terminal Coding & DevOps Agent for AILinux/TriForce — 630+ models, GUI, Connection Pooling"
+arch=('x86_64')
+url="https://github.com/derleiti/ai-coder"
+license=('MIT')
+depends=('glibc')
+optdepends=('git: workspace support' 'python-pyqt6: GUI mode (aicoder gui)' 'python-urllib3: connection pooling')
+source=("aicoder-${pkgver}::https://github.com/derleiti/ai-coder/releases/download/v${pkgver}/aicoder-${pkgver}-x86_64-linux")
+sha256sums=('b44776d7572c29f67dd5439ab58d0c2dfa3a72f8a24031f58e13227ca00e3d80')
+
+package() {
+    install -Dm755 "$srcdir/aicoder-${pkgver}" "$pkgdir/usr/bin/aicoder"
+    install -Dm644 /dev/stdin "$pkgdir/usr/share/licenses/$pkgname/LICENSE" << 'LICEOF'
+MIT License — Copyright (c) 2026 Markus Leitermann / AILinux
+LICEOF
+}
