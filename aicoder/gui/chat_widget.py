@@ -91,6 +91,8 @@ class _AgentWorker(QThread):
                     self.tools,
                     state.get("workspace_root"),
                 )
+                if messages and messages[0].get("role") == "system":
+                    messages[0]["content"] = self.system
                 self.msg.emit("system", f"{len(self.tools)} tools loaded", "")
             except Exception as e:
                 self.msg.emit("error", f"Tool-Loading: {e}", "")
