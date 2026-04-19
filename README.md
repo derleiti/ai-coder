@@ -87,3 +87,13 @@ Siehe `docs/architecture.md`.
 - **API-Docs:** https://api.ailinux.me
 - **Forum:** https://forum.ailinux.me
 - **Beta-Code:** `AILINUX2026` (kostenloser Pro-Zugang)
+
+## License
+
+**ai-coder is licensed under the MIT License.**
+
+You are free to use, copy, modify, merge, publish, distribute, sublicense,
+and/or sell copies of this software with attribution.
+
+Copyright (c) 2026 Markus Leitermann / AILinuX <support@ailinux.me>
+See [LICENSE](./LICENSE) for the full text.
