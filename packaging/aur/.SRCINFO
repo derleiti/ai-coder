@@ -1,13 +1,15 @@
 pkgbase = aicoder
-	pkgdesc = Terminal Coding & DevOps Agent for AILinux/TriForce
-	pkgver = 0.3.2
+	pkgdesc = Terminal Coding & DevOps Agent for AILinux/TriForce — 630+ models, GUI, Connection Pooling
+	pkgver = 0.8.6
 	pkgrel = 1
 	url = https://github.com/derleiti/ai-coder
 	arch = x86_64
 	license = MIT
 	depends = glibc
-	optdepends = git: git_ops support
-	source = aicoder-0.3.2::https://github.com/derleiti/ai-coder/releases/download/v0.3.1/aicoder-0.3.2-x86_64-linux
-	sha256sums = 2de6e56ed2098ed83477abd8eebd6f038b7ecf9f3891f14564c936ae2787b955
+	optdepends = git: workspace support
+	optdepends = python-pyqt6: GUI mode (aicoder gui)
+	optdepends = python-urllib3: connection pooling
+	source = aicoder-0.8.6::https://github.com/derleiti/ai-coder/releases/download/v0.8.6/aicoder-0.8.6-x86_64-linux
+	sha256sums = b44776d7572c29f67dd5439ab58d0c2dfa3a72f8a24031f58e13227ca00e3d80
 
 pkgname = aicoder
