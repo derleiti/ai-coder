@@ -168,25 +168,30 @@ jobs:
           pip install -e .
 
       - name: Build .exe
-        shell: pwsh
+        # Use bash (Git Bash) instead of pwsh — pwsh backtick line-continuation
+        # parser regression in recent Windows runner images was breaking the
+        # multi-line pyinstaller invocation with a "Missing argument in
+        # parameter list" error before the build could even start.
+        shell: bash
         run: |
-          python -m PyInstaller `
-            --onefile --name aicoder --console --noconfirm --clean `
-            --collect-submodules=aicoder `
-            --collect-submodules=PyQt6 `
-            --hidden-import=PyQt6.QtWidgets `
-            --hidden-import=PyQt6.QtGui `
-            --hidden-import=PyQt6.QtCore `
-            --hidden-import=aicoder.gui `
-            --hidden-import=aicoder.gui.app `
-            --hidden-import=aicoder.gui.main_window `
-            --hidden-import=aicoder.gui.chat_widget `
-            --hidden-import=aicoder.gui.settings_widget `
-            --hidden-import=aicoder.gui.autostart `
-            --hidden-import=certifi `
+          python -m PyInstaller \
+            --onefile --name aicoder --console --noconfirm --clean \
+            --collect-submodules=aicoder \
+            --collect-submodules=PyQt6 \
+            --hidden-import=PyQt6.QtWidgets \
+            --hidden-import=PyQt6.QtGui \
+            --hidden-import=PyQt6.QtCore \
+            --hidden-import=aicoder.gui \
+            --hidden-import=aicoder.gui.app \
+            --hidden-import=aicoder.gui.main_window \
+            --hidden-import=aicoder.gui.chat_widget \
+            --hidden-import=aicoder.gui.settings_widget \
+            --hidden-import=aicoder.gui.autostart \
+            --hidden-import=certifi \
             aicoder_main.py
-          $size = (Get-Item dist\aicoder.exe).Length / 1MB
-          Write-Host "aicoder.exe: $([math]::Round($size,1)) MB"
+          ls -la dist/aicoder.exe
+          size_mb=$(du -m dist/aicoder.exe | cut -f1)
+          echo "aicoder.exe: ${size_mb} MB"
 
       - name: Build NSIS Installer
         continue-on-error: true
