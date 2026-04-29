@@ -2,6 +2,7 @@ from __future__ import annotations
 import base64
 import json
 import ssl
+import sys
 import time
 from typing import Any, Dict, Optional
 from urllib.error import HTTPError, URLError
@@ -11,6 +12,33 @@ from urllib.request import Request, urlopen
 from . import __version__
 USER_AGENT = f"ai-coder/{__version__} (AILinux Coding Client)"
 
+# ── Force IPv4 (IPv6 broken on Hetzner/CF, causes 30-60s hangs) ──
+import socket
+_orig_getaddrinfo = socket.getaddrinfo
+def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    """Force IPv4 to avoid IPv6 timeout on broken AAAA records."""
+    if family == 0:
+        family = socket.AF_INET
+    return _orig_getaddrinfo(host, port, family, type, proto, flags)
+socket.getaddrinfo = _ipv4_getaddrinfo
+
+# ── Connection pool (keep-alive) ──────────────────────────────
+_POOL = None
+
+def _get_pool():
+    """Lazy-init urllib3 PoolManager for connection reuse (keep-alive)."""
+    global _POOL
+    if _POOL is not None:
+        return _POOL
+    try:
+        import urllib3
+        _POOL = urllib3.PoolManager(
+            num_pools=4, maxsize=4, retries=False,
+            timeout=urllib3.Timeout(connect=10, read=60),
+        )
+        return _POOL
+    except ImportError:
+        return None  # Fallback to urlopen if urllib3 not installed
 
 _SSL_CTX = None
 
@@ -93,6 +121,7 @@ class TriForceClient:
         payload: Optional[Dict[str, Any]] = None,
         require_auth: bool = False,
         _label: str = "",
+        _retries: int = 1,
     ) -> Dict[str, Any]:
         url = urljoin(self.base_url + "/", path.lstrip("/"))
         data = None
@@ -104,7 +133,6 @@ class TriForceClient:
         if require_auth:
             if not self.token:
                 raise ClientError("Kein Token vorhanden. Erst einloggen.")
-            # Pre-flight expiry check (saves a round-trip)
             if self.is_token_expired():
                 raise TokenExpiredError(
                     "Token expired. Please re-login: aicoder setup"
@@ -112,6 +140,59 @@ class TriForceClient:
             headers["Authorization"] = f"Bearer {self.token}"
         if payload is not None:
             data = json.dumps(payload).encode("utf-8")
+
+        last_err = None
+        for attempt in range(_retries + 1):
+            if attempt > 0:
+                time.sleep(min(2 ** attempt, 4))
+                print(f"  ↻ retry {attempt}/{_retries} [{_label}]", file=sys.stderr)
+            try:
+                return self._do_request(method, url, headers, data, _label)
+            except ClientError as e:
+                last_err = e
+                err_str = str(e)
+                # Don't retry auth errors or 4xx
+                if "HTTP 4" in err_str or "Token expired" in err_str:
+                    raise
+                # Retry on 5xx, timeout, connection errors
+                if attempt < _retries:
+                    continue
+                raise
+        raise last_err  # unreachable but satisfies type checker
+
+    def _do_request(
+        self, method: str, url: str, headers: dict, data: Optional[bytes], _label: str
+    ) -> Dict[str, Any]:
+        """Execute single HTTP request. Uses urllib3 pool if available, else urlopen."""
+        pool = _get_pool()
+        if pool is not None:
+            try:
+                resp = pool.request(
+                    method.upper(), url, headers=headers, body=data,
+                    timeout=self.timeout, redirect=False,
+                )
+                if resp.status >= 400:
+                    body = resp.data.decode("utf-8", errors="replace")
+                    try:
+                        parsed = json.loads(body) if body else {}
+                    except Exception:
+                        parsed = {"raw": body}
+                    label = f" [{_label}]" if _label else ""
+                    if resp.status in (401, 403):
+                        detail = parsed.get("detail", "") or parsed.get("raw", "")
+                        if "expire" in str(detail).lower() or "token" in str(detail).lower():
+                            raise TokenExpiredError(
+                                f"Token expired (HTTP {resp.status}). Please re-login: aicoder setup"
+                            )
+                    raise ClientError(f"HTTP {resp.status}{label} bei {url}: {parsed}")
+                raw = resp.data.decode("utf-8")
+                return json.loads(raw) if raw else {}
+            except (TokenExpiredError, ClientError):
+                raise
+            except Exception:
+                pass  # Fall through to urlopen
+
+        # Fallback: plain urlopen (no pool)
         req = Request(url=url, data=data, headers=headers, method=method.upper())
         try:
             with urlopen(req, timeout=self.timeout, context=_ssl_context()) as resp:
@@ -124,18 +205,17 @@ class TriForceClient:
             except Exception:
                 parsed = {"raw": body}
             label = f" [{_label}]" if _label else ""
-            # Detect 401/403 from expired token specifically
             if e.code in (401, 403):
                 detail = parsed.get("detail", "") or parsed.get("raw", "")
                 if "expire" in str(detail).lower() or "token" in str(detail).lower():
                     raise TokenExpiredError(
                         f"Token expired (HTTP {e.code}). Please re-login: aicoder setup"
                     ) from e
-            raise ClientError(f"HTTP {e.code}{label} bei {path}: {parsed}") from e
+            raise ClientError(f"HTTP {e.code}{label} bei {url}: {parsed}") from e
         except TimeoutError:
             label = f" [{_label}]" if _label else ""
             raise ClientError(
-                f"Timeout nach {self.timeout}s{label} bei {path}. "
+                f"Timeout nach {self.timeout}s{label} bei {url}. "
                 "Backend reachable? Increase timeout via --timeout."
             )
         except URLError as e:
@@ -183,7 +263,14 @@ class TriForceClient:
                 elif isinstance(m, dict):
                     result.append(m)
             return result
-        except Exception:
+        except TokenExpiredError:
+            print("⚠ Token expired — run: aicoder setup", file=sys.stderr)
+            return []
+        except ClientError as e:
+            print(f"⚠ Models laden fehlgeschlagen: {e}", file=sys.stderr)
+            return []
+        except Exception as e:
+            print(f"⚠ Models: unerwarteter Fehler: {e}", file=sys.stderr)
             return []
 
     def chat(
