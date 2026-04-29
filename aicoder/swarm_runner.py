@@ -10,6 +10,7 @@ V3: echte parallele Calls via threading + swarm_broadcast MCP.
 """
 import sys
 import threading
+import time
 from typing import Optional
 
 from .client import ClientError, TriForceClient
@@ -38,13 +39,15 @@ def run_swarm_ask(
     fallback_model: Optional[str],
     system_prompt: Optional[str],
     mode: str,          # "on" | "review"
+    client: Optional[TriForceClient] = None,
 ) -> int:
     """
     Run message through operator + fallback in parallel threads.
     Display both results. Operator output always first.
     """
-    session = load_session()
-    client  = TriForceClient(session.base_url, token=session.token)
+    if client is None:
+        session = load_session()
+        client  = TriForceClient(session.base_url, token=session.token)
 
     op_box  = []
     fb_box  = []
@@ -52,12 +55,14 @@ def run_swarm_ask(
     label = "swarming..." if mode != "review" else "hiveing..."
 
     with Spinner(label):
+        t0 = time.time()
         t1 = threading.Thread(target=_call, args=(client, message, operator_model,  system_prompt, op_box),  daemon=True)
         t2 = threading.Thread(target=_call, args=(client, message, fallback_model, system_prompt, fb_box), daemon=True)
         t1.start()
         t2.start()
         t1.join(timeout=90)
-        t2.join(timeout=90)
+        remaining = max(1, 90 - (time.time() - t0))
+        t2.join(timeout=remaining)
 
     # Operator result
     op = op_box[0] if op_box else None
@@ -128,6 +133,7 @@ def run_swarm_review(
     operator_model: Optional[str],
     fallback_model: Optional[str],
     system_prompt: Optional[str],
+    client: Optional[TriForceClient] = None,
 ) -> None:
     """
     Schickt den Operator-Output als Review-Prompt ans Fallback-Modell.
@@ -142,8 +148,9 @@ def run_swarm_review(
         f"Solution to review:\n{operator_response[:3000]}"
     )
 
-    session = load_session()
-    client  = TriForceClient(session.base_url, token=session.token)
+    if client is None:
+        session = load_session()
+        client  = TriForceClient(session.base_url, token=session.token)
     box: list = []
 
     try:

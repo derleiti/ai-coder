@@ -366,11 +366,16 @@ def cmd_chat(args: argparse.Namespace) -> int:
             continue
 
         # Build proper messages array for multi-turn context
+        # Limit: keep last 6 turns but cap each response to 2000 chars
+        # to avoid context window explosion on long sessions
         chat_messages = []
         if history:
             for turn in history[-6:]:
-                chat_messages.append({"role": "user", "content": turn["user"]})
-                chat_messages.append({"role": "assistant", "content": turn["assistant"]})
+                chat_messages.append({"role": "user", "content": turn["user"][:2000]})
+                resp_trimmed = turn["assistant"]
+                if len(resp_trimmed) > 2000:
+                    resp_trimmed = resp_trimmed[:1900] + "\n[...truncated for context]"
+                chat_messages.append({"role": "assistant", "content": resp_trimmed})
         chat_messages.append({"role": "user", "content": user_input})
 
         # Auto-swarm heuristik
