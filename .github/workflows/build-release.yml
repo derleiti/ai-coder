@@ -170,7 +170,7 @@ jobs:
       - name: Build .exe
         shell: pwsh
         run: |
-          pyinstaller `
+          python -m PyInstaller `
             --onefile --name aicoder --console --noconfirm --clean `
             --collect-submodules=aicoder `
             --collect-submodules=PyQt6 `
