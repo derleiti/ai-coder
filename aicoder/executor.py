@@ -80,13 +80,24 @@ else:
 # MCP-Tools whitelist — READONLY only, run on backend (never write to server)
 # file_ops/git_ops/git/memory_store removed: clients must not write to server
 AGENT_TOOLS = {
-    # MCP v4 Tool Names — READ-ONLY (2026-04-12)
+    # MCP v4 Tool Names — READ-ONLY (updated 2026-04-29)
     # Sicherheitsmodell: MCP = nur lesen/suchen/status
     #                    local_exec = alle Änderungen lokal am Client
     #
     # ── Code lesen/analysieren (READ-ONLY) ──
     "code_read", "code_search", "code_tree",
     "debug",
+    # ── Dev-Tools: AI-powered code analysis (READ-ONLY) ──
+    # Multi-language: Python, JS/TS, Bash, Go, Rust, C/C++, Java, PHP, Ruby
+    "dev_analyze",     # bugs, typos, dead code, security, complexity
+    "dev_debug",       # automatic debugger from traceback / bug description
+    "dev_lint",        # syntax + style check (ruff, eslint, shellcheck, golint, clippy...)
+    "dev_links",       # validate imports, requires, includes — find broken refs
+    "dev_refactor",    # AI refactoring suggestions (naming, structure, performance, patterns)
+    "dev_summarize",   # project/file summary for AI context
+    # ── Documentation (READ-ONLY) ──
+    "doc_read",        # read doc files with metadata
+    "doc_search",      # full-text grep across all docs (md, txt, sh, yml, json, toml...)
     # ── System Status (READ-ONLY) ──
     "health", "status", "init",
     "logs", "logs_errors", "logs_stats",
@@ -101,14 +112,12 @@ AGENT_TOOLS = {
     # ── Ollama (READ-ONLY) ──
     "ollama_list", "ollama_status",
     # ── Mesh/Remote (READ-ONLY Status) ──
-    "mesh_status", "mesh_agents",
+    "mesh_status",
     "remote_hosts", "remote_status",
     # ── Config (READ-ONLY) ──
     "config",
     "vault_keys", "vault_status",
     # ── Research (READ-ONLY) ──
-    "gemini_research",
-    "evolve_history",
     "prompts",
     #
     # NICHT erlaubt für Clients (nur via Admin-Console):
@@ -398,23 +407,43 @@ def is_destructive(cmd: str) -> bool:
     return False
 
 
-def load_tools(client: TriForceClient) -> list[dict]:
-    """Load MCP tool schemas + local_exec pseudo-tool."""
+# ── Tool Cache (TTL-based, avoids re-fetching on every agent run) ──
+_tool_cache: list[dict] | None = None
+_tool_cache_ts: float = 0
+_TOOL_CACHE_TTL = 300  # 5 minutes
+
+def load_tools(client: TriForceClient, force_refresh: bool = False) -> list[dict]:
+    """Load MCP tool schemas + local tools. Cached for 5min to avoid startup lag."""
+    global _tool_cache, _tool_cache_ts
+    if not force_refresh and _tool_cache is not None and (time.time() - _tool_cache_ts) < _TOOL_CACHE_TTL:
+        return _tool_cache
+
     mcp_tools = []
     err_msg = ""
-    try:
-        short_client = TriForceClient(client.base_url, token=client.token, timeout=20)
-        r = short_client._request("POST", "/v1/mcp",
-            {"jsonrpc":"2.0","method":"tools/list","params":{},"id":1},
-            require_auth=True, _label="tools/list")
-        mcp_tools = [t for t in r.get("result",{}).get("tools",[]) if t["name"] in AGENT_TOOLS]
-    except Exception as e:
-        err_msg = str(e)
+    # Use existing client connection (no new TLS handshake)
+    for attempt in range(2):
+        try:
+            r = client._request("POST", "/v1/mcp",
+                {"jsonrpc":"2.0","method":"tools/list","params":{},"id":1},
+                require_auth=True, _label="tools/list", _retries=0)
+            mcp_tools = [t for t in r.get("result",{}).get("tools",[]) if t["name"] in AGENT_TOOLS]
+            if mcp_tools:
+                break
+        except Exception as e:
+            err_msg = str(e)
+            if attempt == 0:
+                time.sleep(1)  # Brief pause before retry
     if not mcp_tools:
         hint = f" ({err_msg[:80]})" if err_msg else ""
-        print(f"  \033[33m⚠ tools/list fehlgeschlagen{hint} — Fallback\033[0m", file=sys.stderr)
+        print(f"\n  \033[1;33m⚠ MCP tools/list fehlgeschlagen{hint}\033[0m", file=sys.stderr)
+        print(f"  \033[33m  → Agent läuft mit {len(FALLBACK_TOOLS)} Fallback-Tools (eingeschränkt)\033[0m", file=sys.stderr)
+        print(f"  \033[33m  → Backend erreichbar? Versuch: aicoder mcp health\033[0m", file=sys.stderr)
         mcp_tools = FALLBACK_TOOLS
-    return LOCAL_TOOL_SCHEMAS + mcp_tools
+
+    result = LOCAL_TOOL_SCHEMAS + mcp_tools
+    _tool_cache = result
+    _tool_cache_ts = time.time()
+    return result
 
 
 def build_tool_desc(tools: list[dict]) -> str:
@@ -540,16 +569,23 @@ def run_local_exec(args: dict) -> Tuple[str, bool]:
 
 
 def run_mcp_tool(client: TriForceClient, name: str, args: dict) -> Tuple[str, bool]:
-    """Execute an MCP tool on the backend. Returns (output, is_error)."""
-    try:
-        r = client.mcp_call(name, args)
-        text = r.get("result",{}).get("content",[{}])[0].get("text","")
-        is_error = r.get("result",{}).get("isError", False)
-        if is_error or text.startswith('{"error"'):
-            return text[:4000], True
-        return text[:4000] + ("…" if len(text) > 4000 else ""), False
-    except ClientError as e:
-        return f"TOOL FAILED: {e}", True
+    """Execute an MCP tool on the backend with retry. Returns (output, is_error)."""
+    last_err = ""
+    for attempt in range(2):
+        try:
+            r = client.mcp_call(name, args)
+            text = r.get("result",{}).get("content",[{}])[0].get("text","")
+            is_error = r.get("result",{}).get("isError", False)
+            if is_error or text.startswith('{"error"'):
+                return text[:4000], True
+            return text[:4000] + ("…" if len(text) > 4000 else ""), False
+        except ClientError as e:
+            last_err = str(e)
+            if "HTTP 4" in last_err or "Token" in last_err:
+                return f"TOOL FAILED: {e}", True
+            if attempt == 0:
+                time.sleep(1)
+    return f"TOOL FAILED (after retry): {last_err}", True
 
 
 def run_tool(
