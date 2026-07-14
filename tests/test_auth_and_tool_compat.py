@@ -7,6 +7,7 @@ import json
 import os
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -15,7 +16,9 @@ from PyQt6.QtWidgets import QApplication
 
 from aicoder.client import ClientError, TriForceClient, _decode_jwt_exp
 from aicoder.config import Session
-from aicoder.executor import is_simple_chat_message, normalize_tool_calls, parse_tool_calls
+from aicoder.executor import (
+    is_action_request, is_simple_chat_message, normalize_tool_calls, parse_tool_calls,
+)
 from aicoder.gui.chat_widget import _AgentWorker, _select_chat_route
 import aicoder.gui.settings_widget as settings_widget
 import aicoder.agent as cli_agent
@@ -253,8 +256,14 @@ class SettingsRegressionTests(unittest.TestCase):
 
 class ReplRegressionTests(unittest.TestCase):
     def test_slash_completion_contains_runtime_controls(self):
-        for command in ("/clear", "/keys", "/permissions", "/status", "/model", "/exit"):
+        for command in ("/clear", "/keys", "/new", "/permissions", "/status", "/model", "/exit"):
             self.assertIn(command, COMMANDS)
+
+    def test_operational_request_is_classified_for_tool_followup(self):
+        self.assertTrue(is_action_request("Sortiere meine Dokumente unter ~/Documents"))
+        self.assertTrue(is_action_request("Prüfe bitte den Docker Socket"))
+        self.assertFalse(is_action_request("Erkläre mir den Unterschied zwischen Listen und Tupeln"))
+        self.assertFalse(is_action_request("Welches Testwort solltest du dir merken?"))
 
     def test_basic_input_fallback_remains_usable(self):
         repl = ReplInput.__new__(ReplInput)
@@ -262,6 +271,13 @@ class ReplRegressionTests(unittest.TestCase):
         with patch("builtins.input", return_value="hello") as basic_input:
             self.assertEqual(repl.read("> "), "hello")
         basic_input.assert_called_once_with("> ")
+
+    def test_enhanced_input_falls_back_to_memory_when_history_is_read_only(self):
+        with patch.object(Path, "open", side_effect=OSError("read only")):
+            repl = ReplInput(Path("/read-only/history"), lambda: "")
+        self.assertTrue(repl.enhanced)
+        self.assertFalse(repl.persistent_history)
+        self.assertEqual(type(repl._session.history).__name__, "InMemoryHistory")
 
     def test_spinner_does_not_suppress_task_exceptions(self):
         with self.assertRaisesRegex(RuntimeError, "boom"):
@@ -312,6 +328,60 @@ class ReplRegressionTests(unittest.TestCase):
         self.assertIsNone(client.chat.call_args.kwargs["fallback_model"])
         self.assertIsNone(client.chat.call_args.kwargs["tools"])
 
+    def test_repl_conversation_is_reused_and_action_gets_one_tool_nudge(self):
+        client = MagicMock()
+        client.chat.side_effect = [
+            {"response": "Ich würde zuerst die Ordner ansehen.", "model": "test"},
+            {
+                "response": '<tool_call>{"name":"file_tree","arguments":{"command":"ls -la ~/Documents"}}</tool_call>',
+                "model": "test",
+            },
+            {"response": "DONE: Dokumente geprüft.", "model": "test"},
+        ]
+        state = {
+            "workspace_root": ".",
+            "tool_mode": "always",
+            "enabled_tools": None,
+            "request_timeout": 30,
+        }
+        session = Session(
+            base_url="https://example.invalid",
+            token="opaque",
+            client_id="test",
+            user_id="test@example.invalid",
+            tier="registered",
+            account_role="user",
+        )
+        conversation = [
+            {"role": "user", "content": "Wir arbeiten in meinem Home-Verzeichnis."},
+            {"role": "assistant", "content": "Verstanden."},
+        ]
+        with (
+            patch.object(cli_agent, "load_session", return_value=session),
+            patch.object(cli_agent, "get_state", return_value=state),
+            patch.object(cli_agent, "TriForceClient", return_value=client),
+            patch.object(cli_agent, "load_tools", return_value=[executor.LOCAL_FILE_TREE_SCHEMA]),
+            patch.object(cli_agent, "run_tool", return_value=("documents", False)) as execute,
+            patch.object(cli_agent, "print_header"),
+            patch.object(cli_agent, "print_task"),
+            patch.object(cli_agent, "print_thought"),
+            patch.object(cli_agent, "print_tool_call"),
+            patch.object(cli_agent, "print_tool_result"),
+            patch.object(cli_agent, "print_final"),
+            patch.object(cli_agent, "history_record"),
+        ):
+            result = cli_agent.run_agent(
+                "Sortiere meine Dokumente", "test", None, conversation=conversation,
+            )
+        self.assertEqual(result, 0)
+        self.assertEqual(client.chat.call_count, 3)
+        self.assertTrue(any(
+            "No tool has been used yet" in m["content"] for m in conversation
+        ))
+        self.assertEqual(execute.call_count, 1)
+        self.assertTrue(any(m["content"] == "Wir arbeiten in meinem Home-Verzeichnis." for m in conversation))
+        self.assertEqual(conversation[-1]["content"], "DONE: Dokumente geprüft.")
+
 
 class PrivilegeBrokerTests(unittest.TestCase):
     def test_reads_do_not_need_approval(self):
@@ -361,6 +431,22 @@ class PrivilegeBrokerTests(unittest.TestCase):
             run.call_args.args[0],
             ["sudo", "--", "sh", "-c", "printf enabled > /etc/aicoder.conf"],
         )
+        self.assertFalse(run.call_args.kwargs["shell"])
+
+    def test_shell_free_local_command_expands_home_paths(self):
+        completed = MagicMock(returncode=0, stdout="ok\n", stderr="")
+        with patch.object(executor.subprocess, "run", return_value=completed) as run:
+            result, is_error = executor.run_local_exec({
+                "command": "ls -la ~/Documents",
+                "cwd": "~/",
+            })
+        self.assertFalse(is_error)
+        self.assertEqual(result, "ok\n")
+        self.assertEqual(
+            run.call_args.args[0],
+            ["ls", "-la", os.path.expanduser("~/Documents")],
+        )
+        self.assertEqual(run.call_args.kwargs["cwd"], os.path.expanduser("~/"))
         self.assertFalse(run.call_args.kwargs["shell"])
 
     def test_cli_sudo_approval_validates_locally_after_consent(self):

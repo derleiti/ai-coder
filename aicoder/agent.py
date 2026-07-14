@@ -11,10 +11,10 @@ from typing import Optional
 from .client import ClientError, TriForceClient
 from .config import load_session
 from .executor import (
-    MAX_ITERATIONS,
+    MAX_CONTEXT_MESSAGES, MAX_ITERATIONS,
     is_destructive, load_tools, build_system_prompt,
     normalize_tool_calls, parse_tool_calls, strip_tool_calls, trim_messages, run_tool,
-    is_simple_chat_message,
+    is_action_request, is_short_confirmation, is_simple_chat_message,
     # Re-export for backwards compat (GUI imports these)
     AGENT_TOOLS, LOCAL_EXEC_SCHEMA, SYSTEM_TEMPLATE as SYSTEM,
     FALLBACK_TOOLS as _FALLBACK_TOOLS, OS_NAME, OS_INSTRUCTIONS,
@@ -73,6 +73,7 @@ def run_agent(
     model: Optional[str],
     fallback_model: Optional[str],
     verbose: bool = False,
+    conversation: Optional[list[dict]] = None,
 ) -> int:
     session = load_session()
     state = get_state()
@@ -118,13 +119,36 @@ def run_agent(
     )
     print_task(initial_prompt)
 
-    # Message array for multi-turn context
-    messages: list[dict] = [{"role": "system", "content": system}]
+    # Keep one conversation for the lifetime of the interactive REPL.  A
+    # direct `aicoder agent <prompt>` call still gets a fresh list by default.
+    prior_context = [
+        dict(message) for message in (conversation or [])
+        if message.get("role") != "system"
+    ]
+    messages: list[dict] = [
+        {"role": "system", "content": system},
+        *prior_context[-MAX_CONTEXT_MESSAGES:],
+    ]
     current_input = initial_prompt
     full_response = ""
     model_used = effective_model or "?"
     total_latency = 0
     fallback_used = False
+    tool_was_called = False
+    tool_nudge_sent = False
+
+    pending_continuation = False
+    if is_short_confirmation(initial_prompt):
+        for message in reversed(prior_context):
+            content = str(message.get("content", ""))
+            if message.get("role") == "assistant" and content.lstrip().upper().startswith("DONE:"):
+                break
+            if message.get("role") == "user" and not content.startswith("Tool "):
+                pending_continuation = is_action_request(content)
+                break
+    must_use_tools = bool(tools) and (
+        is_action_request(initial_prompt) or pending_continuation
+    )
 
     for i in range(MAX_ITERATIONS):
         messages.append({"role": "user", "content": current_input})
@@ -173,6 +197,18 @@ def run_agent(
             print_thought(visible)
 
         if not calls:
+            if must_use_tools and not tool_was_called and not tool_nudge_sent:
+                if response:
+                    print_thought(response)
+                messages.append({"role": "assistant", "content": response})
+                current_input = (
+                    "Continue the requested task now. No tool has been used yet. "
+                    "Inspect the real local state with the most specific available tool, "
+                    "then perform and verify the task. Do not only repeat a plan or ask "
+                    "for generic confirmation. If execution is impossible, name the exact blocker."
+                )
+                tool_nudge_sent = True
+                continue
             messages.append({"role": "assistant", "content": response})
             print_final(
                 response=response,
@@ -184,6 +220,7 @@ def run_agent(
             break
 
         # Tool loop
+        tool_was_called = True
         tool_results = []
         for call in calls:
             tname = call.get("name", "?")
@@ -236,6 +273,11 @@ def run_agent(
             break
     else:
         print_max_iter(MAX_ITERATIONS)
+
+    if conversation is not None:
+        conversation[:] = [
+            dict(message) for message in messages[1:]
+        ][-MAX_CONTEXT_MESSAGES:]
 
     try:
         history_record(kind="ask", prompt=initial_prompt,

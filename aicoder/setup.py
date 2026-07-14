@@ -378,7 +378,14 @@ def _setup_readline():
         pass
 
     import atexit
-    atexit.register(readline.write_history_file, str(histfile))
+
+    def _write_history_safely() -> None:
+        try:
+            readline.write_history_file(str(histfile))
+        except OSError:
+            pass
+
+    atexit.register(_write_history_safely)
 
     # Keybindings: Ctrl+J = literal newline wird zu " && " (Multiline-Hack)
     try:
@@ -428,6 +435,7 @@ def run_repl(skip_setup: bool = False) -> int:
         return f"  {active_model} · tools:{mode} · approvals:ask · swarm:{current.get('swarm_mode', 'off')}"
 
     repl_input = ReplInput(CONFIG_DIR / "history", _toolbar)
+    conversation: list[dict] = []
 
     def _print_repl_header() -> None:
         nonlocal state, model, fallback, swarm, ws
@@ -461,7 +469,7 @@ def run_repl(skip_setup: bool = False) -> int:
             print(f"  {dim('Enter send · Alt+Enter newline · Ctrl+C clear/cancel · Ctrl+R history · Tab commands')}")
         else:
             print(f"  {yellow('Basic input mode')} {dim('· install prompt-toolkit for multiline editing and safe repaint')}")
-        print(f"  {dim('/help commands · /keys shortcuts · /permissions policy · /clear screen · /exit')}")
+        print(f"  {dim('/help commands · /keys shortcuts · /permissions policy · /new context · /exit')}")
         print(f"  {C.DIM}{rule}{C.RESET}")
 
     _print_repl_header()
@@ -525,6 +533,9 @@ def run_repl(skip_setup: bool = False) -> int:
                 if sys.stdout.isatty():
                     print("\033[2J\033[H", end="")
                 _print_repl_header()
+            elif cmd == "/new":
+                conversation.clear()
+                print(f"  {cyan('new session')} {dim('· conversation context cleared')}")
             elif cmd == "/keys":
                 print("  Enter        Aufgabe senden")
                 print("  Alt+Enter    Neue Zeile (Shift+Enter in kompatiblen Terminals)")
@@ -562,7 +573,6 @@ def run_repl(skip_setup: bool = False) -> int:
             elif cmd == "/models":
                 try:
                     from .client import TriForceClient
-                    from .config import load_session
                     s = load_session()
                     c = TriForceClient(s.base_url, token=s.token, timeout=10)
                     data = c._request("GET", "/v1/client/models", require_auth=True, _label="models")
@@ -579,7 +589,7 @@ def run_repl(skip_setup: bool = False) -> int:
                     print(f"  Fehler: {e}")
             elif cmd == "/help":
                 print("  /model <n> · /fallback <n> · /swarm <m> · /models · /status")
-                print("  /shell <cmd> · /setup · /clear · /keys · /permissions · /exit")
+                print("  /shell <cmd> · /setup · /new · /clear · /keys · /permissions · /exit")
             else:
                 print(f"  Unbekannt: {cmd}  — /help für Hilfe")
             continue
@@ -590,6 +600,7 @@ def run_repl(skip_setup: bool = False) -> int:
                 initial_prompt=prompt,
                 model=model,
                 fallback_model=fallback,
+                conversation=conversation,
             )
         except KeyboardInterrupt:
             print(f"\n{_c('yellow','[unterbrochen]')}")

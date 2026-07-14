@@ -53,10 +53,41 @@ _SIMPLE_CHAT_RE = re.compile(
     re.IGNORECASE,
 )
 
+_ACTION_REQUEST_RE = re.compile(
+    r"\b(?:sortier\w*|organisier\w*|r[aä]um\w*|pr[uü]f\w*|test(?:e|en|est|et)?|"
+    r"untersuch\w*|analysier\w*|erstell\w*|[aä]nder\w*|bearbeit\w*|"
+    r"l[oö]sch\w*|verschieb\w*|kopier\w*|installier\w*|aktualisier\w*|"
+    r"reparier\w*|starte?\w*|stoppe?\w*|f[uü]hr\w*\s+.*\s+aus|"
+    r"sort|organize|clean|check|inspect|test|analyze|create|edit|delete|"
+    r"move|copy|install|update|fix|start|stop|restart|run)\b",
+    re.IGNORECASE,
+)
+
+_SHORT_CONFIRMATION_RE = re.compile(
+    r"^(?:ja|ja\s+klar|klar|ok(?:ay)?|mach(?:e)?(?:\s+es)?|weiter|"
+    r"fortfahren|yes|sure|go\s+ahead|continue)[\s.!?]*$",
+    re.IGNORECASE,
+)
+
 
 def is_simple_chat_message(text: str) -> bool:
     """True only for greetings/thanks that never need project tools."""
     return bool(_SIMPLE_CHAT_RE.fullmatch((text or "").strip()))
+
+
+def is_action_request(text: str) -> bool:
+    """Return true for an explicit request to inspect or change real state.
+
+    This is intentionally conservative.  It drives one corrective model turn
+    when an agent-capable model answers an operational request without using
+    any tool at all; it never executes a tool on its own.
+    """
+    return bool(_ACTION_REQUEST_RE.search((text or "").strip()))
+
+
+def is_short_confirmation(text: str) -> bool:
+    """Return true when a REPL message clearly continues the prior task."""
+    return bool(_SHORT_CONFIRMATION_RE.fullmatch((text or "").strip()))
 
 # Destructive patterns for local_exec approval
 DESTRUCTIVE_PATTERNS = [
@@ -361,8 +392,9 @@ You are ai-coder — autonomous coding and DevOps agent on AILinux/TriForce (api
 - MCP tools: Run on REMOTE backend (Hetzner). Use for code reading, search, memory, system info.
 
 ## When to use which:
-- READ/ANALYZE: code_read, code_search, code_tree, debug (READ-ONLY, remote Backend)
-- WRITE/MODIFY: ONLY local_exec! All changes happen locally on the user's machine.
+- LOCAL READ/ANALYZE: file_read, file_tree, code_grep on the user's machine.
+- REMOTE READ/ANALYZE: code_read, code_search, code_tree, debug on the TriForce backend.
+- WRITE/MODIFY: use file_edit or the most specific LOCAL tool. All changes happen locally.
 - STATUS: health, status, logs, logs_errors (READ-ONLY, remote Backend)
 - SEARCH: memory_search (first!) → search → crawl
 - MODELS: models, specialist (info only)
@@ -383,7 +415,15 @@ You are ai-coder — autonomous coding and DevOps agent on AILinux/TriForce (api
 ## Rules:
 - Read before write. Diagnose before patch.
 - Smallest effective change first.
-- After change: dev_lint + health check.
+- A short confirmation such as "ja klar", "mach es" or "continue" refers to the
+  preceding REPL task. Continue that task from conversation context.
+- For an actionable local task, inspect with tools and perform it; do not merely
+  restate a plan or ask for a second generic confirmation. Call the intended
+  write tool and let the local client request the required approval.
+- After a tool error, use its result to correct the command or path. Do not
+  abandon the task or repeat the same failing command unchanged.
+- After a change, verify the exact local result with lint, test, file_read,
+  file_tree, or local_exec as appropriate. Use remote health only for backend work.
 - When done: start reply with DONE:
 
 ## OS: {os_name}
@@ -642,7 +682,8 @@ def trim_messages(msgs: list[dict]) -> list[dict]:
 def run_local_exec(args: dict) -> Tuple[str, bool]:
     """Execute a local command via subprocess. Returns (output, is_error)."""
     cmd = args.get("command", "")
-    cwd = args.get("cwd") or None
+    cwd_value = args.get("cwd") or ""
+    cwd = os.path.expanduser(cwd_value) if cwd_value else None
 
     if IS_WINDOWS:
         run_args = ["powershell", "-NoProfile", "-Command", cmd]
@@ -656,6 +697,13 @@ def run_local_exec(args: dict) -> Tuple[str, bool]:
         use_sudo = bool(args.get("sudo", False))
         try:
             import shlex
+
+            def _argv(command: str) -> list[str]:
+                # subprocess without a shell deliberately does not expand '~'.
+                # Expand only argv path tokens, retaining the safer shell=False
+                # execution for ordinary model-generated commands.
+                return [os.path.expanduser(token) for token in shlex.split(command)]
+
             # Normalize an explicit sudo prefix into the typed sudo flag. For
             # redirects, sudo must own the shell itself (`sudo sh -c ...`), not
             # merely the command left of `>`.
@@ -673,13 +721,13 @@ def run_local_exec(args: dict) -> Tuple[str, bool]:
                 )
             elif use_sudo:
                 r = subprocess.run(
-                    ["sudo", "--", *shlex.split(cmd)], shell=False, cwd=cwd,
+                    ["sudo", "--", *_argv(cmd)], shell=False, cwd=cwd,
                     capture_output=True, text=True, timeout=60,
                 )
             elif needs_shell:
                 r = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True, timeout=60)
             else:
-                r = subprocess.run(shlex.split(cmd), shell=False, cwd=cwd, capture_output=True, text=True, timeout=60)
+                r = subprocess.run(_argv(cmd), shell=False, cwd=cwd, capture_output=True, text=True, timeout=60)
             out = (r.stdout or "") + (r.stderr or "")
             return (out[:4000] or "(no output)"), r.returncode != 0
         except Exception as e:

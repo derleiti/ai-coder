@@ -12,7 +12,7 @@ from typing import Callable
 
 COMMANDS = [
     "/clear", "/exit", "/fallback", "/help", "/keys", "/model",
-    "/models", "/permissions", "/quit", "/setup", "/shell", "/status", "/swarm",
+    "/models", "/new", "/permissions", "/quit", "/setup", "/shell", "/status", "/swarm",
 ]
 
 
@@ -28,12 +28,13 @@ class ReplInput:
         self._ansi = None
         self._patch_stdout = None
         self._toolbar = toolbar
+        self.persistent_history = False
 
         try:
             from prompt_toolkit import PromptSession
             from prompt_toolkit.completion import WordCompleter
             from prompt_toolkit.formatted_text import ANSI
-            from prompt_toolkit.history import FileHistory
+            from prompt_toolkit.history import FileHistory, InMemoryHistory
             from prompt_toolkit.key_binding import KeyBindings
             from prompt_toolkit.patch_stdout import patch_stdout
             from prompt_toolkit.styles import Style
@@ -78,9 +79,19 @@ class ReplInput:
             "bottom-toolbar.key": "bg:#151a24 #43d9c0 bold",
         })
         completer = WordCompleter(COMMANDS, sentence=True, ignore_case=True)
-        history_file.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            history_file.parent.mkdir(parents=True, exist_ok=True)
+            # FileHistory opens the file only when the first entry is stored.
+            # Probe it now so a read-only config directory cannot crash the
+            # prompt-toolkit event loop after the user presses Enter.
+            with history_file.open("ab"):
+                pass
+            history = FileHistory(str(history_file))
+            self.persistent_history = True
+        except OSError:
+            history = InMemoryHistory()
         self._session = PromptSession(
-            history=FileHistory(str(history_file)),
+            history=history,
             completer=completer,
             complete_while_typing=False,
             key_bindings=bindings,
