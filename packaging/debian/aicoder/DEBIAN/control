@@ -3,7 +3,6 @@ Version: 0.9.0
 Section: utils
 Priority: optional
 Architecture: amd64
-Installed-Size: 8000
 Maintainer: Markus Leitermann <admin@ailinux.me>
 Homepage: https://ailinux.me
 Description: ai-coder — Terminal Coding & DevOps Agent

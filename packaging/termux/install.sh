@@ -19,19 +19,21 @@ echo -e "${NC}"
 # Deps installieren
 echo -e "${CYAN}[1/4] Pakete installieren...${NC}"
 pkg update -y -q
-pkg install -y python git curl openssl-tool 2>/dev/null | grep -E "install|upgrade" || true
+pkg install -y python git curl openssl-tool
 
 # ai-coder deps (kein pip upgrade — kaputt in Termux)
 echo -e "${CYAN}[2/4] Python-Deps installieren...${NC}"
-PYTHONPATH="" pip3 install --quiet httpx rich typer certifi 2>/dev/null || \
-  PYTHONPATH="" pip install --quiet httpx rich typer certifi
+PYTHONPATH="" pip3 install --quiet httpx rich typer certifi urllib3 markdown prompt-toolkit 2>/dev/null || \
+  PYTHONPATH="" pip install --quiet httpx rich typer certifi urllib3 markdown prompt-toolkit
 
 echo -e "${CYAN}[3/4] ai-coder holen...${NC}" 
 
 # Source von GitHub holen
 INSTALL_DIR="$HOME/.local/lib/aicoder-src"
 rm -rf "$INSTALL_DIR"
-git clone --depth=1 -q https://github.com/derleiti/ai-coder.git "$INSTALL_DIR"
+AICODER_REF="${AICODER_REF:-master}"
+git clone --depth=1 --branch "$AICODER_REF" -q \
+  https://github.com/derleiti/ai-coder.git "$INSTALL_DIR"
 
 # Wrapper-Script
 mkdir -p "$HOME/.local/bin"

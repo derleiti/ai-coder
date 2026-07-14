@@ -9,9 +9,10 @@ Terminalbasierter Coding & DevOps Agent für AILinux / TriForce.
 | Plattform | Download | Hinweis |
 |---|---|---|
 | **Windows** | [aicoder.exe](https://github.com/derleiti/ai-coder/releases/latest/download/aicoder.exe) | Standalone, 13 MB, PowerShell-ready |
-| **Linux (Binary)** | [aicoder-x86_64-linux](https://github.com/derleiti/ai-coder/releases/latest/download/aicoder-x86_64-linux) | Standalone, ~8 MB |
+| **Linux (Binary)** | [aicoder-x86_64-linux](https://github.com/derleiti/ai-coder/releases/latest/download/aicoder-x86_64-linux) | Standalone inkl. GUI |
 | **Debian/Ubuntu** | [aicoder_amd64.deb](https://github.com/derleiti/ai-coder/releases/latest/download/aicoder_amd64.deb) | `sudo dpkg -i aicoder_*.deb` |
 | **Arch / AILinux** | `yay -S aicoder` | AUR-Paket |
+| **Android / Termux** | [Release-Artefakte](https://github.com/derleiti/ai-coder/releases/latest) | Versionierter Installer + Quell-Bundle |
 | **pip** | `pip install -e .` | Aus Quellcode |
 
 ### Windows-Installation
@@ -37,6 +38,15 @@ sudo chmod +x /usr/bin/aicoder
 echo "deb https://repo.ailinux.me stable main" | sudo tee /etc/apt/sources.list.d/ailinux.list
 sudo apt update && sudo apt install aicoder
 ```
+
+### Android-/Termux-Installation
+
+```bash
+curl -sL https://ailinux.me/ai-coder-termux | bash
+```
+
+Android verwendet wegen Bionic ein eigenes Termux-Quell-Bundle; das Linux-ELF
+ist dort nicht lauffähig. Versionierte Installer liegen in jedem GitHub Release.
 
 ## Schnellstart
 
@@ -76,9 +86,10 @@ Siehe `docs/architecture.md`.
 
 ## CI/CD
 
-- **Linux:** PyInstaller Build auf Push (GitHub Actions)
-- **Windows:** PyInstaller Build + NSIS Installer auf Tag-Push (`v*`)
-- Automatische GitHub Releases mit Binaries
+- **Linux:** PyInstaller-Binary + Debian-Paket
+- **Windows:** PyInstaller-Binary + verpflichtender NSIS-Installer
+- **Android/Termux:** validierter Installer + reproduzierbares Quell-Bundle
+- **Trigger:** manueller Dry-Run per `workflow_dispatch`; Release per Tag `v*`
 
 ## Links
 

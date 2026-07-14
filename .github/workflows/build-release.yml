@@ -1,4 +1,5 @@
-# Combined Release: Linux .deb + Binary, Windows .exe + NSIS, AUR PKGBUILD
+# Combined Release: Linux .deb + Binary, Windows .exe + NSIS,
+# Android/Termux bundle and AUR PKGBUILD
 name: Build Release
 
 on:
@@ -19,32 +20,62 @@ env:
   PYTHON_VERSION: '3.12'
 
 jobs:
+  # Single source of truth for every package and artifact.
+  metadata:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate release version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROJECT_VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          PACKAGE_VERSION=$(python3 -c "import re; print(re.search(r'__version__ = \"([^\"]+)\"', open('aicoder/__init__.py').read()).group(1))")
+          DEB_VERSION=$(awk '/^Version:/ {print $2}' packaging/debian/aicoder/DEBIAN/control)
+          AUR_VERSION=$(awk -F= '/^pkgver=/ {print $2}' packaging/aur/PKGBUILD)
+          SRCINFO_VERSION=$(awk '/pkgver =/ {print $3; exit}' packaging/aur/.SRCINFO)
+          NSIS_VERSION=$(sed -n 's/.*APPVERSION "\([^"]*\)".*/\1/p' installer/aicoder.nsi)
+          MAN_VERSION=$(zgrep -oE '"[0-9]+\.[0-9]+\.[0-9]+"' packaging/debian/aicoder/usr/share/man/man1/aicoder.1.gz | head -n1 | tr -d '"')
+
+          REQUESTED_VERSION=""
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            REQUESTED_VERSION="${{ github.event.inputs.version }}"
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            REQUESTED_VERSION="${GITHUB_REF#refs/tags/v}"
+          fi
+
+          for value in "$PACKAGE_VERSION" "$DEB_VERSION" "$AUR_VERSION" "$SRCINFO_VERSION" "$NSIS_VERSION" "$MAN_VERSION"; do
+            if [ "$value" != "$PROJECT_VERSION" ]; then
+              echo "::error::Version mismatch: project=$PROJECT_VERSION component=$value"
+              exit 1
+            fi
+          done
+          grep -q "^## v${PROJECT_VERSION} " CHANGELOG.md
+          if [ -n "$REQUESTED_VERSION" ] && [ "$REQUESTED_VERSION" != "$PROJECT_VERSION" ]; then
+            echo "::error::Requested/tag version $REQUESTED_VERSION does not match project $PROJECT_VERSION"
+            exit 1
+          fi
+
+          echo "version=$PROJECT_VERSION" >> "$GITHUB_OUTPUT"
+          echo "::notice::Validated ai-coder $PROJECT_VERSION"
+
   # ════════════════════════════════════════════════════════════
   # LINUX — Binary + .deb
   # ════════════════════════════════════════════════════════════
   build-linux:
+    needs: metadata
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.version.outputs.version }}
       linux_sha: ${{ steps.sha.outputs.linux_sha }}
       deb_sha: ${{ steps.sha.outputs.deb_sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - name: Determine version
-        id: version
-        run: |
-          if [ -n "${{ github.event.inputs.version }}" ]; then
-            VER="${{ github.event.inputs.version }}"
-          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            VER="${GITHUB_REF#refs/tags/v}"
-          else
-            VER=$(python3 -c "import re; m=re.search(r'version\s*=\s*\"([^\"]+)\"', open('pyproject.toml').read()); print(m.group(1))")
-          fi
-          echo "version=$VER" >> "$GITHUB_OUTPUT"
-          echo "::notice::Building version $VER"
-
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
@@ -64,7 +95,6 @@ jobs:
             --clean \
             --strip \
             --collect-submodules=aicoder \
-            --collect-submodules=PyQt6 \
             --hidden-import=PyQt6.QtWidgets \
             --hidden-import=PyQt6.QtGui \
             --hidden-import=PyQt6.QtCore \
@@ -80,18 +110,22 @@ jobs:
           echo "Binary size: $(du -h dist/aicoder | cut -f1)"
 
       - name: Verify binary
-        run: dist/aicoder status 2>&1 || true
+        run: |
+          dist/aicoder --help
+          dist/aicoder agent --help
 
       - name: Build .deb package
         env:
-          VERSION: ${{ steps.version.outputs.version }}
+          VERSION: ${{ needs.metadata.outputs.version }}
         run: |
           mkdir -p pkg/usr/bin pkg/DEBIAN
-          mkdir -p pkg/usr/share/applications
+          mkdir -p pkg/usr/share/applications pkg/usr/share/man/man1
           cp dist/aicoder pkg/usr/bin/aicoder
           chmod 755 pkg/usr/bin/aicoder
           cp packaging/linux/ai-coder-gui.desktop pkg/usr/share/applications/
           cp packaging/linux/ai-coder.desktop pkg/usr/share/applications/
+          cp packaging/debian/aicoder/usr/share/man/man1/aicoder.1.gz pkg/usr/share/man/man1/
+          chmod 644 pkg/usr/share/man/man1/aicoder.1.gz
           SIZE=$(du -s pkg/usr | cut -f1)
           cat > pkg/DEBIAN/control << EOF
           Package: aicoder
@@ -109,16 +143,19 @@ jobs:
           # control muss linksbündig sein
           sed -i 's/^          //' pkg/DEBIAN/control
           dpkg-deb --build --root-owner-group pkg "aicoder_${VERSION}_amd64.deb"
+          cp "aicoder_${VERSION}_amd64.deb" aicoder_amd64.deb
 
       - name: Rename binary with version
         env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: cp dist/aicoder "aicoder-${VERSION}-x86_64-linux"
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          cp dist/aicoder "aicoder-${VERSION}-x86_64-linux"
+          cp dist/aicoder aicoder-x86_64-linux
 
       - name: Compute SHA256
         id: sha
         env:
-          VERSION: ${{ steps.version.outputs.version }}
+          VERSION: ${{ needs.metadata.outputs.version }}
         run: |
           LINUX_SHA=$(sha256sum "aicoder-${VERSION}-x86_64-linux" | cut -d' ' -f1)
           DEB_SHA=$(sha256sum "aicoder_${VERSION}_amd64.deb" | cut -d' ' -f1)
@@ -127,37 +164,29 @@ jobs:
           echo "Linux SHA: $LINUX_SHA"
           echo "Deb SHA:   $DEB_SHA"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux-artifacts
+          if-no-files-found: error
           path: |
             aicoder-*-x86_64-linux
+            aicoder-x86_64-linux
             aicoder_*_amd64.deb
+            aicoder_amd64.deb
 
   # ════════════════════════════════════════════════════════════
   # WINDOWS — .exe + NSIS Installer
   # ════════════════════════════════════════════════════════════
   build-windows:
+    needs: metadata
     runs-on: windows-latest
     outputs:
       exe_sha: ${{ steps.sha.outputs.exe_sha }}
+      setup_sha: ${{ steps.sha.outputs.setup_sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - name: Determine version
-        id: version
-        shell: bash
-        run: |
-          if [ -n "${{ github.event.inputs.version }}" ]; then
-            VER="${{ github.event.inputs.version }}"
-          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            VER="${GITHUB_REF#refs/tags/v}"
-          else
-            VER=$(python -c "import re; m=re.search(r'version\s*=\s*\"([^\"]+)\"', open('pyproject.toml').read()); print(m.group(1))")
-          fi
-          echo "version=$VER" >> "$GITHUB_OUTPUT"
-
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
@@ -178,16 +207,15 @@ jobs:
         # parser error. Single line avoids the issue entirely.
         shell: pwsh
         run: |
-          python -m PyInstaller --onefile --name aicoder --console --noconfirm --clean --collect-submodules=aicoder --collect-submodules=PyQt6 --hidden-import=PyQt6.QtWidgets --hidden-import=PyQt6.QtGui --hidden-import=PyQt6.QtCore --hidden-import=aicoder.gui --hidden-import=aicoder.gui.app --hidden-import=aicoder.gui.main_window --hidden-import=aicoder.gui.chat_widget --hidden-import=aicoder.gui.settings_widget --hidden-import=aicoder.gui.autostart --hidden-import=certifi aicoder_main.py
+          python -m PyInstaller --onefile --name aicoder --console --noconfirm --clean --collect-submodules=aicoder --hidden-import=PyQt6.QtWidgets --hidden-import=PyQt6.QtGui --hidden-import=PyQt6.QtCore --hidden-import=aicoder.gui --hidden-import=aicoder.gui.app --hidden-import=aicoder.gui.main_window --hidden-import=aicoder.gui.chat_widget --hidden-import=aicoder.gui.settings_widget --hidden-import=aicoder.gui.autostart --hidden-import=certifi aicoder_main.py
           $size = (Get-Item dist\aicoder.exe).Length / 1MB
           Write-Host "aicoder.exe: $([math]::Round($size,1)) MB"
 
       - name: Build NSIS Installer
-        continue-on-error: true
         id: nsis
         shell: pwsh
         env:
-          APP_VERSION: ${{ steps.version.outputs.version }}
+          APP_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
           choco install nsis nsis-envar -y --no-progress
           $ver = $env:APP_VERSION -replace '[^0-9.]', ''
@@ -198,13 +226,20 @@ jobs:
             /DVERSIONINFO="$nsisVer" `
             /DEXE_PATH="dist\aicoder.exe" `
             packaging\windows\installer.nsi
+          if (-not (Test-Path "aicoder-$env:APP_VERSION-setup.exe")) {
+            throw "NSIS installer was not created"
+          }
 
       - name: Compute SHA256
         id: sha
         shell: bash
         run: |
-          EXE_SHA=$(sha256sum aicoder.exe 2>/dev/null || sha256sum dist/aicoder.exe | cut -d' ' -f1)
+          EXE_SHA=$(sha256sum dist/aicoder.exe | cut -d' ' -f1)
+          SETUP_FILE=$(find . -maxdepth 1 -name 'aicoder-*-setup.exe' -print -quit)
+          test -n "$SETUP_FILE"
+          SETUP_SHA=$(sha256sum "$SETUP_FILE" | cut -d' ' -f1)
           echo "exe_sha=$EXE_SHA" >> "$GITHUB_OUTPUT"
+          echo "setup_sha=$SETUP_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Prepare artifacts
         shell: bash
@@ -212,30 +247,86 @@ jobs:
           cp dist/aicoder.exe aicoder.exe
           ls -lh aicoder.exe aicoder-*-setup.exe 2>/dev/null || true
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows-artifacts
+          if-no-files-found: error
           path: |
             aicoder.exe
             aicoder-*-setup.exe
 
   # ════════════════════════════════════════════════════════════
+  # ANDROID / TERMUX — installer + source bundle
+  # PyInstaller Linux binaries target glibc and cannot run on Android's Bionic.
+  # ════════════════════════════════════════════════════════════
+  build-android:
+    needs: metadata
+    runs-on: ubuntu-latest
+    outputs:
+      android_sha: ${{ steps.sha.outputs.android_sha }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate Termux installer
+        run: bash -n packaging/termux/install.sh
+
+      - name: Build Termux source bundle
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          ROOT="aicoder-${VERSION}-termux"
+          mkdir -p "$ROOT/packaging/termux"
+          cp -a aicoder aicoder_main.py pyproject.toml README.md LICENSE "$ROOT/"
+          cp packaging/termux/install.sh "$ROOT/packaging/termux/"
+          {
+            head -n 1 packaging/termux/install.sh
+            echo "export AICODER_REF=\"v${VERSION}\""
+            tail -n +2 packaging/termux/install.sh
+          } > "aicoder-${VERSION}-termux-install.sh"
+          chmod +x "aicoder-${VERSION}-termux-install.sh"
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+            --exclude='*/__pycache__' --exclude='*.py[co]' \
+            --mtime='UTC 2026-01-01' -czf "aicoder-${VERSION}-termux.tar.gz" "$ROOT"
+
+      - name: Compute Android bundle SHA256
+        id: sha
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          ANDROID_SHA=$(sha256sum "aicoder-${VERSION}-termux.tar.gz" | cut -d' ' -f1)
+          echo "android_sha=$ANDROID_SHA" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: android-termux-artifacts
+          if-no-files-found: error
+          path: |
+            aicoder-*-termux.tar.gz
+            aicoder-*-termux-install.sh
+
+  # ════════════════════════════════════════════════════════════
   # RELEASE — Upload + AUR PKGBUILD
   # ════════════════════════════════════════════════════════════
   release:
-    needs: [build-linux, build-windows]
+    needs: [metadata, build-linux, build-windows, build-android]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: linux-artifacts
           path: artifacts/
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: windows-artifacts
+          path: artifacts/
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: android-termux-artifacts
           path: artifacts/
 
       - name: List artifacts
@@ -243,7 +334,7 @@ jobs:
 
       - name: Generate AUR PKGBUILD
         env:
-          VERSION: ${{ needs.build-linux.outputs.version }}
+          VERSION: ${{ needs.metadata.outputs.version }}
           LINUX_SHA: ${{ needs.build-linux.outputs.linux_sha }}
         run: |
           cat > artifacts/PKGBUILD << PKGEOF
@@ -273,35 +364,40 @@ jobs:
 
       - name: Upload to GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             artifacts/aicoder-*-x86_64-linux
+            artifacts/aicoder-x86_64-linux
             artifacts/aicoder_*_amd64.deb
+            artifacts/aicoder_amd64.deb
             artifacts/aicoder.exe
             artifacts/aicoder-*-setup.exe
+            artifacts/aicoder-*-termux.tar.gz
+            artifacts/aicoder-*-termux-install.sh
             artifacts/PKGBUILD
           generate_release_notes: true
           body: |
-            ## ai-coder ${{ needs.build-linux.outputs.version }}
+            ## ai-coder ${{ needs.metadata.outputs.version }}
 
             ### Downloads
             | Platform | File | SHA256 |
             |---|---|---|
-            | 🐧 Linux Binary | `aicoder-${{ needs.build-linux.outputs.version }}-x86_64-linux` | `${{ needs.build-linux.outputs.linux_sha }}` |
-            | 📦 Debian/Ubuntu | `aicoder_${{ needs.build-linux.outputs.version }}_amd64.deb` | `${{ needs.build-linux.outputs.deb_sha }}` |
-            | 🪟 Windows | `aicoder.exe` | `${{ needs.build-windows.outputs.exe_sha }}` |
+            | 🐧 Linux Binary | `aicoder-${{ needs.metadata.outputs.version }}-x86_64-linux` | `${{ needs.build-linux.outputs.linux_sha }}` |
+            | 📦 Debian/Ubuntu | `aicoder_${{ needs.metadata.outputs.version }}_amd64.deb` | `${{ needs.build-linux.outputs.deb_sha }}` |
+            | 🪟 Windows Binary | `aicoder.exe` | `${{ needs.build-windows.outputs.exe_sha }}` |
+            | 🪟 Windows Installer | `aicoder-${{ needs.metadata.outputs.version }}-setup.exe` | `${{ needs.build-windows.outputs.setup_sha }}` |
             | 🏗️ Arch/AUR | `PKGBUILD` | — |
-            | 🤖 Android/Termux | One-liner Installer | — |
+            | 🤖 Android/Termux | `aicoder-${{ needs.metadata.outputs.version }}-termux.tar.gz` | `${{ needs.build-android.outputs.android_sha }}` |
 
             ### Install
             ```bash
             # Linux Binary
-            sudo wget -O /usr/bin/aicoder https://github.com/derleiti/ai-coder/releases/download/v${{ needs.build-linux.outputs.version }}/aicoder-${{ needs.build-linux.outputs.version }}-x86_64-linux
+            sudo wget -O /usr/bin/aicoder https://github.com/derleiti/ai-coder/releases/download/v${{ needs.metadata.outputs.version }}/aicoder-${{ needs.metadata.outputs.version }}-x86_64-linux
             sudo chmod +x /usr/bin/aicoder
 
             # Debian/Ubuntu
-            wget aicoder_${{ needs.build-linux.outputs.version }}_amd64.deb && sudo dpkg -i aicoder_*.deb
+            wget aicoder_${{ needs.metadata.outputs.version }}_amd64.deb && sudo dpkg -i aicoder_*.deb
 
             # Arch/AUR
             yay -S aicoder
@@ -310,7 +406,10 @@ jobs:
 
             # Android/Termux
             curl -sL https://ailinux.me/ai-coder-termux | bash
+            # Pinned version from this release:
+            curl -LO https://github.com/derleiti/ai-coder/releases/download/v${{ needs.metadata.outputs.version }}/aicoder-${{ needs.metadata.outputs.version }}-termux-install.sh
+            bash aicoder-${{ needs.metadata.outputs.version }}-termux-install.sh
 
             # Termux Update
-            cd ~/.local/lib/aicoder-src && git pull
+            curl -sL https://ailinux.me/ai-coder-termux | AICODER_REF=master bash
             ```
