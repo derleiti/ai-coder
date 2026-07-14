@@ -265,6 +265,18 @@ class ReplRegressionTests(unittest.TestCase):
         self.assertFalse(is_action_request("Erkläre mir den Unterschied zwischen Listen und Tupeln"))
         self.assertFalse(is_action_request("Welches Testwort solltest du dir merken?"))
 
+    def test_agent_budget_no_longer_stops_at_thirty_steps(self):
+        self.assertGreaterEqual(executor.MAX_ITERATIONS, 60)
+        self.assertEqual(executor.AGENT_CHECKPOINT_INTERVAL, 30)
+
+    def test_loop_guard_distinguishes_stagnation_from_progress(self):
+        guard = executor.AgentLoopGuard()
+        calls = [{"name": "file_read", "arguments": {"command": "pwd"}}]
+        repeats = [guard.observe(calls, ["same result"]) for _ in range(6)]
+        self.assertEqual(repeats, [1, 2, 3, 4, 5, 6])
+        guard.reset()
+        self.assertEqual(guard.observe(calls, ["new result"]), 1)
+
     def test_basic_input_fallback_remains_usable(self):
         repl = ReplInput.__new__(ReplInput)
         repl._session = None
@@ -381,6 +393,27 @@ class ReplRegressionTests(unittest.TestCase):
         self.assertEqual(execute.call_count, 1)
         self.assertTrue(any(m["content"] == "Wir arbeiten in meinem Home-Verzeichnis." for m in conversation))
         self.assertEqual(conversation[-1]["content"], "DONE: Dokumente geprüft.")
+
+    def test_gui_switches_to_fallback_after_repeated_tool_loop(self):
+        client = MagicMock()
+        repeated = {
+            "response": '<tool_call>{"name":"health","arguments":{}}</tool_call>',
+            "model": "operator",
+        }
+        client.chat.side_effect = [repeated.copy() for _ in range(6)] + [
+            {"response": "DONE: recovered", "model": "fallback"},
+        ]
+        worker = _AgentWorker(
+            client,
+            [{"role": "system", "content": "simple"}, {"role": "user", "content": "check"}],
+            "operator", "fallback", [{"name": "health", "inputSchema": {}}], "simple",
+            load_tools_on_start=True,
+        )
+        with patch("aicoder.gui.chat_widget.run_tool", return_value=("same result", False)):
+            worker.run()
+        self.assertEqual(client.chat.call_count, 7)
+        self.assertEqual(client.chat.call_args_list[6].kwargs["model"], "fallback")
+        self.assertIsNone(client.chat.call_args_list[6].kwargs["fallback_model"])
 
 
 class PrivilegeBrokerTests(unittest.TestCase):

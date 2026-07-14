@@ -28,6 +28,8 @@ from ..session_state import get_state
 from ..client import TriForceClient, ClientError
 from .. import chat_history
 from ..executor import (
+    AGENT_CHECKPOINT_INTERVAL, STALL_FALLBACK_REPEATS, STALL_NUDGE_REPEATS,
+    STALL_RECOVERY_PROMPT, AgentLoopGuard, agent_checkpoint,
     load_tools, build_system_prompt, build_tool_desc,
     normalize_tool_calls, parse_tool_calls, strip_tool_calls, trim_messages, run_tool,
     is_destructive, is_simple_chat_message, MAX_ITERATIONS,
@@ -89,6 +91,9 @@ class _AgentWorker(QThread):
     def run(self):
         messages = self.messages
         model_used = self.model or "default"
+        active_model = self.model
+        active_fallback = self.fallback
+        loop_guard = AgentLoopGuard()
         MAX_CTX = 30
 
         # None means undiscovered; [] is an intentional no-tools run.
@@ -137,8 +142,8 @@ class _AgentWorker(QThread):
                 model_started = time.monotonic()
                 result = self.client.chat(
                     messages=messages,
-                    model=self.model or None,
-                    fallback_model=self.fallback or None,
+                    model=active_model or None,
+                    fallback_model=active_fallback or None,
                     temperature=0.3,
                     max_tokens=256 if self.quick_chat else 4096,
                     tools=self.tools if self.load_tools_on_start else None,
@@ -151,7 +156,7 @@ class _AgentWorker(QThread):
             response = result.get("response", "").strip()
             model_used = result.get("model", self.model or "default")
             model_elapsed = time.monotonic() - model_started
-            requested = self.model or "default"
+            requested = active_model or "default"
             route = model_used if model_used == requested else f"{requested} → {model_used}"
             self.msg.emit("system", f"Model response in {model_elapsed:.1f}s", route)
 
@@ -208,6 +213,39 @@ class _AgentWorker(QThread):
                 self.msg.emit("tool_result", tr[:2000], f"{tname} {status}")
                 tool_results.append(f"Tool {tname} result:\n{tr}")
 
+            repeats = loop_guard.observe(calls, tool_results)
+            if repeats == STALL_NUDGE_REPEATS:
+                tool_results.append(STALL_RECOVERY_PROMPT)
+
+            if repeats >= STALL_FALLBACK_REPEATS:
+                if active_fallback and active_fallback != model_used:
+                    self.msg.emit(
+                        "system",
+                        "Repeated tool loop detected; switching to fallback model.",
+                        f"{model_used} → {active_fallback}",
+                    )
+                    tool_results.append(
+                        f"Loop recovery: switch to {active_fallback} and continue with "
+                        "a different approach. Do not repeat the prior call."
+                    )
+                    active_model = active_fallback
+                    active_fallback = ""
+                    loop_guard.reset()
+                else:
+                    pause = (
+                        "Agent paused because the same tool operation kept repeating "
+                        "without progress. The conversation is preserved; send "
+                        "'continue' to resume with a different approach."
+                    )
+                    messages.append({"role": "assistant", "content": response})
+                    messages.append({"role": "user", "content": "\n\n".join(tool_results)})
+                    self.messages_updated.emit(messages)
+                    self.finished.emit(pause, model_used)
+                    return
+
+            if (i + 1) % AGENT_CHECKPOINT_INTERVAL == 0:
+                tool_results.append(agent_checkpoint(i + 1))
+
             messages.append({"role": "assistant", "content": response})
             current_input = "\n\n".join(tool_results)
             messages.append({"role": "user", "content": current_input})
@@ -218,7 +256,11 @@ class _AgentWorker(QThread):
                 return
 
         self.messages_updated.emit(messages)
-        self.finished.emit(f"(Max {MAX_ITERATIONS} iterations)\n{visible or response}", model_used)
+        self.finished.emit(
+            "Agent safety pause after an unusually long run. The conversation "
+            "is preserved; send 'continue' to resume.",
+            model_used,
+        )
 
 
 def _select_chat_route(model: str, fallback: str, quick_chat: bool):

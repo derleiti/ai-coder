@@ -11,7 +11,9 @@ from typing import Optional
 from .client import ClientError, TriForceClient
 from .config import load_session
 from .executor import (
-    MAX_CONTEXT_MESSAGES, MAX_ITERATIONS,
+    AGENT_CHECKPOINT_INTERVAL, MAX_CONTEXT_MESSAGES, MAX_ITERATIONS,
+    STALL_FALLBACK_REPEATS, STALL_NUDGE_REPEATS, STALL_RECOVERY_PROMPT,
+    AgentLoopGuard, agent_checkpoint,
     is_destructive, load_tools, build_system_prompt,
     normalize_tool_calls, parse_tool_calls, strip_tool_calls, trim_messages, run_tool,
     is_action_request, is_short_confirmation, is_simple_chat_message,
@@ -26,7 +28,7 @@ from .ui import (
     AgentSpinner, C,
     print_header, print_task, print_thought,
     print_tool_call, print_tool_result, print_final,
-    print_error, print_max_iter,
+    print_error,
 )
 
 
@@ -136,6 +138,7 @@ def run_agent(
     fallback_used = False
     tool_was_called = False
     tool_nudge_sent = False
+    loop_guard = AgentLoopGuard()
 
     pending_continuation = False
     if is_short_confirmation(initial_prompt):
@@ -265,6 +268,39 @@ def run_agent(
             print_tool_result(tname, tr, t_elapsed, error=is_err)
             tool_results.append(f"Tool {tname} result:\n{tr}")
 
+        repeats = loop_guard.observe(calls, tool_results)
+        if repeats == STALL_NUDGE_REPEATS:
+            tool_results.append(STALL_RECOVERY_PROMPT)
+
+        if repeats >= STALL_FALLBACK_REPEATS:
+            fallback_candidate = effective_fallback
+            if fallback_candidate and fallback_candidate != model_used:
+                print_thought(
+                    f"Tool loop detected; switching operator to fallback {fallback_candidate}."
+                )
+                tool_results.append(
+                    f"Loop recovery: switch to {fallback_candidate} and continue the task "
+                    "with a different approach. Do not repeat the prior call."
+                )
+                effective_model = fallback_candidate
+                effective_fallback = None
+                fallback_used = True
+                loop_guard.reset()
+            else:
+                stop_reason = (
+                    "Agent paused because the same tool operation kept repeating without "
+                    "progress. The conversation context is preserved; correct the task or "
+                    "type 'continue' to resume with a different approach."
+                )
+                messages.append({"role": "assistant", "content": response})
+                messages.append({"role": "user", "content": "\n\n".join(tool_results)})
+                full_response = stop_reason
+                print_error(stop_reason)
+                break
+
+        if (i + 1) % AGENT_CHECKPOINT_INTERVAL == 0:
+            tool_results.append(agent_checkpoint(i + 1))
+
         messages.append({"role": "assistant", "content": response})
         current_input = "\n\n".join(tool_results)
 
@@ -272,7 +308,13 @@ def run_agent(
             print_final(response, model_used, total_latency, i+1, fallback_used)
             break
     else:
-        print_max_iter(MAX_ITERATIONS)
+        if current_input:
+            messages.append({"role": "user", "content": current_input})
+        full_response = (
+            "Agent safety pause after an unusually long run. The task context is "
+            "preserved; type 'continue' to resume."
+        )
+        print_error(full_response)
 
     if conversation is not None:
         conversation[:] = [

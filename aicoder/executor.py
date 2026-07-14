@@ -31,8 +31,11 @@ def _safe_int_env(key: str, default: int, lo: int = 1, hi: int = 200) -> int:
     except (ValueError, TypeError):
         return default
 
-MAX_ITERATIONS = _safe_int_env("AICODER_MAX_ITERATIONS", 30, 1, 100)
+MAX_ITERATIONS = _safe_int_env("AICODER_MAX_ITERATIONS", 300, 60, 1000)
 MAX_CONTEXT_MESSAGES = _safe_int_env("AICODER_MAX_CONTEXT", 50, 5, 200)
+AGENT_CHECKPOINT_INTERVAL = _safe_int_env("AICODER_CHECKPOINT_INTERVAL", 30, 10, 100)
+STALL_NUDGE_REPEATS = 3
+STALL_FALLBACK_REPEATS = 6
 
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX = platform.system() == "Linux"
@@ -88,6 +91,48 @@ def is_action_request(text: str) -> bool:
 def is_short_confirmation(text: str) -> bool:
     """Return true when a REPL message clearly continues the prior task."""
     return bool(_SHORT_CONFIRMATION_RE.fullmatch((text or "").strip()))
+
+
+class AgentLoopGuard:
+    """Detect repeated tool/result cycles without limiting productive work."""
+
+    def __init__(self, window: int = 12):
+        self.window = max(STALL_FALLBACK_REPEATS, window)
+        self._recent: list[str] = []
+
+    def observe(self, calls: list[dict], results: list[str]) -> int:
+        payload = {
+            "calls": calls,
+            # Stable, bounded output is enough to distinguish progress from a
+            # model retrying the identical failed or successful operation.
+            "results": [str(result)[-1200:] for result in results],
+        }
+        fingerprint = json.dumps(
+            payload, sort_keys=True, ensure_ascii=False, default=str,
+        )
+        repeats = self._recent.count(fingerprint) + 1
+        self._recent.append(fingerprint)
+        self._recent = self._recent[-self.window:]
+        return repeats
+
+    def reset(self) -> None:
+        self._recent.clear()
+
+
+def agent_checkpoint(step: int) -> str:
+    """Internal instruction for long-running agents; never shown as an error."""
+    return (
+        f"Agent progress checkpoint after {step} steps: continue the unfinished "
+        "task. Re-evaluate the latest tool results, avoid repeated calls, and "
+        "finish with a verified result. Do not stop merely because of the step count."
+    )
+
+
+STALL_RECOVERY_PROMPT = (
+    "Loop recovery: this exact tool call and result has repeated several times. "
+    "Do not issue it again unchanged. Diagnose why it did not advance the task, "
+    "choose a different tool or corrected arguments, and continue from the result."
+)
 
 # Destructive patterns for local_exec approval
 DESTRUCTIVE_PATTERNS = [

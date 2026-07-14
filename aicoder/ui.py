@@ -365,7 +365,3 @@ def print_error(msg: str) -> None:
 
 def print_interrupted() -> None:
     print(f"\n  {C.BYELLOW}◌{C.RESET} {dim('interrupted')}")
-
-
-def print_max_iter(n: int) -> None:
-    print(f"\n  {C.BYELLOW}◎{C.RESET} {dim(f'max iterations ({n}) reached')}")
