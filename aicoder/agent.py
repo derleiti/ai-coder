@@ -2,6 +2,7 @@ from __future__ import annotations
 """
 agent.py — CLI Agent runner. Uses shared executor for tool execution.
 """
+import json
 import sys
 import time
 from pathlib import Path
@@ -12,7 +13,7 @@ from .config import load_session
 from .executor import (
     MAX_ITERATIONS,
     is_destructive, load_tools, build_system_prompt,
-    parse_tool_calls, strip_tool_calls, trim_messages, run_tool,
+    normalize_tool_calls, parse_tool_calls, strip_tool_calls, trim_messages, run_tool,
     # Re-export for backwards compat (GUI imports these)
     AGENT_TOOLS, LOCAL_EXEC_SCHEMA, SYSTEM_TEMPLATE as SYSTEM,
     FALLBACK_TOOLS as _FALLBACK_TOOLS, OS_NAME, OS_INSTRUCTIONS,
@@ -92,6 +93,8 @@ def run_agent(
                     fallback_model=fallback_model,
                     temperature=0.3,
                     max_tokens=4096,
+                    tools=tools,
+                    tool_choice="auto",
                 )
             except (ClientError, RuntimeError) as e:
                 print_error(str(e))
@@ -106,7 +109,16 @@ def run_agent(
             fallback_used = True
         full_response = response
 
-        calls = parse_tool_calls(response)
+        native_calls = normalize_tool_calls(result.get("tool_calls") or [])
+        calls = native_calls + [
+            call for call in parse_tool_calls(response)
+            if call not in native_calls
+        ]
+        if native_calls and not response:
+            response = "\n".join(
+                f"<tool_call>{json.dumps(call, ensure_ascii=False)}</tool_call>"
+                for call in native_calls
+            )
         visible = strip_tool_calls(response)
 
         if visible and calls:

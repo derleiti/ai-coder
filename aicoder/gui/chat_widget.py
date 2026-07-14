@@ -26,7 +26,7 @@ from ..client import TriForceClient, ClientError
 from .. import chat_history
 from ..executor import (
     load_tools, build_system_prompt, build_tool_desc,
-    parse_tool_calls, strip_tool_calls, trim_messages, run_tool,
+    normalize_tool_calls, parse_tool_calls, strip_tool_calls, trim_messages, run_tool,
     is_destructive, is_simple_chat_message, MAX_ITERATIONS,
 )
 
@@ -137,6 +137,8 @@ class _AgentWorker(QThread):
                     fallback_model=self.fallback or None,
                     temperature=0.3,
                     max_tokens=256 if self.quick_chat else 4096,
+                    tools=self.tools if self.load_tools_on_start else None,
+                    tool_choice="auto",
                 )
             except (ClientError, Exception) as e:
                 self.error.emit(str(e))
@@ -149,7 +151,16 @@ class _AgentWorker(QThread):
             route = model_used if model_used == requested else f"{requested} → {model_used}"
             self.msg.emit("system", f"Model response in {model_elapsed:.1f}s", route)
 
-            calls = parse_tool_calls(response)
+            native_calls = normalize_tool_calls(result.get("tool_calls") or [])
+            calls = native_calls + [
+                call for call in parse_tool_calls(response)
+                if call not in native_calls
+            ]
+            if native_calls and not response:
+                response = "\n".join(
+                    f"<tool_call>{json.dumps(call, ensure_ascii=False)}</tool_call>"
+                    for call in native_calls
+                )
             visible = strip_tool_calls(response)
 
             if not calls:

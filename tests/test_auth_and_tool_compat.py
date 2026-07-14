@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import QApplication
 
 from aicoder.client import ClientError, TriForceClient, _decode_jwt_exp
 from aicoder.config import Session
-from aicoder.executor import is_simple_chat_message, parse_tool_calls
+from aicoder.executor import is_simple_chat_message, normalize_tool_calls, parse_tool_calls
 from aicoder.gui.chat_widget import _AgentWorker, _select_chat_route
 import aicoder.gui.settings_widget as settings_widget
 from aicoder.setup import _is_token_expired, run_setup
@@ -82,6 +82,16 @@ class AuthCompatibilityTests(unittest.TestCase):
 
 
 class ToolCallCompatibilityTests(unittest.TestCase):
+    def test_structured_openai_tool_calls(self):
+        self.assertEqual(
+            normalize_tool_calls([{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "health", "arguments": "{}"},
+            }]),
+            [{"name": "health", "arguments": {}}],
+        )
+
     def test_native_openai_shape(self):
         text = '<tool_call>{"type":"function","function":{"name":"code_read","arguments":"{\\"path\\":\\"README.md\\"}"}}</tool_call>'
         self.assertEqual(
@@ -150,8 +160,40 @@ class ClientLatencyGuardTests(unittest.TestCase):
             client.chat(message="hi", model="test")
         self.assertEqual(request.call_args.kwargs["_retries"], 0)
 
+    def test_chat_sends_selected_native_tool_schemas(self):
+        client = TriForceClient("https://example.invalid", token="opaque")
+        schema = {"name": "health", "inputSchema": {"type": "object"}}
+        with patch.object(client, "_request", return_value={"response": "OK"}) as request:
+            client.chat(message="check", model="test", tools=[schema])
+        payload = request.call_args.args[2]
+        self.assertEqual(payload["tools"], [schema])
+        self.assertEqual(payload["tool_choice"], "auto")
+
 
 class GuiToolModeTests(unittest.TestCase):
+    def test_native_structured_tool_call_is_executed(self):
+        client = MagicMock()
+        client.chat.side_effect = [
+            {
+                "response": "",
+                "tool_calls": [{
+                    "type": "function",
+                    "function": {"name": "health", "arguments": "{}"},
+                }],
+                "model": "test",
+            },
+            {"response": "Done", "model": "test"},
+        ]
+        worker = _AgentWorker(
+            client,
+            [{"role": "system", "content": "simple"}, {"role": "user", "content": "check"}],
+            "test", "", [{"name": "health", "inputSchema": {}}], "simple",
+            load_tools_on_start=True,
+        )
+        with patch("aicoder.gui.chat_widget.run_tool", return_value=("healthy", False)) as execute:
+            worker.run()
+        execute.assert_called_once()
+
     def test_no_tools_run_does_not_discover_tools(self):
         client = MagicMock()
         client.chat.return_value = {"response": "Hello", "model": "test"}
@@ -189,7 +231,10 @@ class SettingsRegressionTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def test_model_loader_keeps_backend_default_selected(self):
-        with patch.object(settings_widget, "load_session", side_effect=RuntimeError("offline")):
+        with (
+            patch.object(settings_widget, "load_session", side_effect=RuntimeError("offline")),
+            patch.object(settings_widget, "get_state", return_value={"selected_model": ""}),
+        ):
             widget = settings_widget.SettingsWidget()
         widget._on_models_loaded(
             ["ollama/ministral-3:14b", "anthropic/claude-opus-4-8"],

@@ -288,6 +288,8 @@ class TriForceClient:
         max_tokens: int = 4096,
         fallback_model: Optional[str] = None,
         messages: Optional[list] = None,
+        tools: Optional[list] = None,
+        tool_choice: Any = "auto",
     ) -> Dict[str, Any]:
         """Call /v1/client/chat. Supports messages array for multi-turn context."""
         payload: Dict[str, Any] = {
@@ -302,6 +304,9 @@ class TriForceClient:
             payload["model"] = model
         if system_prompt:
             payload["system_prompt"] = system_prompt
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = tool_choice
         try:
             return self._request(
                 "POST", "/v1/client/chat", payload, require_auth=True,

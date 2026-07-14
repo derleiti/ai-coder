@@ -552,6 +552,17 @@ def _append_json_calls(calls: list[dict], raw: str) -> bool:
     return added
 
 
+def normalize_tool_calls(value: Any) -> list[dict]:
+    """Normalize structured tool calls returned outside the text response."""
+    values = value if isinstance(value, list) else [value]
+    calls = []
+    for item in values:
+        call = _normalize_tool_call(item)
+        if call:
+            calls.append(call)
+    return calls
+
+
 def parse_tool_calls(text: str) -> list[dict]:
     """Extract tool calls from common OpenAI, Mistral, Hermes and XML forms."""
     calls: list[dict] = []
