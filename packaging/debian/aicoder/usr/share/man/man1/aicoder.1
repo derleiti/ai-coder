@@ -1,0 +1,20 @@
+.TH AICODER 1 "2026" "0.9.0" "AILinux Tools"
+.SH NAME
+aicoder \- Terminal Coding & DevOps Agent (AILinux/TriForce)
+.SH SYNOPSIS
+.B aicoder
+[\fICOMMAND\fR] [\fIOPTIONS\fR]
+.SH DESCRIPTION
+Terminalbasierter autonomer Agent. Ohne Argumente startet Setup+REPL.
+.SH COMMANDS
+ask, chat, task, review, agent, shell, sudo, sysinfo, service,
+model, fallback, swarm, status, models, broadcast, hist, init
+.SH EXAMPLES
+.B aicoder
+(Setup + Agent-REPL)
+.br
+.B aicoder agent "Zeige Docker-Status"
+.br
+.B aicoder ask "Was macht diese Funktion?" --model groq/llama-3.3-70b-versatile
+.SH AUTHOR
+Markus Leitermann <admin@ailinux.me>
