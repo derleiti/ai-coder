@@ -12,7 +12,7 @@ from typing import Callable
 
 COMMANDS = [
     "/clear", "/exit", "/fallback", "/help", "/keys", "/model",
-    "/models", "/quit", "/setup", "/shell", "/status", "/swarm",
+    "/models", "/permissions", "/quit", "/setup", "/shell", "/status", "/swarm",
 ]
 
 

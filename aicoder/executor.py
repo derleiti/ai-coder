@@ -20,6 +20,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from .client import ClientError, TriForceClient
 from .config import load_session
 from .docs_context import read_agents_md
+from .privileges import SUDO_PREFIX_RE, assess_execution
 from .session_state import get_state
 from . import audit
 
@@ -163,6 +164,7 @@ LOCAL_EXEC_SCHEMA = {
             "command": {"type": "string", "description": (
                 "PowerShell command" if IS_WINDOWS else "bash command")},
             "cwd": {"type": "string", "description": "Working directory (optional)"},
+            "reason": {"type": "string", "description": "Why this local or privileged action is necessary"},
             **({"sudo": {"type": "boolean", "description": "Run with sudo"}}
                if not IS_WINDOWS else {}),
         },
@@ -191,6 +193,9 @@ LOCAL_FILE_EDIT_SCHEMA = {
         "properties": {
             "command": {"type": "string", "description": "sed/awk/tee command to edit file"},
             "cwd": {"type": "string", "description": "Working directory (optional)"},
+            "reason": {"type": "string", "description": "Why this write or privileged action is necessary"},
+            **({"sudo": {"type": "boolean", "description": "Request local sudo after explicit user approval"}}
+               if not IS_WINDOWS else {}),
         },
         "required": ["command"]
     }
@@ -270,6 +275,7 @@ LOCAL_DEVOPS_SCHEMA = {
             "command": {"type": "string", "description": "DevOps command"},
             "cwd": {"type": "string", "description": "Working directory (optional)"},
             "sudo": {"type": "boolean", "description": "Run with sudo"},
+            "reason": {"type": "string", "description": "Why this privileged action is necessary"},
         },
         "required": ["command"]
     }
@@ -368,6 +374,11 @@ You are ai-coder — autonomous coding and DevOps agent on AILinux/TriForce (api
 - All code changes, file edits, installs, git, docker — use LOCAL tools only.
 - Choose the most specific local tool: file_edit for edits, git for version control,
   lint for code checks, test for testing, devops for services/containers.
+- For sudo or protected paths: set sudo=true and provide a short reason. The local
+  client asks the user and sudo authenticates only in the local terminal. Never ask
+  for, print, store, or transmit a password.
+- File creation, modification, deletion, package/service changes, and destructive
+  commands require explicit local confirmation. Never hide mutations in read tools.
 
 ## Rules:
 - Read before write. Diagnose before patch.
@@ -642,16 +653,30 @@ def run_local_exec(args: dict) -> Tuple[str, bool]:
         except Exception as e:
             return f"local_exec error: {e}", True
     else:
-        use_sudo = args.get("sudo", False)
-        if use_sudo and not cmd.strip().startswith("sudo "):
-            cmd = "sudo " + cmd
+        use_sudo = bool(args.get("sudo", False))
         try:
             import shlex
+            # Normalize an explicit sudo prefix into the typed sudo flag. For
+            # redirects, sudo must own the shell itself (`sudo sh -c ...`), not
+            # merely the command left of `>`.
+            if SUDO_PREFIX_RE.match(cmd):
+                use_sudo = True
+                cmd = SUDO_PREFIX_RE.sub("", cmd, count=1)
             # Security: avoid shell=True for model-generated commands
             # Use shell only for commands with shell operators (pipes, redirects)
             _SHELL_CHARS = {'|', '>', '<', '&', ';', '`', '$', '(', ')'}
             needs_shell = bool(set(cmd) & _SHELL_CHARS)
-            if needs_shell:
+            if use_sudo and needs_shell:
+                r = subprocess.run(
+                    ["sudo", "--", "sh", "-c", cmd], shell=False, cwd=cwd,
+                    capture_output=True, text=True, timeout=60,
+                )
+            elif use_sudo:
+                r = subprocess.run(
+                    ["sudo", "--", *shlex.split(cmd)], shell=False, cwd=cwd,
+                    capture_output=True, text=True, timeout=60,
+                )
+            elif needs_shell:
                 r = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True, timeout=60)
             else:
                 r = subprocess.run(shlex.split(cmd), shell=False, cwd=cwd, capture_output=True, text=True, timeout=60)
@@ -692,23 +717,44 @@ def run_tool(
     """
     Execute a tool with audit logging and optional approval.
     
-    approval_fn(tool_name, args) -> bool: Called for local_exec commands.
+    approval_fn(tool_name, args) -> bool: Called for risky local operations.
       If it returns False, execution is aborted.
-      If None, all commands run without approval (legacy behavior).
+      If None, risky writes and privilege requests are blocked.
     """
     # Route local tools (all execute via subprocess on client machine)
     _is_local = name in LOCAL_TOOL_NAMES
     _SAFE_LOCAL_TOOLS = {"clipboard_read", "clipboard_write", "web_search_local", "web_fetch_local"}
     if _is_local and name not in _SAFE_LOCAL_TOOLS:
         cmd = args.get("command", "")
-        if approval_fn is not None:
+        risk = assess_execution(name, args, destructive=is_destructive(cmd))
+        if risk.needs_approval and approval_fn is not None:
             if not approval_fn(name, args):
-                return f"{name}: aborted by user", True
-        elif is_destructive(cmd):
+                result = f"{name}: aborted by user"
+                audit.log_tool(
+                    tool_name=name,
+                    arguments=args,
+                    result=result,
+                    duration_s=0,
+                    is_error=True,
+                    model=model,
+                    iteration=iteration,
+                )
+                return result, True
+        elif risk.needs_approval:
             import sys as _sys
-            print(f"\033[31m⚠ BLOCKED (destructive, no approval_fn): {cmd[:120]}\033[0m",
+            print(f"\033[31m⚠ BLOCKED (local write/privilege without approval): {cmd[:120]}\033[0m",
                   file=_sys.stderr)
-            return f"{name}: blocked — destructive command requires explicit approval: {cmd[:120]}", True
+            result = f"{name}: blocked — local write or privilege requires explicit approval: {cmd[:120]}"
+            audit.log_tool(
+                tool_name=name,
+                arguments=args,
+                result=result,
+                duration_s=0,
+                is_error=True,
+                model=model,
+                iteration=iteration,
+            )
+            return result, True
 
     t_start = time.time()
 

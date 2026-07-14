@@ -22,6 +22,8 @@ import aicoder.agent as cli_agent
 from aicoder.setup import _is_token_expired, run_setup
 from aicoder.repl_input import COMMANDS, ReplInput
 from aicoder.ui import AgentSpinner
+from aicoder.privileges import assess_execution
+import aicoder.executor as executor
 
 
 def _unsigned_token(exp: int) -> str:
@@ -251,7 +253,7 @@ class SettingsRegressionTests(unittest.TestCase):
 
 class ReplRegressionTests(unittest.TestCase):
     def test_slash_completion_contains_runtime_controls(self):
-        for command in ("/clear", "/keys", "/status", "/model", "/exit"):
+        for command in ("/clear", "/keys", "/permissions", "/status", "/model", "/exit"):
             self.assertIn(command, COMMANDS)
 
     def test_basic_input_fallback_remains_usable(self):
@@ -309,6 +311,85 @@ class ReplRegressionTests(unittest.TestCase):
         self.assertEqual(client.chat.call_args.kwargs["model"], "ollama/fast")
         self.assertIsNone(client.chat.call_args.kwargs["fallback_model"])
         self.assertIsNone(client.chat.call_args.kwargs["tools"])
+
+
+class PrivilegeBrokerTests(unittest.TestCase):
+    def test_reads_do_not_need_approval(self):
+        risk = assess_execution("file_read", {"command": "cat README.md"})
+        self.assertFalse(risk.needs_approval)
+        self.assertEqual(risk.level, "read")
+
+    def test_file_creation_and_deletion_need_approval(self):
+        create = assess_execution("file_edit", {"command": "touch notes.txt"})
+        delete = assess_execution("local_exec", {"command": "rm notes.txt"})
+        self.assertTrue(create.needs_approval)
+        self.assertTrue(create.mutation)
+        self.assertTrue(delete.needs_approval)
+        self.assertTrue(delete.deletion)
+        self.assertEqual(delete.level, "high")
+
+    def test_sudo_request_preserves_reason_and_protected_scope(self):
+        risk = assess_execution("file_edit", {
+            "command": "printf enabled > /etc/aicoder.conf",
+            "sudo": True,
+            "reason": "Aktiviere die lokale Integration",
+        })
+        self.assertTrue(risk.elevation)
+        self.assertTrue(risk.sudo)
+        self.assertTrue(risk.protected_path)
+        self.assertEqual(risk.user_reason, "Aktiviere die lokale Integration")
+
+    def test_risky_local_tool_is_blocked_without_approval_callback(self):
+        with patch.object(executor.audit, "log_tool") as audit_log:
+            result, is_error = executor.run_tool(
+                MagicMock(), "file_edit", {"command": "touch new.txt"}
+            )
+        self.assertTrue(is_error)
+        self.assertIn("requires explicit approval", result)
+        audit_log.assert_called_once()
+
+    def test_sudo_redirect_runs_inside_elevated_shell(self):
+        completed = MagicMock(returncode=0, stdout="", stderr="")
+        with patch.object(executor.subprocess, "run", return_value=completed) as run:
+            result, is_error = executor.run_local_exec({
+                "command": "printf enabled > /etc/aicoder.conf",
+                "sudo": True,
+            })
+        self.assertFalse(is_error)
+        self.assertEqual(result, "(no output)")
+        self.assertEqual(
+            run.call_args.args[0],
+            ["sudo", "--", "sh", "-c", "printf enabled > /etc/aicoder.conf"],
+        )
+        self.assertFalse(run.call_args.kwargs["shell"])
+
+    def test_cli_sudo_approval_validates_locally_after_consent(self):
+        args = {
+            "command": "install -m 644 app.conf /etc/app.conf",
+            "sudo": True,
+            "reason": "Installiere die bestätigte Konfiguration",
+        }
+        with (
+            patch("builtins.input", return_value="j"),
+            patch.object(cli_agent, "validate_sudo_session", return_value=(True, "ok")) as validate,
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertTrue(cli_agent._cli_approval("file_edit", args))
+        validate.assert_called_once_with()
+
+    def test_cli_rejects_unexplained_elevation_request(self):
+        with (
+            patch("builtins.input") as prompt,
+            patch.object(cli_agent, "validate_sudo_session") as validate,
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            allowed = cli_agent._cli_approval(
+                "local_exec", {"command": "apt update", "sudo": True}
+            )
+        self.assertFalse(allowed)
+        prompt.assert_not_called()
+        validate.assert_not_called()
 
 
 if __name__ == "__main__":

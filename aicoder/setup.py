@@ -425,7 +425,7 @@ def run_repl(skip_setup: bool = False) -> int:
         current = get_state()
         active_model = current.get("selected_model") or "backend"
         mode = current.get("tool_mode", "on_demand")
-        return f"  {active_model} · tools:{mode} · swarm:{current.get('swarm_mode', 'off')}"
+        return f"  {active_model} · tools:{mode} · approvals:ask · swarm:{current.get('swarm_mode', 'off')}"
 
     repl_input = ReplInput(CONFIG_DIR / "history", _toolbar)
 
@@ -461,7 +461,7 @@ def run_repl(skip_setup: bool = False) -> int:
             print(f"  {dim('Enter send · Alt+Enter newline · Ctrl+C clear/cancel · Ctrl+R history · Tab commands')}")
         else:
             print(f"  {yellow('Basic input mode')} {dim('· install prompt-toolkit for multiline editing and safe repaint')}")
-        print(f"  {dim('/help commands · /keys shortcuts · /status runtime · /clear screen · /exit')}")
+        print(f"  {dim('/help commands · /keys shortcuts · /permissions policy · /clear screen · /exit')}")
         print(f"  {C.DIM}{rule}{C.RESET}")
 
     _print_repl_header()
@@ -534,6 +534,14 @@ def run_repl(skip_setup: bool = False) -> int:
                 print("  Ctrl+P/N     Vorige/nächste History")
                 print("  Ctrl+L       Terminal neu zeichnen")
                 print("  Tab          Slash-Kommandos vervollständigen")
+            elif cmd == "/permissions":
+                print("  Lokale Berechtigungsrichtlinie")
+                print("  read       automatisch · keine Änderung")
+                print("  write      jedes Erstellen/Ändern einzeln bestätigen")
+                print("  delete     hohe Warnstufe · jedes Löschen einzeln bestätigen")
+                print("  sudo       einzeln bestätigen + Authentifizierung direkt durch lokales sudo")
+                print("  password   wird nie von ai-coder gelesen, gespeichert oder an TriForce gesendet")
+                print("  GUI sudo   blockiert · erhöhte Rechte nur im interaktiven Terminal-REPL")
             elif cmd == "/shell":
                 if val:
                     import subprocess, time as _t
@@ -571,7 +579,7 @@ def run_repl(skip_setup: bool = False) -> int:
                     print(f"  Fehler: {e}")
             elif cmd == "/help":
                 print("  /model <n> · /fallback <n> · /swarm <m> · /models · /status")
-                print("  /shell <cmd> · /setup · /clear · /keys · /exit")
+                print("  /shell <cmd> · /setup · /clear · /keys · /permissions · /exit")
             else:
                 print(f"  Unbekannt: {cmd}  — /help für Hilfe")
             continue

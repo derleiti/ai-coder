@@ -20,6 +20,7 @@ from .executor import (
     FALLBACK_TOOLS as _FALLBACK_TOOLS, OS_NAME, OS_INSTRUCTIONS,
 )
 from .history import record as history_record
+from .privileges import assess_execution, format_request, validate_sudo_session
 from .session_state import get_state
 from .ui import (
     AgentSpinner, C,
@@ -30,19 +31,41 @@ from .ui import (
 
 
 def _cli_approval(tool_name: str, args: dict) -> bool:
-    """CLI approval: ask user for destructive commands, auto-approve safe ones."""
-    if tool_name != "local_exec":
-        return True
+    """Explain and approve one risky local action in the terminal.
+
+    Sudo authentication is intentionally delegated to the local TTY. Password
+    bytes never pass through ai-coder, its audit log, the model, or TriForce.
+    """
     cmd = args.get("command", "")
-    if not is_destructive(cmd):
-        return True  # Safe commands run without asking
-    print("\n⚠️  DESTRUCTIVE COMMAND DETECTED:", file=sys.stderr)
-    print(f"   {cmd}", file=sys.stderr)
+    risk = assess_execution(tool_name, args, destructive=is_destructive(cmd))
+    if not risk.needs_approval:
+        return True
+
+    if risk.elevation and not risk.user_reason:
+        print(
+            f"\n{C.BRED}✗ Privilegienanfrage abgelehnt:{C.RESET} "
+            "Das Modell muss einen konkreten Grund mitliefern.",
+            file=sys.stderr,
+        )
+        return False
+
+    print(f"\n{C.BYELLOW}{C.BOLD}◆ Lokale Freigabe erforderlich{C.RESET}", file=sys.stderr)
+    print(format_request(risk), file=sys.stderr)
     try:
-        confirm = input("Execute? [y/N] ").strip().lower()
+        confirm = input("  Einmal erlauben? [y/N] ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         confirm = "n"
-    return confirm == "y"
+    if confirm not in {"y", "yes", "j", "ja"}:
+        print("  Abgelehnt.", file=sys.stderr)
+        return False
+
+    if risk.sudo:
+        print("  sudo authentifiziert jetzt direkt im lokalen Terminal.", file=sys.stderr)
+        ok, message = validate_sudo_session()
+        color = C.BGREEN if ok else C.BRED
+        print(f"  {color}{message}{C.RESET}", file=sys.stderr)
+        return ok
+    return True
 
 
 def run_agent(
@@ -167,15 +190,40 @@ def run_agent(
             targs = call.get("arguments", {})
             print_tool_call(tname, targs, i)
 
-            with AgentSpinner(tname, tool=tname) as sp:
-                t_start = time.time()
-                tr, is_err = run_tool(
-                    client, tname, targs,
-                    approval_fn=_cli_approval,
-                    model=model_used,
-                    iteration=i,
-                )
-                t_elapsed = time.time() - t_start
+            risk = assess_execution(
+                tname, targs,
+                destructive=is_destructive(targs.get("command", "")),
+            )
+            if risk.needs_approval:
+                approved = _cli_approval(tname, targs)
+                if not approved:
+                    tr, is_err = run_tool(
+                        client, tname, targs,
+                        approval_fn=lambda _name, _args: False,
+                        model=model_used,
+                        iteration=i,
+                    )
+                    t_elapsed = 0.0
+                else:
+                    with AgentSpinner(tname, tool=tname):
+                        t_start = time.time()
+                        tr, is_err = run_tool(
+                            client, tname, targs,
+                            approval_fn=lambda _name, _args: True,
+                            model=model_used,
+                            iteration=i,
+                        )
+                        t_elapsed = time.time() - t_start
+            else:
+                with AgentSpinner(tname, tool=tname):
+                    t_start = time.time()
+                    tr, is_err = run_tool(
+                        client, tname, targs,
+                        approval_fn=_cli_approval,
+                        model=model_used,
+                        iteration=i,
+                    )
+                    t_elapsed = time.time() - t_start
 
             print_tool_result(tname, tr, t_elapsed, error=is_err)
             tool_results.append(f"Tool {tname} result:\n{tr}")

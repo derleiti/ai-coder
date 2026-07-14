@@ -23,6 +23,7 @@ from PyQt6.QtGui import (
 )
 
 from ..config import load_session
+from ..privileges import assess_execution, format_request
 from ..session_state import get_state
 from ..client import TriForceClient, ClientError
 from .. import chat_history
@@ -39,7 +40,7 @@ class _AgentWorker(QThread):
     finished = pyqtSignal(str, str)           # (final_text, model)
     error = pyqtSignal(str)
     messages_updated = pyqtSignal(list)
-    approval_needed = pyqtSignal(str, str)    # (tool_name, command_preview)
+    approval_needed = pyqtSignal(str, str, bool, str)  # tool, command, elevation, reason
 
     def __init__(
         self, client, messages_array, model, fallback, tools, system_prompt,
@@ -70,12 +71,13 @@ class _AgentWorker(QThread):
         self._approval_event.set()
 
     def _gui_approval(self, tool_name: str, args: dict) -> bool:
-        """Approval callback for local_exec — blocks until user decides or stop."""
+        """Approval callback for risky writes; elevation stays terminal-only."""
         cmd = args.get("command", "")
+        risk = assess_execution(tool_name, args, destructive=is_destructive(cmd))
         # Emit signal to main thread, then wait
         self._approval_event.clear()
         self._approval_result = False
-        self.approval_needed.emit(tool_name, cmd)
+        self.approval_needed.emit(tool_name, cmd, risk.elevation, risk.user_reason)
         # Poll every 2s so stop() is respected during pending approval
         for _ in range(60):  # max 120s total
             if self._approval_event.wait(timeout=2):
@@ -578,17 +580,29 @@ class ChatWidget(QWidget):
             self._activity_label = "stopping safely"
             self._append_msg("system", "Stop requested...", "")
 
-    def _on_approval_needed(self, tool_name: str, command: str):
+    def _on_approval_needed(self, tool_name: str, command: str, elevation: bool, reason: str):
         """Show modal dialog for command approval (main thread)."""
         preview = command if len(command) <= 300 else command[:300] + "…"
-        destructive = is_destructive(command)
-        title = "⚠️ Destructive Command" if destructive else "local_exec"
-        msg = (
-            f"The agent wants to run the following command locally:\n\n"
-            f"{preview}\n\n"
-            f"{'⚠️ WARNING: Potentially destructive!' if destructive else ''}\n"
-            f"Execute?"
-        )
+        args = {"command": command}
+        if elevation:
+            args["sudo"] = True
+        if reason:
+            args["reason"] = reason
+        risk = assess_execution(tool_name, args, destructive=is_destructive(command))
+        if risk.elevation:
+            QMessageBox.warning(
+                self,
+                "Terminal authorization required",
+                format_request(risk) +
+                "\n\nErhöhte Rechte sind nur im interaktiven `aicoder agent`-REPL erlaubt. "
+                "Dadurch bleibt das sudo-Passwort vollständig im lokalen Terminal.",
+            )
+            if self._worker:
+                self._worker.set_approval(False)
+            return
+
+        title = "Delete local files?" if risk.deletion else "Allow local write?"
+        msg = format_request(risk) + "\n\nEinmal ausführen?"
         reply = QMessageBox.question(
             self, title, msg,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,

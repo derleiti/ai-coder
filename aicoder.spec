@@ -20,6 +20,7 @@ a = Analysis(
         'aicoder.agent',
         'aicoder.setup',
         'aicoder.repl_input',
+        'aicoder.privileges',
         'aicoder.ui',
         'aicoder.gui',
         'aicoder.gui.app',
