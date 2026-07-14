@@ -1,3 +1,19 @@
+## v0.9.0 — Reliable Agent Runtime + Privilege Broker (2026-07-15)
+
+### Agent Runtime
+- Persistent REPL conversation context across follow-up prompts.
+- Progress-aware long-running agent loop with checkpoints, stagnation detection,
+  automatic fallback switching, and no fixed 30-step interruption.
+- Provider-compatible native and text tool-call normalization.
+- Correct local `~` path expansion without weakening `shell=False` execution.
+
+### Security and UX
+- Explicit local approval broker for writes, deletion, protected paths, and sudo.
+- Password handling remains entirely inside the operating system's sudo/Polkit flow.
+- Prompt-Toolkit REPL with multiline input, history, safe repaint, and `/new`.
+- Improved PyQt6 GUI tool selection, model controls, and agent status feedback.
+
+
 ## v0.8.0 — Desktop Integration + Web + History (2026-04-13)
 
 ### New Features
