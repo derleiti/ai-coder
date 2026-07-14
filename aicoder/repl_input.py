@@ -9,6 +9,19 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable
 
+try:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.completion import WordCompleter
+    from prompt_toolkit.formatted_text import ANSI
+    from prompt_toolkit.history import FileHistory, InMemoryHistory
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.patch_stdout import patch_stdout
+    from prompt_toolkit.styles import Style
+except (ImportError, OSError):
+    # Keep the basic ``input`` fallback usable when prompt_toolkit is missing
+    # or its package metadata cannot be read in a restricted environment.
+    PromptSession = None
+
 
 COMMANDS = [
     "/clear", "/exit", "/fallback", "/help", "/keys", "/model",
@@ -30,15 +43,7 @@ class ReplInput:
         self._toolbar = toolbar
         self.persistent_history = False
 
-        try:
-            from prompt_toolkit import PromptSession
-            from prompt_toolkit.completion import WordCompleter
-            from prompt_toolkit.formatted_text import ANSI
-            from prompt_toolkit.history import FileHistory, InMemoryHistory
-            from prompt_toolkit.key_binding import KeyBindings
-            from prompt_toolkit.patch_stdout import patch_stdout
-            from prompt_toolkit.styles import Style
-        except ImportError:
+        if PromptSession is None:
             return
 
         bindings = KeyBindings()
