@@ -79,6 +79,23 @@ class MainWindow(QMainWindow):
                 border-radius: 4px;
                 padding: 6px 10px;
             }
+            QSpinBox {
+                background: #111;
+                color: #fff;
+                border: 1px solid #444;
+                border-radius: 4px;
+                padding: 5px 8px;
+            }
+            QListWidget {
+                background: #0a0a1a;
+                alternate-background-color: #111122;
+                color: #ccc;
+                border: 1px solid #444;
+                border-radius: 4px;
+                padding: 3px;
+            }
+            QListWidget::item { padding: 4px 6px; }
+            QListWidget::item:selected { background: #1a3a5e; color: #fff; }
             QPushButton {
                 background: #1a1a2e;
                 color: #ccc;

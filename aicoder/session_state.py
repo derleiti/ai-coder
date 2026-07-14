@@ -8,12 +8,19 @@ from .config import CONFIG_DIR
 STATE_FILE = CONFIG_DIR / "state.json"
 
 SWARM_MODES = {"off", "auto", "on", "review"}
+TOOL_MODES = {"off", "on_demand", "always"}
+DEFAULT_FALLBACK_MODEL = "ollama/llama3.2:latest"
 
 _DEFAULTS: Dict[str, Any] = {
     "selected_model": None,
-    "fallback_model": None,
+    "fallback_model": DEFAULT_FALLBACK_MODEL,
     "swarm_mode": "off",
     "workspace_root": None,
+    # on_demand skips tool discovery for greetings/small talk, but keeps the
+    # full agent available for actual work.  None means "all discovered tools".
+    "tool_mode": "on_demand",
+    "enabled_tools": None,
+    "request_timeout": 30,
 }
 
 # In-memory cache — vermeidet wiederholte Disk-Reads im Agent-Loop
@@ -31,6 +38,10 @@ def _load_raw() -> Dict[str, Any]:
             return dict(_cache)
         try:
             data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            # Migrate the old "unset" null value. An explicit empty string
+            # still means that the user intentionally disabled fallback.
+            if data.get("fallback_model") is None:
+                data["fallback_model"] = DEFAULT_FALLBACK_MODEL
             _cache = {**_DEFAULTS, **data}
             return dict(_cache)
         except Exception:
@@ -60,6 +71,27 @@ def set_model(model: str) -> None:
 def set_fallback(model: str) -> None:
     d = _load_raw()
     d["fallback_model"] = model
+    _save_raw(d)
+
+
+def set_tool_mode(mode: str) -> None:
+    if mode not in TOOL_MODES:
+        raise ValueError(f"Ungültiger Tool-Modus '{mode}'. Erlaubt: {', '.join(sorted(TOOL_MODES))}")
+    d = _load_raw()
+    d["tool_mode"] = mode
+    _save_raw(d)
+
+
+def set_enabled_tools(names: Optional[list[str]]) -> None:
+    """Persist selected tool names. None means all discovered tools."""
+    d = _load_raw()
+    d["enabled_tools"] = None if names is None else sorted(set(names))
+    _save_raw(d)
+
+
+def set_request_timeout(seconds: int) -> None:
+    d = _load_raw()
+    d["request_timeout"] = max(10, min(180, int(seconds)))
     _save_raw(d)
 
 

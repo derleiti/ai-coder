@@ -189,8 +189,14 @@ class TriForceClient:
                 return json.loads(raw) if raw else {}
             except (TokenExpiredError, ClientError):
                 raise
-            except Exception:
-                pass  # Fall through to urlopen
+            except Exception as e:
+                # urllib3 already performed the request. Falling through to
+                # urlopen here sends it a second time and can double the wait
+                # after a read timeout.
+                label = f" [{_label}]" if _label else ""
+                raise ClientError(
+                    f"Verbindung/Timeout nach {self.timeout}s{label} bei {url}: {e}"
+                ) from e
 
         # Fallback: plain urlopen (no pool)
         req = Request(url=url, data=data, headers=headers, method=method.upper())
@@ -299,7 +305,7 @@ class TriForceClient:
         try:
             return self._request(
                 "POST", "/v1/client/chat", payload, require_auth=True,
-                _label=f"chat/{model or 'default'}"
+                _label=f"chat/{model or 'default'}", _retries=0,
             )
         except ClientError as e:
             if fallback_model and fallback_model != model:
@@ -308,6 +314,6 @@ class TriForceClient:
                 payload["model"] = fallback_model
                 return self._request(
                     "POST", "/v1/client/chat", payload, require_auth=True,
-                    _label=f"chat/{fallback_model}(fallback)"
+                    _label=f"chat/{fallback_model}(fallback)", _retries=0,
                 )
             raise

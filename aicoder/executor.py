@@ -45,6 +45,18 @@ FUNCTION_RE = re.compile(
 )
 FENCED_JSON_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
 
+_SIMPLE_CHAT_RE = re.compile(
+    r"^(?:hi|hallo|hello|hey|moin|servus|guten\s+(?:morgen|tag|abend)|"
+    r"wie\s+geht(?:'s|\s+es)?|danke|dankesch[oö]n|thanks|thank\s+you)"
+    r"[\s!?.:,;👋🙂😊]*$",
+    re.IGNORECASE,
+)
+
+
+def is_simple_chat_message(text: str) -> bool:
+    """True only for greetings/thanks that never need project tools."""
+    return bool(_SIMPLE_CHAT_RE.fullmatch((text or "").strip()))
+
 # Destructive patterns for local_exec approval
 DESTRUCTIVE_PATTERNS = [
     # Linux/Mac destructive

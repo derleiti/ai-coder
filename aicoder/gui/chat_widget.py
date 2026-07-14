@@ -27,7 +27,7 @@ from .. import chat_history
 from ..executor import (
     load_tools, build_system_prompt, build_tool_desc,
     parse_tool_calls, strip_tool_calls, trim_messages, run_tool,
-    is_destructive, MAX_ITERATIONS,
+    is_destructive, is_simple_chat_message, MAX_ITERATIONS,
 )
 
 
@@ -39,7 +39,10 @@ class _AgentWorker(QThread):
     messages_updated = pyqtSignal(list)
     approval_needed = pyqtSignal(str, str)    # (tool_name, command_preview)
 
-    def __init__(self, client, messages_array, model, fallback, tools, system_prompt):
+    def __init__(
+        self, client, messages_array, model, fallback, tools, system_prompt,
+        load_tools_on_start=True, enabled_tool_names=None, quick_chat=False,
+    ):
         super().__init__()
         self.client = client
         self.messages = list(messages_array)
@@ -47,6 +50,9 @@ class _AgentWorker(QThread):
         self.fallback = fallback
         self.tools = tools
         self.system = system_prompt
+        self.load_tools_on_start = load_tools_on_start
+        self.enabled_tool_names = enabled_tool_names
+        self.quick_chat = quick_chat
         # Approval mechanism: threading.Event + result flag
         self._approval_event = threading.Event()
         self._approval_result = False
@@ -81,10 +87,14 @@ class _AgentWorker(QThread):
         model_used = self.model or "default"
         MAX_CTX = 30
 
-        # Load tools in background thread (not GUI thread)
-        if not self.tools:
+        # None means undiscovered; [] is an intentional no-tools run.
+        if self.load_tools_on_start and self.tools is None:
             try:
+                tool_started = time.monotonic()
                 self.tools = load_tools(self.client)
+                if self.enabled_tool_names is not None:
+                    enabled = set(self.enabled_tool_names)
+                    self.tools = [tool for tool in self.tools if tool.get("name") in enabled]
                 from ..session_state import get_state
                 state = get_state()
                 self.system = build_system_prompt(
@@ -93,7 +103,8 @@ class _AgentWorker(QThread):
                 )
                 if messages and messages[0].get("role") == "system":
                     messages[0]["content"] = self.system
-                self.msg.emit("system", f"{len(self.tools)} tools loaded", "")
+                elapsed = time.monotonic() - tool_started
+                self.msg.emit("system", f"{len(self.tools)} tools ready in {elapsed:.2f}s", "")
             except Exception as e:
                 self.msg.emit("error", f"Tool-Loading: {e}", "")
                 self.tools = []
@@ -102,6 +113,14 @@ class _AgentWorker(QThread):
                     "INIT: current_time pruefen, memory_search, dann handeln. "
                     "Lesen vor Schreiben. Diagnose vor Patch. Kleinste Aenderung zuerst. Sprache: Deutsch."
                 )
+        elif self.tools is None:
+            self.tools = []
+
+        if not self.system:
+            from ..session_state import get_state
+            self.system = build_system_prompt(self.tools, get_state().get("workspace_root"))
+        if messages and messages[0].get("role") == "system":
+            messages[0]["content"] = self.system
 
         for i in range(MAX_ITERATIONS):
             if self._stopped:
@@ -111,12 +130,13 @@ class _AgentWorker(QThread):
             messages = trim_messages(messages)
 
             try:
+                model_started = time.monotonic()
                 result = self.client.chat(
                     messages=messages,
                     model=self.model or None,
                     fallback_model=self.fallback or None,
                     temperature=0.3,
-                    max_tokens=4096,
+                    max_tokens=256 if self.quick_chat else 4096,
                 )
             except (ClientError, Exception) as e:
                 self.error.emit(str(e))
@@ -124,6 +144,10 @@ class _AgentWorker(QThread):
 
             response = result.get("response", "").strip()
             model_used = result.get("model", self.model or "default")
+            model_elapsed = time.monotonic() - model_started
+            requested = self.model or "default"
+            route = model_used if model_used == requested else f"{requested} → {model_used}"
+            self.msg.emit("system", f"Model response in {model_elapsed:.1f}s", route)
 
             calls = parse_tool_calls(response)
             visible = strip_tool_calls(response)
@@ -139,6 +163,7 @@ class _AgentWorker(QThread):
 
             # Tool execution
             tool_results = []
+            allowed_tools = {tool.get("name") for tool in self.tools}
             for call in calls:
                 if self._stopped:
                     self.messages_updated.emit(messages)
@@ -148,6 +173,12 @@ class _AgentWorker(QThread):
                 tname = call.get("name", "?")
                 targs = call.get("arguments", {})
                 self.msg.emit("tool", f">> {tname}({json.dumps(targs, ensure_ascii=False)[:200]})", "")
+
+                if tname not in allowed_tools:
+                    tr = f"Tool '{tname}' is disabled for this run. Enable it in Settings > Tools."
+                    self.msg.emit("tool_result", tr, f"{tname} BLOCKED")
+                    tool_results.append(f"Tool {tname} result:\n{tr}")
+                    continue
 
                 t0 = time.time()
                 tr, is_err = run_tool(
@@ -175,6 +206,13 @@ class _AgentWorker(QThread):
         self.finished.emit(f"(Max {MAX_ITERATIONS} iterations)\n{visible or response}", model_used)
 
 
+def _select_chat_route(model: str, fallback: str, quick_chat: bool):
+    """Use the configured fast fallback directly for greetings."""
+    if quick_chat and fallback and fallback != model:
+        return fallback, "", True
+    return model, fallback, False
+
+
 class ChatWidget(QWidget):
     def __init__(self, settings_ref=None, parent=None):
         super().__init__(parent)
@@ -194,6 +232,13 @@ class ChatWidget(QWidget):
                 self.settings_ref.models_loaded.connect(self._on_models_updated)
             if hasattr(self.settings_ref, "selection_changed"):
                 self.settings_ref.selection_changed.connect(self._on_settings_selection_changed)
+            if hasattr(self.settings_ref, "tools_changed"):
+                self.settings_ref.tools_changed.connect(self._on_tools_changed)
+
+    def _on_tools_changed(self, _mode: str, _names):
+        """Invalidate the filtered cache after a settings change."""
+        self._tools = None
+        self._system = None
 
     def _on_models_updated(self, models: list):
         """Update model dropdowns with list from backend."""
@@ -562,16 +607,16 @@ class ChatWidget(QWidget):
 
         try:
             session = load_session()
-            client = TriForceClient(session.base_url, token=session.token, timeout=120)
+            state = get_state()
+            timeout = int(state.get("request_timeout", 30))
+            if self.settings_ref and hasattr(self.settings_ref, "get_request_timeout"):
+                timeout = self.settings_ref.get_request_timeout()
+            client = TriForceClient(session.base_url, token=session.token, timeout=timeout)
         except Exception as e:
             self._append_msg("error", f"Keine Session: {e}")
             self.send_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
             return
-
-        # Tools loaded lazily in worker thread (not here — would block GUI)
-        if self._tools is None:
-            self._append_msg("system", "Loading MCP tools...", "")
 
         # Priority: combo box > settings tab > state file
         model = self.model_combo.currentText().strip()
@@ -586,8 +631,32 @@ class ChatWidget(QWidget):
         if not fallback:
             fallback = state.get("fallback_model", "")
 
+        quick_chat = is_simple_chat_message(text)
+        model, fallback, fast_fallback = _select_chat_route(model, fallback, quick_chat)
+        if fast_fallback:
+            self._append_msg("system", f"Fast chat model · {model}", "")
+        tool_mode = state.get("tool_mode", "on_demand")
+        enabled_tool_names = state.get("enabled_tools")
+        if self.settings_ref and hasattr(self.settings_ref, "get_tool_mode"):
+            tool_mode = self.settings_ref.get_tool_mode()
+            enabled_tool_names = self.settings_ref.get_enabled_tool_names()
+        should_load_tools = (
+            tool_mode == "always"
+            or (tool_mode == "on_demand" and not quick_chat)
+        ) and enabled_tool_names != []
+
+        if should_load_tools and self._tools is None:
+            self._append_msg("system", "Loading selected tools on demand...", "")
+        elif quick_chat and tool_mode != "always":
+            self._append_msg("system", "Fast chat · tools skipped", "")
+
+        run_tools = self._tools if should_load_tools else []
+        run_system = self._system if should_load_tools else build_system_prompt(
+            [], state.get("workspace_root")
+        )
+
         if not self._messages:
-            self._messages = [{"role": "system", "content": self._system}]
+            self._messages = [{"role": "system", "content": run_system}]
 
         # Attach dropped files as context
         user_content = text
@@ -606,7 +675,12 @@ class ChatWidget(QWidget):
             self._session_id = chat_history.create_session(title=title)
         chat_history.save_message(self._session_id, "user", text)
 
-        self._worker = _AgentWorker(client, self._messages, model, fallback, self._tools or [], self._system or "")
+        self._worker = _AgentWorker(
+            client, self._messages, model, fallback, run_tools, run_system,
+            load_tools_on_start=should_load_tools,
+            enabled_tool_names=enabled_tool_names,
+            quick_chat=quick_chat,
+        )
         self._worker.msg.connect(self._on_agent_msg)
         self._worker.finished.connect(self._on_response)
         self._worker.messages_updated.connect(self._on_messages_updated)
@@ -619,7 +693,7 @@ class ChatWidget(QWidget):
 
     def _on_response(self, text: str, model_used: str):
         # Cache tools loaded by worker for next message
-        if self._worker and self._worker.tools:
+        if self._worker and self._worker.load_tools_on_start and self._worker.tools is not None:
             self._tools = self._worker.tools
             self._system = self._worker.system
         self._append_msg("assistant", text, model_used)
