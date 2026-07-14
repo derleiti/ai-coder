@@ -1,10 +1,14 @@
 """Hauptfenster fuer ai-coder GUI — Tabs: Chat + Settings."""
 from __future__ import annotations
-from PyQt6.QtWidgets import QMainWindow, QTabWidget
+from PyQt6.QtWidgets import (
+    QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame,
+)
 from PyQt6.QtCore import Qt, QSize
+from PyQt6.QtGui import QKeySequence, QShortcut
 
 from .chat_widget import ChatWidget
 from .settings_widget import SettingsWidget
+from .theme import APP_STYLESHEET
 
 
 class MainWindow(QMainWindow):
@@ -12,99 +16,53 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.tray = None  # wird von app.py gesetzt
         self.setWindowTitle("ai-coder")
-        self.setMinimumSize(QSize(600, 450))
-        self.resize(800, 600)
+        self.setMinimumSize(QSize(720, 540))
+        self.resize(940, 720)
 
         self._apply_style()
 
-        # Tabs
+        root = QWidget()
+        root.setObjectName("AppRoot")
+        root_layout = QVBoxLayout(root)
+        root_layout.setContentsMargins(14, 12, 14, 14)
+        root_layout.setSpacing(10)
+
+        top_bar = QFrame()
+        top_bar.setObjectName("TopBar")
+        top_layout = QHBoxLayout(top_bar)
+        top_layout.setContentsMargins(14, 8, 14, 8)
+        mark = QLabel(">_")
+        mark.setObjectName("BrandMark")
+        brand = QLabel("ai-coder")
+        brand.setObjectName("Brand")
+        caption = QLabel("AILinux coding agent")
+        caption.setObjectName("Caption")
+        shortcut_hint = QLabel("Ctrl+1 Chat   Ctrl+2 Settings   Ctrl+K Prompt")
+        shortcut_hint.setObjectName("Caption")
+        top_layout.addWidget(mark)
+        top_layout.addWidget(brand)
+        top_layout.addWidget(caption)
+        top_layout.addStretch()
+        top_layout.addWidget(shortcut_hint)
+        root_layout.addWidget(top_bar)
+
         self.tabs = QTabWidget()
         self.settings_tab = SettingsWidget()
         self.chat_tab = ChatWidget(settings_ref=self.settings_tab)
 
         self.tabs.addTab(self.chat_tab, "Chat")
         self.tabs.addTab(self.settings_tab, "Settings")
+        root_layout.addWidget(self.tabs, stretch=1)
+        self.setCentralWidget(root)
 
-        self.setCentralWidget(self.tabs)
+        self._shortcuts = [
+            QShortcut(QKeySequence("Ctrl+1"), self, activated=lambda: self.tabs.setCurrentIndex(0)),
+            QShortcut(QKeySequence("Ctrl+2"), self, activated=lambda: self.tabs.setCurrentIndex(1)),
+            QShortcut(QKeySequence("Ctrl+,"), self, activated=lambda: self.tabs.setCurrentIndex(1)),
+        ]
 
     def _apply_style(self):
-        self.setStyleSheet("""
-            QMainWindow { background: #0d0d1a; }
-            QTabWidget::pane {
-                border: 1px solid #333;
-                background: #0d0d1a;
-            }
-            QTabBar::tab {
-                background: #1a1a2e;
-                color: #aaa;
-                padding: 8px 20px;
-                border: 1px solid #333;
-                border-bottom: none;
-                border-top-left-radius: 4px;
-                border-top-right-radius: 4px;
-                margin-right: 2px;
-            }
-            QTabBar::tab:selected {
-                background: #0d0d1a;
-                color: #00d4ff;
-                border-bottom: 2px solid #00d4ff;
-            }
-            QTabBar::tab:hover { color: #fff; }
-            QGroupBox {
-                color: #ccc;
-                border: 1px solid #333;
-                border-radius: 6px;
-                margin-top: 12px;
-                padding-top: 16px;
-                font-weight: bold;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 12px;
-                padding: 0 6px;
-            }
-            QLabel { color: #ccc; }
-            QLineEdit {
-                background: #111;
-                color: #fff;
-                border: 1px solid #444;
-                border-radius: 4px;
-                padding: 6px 10px;
-            }
-            QLineEdit:focus { border-color: #00d4ff; }
-            QComboBox {
-                background: #111;
-                color: #fff;
-                border: 1px solid #444;
-                border-radius: 4px;
-                padding: 6px 10px;
-            }
-            QSpinBox {
-                background: #111;
-                color: #fff;
-                border: 1px solid #444;
-                border-radius: 4px;
-                padding: 5px 8px;
-            }
-            QListWidget {
-                background: #0a0a1a;
-                alternate-background-color: #111122;
-                color: #ccc;
-                border: 1px solid #444;
-                border-radius: 4px;
-                padding: 3px;
-            }
-            QListWidget::item { padding: 4px 6px; }
-            QListWidget::item:selected { background: #1a3a5e; color: #fff; }
-            QPushButton {
-                background: #1a1a2e;
-                color: #ccc;
-                border: 1px solid #444;
-                border-radius: 4px;
-                padding: 6px 16px;
-            }
-            QPushButton:hover { background: #252545; color: #fff; }
-        """)
+        self.setStyleSheet(APP_STYLESHEET)
 
     def closeEvent(self, event):
         """Minimize to tray statt schliessen."""

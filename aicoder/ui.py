@@ -10,7 +10,25 @@ import shutil
 import sys
 import threading
 import time
+import re
 from typing import Any
+
+_OUTPUT_LOCK = threading.RLock()
+_CLEAR_LINE = "\r\033[2K"
+
+
+def _visible_len(value: str) -> int:
+    return len(re.sub(r"\033\[[0-9;]*m", "", value))
+
+
+def reset_live_line(file=None) -> None:
+    """Clear only the active terminal row, never previously printed output."""
+    stream = file or sys.stderr
+    if not getattr(stream, "isatty", lambda: False)():
+        return
+    with _OUTPUT_LOCK:
+        stream.write(_CLEAR_LINE)
+        stream.flush()
 
 # ── Terminal-Breite ──────────────────────────────────────────────────────────
 
@@ -93,30 +111,40 @@ def _spinner_for(tool_name: str) -> tuple[str, str]:
 
 
 class AgentSpinner:
-    """Styled spinner running on stderr."""
-    def __init__(self, label: str, tool: str = "", color: str = C.CYAN):
+    """Cursor-safe single-line spinner.
+
+    Animation is disabled for redirected output.  The old implementation used
+    width-sized runs of spaces and independent carriage returns; after a line
+    wrap those could jump into already printed content.
+    """
+    def __init__(self, label: str, tool: str = "", color: str = C.CYAN, file=None):
         self.label = label
         self.color = color
+        self.file = file or sys.stderr
         cycle, col = _spinner_for(tool) if tool else (BRAILLE_CYCLE, color)
         self._cycle = cycle
         self._col   = col
         self._stop  = threading.Event()
         self._t     = None
         self._start = time.time()
+        self.elapsed = 0.0
+        self._animated = False
 
     def __enter__(self):
-        self._t = threading.Thread(target=self._run, daemon=True)
-        self._t.start()
+        self._animated = bool(getattr(self.file, "isatty", lambda: False)())
+        if self._animated:
+            self._t = threading.Thread(target=self._run, daemon=True)
+            self._t.start()
         return self
 
     def __exit__(self, *_):
         self._stop.set()
         if self._t:
             self._t.join(timeout=1)
-        elapsed = time.time() - self._start
-        sys.stderr.write(f"\r{' ' * (term_width()-1)}\r")
-        sys.stderr.flush()
-        return elapsed
+        self.elapsed = time.time() - self._start
+        if self._animated:
+            reset_live_line(self.file)
+        return False
 
     def _run(self):
         for ch in itertools.cycle(self._cycle):
@@ -124,12 +152,16 @@ class AgentSpinner:
                 break
             elapsed = time.time() - self._start
             line = (
-                f"\r  {self._col}{ch}{C.RESET} "
+                f"  {self._col}{ch}{C.RESET} "
                 f"{dim(self.label)} "
                 f"{C.DIM}{elapsed:.1f}s{C.RESET}"
             )
-            sys.stderr.write(line)
-            sys.stderr.flush()
+            available = max(12, term_width() - 1)
+            if _visible_len(line) > available:
+                line = line[:max(1, available - 1)] + "…"
+            with _OUTPUT_LOCK:
+                self.file.write(_CLEAR_LINE + line)
+                self.file.flush()
             time.sleep(0.08)
 
 
@@ -206,13 +238,18 @@ def panel(
 
 # ── Spezialisierte Print-Funktionen ──────────────────────────────────────────
 
-def print_header(model: str, fallback: str, tools: int, workspace: str, iteration: int = 0) -> None:
+def print_header(model: str, fallback: str, tools: int, workspace: str,
+                 iteration: int = 0, tool_mode: str = "on_demand",
+                 timeout: int | None = None) -> None:
     w = min(term_width(), 100)
     print()
-    print(f"  {C.BOLD}{C.BCYAN}◆ ai-coder{C.RESET}  "
-          f"{dim('model='+ model)}  "
-          f"{dim('tools='+str(tools))}  "
-          f"{dim('ws='+workspace)}")
+    print(f"  {C.BOLD}{C.BCYAN}◆ ai-coder{C.RESET}  {dim('agent run')}")
+    print(f"  {C.DIM}{'─' * (w-4)}{C.RESET}")
+    print(f"  {dim('model   ')} {cyan(model)}")
+    print(f"  {dim('fallback')} {dim(fallback or '—')}  "
+          f"{dim('tools')} {cyan(str(tools))} {dim('('+tool_mode+')')}  "
+          f"{dim('timeout')} {dim(str(timeout)+'s') if timeout else dim('—')}")
+    print(f"  {dim('workspace')} {dim(workspace)}")
     print(f"  {C.DIM}{'─' * (w-4)}{C.RESET}")
 
 
@@ -315,8 +352,10 @@ def print_final(response: str, model: str, latency_ms: Any, total_iters: int,
         else:
             print(f"  {line}")
     print()
-    print(f"  {C.DIM}{'─'*50}{C.RESET}")
-    print(f"  {dim(model)}  {dim('steps='+str(total_iters))}")
+    width = max(20, min(term_width() - 4, 96))
+    print(f"  {C.DIM}{'─'*width}{C.RESET}")
+    print(f"  {dim(model)}  {dim('steps='+str(total_iters))}  "
+          f"{dim('latency='+str(latency_ms)+'ms') if latency_ms else ''}")
     print()
 
 

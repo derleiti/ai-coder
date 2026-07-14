@@ -14,6 +14,7 @@ from .executor import (
     MAX_ITERATIONS,
     is_destructive, load_tools, build_system_prompt,
     normalize_tool_calls, parse_tool_calls, strip_tool_calls, trim_messages, run_tool,
+    is_simple_chat_message,
     # Re-export for backwards compat (GUI imports these)
     AGENT_TOOLS, LOCAL_EXEC_SCHEMA, SYSTEM_TEMPLATE as SYSTEM,
     FALLBACK_TOOLS as _FALLBACK_TOOLS, OS_NAME, OS_INSTRUCTIONS,
@@ -52,21 +53,45 @@ def run_agent(
 ) -> int:
     session = load_session()
     state = get_state()
-    client = TriForceClient(session.base_url, token=session.token, timeout=120)
+    request_timeout = int(state.get("request_timeout", 30))
+    client = TriForceClient(session.base_url, token=session.token, timeout=request_timeout)
     ws_path = Path(state.get("workspace_root") or ".").resolve()
 
-    # Load tools
-    with AgentSpinner("loading tools", color=C.DIM):
-        tools = load_tools(client)
+    # A greeting must not pay for MCP discovery.  REPL and GUI now use the same
+    # on-demand policy and the same enabled-tools selection from Settings.
+    quick_chat = is_simple_chat_message(initial_prompt)
+    tool_mode = state.get("tool_mode", "on_demand")
+    enabled_tool_names = state.get("enabled_tools")
+    should_load_tools = (
+        tool_mode == "always"
+        or (tool_mode == "on_demand" and not quick_chat)
+    ) and enabled_tool_names != []
+
+    tools = []
+    if should_load_tools:
+        with AgentSpinner("discovering selected tools", color=C.DIM):
+            tools = load_tools(client)
+        if enabled_tool_names is not None:
+            enabled = set(enabled_tool_names)
+            tools = [tool for tool in tools if tool.get("name") in enabled]
+
+    effective_model = model
+    effective_fallback = fallback_model
+    fast_route = quick_chat and fallback_model and fallback_model != model
+    if fast_route:
+        effective_model = fallback_model
+        effective_fallback = None
 
     system = build_system_prompt(tools, str(ws_path))
 
     # Header
     print_header(
-        model=model or "backend-default",
-        fallback=fallback_model or "",
+        model=effective_model or "backend-default",
+        fallback=effective_fallback or "",
         tools=len(tools),
         workspace=ws_path.name,
+        tool_mode="skipped (fast chat)" if not should_load_tools and quick_chat else tool_mode,
+        timeout=request_timeout,
     )
     print_task(initial_prompt)
 
@@ -74,7 +99,7 @@ def run_agent(
     messages: list[dict] = [{"role": "system", "content": system}]
     current_input = initial_prompt
     full_response = ""
-    model_used = model or "?"
+    model_used = effective_model or "?"
     total_latency = 0
     fallback_used = False
 
@@ -89,11 +114,11 @@ def run_agent(
             try:
                 result = client.chat(
                     messages=messages,
-                    model=model,
-                    fallback_model=fallback_model,
+                    model=effective_model,
+                    fallback_model=effective_fallback,
                     temperature=0.3,
-                    max_tokens=4096,
-                    tools=tools,
+                    max_tokens=256 if quick_chat else 4096,
+                    tools=tools if should_load_tools else None,
                     tool_choice="auto",
                 )
             except (ClientError, RuntimeError) as e:
@@ -102,7 +127,7 @@ def run_agent(
             llm_ms = int((time.time() - t0) * 1000)
 
         response = result.get("response", "").strip()
-        model_used = result.get("model", model or "?")
+        model_used = result.get("model", effective_model or "?")
         lat = result.get("latency_ms") or llm_ms
         total_latency += lat
         if result.get("fallback_used"):

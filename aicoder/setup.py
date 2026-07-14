@@ -20,7 +20,8 @@ from .session_state import (
     SWARM_MODES, get_state,
     set_fallback, set_model, set_swarm, set_workspace,
 )
-from .ui import C, bold, dim, cyan, green, yellow, red, magenta, white, panel, term_width
+from .ui import C, bold, dim, cyan, green, yellow, red, magenta, white, panel, term_width, reset_live_line
+from .repl_input import COMMANDS, PromptCancelled, ReplInput
 
 
 
@@ -388,8 +389,7 @@ def _setup_readline():
         pass
 
     # Tab-Completion fuer Slash-Kommandos
-    _commands = ["/model", "/fallback", "/swarm", "/status", "/shell",
-                 "/setup", "/exit", "/quit", "/help", "/models"]
+    _commands = COMMANDS
 
     def _completer(text, state):
         if text.startswith("/"):
@@ -421,25 +421,64 @@ def run_repl(skip_setup: bool = False) -> int:
     swarm    = state.get("swarm_mode","off")
     ws       = state.get("workspace_root") or str(Path.cwd())
 
-    w = min(term_width(), 80)
-    print()
-    print(f"  {C.BOLD}{C.BCYAN}◆ ai-coder{C.RESET}  {C.DIM}Agent REPL{C.RESET}")
-    print(f"  {C.DIM}{'─' * (w-4)}{C.RESET}")
-    print(f"  {dim('model    ')} {cyan(model or '(backend default)')}")
-    print(f"  {dim('fallback ')} {dim(fallback or '—')}")
-    print(f"  {dim('swarm    ')} {dim(swarm)}")
-    print(f"  {dim('workspace')} {dim(ws)}")
-    print(f"  {C.DIM}{'─' * (w-4)}{C.RESET}")
-    print(f"  {dim('/model <n>  /fallback <n>  /swarm <m>  /models  /shell <cmd>  /exit')}")
-    print(f"  {dim('Aufgabe eingeben → Agent führt sie autonom durch')}")
-    print(f"  {C.DIM}{'─' * (w-4)}{C.RESET}")
+    def _toolbar() -> str:
+        current = get_state()
+        active_model = current.get("selected_model") or "backend"
+        mode = current.get("tool_mode", "on_demand")
+        return f"  {active_model} · tools:{mode} · swarm:{current.get('swarm_mode', 'off')}"
+
+    repl_input = ReplInput(CONFIG_DIR / "history", _toolbar)
+
+    def _print_repl_header() -> None:
+        nonlocal state, model, fallback, swarm, ws
+        state = get_state()
+        model = state.get("selected_model")
+        fallback = state.get("fallback_model")
+        swarm = state.get("swarm_mode", "off")
+        ws = state.get("workspace_root") or str(Path.cwd())
+        tool_mode = state.get("tool_mode", "on_demand")
+        enabled = state.get("enabled_tools")
+        timeout = int(state.get("request_timeout", 30))
+        try:
+            session = load_session()
+            identity = f"{session.user_id} · {session.tier}"
+        except Exception:
+            identity = "offline"
+
+        w = max(48, min(term_width(), 92))
+        rule = "─" * (w - 4)
+        print()
+        print(f"  {C.BOLD}{C.BCYAN}◆ ai-coder{C.RESET}  {C.DIM}interactive agent{C.RESET}")
+        print(f"  {C.DIM}{rule}{C.RESET}")
+        print(f"  {dim('account  ')} {cyan(identity)}")
+        print(f"  {dim('operator ')} {cyan(model or '(backend default)')}")
+        print(f"  {dim('fallback ')} {dim(fallback or '—')}")
+        print(f"  {dim('runtime  ')} tools={cyan(tool_mode)} · enabled={cyan('all' if enabled is None else str(len(enabled)))} · "
+              f"swarm={cyan(swarm)} · timeout={cyan(str(timeout)+'s')}")
+        print(f"  {dim('workspace')} {dim(ws)}")
+        print(f"  {C.DIM}{rule}{C.RESET}")
+        if repl_input.enhanced:
+            print(f"  {dim('Enter send · Alt+Enter newline · Ctrl+C clear/cancel · Ctrl+R history · Tab commands')}")
+        else:
+            print(f"  {yellow('Basic input mode')} {dim('· install prompt-toolkit for multiline editing and safe repaint')}")
+        print(f"  {dim('/help commands · /keys shortcuts · /status runtime · /clear screen · /exit')}")
+        print(f"  {C.DIM}{rule}{C.RESET}")
+
+    _print_repl_header()
 
     from .agent import run_agent
 
     while True:
         try:
-            prompt = input(f"\n  {C.BOLD}{C.BCYAN}◆{C.RESET} ").strip()
-        except (EOFError, KeyboardInterrupt):
+            reset_live_line()
+            prompt = repl_input.read(f"\n  {C.BOLD}{C.BCYAN}◆{C.RESET} ").strip()
+        except PromptCancelled:
+            print(f"  {dim('prompt cancelled')}")
+            continue
+        except KeyboardInterrupt:
+            print(f"  {dim('prompt cancelled')}")
+            continue
+        except EOFError:
             print(f"\n{_c('dim','Session beendet.')}")
             break
 
@@ -457,10 +496,7 @@ def run_repl(skip_setup: bool = False) -> int:
                 break
             elif cmd == "/setup":
                 run_setup(force=True)
-                state    = get_state()
-                model    = state.get("selected_model")
-                fallback = state.get("fallback_model")
-                swarm    = state.get("swarm_mode","off")
+                _print_repl_header()
             elif cmd == "/model":
                 if val:
                     set_model(val)
@@ -484,7 +520,20 @@ def run_repl(skip_setup: bool = False) -> int:
                 except ValueError as e:
                     print(f"  Fehler: {e}")
             elif cmd == "/status":
-                print(f"  model={model}  fallback={fallback}  swarm={swarm}")
+                _print_repl_header()
+            elif cmd == "/clear":
+                if sys.stdout.isatty():
+                    print("\033[2J\033[H", end="")
+                _print_repl_header()
+            elif cmd == "/keys":
+                print("  Enter        Aufgabe senden")
+                print("  Alt+Enter    Neue Zeile (Shift+Enter in kompatiblen Terminals)")
+                print("  Ctrl+C       Eingabe leeren; leer erneut = aktuellen Prompt abbrechen")
+                print("  Ctrl+D       Zeichen löschen; bei leerer Eingabe Session beenden")
+                print("  Ctrl+R       History durchsuchen")
+                print("  Ctrl+P/N     Vorige/nächste History")
+                print("  Ctrl+L       Terminal neu zeichnen")
+                print("  Tab          Slash-Kommandos vervollständigen")
             elif cmd == "/shell":
                 if val:
                     import subprocess, time as _t
@@ -521,7 +570,8 @@ def run_repl(skip_setup: bool = False) -> int:
                 except Exception as e:
                     print(f"  Fehler: {e}")
             elif cmd == "/help":
-                print("  /model <n>  /fallback <n>  /swarm <m>  /models  /status  /shell <cmd>  /setup  /exit")
+                print("  /model <n> · /fallback <n> · /swarm <m> · /models · /status")
+                print("  /shell <cmd> · /setup · /clear · /keys · /exit")
             else:
                 print(f"  Unbekannt: {cmd}  — /help für Hilfe")
             continue

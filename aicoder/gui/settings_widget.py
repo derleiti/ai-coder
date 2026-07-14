@@ -3,7 +3,7 @@ from __future__ import annotations
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLineEdit, QPushButton, QComboBox, QLabel, QGroupBox, QMessageBox,
-    QListWidget, QListWidgetItem, QSpinBox, QSizePolicy,
+    QListWidget, QListWidgetItem, QSpinBox, QSizePolicy, QScrollArea,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
@@ -116,12 +116,25 @@ class SettingsWidget(QWidget):
         self._load_current()
 
     def _build_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 16)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setObjectName("SettingsScroll")
+        scroll.setWidgetResizable(True)
+        scroll.viewport().setObjectName("SettingsViewport")
+        content = QWidget()
+        content.setObjectName("SettingsContent")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(18, 10, 18, 18)
+        layout.setSpacing(10)
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
 
         # --- Login Group ---
         login_group = QGroupBox("Login")
         login_form = QFormLayout()
+        login_form.setHorizontalSpacing(14)
+        login_form.setVerticalSpacing(9)
         self.base_url_edit = QLineEdit(DEFAULT_BASE_URL)
         self.email_edit = QLineEdit()
         self.email_edit.setPlaceholderText("user@example.com")
@@ -149,6 +162,8 @@ class SettingsWidget(QWidget):
         # --- Model Group ---
         model_group = QGroupBox("Model Configuration")
         model_form = QFormLayout()
+        model_form.setHorizontalSpacing(14)
+        model_form.setVerticalSpacing(9)
 
         # Model Dropdown (editable — user can type custom model too)
         self.model_combo = QComboBox()
@@ -224,7 +239,7 @@ class SettingsWidget(QWidget):
 
         self.tool_list = QListWidget()
         self.tool_list.setMinimumHeight(120)
-        self.tool_list.setMaximumHeight(180)
+        self.tool_list.setMaximumHeight(260)
         self.tool_list.setAlternatingRowColors(True)
         tools_layout.addWidget(self.tool_list)
 

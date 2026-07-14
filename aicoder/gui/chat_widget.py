@@ -14,11 +14,13 @@ except ImportError:
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
-    QTextEdit, QLineEdit, QPushButton, QLabel, QMessageBox, QComboBox,
+    QTextEdit, QPlainTextEdit, QPushButton, QLabel, QMessageBox, QComboBox,
     QMenu, QInputDialog,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QMetaObject, Q_ARG, QMimeData, QUrl
-from PyQt6.QtGui import QTextCursor, QDragEnterEvent, QDropEvent
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, QMetaObject, Q_ARG, QMimeData, QUrl
+from PyQt6.QtGui import (
+    QTextCursor, QDragEnterEvent, QDropEvent, QKeyEvent, QKeySequence, QShortcut,
+)
 
 from ..config import load_session
 from ..session_state import get_state
@@ -224,6 +226,23 @@ def _select_chat_route(model: str, fallback: str, quick_chat: bool):
     return model, fallback, False
 
 
+class PromptEdit(QPlainTextEdit):
+    """Compact multiline prompt: Enter sends, Alt/Shift+Enter adds a line."""
+
+    submitted = pyqtSignal()
+
+    def keyPressEvent(self, event: QKeyEvent):
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            modifiers = event.modifiers()
+            if modifiers & (Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.AltModifier):
+                super().keyPressEvent(event)
+                return
+            self.submitted.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
 class ChatWidget(QWidget):
     def __init__(self, settings_ref=None, parent=None):
         super().__init__(parent)
@@ -235,6 +254,12 @@ class ChatWidget(QWidget):
         self._syncing = False
         self._session_id = None
         self._dropped_files = []
+        self._activity_started = 0.0
+        self._activity_label = ""
+        self._activity_frame = 0
+        self._activity_timer = QTimer(self)
+        self._activity_timer.setInterval(120)
+        self._activity_timer.timeout.connect(self._tick_activity)
         self._build_ui()
         self.setAcceptDrops(True)
         # Connect to settings model list + selection changes
@@ -245,6 +270,10 @@ class ChatWidget(QWidget):
                 self.settings_ref.selection_changed.connect(self._on_settings_selection_changed)
             if hasattr(self.settings_ref, "tools_changed"):
                 self.settings_ref.tools_changed.connect(self._on_tools_changed)
+            # Editable combos can show the persisted route before the async
+            # model catalogue arrives, avoiding blank selectors on startup.
+            self.model_combo.setCurrentText(self.settings_ref.get_current_model())
+            self.fallback_combo.setCurrentText(self.settings_ref.get_current_fallback())
 
     def _on_tools_changed(self, _mode: str, _names):
         """Invalidate the filtered cache after a settings change."""
@@ -289,7 +318,7 @@ class ChatWidget(QWidget):
         elif mime.hasText():
             text = mime.text().strip()
             if text:
-                self.input.setText(text)
+                self.input.setPlainText(text)
         event.acceptProposedAction()
 
     def _handle_dropped_file(self, path: str):
@@ -358,15 +387,8 @@ class ChatWidget(QWidget):
 
         # Chat-Log
         self.log = QTextEdit()
+        self.log.setObjectName("ChatLog")
         self.log.setReadOnly(True)
-        self.log.setStyleSheet("""
-            QTextEdit {
-                background: #0a0a1a; color: #e0e0e0;
-                font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
-                font-size: 13px; border: 1px solid #333;
-                border-radius: 4px; padding: 8px;
-            }
-        """)
         layout.addWidget(self.log, stretch=1)
 
         # Model-Selector Row
@@ -374,43 +396,26 @@ class ChatWidget(QWidget):
         model_row.setSpacing(6)
 
         model_label = QLabel("Model:")
-        model_label.setStyleSheet("color: #888; font-size: 11px;")
+        model_label.setObjectName("Caption")
         model_label.setFixedWidth(45)
         model_row.addWidget(model_label)
 
         self.model_combo = QComboBox()
         self.model_combo.setEditable(True)
-        self.model_combo.setStyleSheet("""
-            QComboBox {
-                background: #111; color: #ccc; border: 1px solid #333;
-                border-radius: 3px; padding: 3px 8px; font-size: 11px;
-            }
-            QComboBox:focus { border-color: #00d4ff; }
-            QComboBox QAbstractItemView {
-                background: #111; color: #ccc; selection-background-color: #1a3a5e;
-            }
-        """)
+        self.model_combo.setMinimumWidth(250)
         self.model_combo.addItem("")  # Backend-Default (liste wird dynamisch geladen)
         self.model_combo.setCurrentText("")
         self.model_combo.setToolTip("Select model (empty = backend default)")
         model_row.addWidget(self.model_combo, stretch=1)
 
         fb_label = QLabel("Fallback:")
-        fb_label.setStyleSheet("color: #666; font-size: 11px;")
+        fb_label.setObjectName("Caption")
         fb_label.setFixedWidth(55)
         model_row.addWidget(fb_label)
 
         self.fallback_combo = QComboBox()
         self.fallback_combo.setEditable(True)
-        self.fallback_combo.setStyleSheet("""
-            QComboBox {
-                background: #111; color: #999; border: 1px solid #333;
-                border-radius: 3px; padding: 3px 8px; font-size: 11px;
-            }
-            QComboBox QAbstractItemView {
-                background: #111; color: #ccc; selection-background-color: #1a3a5e;
-            }
-        """)
+        self.fallback_combo.setMinimumWidth(250)
         self.fallback_combo.addItem("")  # (liste wird dynamisch geladen)
         self.fallback_combo.setCurrentText("")
         self.fallback_combo.setToolTip("Fallback model (optional)")
@@ -420,84 +425,54 @@ class ChatWidget(QWidget):
 
         # Status-Zeile (erweitert: User, Tier, Workspace, Tools)
         self.status = QLabel("Ready.")
-        self.status.setStyleSheet("color: #888; font-size: 11px;")
+        self.status.setObjectName("Caption")
         layout.addWidget(self.status)
 
         # Input-Zeile
         input_row = QHBoxLayout()
-        self.input = QLineEdit()
-        self.input.setPlaceholderText("Enter message... (Enter to send)")
-        self.input.setStyleSheet("""
-            QLineEdit {
-                background: #111; color: #fff;
-                border: 1px solid #444; border-radius: 4px;
-                padding: 8px 12px; font-size: 13px;
-            }
-            QLineEdit:focus { border-color: #00d4ff; }
-        """)
-        self.input.returnPressed.connect(self._send)
+        self.input = PromptEdit()
+        self.input.setPlaceholderText("Ask ai-coder…  Enter sends · Shift/Alt+Enter adds a line")
+        self.input.setFixedHeight(68)
+        self.input.submitted.connect(self._send)
         input_row.addWidget(self.input, stretch=1)
 
         self.send_btn = QPushButton("Send")
-        self.send_btn.setStyleSheet("""
-            QPushButton {
-                background: #00d4ff; color: #000; border: none;
-                border-radius: 4px; padding: 8px 18px; font-weight: bold;
-            }
-            QPushButton:hover { background: #00b8e6; }
-            QPushButton:disabled { background: #555; color: #999; }
-        """)
+        self.send_btn.setObjectName("PrimaryButton")
+        self.send_btn.setMinimumHeight(40)
         self.send_btn.clicked.connect(self._send)
         input_row.addWidget(self.send_btn)
 
         # Stop-Button — bricht laufenden Agent-Loop ab
         self.stop_btn = QPushButton("■")
-        self.stop_btn.setToolTip("Stop agent")
+        self.stop_btn.setObjectName("DangerButton")
+        self.stop_btn.setToolTip("Stop agent (Esc)")
         self.stop_btn.setFixedWidth(38)
-        self.stop_btn.setStyleSheet("""
-            QPushButton {
-                background: #1a1a2e; color: #ff6b6b;
-                border: 1px solid #444; border-radius: 4px;
-                font-size: 14px; padding: 4px; font-weight: bold;
-            }
-            QPushButton:hover { background: #3a1a1a; border-color: #ff6b6b; }
-            QPushButton:disabled { color: #555; border-color: #333; }
-        """)
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self._stop_agent)
         input_row.addWidget(self.stop_btn)
 
         # Clear-Button
         self.clear_btn = QPushButton("↺")
-        self.clear_btn.setToolTip("Reset chat & context")
+        self.clear_btn.setToolTip("New chat and reset context (Ctrl+Shift+L)")
         self.clear_btn.setFixedWidth(38)
-        self.clear_btn.setStyleSheet("""
-            QPushButton {
-                background: #1a1a2e; color: #888;
-                border: 1px solid #444; border-radius: 4px;
-                font-size: 16px; padding: 4px;
-            }
-            QPushButton:hover { background: #2a2a3e; color: #ff9800; border-color: #ff9800; }
-        """)
         self.clear_btn.clicked.connect(self._clear_chat)
         input_row.addWidget(self.clear_btn)
 
         # History-Button
         self.history_btn = QPushButton("📋")
-        self.history_btn.setToolTip("Chat-Verlauf")
+        self.history_btn.setToolTip("Chat history (Ctrl+H)")
         self.history_btn.setFixedWidth(38)
-        self.history_btn.setStyleSheet("""
-            QPushButton {
-                background: #1a1a2e; color: #888;
-                border: 1px solid #444; border-radius: 4px;
-                font-size: 14px; padding: 4px;
-            }
-            QPushButton:hover { background: #2a2a3e; color: #00d4ff; border-color: #00d4ff; }
-        """)
         self.history_btn.clicked.connect(self._show_history_menu)
         input_row.addWidget(self.history_btn)
 
         layout.addLayout(input_row)
+
+        self._shortcuts = [
+            QShortcut(QKeySequence("Ctrl+K"), self, activated=self.input.setFocus),
+            QShortcut(QKeySequence("Escape"), self, activated=self._stop_agent),
+            QShortcut(QKeySequence("Ctrl+Shift+L"), self, activated=self._clear_chat),
+            QShortcut(QKeySequence("Ctrl+H"), self, activated=self._show_history_menu),
+        ]
 
     def _append_msg(self, role: str, text: str, meta: str = ""):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -570,6 +545,25 @@ class ChatWidget(QWidget):
             color = "#ff9800"
         self.status.setStyleSheet(f"color: {color}; font-size: 11px;")
 
+    def _start_activity(self, model: str, tools_enabled: bool):
+        self._activity_started = time.monotonic()
+        self._activity_frame = 0
+        route = model or "backend default"
+        self._activity_label = f"{route} · {'agent tools' if tools_enabled else 'chat'}"
+        self._activity_timer.start()
+        self._tick_activity()
+
+    def _tick_activity(self):
+        frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+        elapsed = max(0.0, time.monotonic() - self._activity_started)
+        glyph = frames[self._activity_frame % len(frames)]
+        self._activity_frame += 1
+        self.status.setText(f"{glyph} Working · {elapsed:4.1f}s · {self._activity_label}")
+        self.status.setStyleSheet("color: #43d9c0; font-size: 11px; font-weight: 600;")
+
+    def _stop_activity(self):
+        self._activity_timer.stop()
+
     def _clear_chat(self):
         self.log.clear()
         self._tools = None
@@ -581,6 +575,7 @@ class ChatWidget(QWidget):
     def _stop_agent(self):
         if self._worker and self._worker.isRunning():
             self._worker.stop()
+            self._activity_label = "stopping safely"
             self._append_msg("system", "Stop requested...", "")
 
     def _on_approval_needed(self, tool_name: str, command: str):
@@ -606,15 +601,13 @@ class ChatWidget(QWidget):
             self._append_msg("system", f"Command rejected: {preview[:100]}", "")
 
     def _send(self):
-        text = self.input.text().strip()
+        text = self.input.toPlainText().strip()
         if not text:
             return
         self._append_msg("user", text)
         self.input.clear()
         self.send_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
-        self.status.setText("Agent working...")
-        self.status.setStyleSheet("color: #00d4ff; font-size: 11px;")
 
         try:
             session = load_session()
@@ -627,6 +620,7 @@ class ChatWidget(QWidget):
             self._append_msg("error", f"Keine Session: {e}")
             self.send_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
+            self._stop_activity()
             return
 
         # Priority: combo box > settings tab > state file
@@ -655,6 +649,7 @@ class ChatWidget(QWidget):
             tool_mode == "always"
             or (tool_mode == "on_demand" and not quick_chat)
         ) and enabled_tool_names != []
+        self._start_activity(model, should_load_tools)
 
         if should_load_tools and self._tools is None:
             self._append_msg("system", "Loading selected tools on demand...", "")
@@ -703,6 +698,7 @@ class ChatWidget(QWidget):
         self._append_msg(role, text, meta)
 
     def _on_response(self, text: str, model_used: str):
+        self._stop_activity()
         # Cache tools loaded by worker for next message
         if self._worker and self._worker.load_tools_on_start and self._worker.tools is not None:
             self._tools = self._worker.tools
@@ -718,6 +714,7 @@ class ChatWidget(QWidget):
         self._messages = messages
 
     def _on_error(self, err: str):
+        self._stop_activity()
         self._append_msg("error", err)
         self.send_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)

@@ -18,7 +18,10 @@ from aicoder.config import Session
 from aicoder.executor import is_simple_chat_message, normalize_tool_calls, parse_tool_calls
 from aicoder.gui.chat_widget import _AgentWorker, _select_chat_route
 import aicoder.gui.settings_widget as settings_widget
+import aicoder.agent as cli_agent
 from aicoder.setup import _is_token_expired, run_setup
+from aicoder.repl_input import COMMANDS, ReplInput
+from aicoder.ui import AgentSpinner
 
 
 def _unsigned_token(exp: int) -> str:
@@ -244,6 +247,68 @@ class SettingsRegressionTests(unittest.TestCase):
         self.assertGreaterEqual(widget.model_combo.minimumWidth(), 500)
         self.assertGreaterEqual(widget.fallback_combo.minimumWidth(), 500)
         widget.close()
+
+
+class ReplRegressionTests(unittest.TestCase):
+    def test_slash_completion_contains_runtime_controls(self):
+        for command in ("/clear", "/keys", "/status", "/model", "/exit"):
+            self.assertIn(command, COMMANDS)
+
+    def test_basic_input_fallback_remains_usable(self):
+        repl = ReplInput.__new__(ReplInput)
+        repl._session = None
+        with patch("builtins.input", return_value="hello") as basic_input:
+            self.assertEqual(repl.read("> "), "hello")
+        basic_input.assert_called_once_with("> ")
+
+    def test_spinner_does_not_suppress_task_exceptions(self):
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            with AgentSpinner("test", file=io.StringIO()):
+                raise RuntimeError("boom")
+
+    def test_spinner_is_silent_when_output_is_redirected(self):
+        target = io.StringIO()
+        with AgentSpinner("test", file=target):
+            pass
+        self.assertEqual(target.getvalue(), "")
+
+    def test_cli_greeting_skips_discovery_and_uses_fast_model(self):
+        client = MagicMock()
+        client.chat.return_value = {
+            "response": "Hello",
+            "model": "ollama/fast",
+            "latency_ms": 20,
+        }
+        state = {
+            "workspace_root": ".",
+            "tool_mode": "on_demand",
+            "enabled_tools": None,
+            "request_timeout": 30,
+        }
+        session = Session(
+            base_url="https://example.invalid",
+            token="opaque",
+            client_id="test",
+            user_id="test@example.invalid",
+            tier="registered",
+            account_role="user",
+        )
+        with (
+            patch.object(cli_agent, "load_session", return_value=session),
+            patch.object(cli_agent, "get_state", return_value=state),
+            patch.object(cli_agent, "TriForceClient", return_value=client),
+            patch.object(cli_agent, "load_tools") as discover,
+            patch.object(cli_agent, "print_header"),
+            patch.object(cli_agent, "print_task"),
+            patch.object(cli_agent, "print_final"),
+            patch.object(cli_agent, "history_record"),
+        ):
+            result = cli_agent.run_agent("hi", "anthropic/slow", "ollama/fast")
+        self.assertEqual(result, 0)
+        discover.assert_not_called()
+        self.assertEqual(client.chat.call_args.kwargs["model"], "ollama/fast")
+        self.assertIsNone(client.chat.call_args.kwargs["fallback_model"])
+        self.assertIsNone(client.chat.call_args.kwargs["tools"])
 
 
 if __name__ == "__main__":
