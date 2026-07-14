@@ -36,33 +36,20 @@ def _is_token_expired(token: str) -> bool:
         return False
 
 
-def _ensure_valid_session() -> None:
-    """Re-Login wenn Token abgelaufen."""
+def _ensure_valid_session() -> bool:
+    """Return whether the stored session can still be used.
+
+    Re-authentication belongs to ``run_setup`` so there is only one login
+    path for CLI, REPL and first-run setup.
+    """
     try:
-        from .config import load_session, save_session, Session
-        from .client import TriForceClient
         session = load_session()
         if not _is_token_expired(session.token):
-            return
-        print(f"  \033[33mToken abgelaufen — Re-Login erforderlich\033[0m")
-        from getpass import getpass
-        password = getpass(f"  Passwort für {session.user_id}: ")
-        client = TriForceClient(session.base_url)
-        result = client.login(email=session.user_id, password=password)
-        new_session = Session(
-            base_url=session.base_url,
-            token=result["token"],
-            client_id=result.get("client_id", session.client_id),
-            user_id=result.get("user_id", session.user_id),
-            tier=result.get("tier", session.tier),
-            account_role=result.get("account_role", session.account_role),
-        )
-        save_session(new_session)
-        print(f"  \033[32m✓ Re-Login OK\033[0m")
-    except KeyboardInterrupt:
-        print("\n  Re-Login abgebrochen.")
-    except Exception as e:
-        print(f"  \033[31m✗ Re-Login fehlgeschlagen: {e}\033[0m", file=__import__("sys").stderr)
+            return True
+        print("  \033[33mSession abgelaufen — Login erforderlich\033[0m")
+        return False
+    except Exception:
+        return False
 
 
 # ── Interaktiver Model-Picker ──────────────────────────────────────────────
@@ -251,19 +238,31 @@ def run_setup(force: bool = False) -> bool:
     print(_c("bold",   "╚══════════════════════════════════════════╝"))
 
     # Session prüfen
+    previous_session = None
     try:
-        session = load_session()
-        print(f"\n✓ Eingeloggt als {_c('green', session.user_id)}  "
-              f"(tier={session.tier}  base={session.base_url})")
-        logged_in = True
+        previous_session = load_session()
+        if _is_token_expired(previous_session.token):
+            logged_in = False
+            print(f"\n{_c('yellow','! Session abgelaufen. Bitte erneut einloggen.')}")
+        else:
+            session = previous_session
+            print(f"\n✓ Eingeloggt als {_c('green', session.user_id)}  "
+                  f"(tier={session.tier}  base={session.base_url})")
+            logged_in = True
     except RuntimeError:
         logged_in = False
         print(f"\n{_c('yellow','! Nicht eingeloggt.')}")
 
     if not logged_in:
         print("\n── Login ──────────────────────────────────")
-        base = _ask("Backend URL", DEFAULT_BASE_URL)
-        email = _ask("E-Mail")
+        base = _ask(
+            "Backend URL",
+            previous_session.base_url if previous_session else DEFAULT_BASE_URL,
+        )
+        email = _ask(
+            "E-Mail",
+            previous_session.user_id if previous_session else "",
+        )
         password = getpass("Passwort: ")
         if email and password:
             from .client import ClientError, TriForceClient
@@ -404,14 +403,14 @@ def _setup_readline():
 
 
 def run_repl(skip_setup: bool = False) -> int:
-    _ensure_valid_session()
     """
     Interaktiver Agent-REPL.
     Startet Setup-Wizard wenn nötig, dann Agent-Loop.
     """
     _setup_readline()
 
-    if not skip_setup:
+    session_valid = _ensure_valid_session()
+    if not skip_setup or not session_valid:
         ok = run_setup()
         if not ok:
             return 1

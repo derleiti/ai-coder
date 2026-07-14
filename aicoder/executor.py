@@ -39,6 +39,11 @@ IS_TERMUX = bool(os.environ.get("TERMUX_VERSION") or os.path.exists("/data/data/
 OS_NAME = "Android/Termux" if IS_TERMUX else platform.system()
 
 TOOL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL | re.IGNORECASE)
+FUNCTION_RE = re.compile(
+    r"<function[=:](?P<name>[\w.-]+)>\s*(?P<args>.*?)\s*</function>",
+    re.DOTALL | re.IGNORECASE,
+)
+FENCED_JSON_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
 
 # Destructive patterns for local_exec approval
 DESTRUCTIVE_PATTERNS = [
@@ -493,19 +498,55 @@ def build_system_prompt(tools: list[dict], workspace_root: Optional[str] = None)
     )
 
 
+def _normalize_tool_call(value: Any) -> Optional[dict]:
+    """Normalize common provider tool-call shapes to ai-coder's contract."""
+    if not isinstance(value, dict):
+        return None
+
+    if isinstance(value.get("function"), dict):
+        fn = value["function"]
+        value = {"name": fn.get("name"), "arguments": fn.get("arguments", {})}
+
+    name = value.get("name") or value.get("tool") or value.get("tool_name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+
+    args = value.get("arguments", value.get("args", value.get("parameters", {})))
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except json.JSONDecodeError:
+            args = {"input": args}
+    if args is None:
+        args = {}
+    if not isinstance(args, dict):
+        return None
+    return {"name": name.strip(), "arguments": args}
+
+
+def _append_json_calls(calls: list[dict], raw: str) -> bool:
+    """Parse one JSON object/list and append any valid tool calls."""
+    try:
+        value = json.loads(raw.strip())
+    except (json.JSONDecodeError, TypeError):
+        return False
+    values = value if isinstance(value, list) else [value]
+    added = False
+    for item in values:
+        call = _normalize_tool_call(item)
+        if call:
+            calls.append(call)
+            added = True
+    return added
+
+
 def parse_tool_calls(text: str) -> list[dict]:
-    """Extract tool calls from LLM response text. Supports JSON and XML format."""
-    calls = []
+    """Extract tool calls from common OpenAI, Mistral, Hermes and XML forms."""
+    calls: list[dict] = []
     for m in TOOL_RE.finditer(text):
         raw = m.group(1).strip()
-        # Format 1: JSON {"name": ..., "arguments": {...}}
-        try:
-            c = json.loads(raw)
-            if "name" in c:
-                calls.append(c)
-                continue
-        except Exception:
-            pass
+        if _append_json_calls(calls, raw):
+            continue
         # Format 2: XML <n>tool_name</n><arguments><key>val</key></arguments>
         try:
             import re as _re
@@ -520,7 +561,36 @@ def parse_tool_calls(text: str) -> list[dict]:
                 calls.append({"name": name, "arguments": args})
         except Exception:
             pass
-    return calls
+
+    # Hermes/function-tag form: <function=tool>{"arg": "value"}</function>
+    for m in FUNCTION_RE.finditer(text):
+        raw_args = m.group("args").strip()
+        try:
+            args = json.loads(raw_args) if raw_args else {}
+        except json.JSONDecodeError:
+            args = {"input": raw_args}
+        call = _normalize_tool_call({"name": m.group("name"), "arguments": args})
+        if call:
+            calls.append(call)
+
+    # Mistral commonly emits: [TOOL_CALLS] [{"name": ..., "arguments": ...}]
+    marker = re.search(r"\[TOOL_CALLS?\]\s*(\[.*\]|\{.*\})", text, re.DOTALL | re.IGNORECASE)
+    if marker:
+        _append_json_calls(calls, marker.group(1))
+
+    # Some providers wrap the requested object in a JSON code fence.
+    for m in FENCED_JSON_RE.finditer(text):
+        _append_json_calls(calls, m.group(1))
+
+    # Preserve order while removing duplicate representations of the same call.
+    unique: list[dict] = []
+    seen: set[str] = set()
+    for call in calls:
+        key = json.dumps(call, sort_keys=True, ensure_ascii=False)
+        if key not in seen:
+            seen.add(key)
+            unique.append(call)
+    return unique
 
 
 def strip_tool_calls(text: str) -> str:

@@ -147,10 +147,16 @@ class SettingsWidget(QWidget):
         try:
             session = load_session()
             self.base_url_edit.setText(session.base_url)
-            self.status_label.setText(f"Logged in as {session.user_id} ({session.tier})")
-            self.status_label.setStyleSheet("color: #00d4ff;")
-            # Auto-load models on startup if logged in
-            self._load_models()
+            self.email_edit.setText(session.user_id)
+            client = TriForceClient(session.base_url, token=session.token)
+            if client.is_token_expired():
+                self.status_label.setText("Session expired — login again")
+                self.status_label.setStyleSheet("color: #ffb020;")
+            else:
+                self.status_label.setText(f"Logged in as {session.user_id} ({session.tier})")
+                self.status_label.setStyleSheet("color: #00d4ff;")
+                # Auto-load models on startup if logged in
+                self._load_models()
         except Exception:
             self.status_label.setText("Not logged in")
             self.status_label.setStyleSheet("color: #ff6b6b;")
