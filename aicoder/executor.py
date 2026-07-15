@@ -785,7 +785,14 @@ def run_mcp_tool(client: TriForceClient, name: str, args: dict) -> Tuple[str, bo
     for attempt in range(2):
         try:
             r = client.mcp_call(name, args)
-            text = r.get("result",{}).get("content",[{}])[0].get("text","")
+            _res = r.get("result", {}) if isinstance(r, dict) else {}
+            _content = _res.get("content", [])
+            if isinstance(_content, list) and _content and isinstance(_content[0], dict):
+                text = _content[0].get("text", "")
+            elif isinstance(_content, str):
+                text = _content
+            else:
+                text = ""
             is_error = r.get("result",{}).get("isError", False)
             if is_error or text.startswith('{"error"'):
                 return text[:4000], True
@@ -796,6 +803,8 @@ def run_mcp_tool(client: TriForceClient, name: str, args: dict) -> Tuple[str, bo
                 return f"TOOL FAILED: {e}", True
             if attempt == 0:
                 time.sleep(1)
+        except Exception as e:
+            return f"TOOL FAILED (unexpected {type(e).__name__}): {e}", True
     return f"TOOL FAILED (after retry): {last_err}", True
 
 

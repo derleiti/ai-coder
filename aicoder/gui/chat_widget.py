@@ -89,6 +89,20 @@ class _AgentWorker(QThread):
         return self._approval_result
 
     def run(self):
+        # GUI-Resilienz: in PyQt6 killt eine unbehandelte Exception in einer
+        # QThread.run()-Reimplementation den ganzen Prozess (stiller GUI-Abbruch).
+        # Die REPL ueberlebt dieselben Fehler, weil sie im Main-Thread unter
+        # hoeheren except-Handlern laeuft. Dasselbe Sicherheitsnetz hier:
+        try:
+            self._run_impl()
+        except Exception as e:  # bewusster catch-all: Thread darf nie ungebremst sterben
+            import traceback
+            try:
+                self.error.emit(f"Agent crashed: {e}\n{traceback.format_exc()}")
+            except Exception:
+                pass
+
+    def _run_impl(self):
         messages = self.messages
         model_used = self.model or "default"
         active_model = self.model
