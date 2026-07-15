@@ -1,0 +1,16 @@
+[Desktop Entry]
+Comment[de_DE]=
+Comment=
+Exec="/bin/python" "/home/zombie/ai-coder/aicoder_main.py" "gui"
+GenericName[de_DE]=
+GenericName=
+MimeType=
+Name[de_DE]=AI-Coder
+Name=AI-Coder
+Path=
+StartupNotify=true
+Terminal=false
+TerminalOptions=
+Type=Application
+X-KDE-SubstituteUID=false
+X-KDE-Username=
