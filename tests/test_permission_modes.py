@@ -94,6 +94,7 @@ class GuiRootExecutionTests(unittest.TestCase):
             patch.object(executor.sys.stdin, "isatty", return_value=False),
             patch.dict(os.environ, {"DISPLAY": ":0"}, clear=False),
             patch.object(executor.shutil, "which", return_value="/usr/bin/pkexec"),
+            patch.object(executor, "_ensure_graphical_polkit_agent", return_value=(True, "ok")) as ensure,
             patch.object(executor.subprocess, "run", return_value=completed) as run,
         ):
             result, is_error = executor.run_local_exec({
@@ -101,6 +102,7 @@ class GuiRootExecutionTests(unittest.TestCase):
             })
         self.assertFalse(is_error)
         self.assertEqual(result, "ok\n")
+        ensure.assert_called_once_with()
         self.assertEqual(run.call_args.args[0], ["pkexec", "apt", "update"])
 
     def test_graphical_root_redirect_runs_in_pkexec_shell(self):
@@ -109,6 +111,7 @@ class GuiRootExecutionTests(unittest.TestCase):
             patch.object(executor.sys.stdin, "isatty", return_value=False),
             patch.dict(os.environ, {"WAYLAND_DISPLAY": "wayland-0"}, clear=False),
             patch.object(executor.shutil, "which", return_value="/usr/bin/pkexec"),
+            patch.object(executor, "_ensure_graphical_polkit_agent", return_value=(True, "ok")) as ensure,
             patch.object(executor.subprocess, "run", return_value=completed) as run,
         ):
             result, is_error = executor.run_local_exec({
@@ -116,10 +119,30 @@ class GuiRootExecutionTests(unittest.TestCase):
             })
         self.assertFalse(is_error)
         self.assertEqual(result, "(no output)")
+        ensure.assert_called_once_with()
         self.assertEqual(
             run.call_args.args[0],
             ["pkexec", "sh", "-c", "printf enabled > /etc/aicoder.conf"],
         )
+
+
+    def test_graphical_root_stops_when_polkit_agent_is_unavailable(self):
+        with (
+            patch.object(executor.sys.stdin, "isatty", return_value=False),
+            patch.dict(os.environ, {"DISPLAY": ":0"}, clear=False),
+            patch.object(executor.shutil, "which", return_value="/usr/bin/pkexec"),
+            patch.object(
+                executor, "_ensure_graphical_polkit_agent",
+                return_value=(False, "kein grafischer Polkit-Authentifizierungsagent installiert"),
+            ),
+            patch.object(executor.subprocess, "run") as run,
+        ):
+            result, is_error = executor.run_local_exec({
+                "command": "apt update", "sudo": True,
+            })
+        self.assertTrue(is_error)
+        self.assertIn("kein grafischer Polkit", result)
+        run.assert_not_called()
 
     def test_terminal_root_command_keeps_sudo(self):
         completed = MagicMock(returncode=0, stdout="", stderr="")

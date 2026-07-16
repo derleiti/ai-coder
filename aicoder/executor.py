@@ -45,6 +45,54 @@ IS_LINUX = platform.system() == "Linux"
 IS_TERMUX = bool(os.environ.get("TERMUX_VERSION") or os.path.exists("/data/data/com.termux"))
 OS_NAME = "Android/Termux" if IS_TERMUX else platform.system()
 
+
+def _ensure_graphical_polkit_agent() -> tuple[bool, str]:
+    """Ensure a desktop Polkit authentication agent is available.
+
+    A package can be installed while the desktop session is already running,
+    before its XDG autostart entry has had a chance to launch. Start a known
+    user-session agent on demand; it only brokers the system password dialog.
+    """
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return False, "keine grafische Sitzung für die Root-Authentifizierung erkannt"
+
+    try:
+        processes = subprocess.run(
+            ["ps", "-eo", "args="], capture_output=True, text=True, check=False, timeout=5
+        ).stdout.lower()
+    except (OSError, subprocess.TimeoutExpired):
+        processes = ""
+
+    names = (
+        "polkit-kde-authentication-agent-1",
+        "polkit-gnome-authentication-agent-1",
+        "lxqt-policykit-agent",
+    )
+    if any(name in processes for name in names):
+        return True, "Polkit-Agent ist aktiv"
+
+    candidates = (
+        "/usr/lib/x86_64-linux-gnu/libexec/polkit-kde-authentication-agent-1",
+        "/usr/libexec/polkit-kde-authentication-agent-1",
+        "/usr/lib/polkit-kde-authentication-agent-1",
+        "/usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1",
+        "/usr/bin/lxqt-policykit-agent",
+    )
+    agent = next((x for x in candidates if os.path.isfile(x) and os.access(x, os.X_OK)), None)
+    if agent is None:
+        return False, "kein grafischer Polkit-Authentifizierungsagent installiert"
+
+    try:
+        subprocess.Popen(
+            [agent], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True,
+        )
+    except OSError as exc:
+        return False, f"Polkit-Agent konnte nicht gestartet werden: {exc}"
+
+    time.sleep(0.6)
+    return True, f"Polkit-Agent gestartet: {os.path.basename(agent)}"
+
 TOOL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL | re.IGNORECASE)
 FUNCTION_RE = re.compile(
     r"<function[=:](?P<name>[\w.-]+)>\s*(?P<args>.*?)\s*</function>",
@@ -810,14 +858,13 @@ def run_local_exec(args: dict) -> Tuple[str, bool]:
                 and (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
                 and shutil.which("pkexec")
             )
-            if use_sudo and graphical_auth and needs_shell:
+            if use_sudo and graphical_auth:
+                agent_ok, agent_message = _ensure_graphical_polkit_agent()
+                if not agent_ok:
+                    return f"local_exec error: {agent_message}", True
+                run_args = ["pkexec", "sh", "-c", cmd] if needs_shell else ["pkexec", *_argv(cmd)]
                 r = subprocess.run(
-                    ["pkexec", "sh", "-c", cmd], shell=False, cwd=cwd,
-                    capture_output=True, text=True, timeout=120,
-                )
-            elif use_sudo and graphical_auth:
-                r = subprocess.run(
-                    ["pkexec", *_argv(cmd)], shell=False, cwd=cwd,
+                    run_args, shell=False, cwd=cwd,
                     capture_output=True, text=True, timeout=120,
                 )
             elif use_sudo and needs_shell:
