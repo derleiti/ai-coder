@@ -24,7 +24,7 @@ from PyQt6.QtGui import (
 
 from ..config import load_session
 from ..privileges import (
-    approval_is_automatic, assess_execution, format_request, validate_sudo_session_gui,
+    approval_is_automatic, assess_execution, format_request,
 )
 from ..session_state import get_state
 from ..client import TriForceClient, ClientError
@@ -704,16 +704,9 @@ class ChatWidget(QWidget):
         if risk.sudo:
             self._append_msg(
                 "system",
-                "Opening a local terminal for sudo authentication…",
-                f"mode={mode}",
+                "System authentication will open for this root command.",
+                f"mode={mode} · password handled by Polkit",
             )
-            ok, message = validate_sudo_session_gui()
-            if not ok:
-                QMessageBox.critical(self, "sudo authentication failed", message)
-                if self._worker:
-                    self._worker.set_approval(False)
-                return
-            self._append_msg("system", message, "password stayed in local terminal")
 
         if automatic:
             self._append_msg("system", f"Auto-approved: {tool_name}", f"mode={mode}")

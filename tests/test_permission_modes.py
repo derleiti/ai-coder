@@ -9,6 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from aicoder.gui.chat_widget import ChatWidget
+import aicoder.executor as executor
 from aicoder.privileges import approval_is_automatic, assess_execution
 
 
@@ -66,11 +67,9 @@ class GuiSudoApprovalTests(unittest.TestCase):
         }
         with (
             patch("aicoder.gui.chat_widget.get_state", return_value={"approval_mode": "sudo_only"}),
-            patch("aicoder.gui.chat_widget.validate_sudo_session_gui", return_value=(True, "ok")) as auth,
             patch.object(QMessageBox, "question") as question,
         ):
             ChatWidget._on_approval_needed(widget, "local_exec", args)
-        auth.assert_called_once_with()
         question.assert_not_called()
         widget._worker.set_approval.assert_called_once_with(True)
 
@@ -80,14 +79,56 @@ class GuiSudoApprovalTests(unittest.TestCase):
         widget._append_msg = MagicMock()
         with (
             patch("aicoder.gui.chat_widget.get_state", return_value={"approval_mode": "all"}),
-            patch("aicoder.gui.chat_widget.validate_sudo_session_gui") as auth,
             patch.object(QMessageBox, "warning"),
         ):
             ChatWidget._on_approval_needed(widget, "local_exec", {
                 "command": "apt update", "sudo": True,
             })
-        auth.assert_not_called()
         widget._worker.set_approval.assert_called_once_with(False)
+
+
+class GuiRootExecutionTests(unittest.TestCase):
+    def test_graphical_root_command_uses_pkexec(self):
+        completed = MagicMock(returncode=0, stdout="ok\n", stderr="")
+        with (
+            patch.object(executor.sys.stdin, "isatty", return_value=False),
+            patch.dict(os.environ, {"DISPLAY": ":0"}, clear=False),
+            patch.object(executor.shutil, "which", return_value="/usr/bin/pkexec"),
+            patch.object(executor.subprocess, "run", return_value=completed) as run,
+        ):
+            result, is_error = executor.run_local_exec({
+                "command": "apt update", "sudo": True,
+            })
+        self.assertFalse(is_error)
+        self.assertEqual(result, "ok\n")
+        self.assertEqual(run.call_args.args[0], ["pkexec", "apt", "update"])
+
+    def test_graphical_root_redirect_runs_in_pkexec_shell(self):
+        completed = MagicMock(returncode=0, stdout="", stderr="")
+        with (
+            patch.object(executor.sys.stdin, "isatty", return_value=False),
+            patch.dict(os.environ, {"WAYLAND_DISPLAY": "wayland-0"}, clear=False),
+            patch.object(executor.shutil, "which", return_value="/usr/bin/pkexec"),
+            patch.object(executor.subprocess, "run", return_value=completed) as run,
+        ):
+            result, is_error = executor.run_local_exec({
+                "command": "printf enabled > /etc/aicoder.conf", "sudo": True,
+            })
+        self.assertFalse(is_error)
+        self.assertEqual(result, "(no output)")
+        self.assertEqual(
+            run.call_args.args[0],
+            ["pkexec", "sh", "-c", "printf enabled > /etc/aicoder.conf"],
+        )
+
+    def test_terminal_root_command_keeps_sudo(self):
+        completed = MagicMock(returncode=0, stdout="", stderr="")
+        with (
+            patch.object(executor.sys.stdin, "isatty", return_value=True),
+            patch.object(executor.subprocess, "run", return_value=completed) as run,
+        ):
+            executor.run_local_exec({"command": "id", "sudo": True})
+        self.assertEqual(run.call_args.args[0], ["sudo", "--", "id"])
 
 
 if __name__ == "__main__":

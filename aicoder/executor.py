@@ -12,6 +12,7 @@ import json
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -803,7 +804,23 @@ def run_local_exec(args: dict) -> Tuple[str, bool]:
             # Use shell only for commands with shell operators (pipes, redirects)
             _SHELL_CHARS = {'|', '>', '<', '&', ';', '`', '$', '(', ')'}
             needs_shell = bool(set(cmd) & _SHELL_CHARS)
-            if use_sudo and needs_shell:
+            graphical_auth = bool(
+                use_sudo
+                and not sys.stdin.isatty()
+                and (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+                and shutil.which("pkexec")
+            )
+            if use_sudo and graphical_auth and needs_shell:
+                r = subprocess.run(
+                    ["pkexec", "sh", "-c", cmd], shell=False, cwd=cwd,
+                    capture_output=True, text=True, timeout=120,
+                )
+            elif use_sudo and graphical_auth:
+                r = subprocess.run(
+                    ["pkexec", *_argv(cmd)], shell=False, cwd=cwd,
+                    capture_output=True, text=True, timeout=120,
+                )
+            elif use_sudo and needs_shell:
                 r = subprocess.run(
                     ["sudo", "--", "sh", "-c", cmd], shell=False, cwd=cwd,
                     capture_output=True, text=True, timeout=60,

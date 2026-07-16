@@ -220,6 +220,32 @@ class SettingsWidget(QWidget):
         model_group.setLayout(model_form)
         layout.addWidget(model_group)
 
+        # --- Permission Group ---
+        permission_group = QGroupBox("Berechtigungen und Autopilot")
+        permission_form = QFormLayout()
+        self.approval_mode_combo = QComboBox()
+        self.approval_mode_combo.addItem("Manuell — jede Änderung bestätigen", "ask")
+        self.approval_mode_combo.addItem("Autopilot — normale Befehle automatisch freigeben", "autopilot")
+        self.approval_mode_combo.addItem("Nur sudo/root — Root-Anfragen automatisch freigeben", "sudo_only")
+        self.approval_mode_combo.addItem("Alles — sämtliche Änderungen automatisch freigeben", "all")
+        self.approval_mode_combo.setMinimumWidth(420)
+        self.approval_mode_combo.setToolTip(
+            "Root-Befehle öffnen den systemeigenen Polkit-Passwortdialog. Passwörter werden weder von ai-coder gelesen noch gespeichert oder an das Backend gesendet."
+        )
+        save_permissions_btn = QPushButton("Berechtigungen speichern")
+        save_permissions_btn.clicked.connect(self._save_permission_config)
+        self.permission_status = QLabel("Aktueller Modus wird aus state.json geladen")
+        self.permission_status.setStyleSheet("color: #888; font-size: 11px;")
+        row = QHBoxLayout()
+        row.addWidget(save_permissions_btn)
+        row.addWidget(self.permission_status)
+        row.addStretch()
+        permission_form.addRow("Freigabemodus:", self.approval_mode_combo)
+        permission_form.addRow(row)
+        self.approval_mode_combo.currentIndexChanged.connect(self._save_permission_config)
+        permission_group.setLayout(permission_form)
+        layout.addWidget(permission_group)
+
         # --- Tools Group ---
         tools_group = QGroupBox("Tools — loaded on demand")
         tools_layout = QVBoxLayout()
@@ -264,29 +290,7 @@ class SettingsWidget(QWidget):
         tools_group.setLayout(tools_layout)
         layout.addWidget(tools_group, stretch=1)
 
-        # --- Permission Group ---
-        permission_group = QGroupBox("Permissions / Autopilot")
-        permission_form = QFormLayout()
-        self.approval_mode_combo = QComboBox()
-        self.approval_mode_combo.addItem("Ask — confirm every change", "ask")
-        self.approval_mode_combo.addItem("Autopilot — approve normal writes", "autopilot")
-        self.approval_mode_combo.addItem("Just sudo/root — auto-approve elevated requests", "sudo_only")
-        self.approval_mode_combo.addItem("All — approve every mutation", "all")
-        self.approval_mode_combo.setMinimumWidth(420)
-        self.approval_mode_combo.setToolTip(
-            "Sudo always authenticates locally. Passwords are never stored or sent to the backend."
-        )
-        save_permissions_btn = QPushButton("Save Permissions")
-        save_permissions_btn.clicked.connect(self._save_permission_config)
-        self.permission_status = QLabel("")
-        row = QHBoxLayout()
-        row.addWidget(save_permissions_btn)
-        row.addWidget(self.permission_status)
-        row.addStretch()
-        permission_form.addRow("Approval mode:", self.approval_mode_combo)
-        permission_form.addRow(row)
-        permission_group.setLayout(permission_form)
-        layout.addWidget(permission_group)
+
 
 
     def _load_current(self):

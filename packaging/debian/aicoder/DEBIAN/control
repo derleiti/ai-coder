@@ -3,6 +3,7 @@ Version: 0.9.1
 Section: utils
 Priority: optional
 Architecture: amd64
+Depends: pkexec, polkitd, polkit-kde-agent-1
 Maintainer: Markus Leitermann <admin@ailinux.me>
 Homepage: https://ailinux.me
 Description: ai-coder — Terminal Coding & DevOps Agent
