@@ -35,6 +35,22 @@ _PROTECTED_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Tool-level mutation classification is transport-independent. The GUI may
+# execute both local tools and MCP tools, so approval must not depend on where
+# a tool happens to run. Exact names avoid false positives for read helpers.
+_MUTATING_TOOL_NAMES = {
+    "file_edit", "file_write", "file_ops", "code_edit", "code_patch",
+    "shell", "task_runner", "custom_exec", "binary_exec",
+    "git_ops", "config_set", "prompt_set", "vault_add",
+    "memory_store", "memory_clear", "clipboard_write",
+    "service_control", "container_control", "remote_task", "mesh_task",
+    "agent_start", "agent_stop", "agent_broadcast", "restart",
+    "ollama_pull", "ollama_delete", "package_manager",
+    "wp_create_draft", "wp_create_page", "wp_publish_post",
+    "wp_update_post", "wp_delete_post", "mail_send", "notify_send",
+}
+_DESTRUCTIVE_TOOL_NAMES = {"memory_clear", "ollama_delete", "wp_delete_post"}
+
 
 @dataclass(frozen=True)
 class ExecutionRisk:
@@ -63,12 +79,24 @@ def assess_execution(tool_name: str, args: dict[str, Any], *, destructive: bool 
     """Classify a local tool call without executing or modifying it."""
     command = str(args.get("command") or "").strip()
     cwd = str(args.get("cwd") or "").strip()
+    normalized_tool = str(tool_name or "").strip().lower()
+    # Providers and MCP gateways may namespace tool names (for example
+    # ``mcp.code_edit`` or ``server/code_edit``). Security classification must
+    # use the canonical leaf name while execution keeps the original name.
+    canonical_tool = re.split(r"[./:]", normalized_tool)[-1]
+    metadata_mutating = args.get("_mutating")
+    metadata_destructive = args.get("_destructive")
     sudo_requested = bool(args.get("sudo")) or bool(SUDO_PREFIX_RE.match(command))
     explicit_elevation = sudo_requested or bool(_ELEVATION_PREFIX_RE.match(command))
-    deletion = bool(_DELETE_RE.search(command))
+    deletion = (
+        bool(_DELETE_RE.search(command))
+        or canonical_tool in _DESTRUCTIVE_TOOL_NAMES
+        or metadata_destructive is True
+    )
     protected_path = bool(_PROTECTED_PATH_RE.search(command))
     mutation = (
-        tool_name == "file_edit"
+        metadata_mutating is True
+        or canonical_tool in _MUTATING_TOOL_NAMES
         or deletion
         or bool(_CREATE_OR_WRITE_RE.search(command))
         or bool(_PACKAGE_OR_SERVICE_RE.search(command))

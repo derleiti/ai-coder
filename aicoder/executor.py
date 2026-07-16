@@ -6,6 +6,8 @@ Eliminates code duplication for: tool parsing, tool execution,
 message management, destructive-command guards, audit logging.
 """
 from __future__ import annotations
+import copy
+import hashlib
 import json
 import os
 import platform
@@ -523,13 +525,49 @@ def is_destructive(cmd: str) -> bool:
 # ── Tool Cache (TTL-based, avoids re-fetching on every agent run) ──
 _tool_cache: list[dict] | None = None
 _tool_cache_ts: float = 0
+_tool_cache_key: tuple[str, str] | None = None
+_tool_security_hints: dict[str, tuple[bool | None, bool | None]] = {}
 _TOOL_CACHE_TTL = 300  # 5 minutes
 
+
+def _client_tool_cache_key(client: TriForceClient) -> tuple[str, str]:
+    """Keep tool catalogs isolated per endpoint and authenticated account."""
+    base_url = str(getattr(client, "base_url", "") or "").rstrip("/")
+    token = str(getattr(client, "token", "") or "")
+    token_id = hashlib.sha256(token.encode("utf-8")).hexdigest()[:16] if token else "anonymous"
+    return base_url, token_id
+
+
+def _tool_security_metadata(tool: dict) -> tuple[bool | None, bool | None]:
+    """Normalize MCP/provider safety annotations for the local approval broker."""
+    annotations = tool.get("annotations") if isinstance(tool.get("annotations"), dict) else {}
+    mutating = tool.get("mutating")
+    destructive = tool.get("destructive")
+    if not isinstance(mutating, bool):
+        read_only = annotations.get("readOnlyHint")
+        if isinstance(read_only, bool):
+            mutating = not read_only
+        elif isinstance(annotations.get("mutating"), bool):
+            mutating = annotations["mutating"]
+        else:
+            mutating = None
+    if not isinstance(destructive, bool):
+        hint = annotations.get("destructiveHint")
+        destructive = hint if isinstance(hint, bool) else None
+    return mutating, destructive
+
+
 def load_tools(client: TriForceClient, force_refresh: bool = False) -> list[dict]:
-    """Load MCP tool schemas + local tools. Cached for 5min to avoid startup lag."""
-    global _tool_cache, _tool_cache_ts
-    if not force_refresh and _tool_cache is not None and (time.time() - _tool_cache_ts) < _TOOL_CACHE_TTL:
-        return _tool_cache
+    """Load MCP tool schemas + local tools. Cached per account for 5 minutes."""
+    global _tool_cache, _tool_cache_ts, _tool_cache_key, _tool_security_hints
+    cache_key = _client_tool_cache_key(client)
+    if (
+        not force_refresh
+        and _tool_cache is not None
+        and _tool_cache_key == cache_key
+        and (time.time() - _tool_cache_ts) < _TOOL_CACHE_TTL
+    ):
+        return copy.deepcopy(_tool_cache)
 
     mcp_tools = []
     err_msg = ""
@@ -554,9 +592,15 @@ def load_tools(client: TriForceClient, force_refresh: bool = False) -> list[dict
         mcp_tools = FALLBACK_TOOLS
 
     result = LOCAL_TOOL_SCHEMAS + mcp_tools
-    _tool_cache = result
+    _tool_security_hints = {
+        str(tool.get("name", "")): _tool_security_metadata(tool)
+        for tool in result
+        if tool.get("name")
+    }
+    _tool_cache = copy.deepcopy(result)
     _tool_cache_ts = time.time()
-    return result
+    _tool_cache_key = cache_key
+    return copy.deepcopy(result)
 
 
 def build_tool_desc(tools: list[dict]) -> str:
@@ -823,40 +867,41 @@ def run_tool(
       If it returns False, execution is aborted.
       If None, risky writes and privilege requests are blocked.
     """
-    # Route local tools (all execute via subprocess on client machine)
-    _is_local = name in LOCAL_TOOL_NAMES
-    _SAFE_LOCAL_TOOLS = {"clipboard_read", "clipboard_write", "web_search_local", "web_fetch_local"}
-    if _is_local and name not in _SAFE_LOCAL_TOOLS:
-        cmd = args.get("command", "")
-        risk = assess_execution(name, args, destructive=is_destructive(cmd))
-        if risk.needs_approval and approval_fn is not None:
-            if not approval_fn(name, args):
+    # Approval is transport-independent. A mutating MCP tool is just as
+    # consequential as a local subprocess and must pass through the same local
+    # broker. This keeps GUI and REPL behaviour identical.
+    cmd = args.get("command", "")
+    approval_args = dict(args)
+    mutating_hint, destructive_hint = _tool_security_hints.get(name, (None, None))
+    if isinstance(mutating_hint, bool):
+        approval_args["_mutating"] = mutating_hint
+    if isinstance(destructive_hint, bool):
+        approval_args["_destructive"] = destructive_hint
+    risk = assess_execution(name, approval_args, destructive=is_destructive(cmd))
+    if risk.needs_approval:
+        if approval_fn is not None:
+            if not approval_fn(name, approval_args):
                 result = f"{name}: aborted by user"
                 audit.log_tool(
-                    tool_name=name,
-                    arguments=args,
-                    result=result,
-                    duration_s=0,
-                    is_error=True,
-                    model=model,
-                    iteration=iteration,
+                    tool_name=name, arguments=args, result=result, duration_s=0,
+                    is_error=True, model=model, iteration=iteration,
                 )
                 return result, True
-        elif risk.needs_approval:
+        else:
             import sys as _sys
-            print(f"\033[31m⚠ BLOCKED (local write/privilege without approval): {cmd[:120]}\033[0m",
-                  file=_sys.stderr)
-            result = f"{name}: blocked — local write or privilege requires explicit approval: {cmd[:120]}"
+            print(
+                f"\033[31m⚠ BLOCKED (write/privilege without approval): {name} {cmd[:120]}\033[0m",
+                file=_sys.stderr,
+            )
+            result = f"{name}: blocked — write or privilege requires explicit approval"
             audit.log_tool(
-                tool_name=name,
-                arguments=args,
-                result=result,
-                duration_s=0,
-                is_error=True,
-                model=model,
-                iteration=iteration,
+                tool_name=name, arguments=args, result=result, duration_s=0,
+                is_error=True, model=model, iteration=iteration,
             )
             return result, True
+
+    # Route local tools (all execute via subprocess on client machine)
+    _is_local = name in LOCAL_TOOL_NAMES
 
     t_start = time.time()
 

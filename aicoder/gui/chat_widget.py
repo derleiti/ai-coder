@@ -42,7 +42,7 @@ class _AgentWorker(QThread):
     finished = pyqtSignal(str, str)           # (final_text, model)
     error = pyqtSignal(str)
     messages_updated = pyqtSignal(list)
-    approval_needed = pyqtSignal(str, str, bool, str)  # tool, command, elevation, reason
+    approval_needed = pyqtSignal(str, object)  # tool, complete approval arguments
 
     def __init__(
         self, client, messages_array, model, fallback, tools, system_prompt,
@@ -74,12 +74,13 @@ class _AgentWorker(QThread):
 
     def _gui_approval(self, tool_name: str, args: dict) -> bool:
         """Approval callback for risky writes; elevation stays terminal-only."""
-        cmd = args.get("command", "")
-        risk = assess_execution(tool_name, args, destructive=is_destructive(cmd))
-        # Emit signal to main thread, then wait
+        approval_args = dict(args)
+        # Preserve the complete, security-enriched argument map. Structured MCP
+        # writes often have no command string; dropping metadata here made the
+        # GUI dialog misclassify or hide the requested operation.
         self._approval_event.clear()
         self._approval_result = False
-        self.approval_needed.emit(tool_name, cmd, risk.elevation, risk.user_reason)
+        self.approval_needed.emit(tool_name, approval_args)
         # Poll every 2s so stop() is respected during pending approval
         for _ in range(60):  # max 120s total
             if self._approval_event.wait(timeout=2):
@@ -636,20 +637,41 @@ class ChatWidget(QWidget):
             self._activity_label = "stopping safely"
             self._append_msg("system", "Stop requested...", "")
 
-    def _on_approval_needed(self, tool_name: str, command: str, elevation: bool, reason: str):
-        """Show modal dialog for command approval (main thread)."""
-        preview = command if len(command) <= 300 else command[:300] + "…"
-        args = {"command": command}
-        if elevation:
-            args["sudo"] = True
-        if reason:
-            args["reason"] = reason
+    @staticmethod
+    def _approval_preview(arguments: dict, limit: int = 1200) -> str:
+        """Render structured tool arguments without exposing common secrets."""
+        sensitive = {"token", "password", "secret", "api_key", "apikey", "authorization"}
+
+        def scrub(value):
+            if isinstance(value, dict):
+                return {
+                    str(key): ("<redacted>" if str(key).lower() in sensitive else scrub(item))
+                    for key, item in value.items()
+                    if not str(key).startswith("_")
+                }
+            if isinstance(value, list):
+                return [scrub(item) for item in value]
+            return value
+
+        try:
+            rendered = json.dumps(scrub(arguments), ensure_ascii=False, indent=2, default=str)
+        except Exception:
+            rendered = repr(arguments)
+        return rendered if len(rendered) <= limit else rendered[:limit] + "…"
+
+    def _on_approval_needed(self, tool_name: str, arguments: object):
+        """Show a complete, metadata-aware approval dialog in the main thread."""
+        args = dict(arguments) if isinstance(arguments, dict) else {}
+        command = str(args.get("command", "") or "")
         risk = assess_execution(tool_name, args, destructive=is_destructive(command))
+        preview = self._approval_preview(args)
+
         if risk.elevation:
             QMessageBox.warning(
                 self,
                 "Terminal authorization required",
                 format_request(risk) +
+                "\n\nTool arguments:\n" + preview +
                 "\n\nErhöhte Rechte sind nur im interaktiven `aicoder agent`-REPL erlaubt. "
                 "Dadurch bleibt das sudo-Passwort vollständig im lokalen Terminal.",
             )
@@ -657,18 +679,27 @@ class ChatWidget(QWidget):
                 self._worker.set_approval(False)
             return
 
-        title = "Delete local files?" if risk.deletion else "Allow local write?"
-        msg = format_request(risk) + "\n\nEinmal ausführen?"
+        if risk.deletion or risk.destructive:
+            title = "Destructive operation — allow once?"
+            default = QMessageBox.StandardButton.No
+        elif risk.mutation:
+            title = "State-changing operation — allow once?"
+            default = QMessageBox.StandardButton.No
+        else:
+            title = "Tool operation — allow once?"
+            default = QMessageBox.StandardButton.No
+
+        msg = format_request(risk) + "\n\nTool arguments:\n" + preview + "\n\nEinmal ausführen?"
         reply = QMessageBox.question(
             self, title, msg,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No if destructive else QMessageBox.StandardButton.Yes,
+            default,
         )
         approved = reply == QMessageBox.StandardButton.Yes
         if self._worker:
             self._worker.set_approval(approved)
         if not approved:
-            self._append_msg("system", f"Command rejected: {preview[:100]}", "")
+            self._append_msg("system", f"Tool rejected: {tool_name}", preview[:160])
 
     def _send(self):
         text = self.input.toPlainText().strip()

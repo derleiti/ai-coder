@@ -451,6 +451,33 @@ class PrivilegeBrokerTests(unittest.TestCase):
         self.assertIn("requires explicit approval", result)
         audit_log.assert_called_once()
 
+    def test_mutating_mcp_tool_is_blocked_without_approval_callback(self):
+        client = MagicMock()
+        with patch.object(executor.audit, "log_tool") as audit_log:
+            result, is_error = executor.run_tool(
+                client, "code_patch", {"patch": "--- a/x\n+++ b/x\n"}
+            )
+        self.assertTrue(is_error)
+        self.assertIn("requires explicit approval", result)
+        client.mcp_call.assert_not_called()
+        audit_log.assert_called_once()
+
+    def test_mutating_mcp_tool_runs_after_local_approval(self):
+        client = MagicMock()
+        client.mcp_call.return_value = {
+            "result": {"content": [{"type": "text", "text": "patched"}]}
+        }
+        approval = MagicMock(return_value=True)
+        with patch.object(executor.audit, "log_tool"):
+            result, is_error = executor.run_tool(
+                client, "code_patch", {"patch": "--- a/x\n+++ b/x\n"},
+                approval_fn=approval,
+            )
+        self.assertFalse(is_error)
+        self.assertEqual(result, "patched")
+        approval.assert_called_once()
+        client.mcp_call.assert_called_once()
+
     def test_sudo_redirect_runs_inside_elevated_shell(self):
         completed = MagicMock(returncode=0, stdout="", stderr="")
         with patch.object(executor.subprocess, "run", return_value=completed) as run:
@@ -513,3 +540,54 @@ class PrivilegeBrokerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ToolSecurityHardeningTests(unittest.TestCase):
+    def test_namespaced_mutating_tool_requires_approval(self):
+        for name in ("mcp.code_edit", "server/code_patch", "plugin:memory_clear"):
+            with self.subTest(name=name):
+                self.assertTrue(assess_execution(name, {}).needs_approval)
+
+    def test_dynamic_mutating_hint_requires_approval(self):
+        self.assertTrue(assess_execution("future_tool", {"_mutating": True}).needs_approval)
+        self.assertFalse(assess_execution("future_tool", {"_mutating": False}).needs_approval)
+
+    def test_tool_cache_is_scoped_per_authenticated_client(self):
+        class FakeClient:
+            def __init__(self, base_url, token, tool_name):
+                self.base_url = base_url
+                self.token = token
+                self.tool_name = tool_name
+                self.calls = 0
+
+            def _request(self, *args, **kwargs):
+                self.calls += 1
+                return {"result": {"tools": [{
+                    "name": self.tool_name,
+                    "description": "test",
+                    "inputSchema": {"type": "object", "properties": {}},
+                }]}}
+
+        saved = (
+            executor.AGENT_TOOLS, executor._tool_cache, executor._tool_cache_ts,
+            executor._tool_cache_key, executor._tool_security_hints,
+        )
+        try:
+            executor.AGENT_TOOLS = {"health", "status"}
+            executor._tool_cache = None
+            executor._tool_cache_ts = 0
+            executor._tool_cache_key = None
+            executor._tool_security_hints = {}
+            first = FakeClient("https://one.invalid", "token-a", "health")
+            second = FakeClient("https://one.invalid", "token-b", "status")
+            first_tools = executor.load_tools(first)
+            second_tools = executor.load_tools(second)
+            self.assertIn("health", {tool["name"] for tool in first_tools})
+            self.assertIn("status", {tool["name"] for tool in second_tools})
+            self.assertEqual(first.calls, 1)
+            self.assertEqual(second.calls, 1)
+        finally:
+            (
+                executor.AGENT_TOOLS, executor._tool_cache, executor._tool_cache_ts,
+                executor._tool_cache_key, executor._tool_security_hints,
+            ) = saved

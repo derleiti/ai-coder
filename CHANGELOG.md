@@ -1,3 +1,10 @@
+## v0.9.1 — GUI Approval Broker + Tool Loading Hardening (2026-07-16)
+
+- Preserve complete structured MCP arguments and mutation/destruction metadata through the GUI approval signal.
+- Display redacted tool arguments in approval dialogs and default state-changing operations to deny.
+- Harden provider tool-call normalization, account-scoped tool caching, and on-demand tool loading behavior.
+- Add regression coverage for GUI approval metadata, secret redaction, provider compatibility, and tool selection.
+
 ## v0.9.0 — Reliable Agent Runtime + Privilege Broker (2026-07-15)
 
 ### Agent Runtime
