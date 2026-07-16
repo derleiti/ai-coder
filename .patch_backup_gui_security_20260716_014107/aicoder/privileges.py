@@ -1,0 +1,134 @@
+"""Risk classification and local privilege acquisition for agent commands.
+
+The model may request elevation, but only the local user can grant it. No
+password is accepted by ai-coder or sent to TriForce; ``sudo`` owns the TTY.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+import re
+import shutil
+import subprocess
+import sys
+from typing import Any
+
+
+SUDO_PREFIX_RE = re.compile(r"^\s*sudo(?:\s+--)?\s+", re.IGNORECASE)
+_ELEVATION_PREFIX_RE = re.compile(r"^\s*(?:sudo|doas|pkexec)(?:\s+--)?\s+", re.IGNORECASE)
+_DELETE_RE = re.compile(r"(?:^|[;&|]\s*|\s)(?:sudo\s+)?(?:rm|rmdir|unlink|shred)\b", re.IGNORECASE)
+_CREATE_OR_WRITE_RE = re.compile(
+    r"(?:^|[;&|]\s*|\s)(?:sudo\s+)?(?:touch|mkdir|mktemp|install|cp|mv|tee|truncate|chmod|chown|ln)\b"
+    r"|(?:^|\s)sed\s+[^\n]*\s-i(?:\s|$)|(?:^|\s)>+\s*\S+",
+    re.IGNORECASE,
+)
+_PACKAGE_OR_SERVICE_RE = re.compile(
+    r"\b(?:apt(?:-get)?|dnf|yum|pacman|zypper)\s+(?:install|remove|purge|upgrade|update)\b"
+    r"|\bsystemctl\s+(?:start|stop|restart|reload|enable|disable|mask|unmask)\b",
+    re.IGNORECASE,
+)
+_GIT_MUTATION_RE = re.compile(
+    r"\bgit\s+(?:add|commit|push|pull|merge|rebase|checkout|switch|reset|clean|stash|tag|branch\s+-[dD])\b",
+    re.IGNORECASE,
+)
+_PROTECTED_PATH_RE = re.compile(
+    r"(?<![\w.-])/(?:etc|boot|usr|bin|sbin|lib(?:32|64)?|root|var|opt|dev)(?:/|\b)",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class ExecutionRisk:
+    needs_approval: bool
+    elevation: bool
+    sudo: bool
+    mutation: bool
+    deletion: bool
+    protected_path: bool
+    destructive: bool
+    reasons: tuple[str, ...]
+    command: str
+    cwd: str
+    user_reason: str
+
+    @property
+    def level(self) -> str:
+        if self.elevation or self.destructive or self.deletion:
+            return "high"
+        if self.mutation:
+            return "write"
+        return "read"
+
+
+def assess_execution(tool_name: str, args: dict[str, Any], *, destructive: bool = False) -> ExecutionRisk:
+    """Classify a local tool call without executing or modifying it."""
+    command = str(args.get("command") or "").strip()
+    cwd = str(args.get("cwd") or "").strip()
+    sudo_requested = bool(args.get("sudo")) or bool(SUDO_PREFIX_RE.match(command))
+    explicit_elevation = sudo_requested or bool(_ELEVATION_PREFIX_RE.match(command))
+    deletion = bool(_DELETE_RE.search(command))
+    protected_path = bool(_PROTECTED_PATH_RE.search(command))
+    mutation = (
+        tool_name == "file_edit"
+        or deletion
+        or bool(_CREATE_OR_WRITE_RE.search(command))
+        or bool(_PACKAGE_OR_SERVICE_RE.search(command))
+        or bool(_GIT_MUTATION_RE.search(command))
+    )
+
+    reasons: list[str] = []
+    if explicit_elevation:
+        reasons.append("erhöhte lokale Rechte angefordert")
+    if deletion:
+        reasons.append("Dateien oder Verzeichnisse werden gelöscht")
+    elif mutation:
+        reasons.append("lokaler Zustand oder Dateien werden verändert")
+    if protected_path:
+        reasons.append("geschützter Systempfad betroffen")
+    if destructive:
+        reasons.append("potenziell destruktives Befehlsmuster")
+
+    return ExecutionRisk(
+        needs_approval=bool(explicit_elevation or mutation or destructive),
+        elevation=explicit_elevation,
+        sudo=sudo_requested,
+        mutation=mutation,
+        deletion=deletion,
+        protected_path=protected_path,
+        destructive=destructive,
+        reasons=tuple(dict.fromkeys(reasons)),
+        command=command,
+        cwd=cwd,
+        user_reason=str(args.get("reason") or "").strip(),
+    )
+
+
+def validate_sudo_session(timeout: int = 120) -> tuple[bool, str]:
+    """Authenticate through sudo's controlling TTY without seeing a password."""
+    if shutil.which("sudo") is None:
+        return False, "sudo ist auf diesem System nicht installiert"
+    if not sys.stdin.isatty() or not sys.stderr.isatty():
+        return False, "sudo-Authentifizierung benötigt einen interaktiven Terminal-REPL"
+    try:
+        result = subprocess.run(["sudo", "-v"], timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        return False, "sudo-Authentifizierung hat das Zeitlimit überschritten"
+    except OSError as exc:
+        return False, f"sudo konnte nicht gestartet werden: {exc}"
+    if result.returncode != 0:
+        return False, f"sudo-Authentifizierung abgelehnt (Exit {result.returncode})"
+    return True, "sudo-Berechtigung lokal bestätigt"
+
+
+def format_request(risk: ExecutionRisk) -> str:
+    """Human-readable approval card used by terminal and GUI."""
+    title = "PRIVILEGIEN" if risk.elevation else ("LÖSCHEN" if risk.deletion else "SCHREIBZUGRIFF")
+    details = [f"  Anfrage : {title}"]
+    if risk.user_reason:
+        details.append(f"  Grund   : {risk.user_reason}")
+    details.append(f"  Befehl  : {risk.command[:500]}")
+    details.append(f"  Ordner  : {risk.cwd or '(aktueller Workspace)'}")
+    if risk.reasons:
+        details.append(f"  Risiko  : {'; '.join(risk.reasons)}")
+    if risk.elevation:
+        details.append("  Passwort: ausschließlich lokaler sudo-Dialog; nie an Modell oder Backend")
+    return "\n".join(details)

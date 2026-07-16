@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=ai-coder GUI
+Comment=AILinux Coding Agent — 625+ Modelle, MCP-Tools
+Exec=aicoder gui
+Icon=utilities-terminal
+Terminal=false
+Type=Application
+Categories=Development;AI;
+Keywords=ai;coding;agent;llm;ailinux;
+StartupNotify=true

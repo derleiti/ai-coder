@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=ai-coder Terminal
+Comment=AILinux Coding Agent — Terminal REPL
+Exec=x-terminal-emulator -e aicoder
+Icon=utilities-terminal
+Terminal=true
+Type=Application
+Categories=Development;AI;
+Keywords=ai;coding;agent;llm;ailinux;
