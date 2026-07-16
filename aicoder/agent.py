@@ -22,7 +22,9 @@ from .executor import (
     FALLBACK_TOOLS as _FALLBACK_TOOLS, OS_NAME, OS_INSTRUCTIONS,
 )
 from .history import record as history_record
-from .privileges import assess_execution, format_request, validate_sudo_session
+from .privileges import (
+    approval_is_automatic, assess_execution, format_request, validate_sudo_session,
+)
 from .session_state import get_state
 from .ui import (
     AgentSpinner, C,
@@ -43,6 +45,7 @@ def _cli_approval(tool_name: str, args: dict) -> bool:
     if not risk.needs_approval:
         return True
 
+    mode = get_state().get("approval_mode", "ask")
     if risk.elevation and not risk.user_reason:
         print(
             f"\n{C.BRED}✗ Privilegienanfrage abgelehnt:{C.RESET} "
@@ -51,15 +54,20 @@ def _cli_approval(tool_name: str, args: dict) -> bool:
         )
         return False
 
-    print(f"\n{C.BYELLOW}{C.BOLD}◆ Lokale Freigabe erforderlich{C.RESET}", file=sys.stderr)
+    automatic = approval_is_automatic(mode, risk)
+    if automatic:
+        print(f"\n{C.BGREEN}✓ Automatisch freigegeben ({mode}){C.RESET}", file=sys.stderr)
+    else:
+        print(f"\n{C.BYELLOW}{C.BOLD}◆ Lokale Freigabe erforderlich{C.RESET}", file=sys.stderr)
     print(format_request(risk), file=sys.stderr)
-    try:
-        confirm = input("  Einmal erlauben? [y/N] ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        confirm = "n"
-    if confirm not in {"y", "yes", "j", "ja"}:
-        print("  Abgelehnt.", file=sys.stderr)
-        return False
+    if not automatic:
+        try:
+            confirm = input("  Einmal erlauben? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            confirm = "n"
+        if confirm not in {"y", "yes", "j", "ja"}:
+            print("  Abgelehnt.", file=sys.stderr)
+            return False
 
     if risk.sudo:
         print("  sudo authentifiziert jetzt direkt im lokalen Terminal.", file=sys.stderr)

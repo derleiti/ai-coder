@@ -9,6 +9,7 @@ STATE_FILE = CONFIG_DIR / "state.json"
 
 SWARM_MODES = {"off", "auto", "on", "review"}
 TOOL_MODES = {"off", "on_demand", "always"}
+APPROVAL_MODES = {"ask", "autopilot", "sudo_only", "all"}
 DEFAULT_FALLBACK_MODEL = "ollama/llama3.2:latest"
 
 _DEFAULTS: Dict[str, Any] = {
@@ -21,6 +22,9 @@ _DEFAULTS: Dict[str, Any] = {
     "tool_mode": "on_demand",
     "enabled_tools": None,
     "request_timeout": 30,
+    # ask: confirm every mutation; autopilot: safe writes only; sudo_only:
+    # automatically approve elevated requests after local sudo auth; all: all mutations.
+    "approval_mode": "ask",
 }
 
 # In-memory cache — vermeidet wiederholte Disk-Reads im Agent-Loop
@@ -86,6 +90,17 @@ def set_enabled_tools(names: Optional[list[str]]) -> None:
     """Persist selected tool names. None means all discovered tools."""
     d = _load_raw()
     d["enabled_tools"] = None if names is None else sorted(set(names))
+    _save_raw(d)
+
+
+
+def set_approval_mode(mode: str) -> None:
+    if mode not in APPROVAL_MODES:
+        raise ValueError(
+            f"Ungültiger Approval-Modus '{mode}'. Erlaubt: {', '.join(sorted(APPROVAL_MODES))}"
+        )
+    d = _load_raw()
+    d["approval_mode"] = mode
     _save_raw(d)
 
 

@@ -23,7 +23,9 @@ from PyQt6.QtGui import (
 )
 
 from ..config import load_session
-from ..privileges import assess_execution, format_request
+from ..privileges import (
+    approval_is_automatic, assess_execution, format_request, validate_sudo_session_gui,
+)
 from ..session_state import get_state
 from ..client import TriForceClient, ClientError
 from .. import chat_history
@@ -660,46 +662,63 @@ class ChatWidget(QWidget):
         return rendered if len(rendered) <= limit else rendered[:limit] + "…"
 
     def _on_approval_needed(self, tool_name: str, arguments: object):
-        """Show a complete, metadata-aware approval dialog in the main thread."""
+        """Apply the persisted approval policy and authenticate sudo locally."""
         args = dict(arguments) if isinstance(arguments, dict) else {}
         command = str(args.get("command", "") or "")
         risk = assess_execution(tool_name, args, destructive=is_destructive(command))
         preview = self._approval_preview(args)
+        mode = get_state().get("approval_mode", "ask")
+        automatic = approval_is_automatic(mode, risk)
 
-        if risk.elevation:
+        if risk.elevation and not risk.user_reason:
             QMessageBox.warning(
-                self,
-                "Terminal authorization required",
-                format_request(risk) +
-                "\n\nTool arguments:\n" + preview +
-                "\n\nErhöhte Rechte sind nur im interaktiven `aicoder agent`-REPL erlaubt. "
-                "Dadurch bleibt das sudo-Passwort vollständig im lokalen Terminal.",
+                self, "Root request rejected",
+                "Root-/sudo-Anfragen benötigen einen konkreten Grund vom Modell.\n\n"
+                + format_request(risk),
             )
             if self._worker:
                 self._worker.set_approval(False)
             return
 
-        if risk.deletion or risk.destructive:
-            title = "Destructive operation — allow once?"
-            default = QMessageBox.StandardButton.No
-        elif risk.mutation:
-            title = "State-changing operation — allow once?"
-            default = QMessageBox.StandardButton.No
-        else:
-            title = "Tool operation — allow once?"
-            default = QMessageBox.StandardButton.No
+        if not automatic:
+            if risk.deletion or risk.destructive:
+                title = "Destructive operation — allow once?"
+            elif risk.elevation:
+                title = "Root operation — authenticate and allow once?"
+            elif risk.mutation:
+                title = "State-changing operation — allow once?"
+            else:
+                title = "Tool operation — allow once?"
+            msg = format_request(risk) + "\n\nTool arguments:\n" + preview + "\n\nEinmal ausführen?"
+            reply = QMessageBox.question(
+                self, title, msg,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                if self._worker:
+                    self._worker.set_approval(False)
+                self._append_msg("system", f"Tool rejected: {tool_name}", preview[:160])
+                return
 
-        msg = format_request(risk) + "\n\nTool arguments:\n" + preview + "\n\nEinmal ausführen?"
-        reply = QMessageBox.question(
-            self, title, msg,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            default,
-        )
-        approved = reply == QMessageBox.StandardButton.Yes
+        if risk.sudo:
+            self._append_msg(
+                "system",
+                "Opening a local terminal for sudo authentication…",
+                f"mode={mode}",
+            )
+            ok, message = validate_sudo_session_gui()
+            if not ok:
+                QMessageBox.critical(self, "sudo authentication failed", message)
+                if self._worker:
+                    self._worker.set_approval(False)
+                return
+            self._append_msg("system", message, "password stayed in local terminal")
+
+        if automatic:
+            self._append_msg("system", f"Auto-approved: {tool_name}", f"mode={mode}")
         if self._worker:
-            self._worker.set_approval(approved)
-        if not approved:
-            self._append_msg("system", f"Tool rejected: {tool_name}", preview[:160])
+            self._worker.set_approval(True)
 
     def _send(self):
         text = self.input.toPlainText().strip()

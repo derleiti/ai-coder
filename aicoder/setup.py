@@ -17,8 +17,8 @@ from typing import Optional
 
 from .config import CONFIG_DIR, DEFAULT_BASE_URL, Session, load_session, save_session
 from .session_state import (
-    SWARM_MODES, get_state,
-    set_fallback, set_model, set_swarm, set_workspace,
+    SWARM_MODES, APPROVAL_MODES, get_state,
+    set_approval_mode, set_fallback, set_model, set_swarm, set_workspace,
 )
 from .ui import C, bold, dim, cyan, green, yellow, red, magenta, white, panel, term_width, reset_live_line
 from .repl_input import COMMANDS, PromptCancelled, ReplInput
@@ -432,7 +432,8 @@ def run_repl(skip_setup: bool = False) -> int:
         current = get_state()
         active_model = current.get("selected_model") or "backend"
         mode = current.get("tool_mode", "on_demand")
-        return f"  {active_model} · tools:{mode} · approvals:ask · swarm:{current.get('swarm_mode', 'off')}"
+        approval = current.get("approval_mode", "ask")
+        return f"  {active_model} · tools:{mode} · approvals:{approval} · swarm:{current.get('swarm_mode', 'off')}"
 
     repl_input = ReplInput(CONFIG_DIR / "history", _toolbar)
     conversation: list[dict] = []
@@ -461,8 +462,9 @@ def run_repl(skip_setup: bool = False) -> int:
         print(f"  {dim('account  ')} {cyan(identity)}")
         print(f"  {dim('operator ')} {cyan(model or '(backend default)')}")
         print(f"  {dim('fallback ')} {dim(fallback or '—')}")
+        approval_mode = state.get("approval_mode", "ask")
         print(f"  {dim('runtime  ')} tools={cyan(tool_mode)} · enabled={cyan('all' if enabled is None else str(len(enabled)))} · "
-              f"swarm={cyan(swarm)} · timeout={cyan(str(timeout)+'s')}")
+              f"approvals={cyan(approval_mode)} · swarm={cyan(swarm)} · timeout={cyan(str(timeout)+'s')}")
         print(f"  {dim('workspace')} {dim(ws)}")
         print(f"  {C.DIM}{rule}{C.RESET}")
         if repl_input.enhanced:
@@ -546,13 +548,23 @@ def run_repl(skip_setup: bool = False) -> int:
                 print("  Ctrl+L       Terminal neu zeichnen")
                 print("  Tab          Slash-Kommandos vervollständigen")
             elif cmd == "/permissions":
-                print("  Lokale Berechtigungsrichtlinie")
-                print("  read       automatisch · keine Änderung")
-                print("  write      jedes Erstellen/Ändern einzeln bestätigen")
-                print("  delete     hohe Warnstufe · jedes Löschen einzeln bestätigen")
-                print("  sudo       einzeln bestätigen + Authentifizierung direkt durch lokales sudo")
-                print("  password   wird nie von ai-coder gelesen, gespeichert oder an TriForce gesendet")
-                print("  GUI sudo   blockiert · erhöhte Rechte nur im interaktiven Terminal-REPL")
+                if val:
+                    aliases = {"manual": "ask", "auto": "autopilot", "sudo": "sudo_only", "root": "sudo_only"}
+                    requested = aliases.get(val.strip().lower(), val.strip().lower())
+                    try:
+                        set_approval_mode(requested)
+                        print(f"  approvals → {requested}")
+                    except ValueError as e:
+                        print(f"  Fehler: {e}")
+                else:
+                    active = get_state().get("approval_mode", "ask")
+                    print(f"  Lokale Berechtigungsrichtlinie · aktiv: {active}")
+                    print("  ask        jede Änderung einzeln bestätigen")
+                    print("  autopilot  normale Schreibzugriffe automatisch; sudo/delete weiter bestätigen")
+                    print("  sudo_only  nur root/sudo automatisch; lokale sudo-Authentifizierung bleibt Pflicht")
+                    print("  all        alle Mutationen automatisch; sudo-Authentifizierung bleibt Pflicht")
+                    print("  Passwort   wird nie gelesen, gespeichert oder an TriForce gesendet")
+                    print("  Setzen: /permissions ask|autopilot|sudo_only|all")
             elif cmd == "/shell":
                 if val:
                     import subprocess, time as _t

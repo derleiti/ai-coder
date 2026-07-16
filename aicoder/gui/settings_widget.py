@@ -11,6 +11,7 @@ from ..config import DEFAULT_BASE_URL, Session, load_session, save_session, dele
 from ..session_state import (
     SWARM_MODES, get_state, set_model, set_fallback, set_swarm,
     set_tool_mode, set_enabled_tools, set_request_timeout,
+    set_approval_mode,
 )
 from ..client import TriForceClient
 from ..executor import load_tools
@@ -263,6 +264,30 @@ class SettingsWidget(QWidget):
         tools_group.setLayout(tools_layout)
         layout.addWidget(tools_group, stretch=1)
 
+        # --- Permission Group ---
+        permission_group = QGroupBox("Permissions / Autopilot")
+        permission_form = QFormLayout()
+        self.approval_mode_combo = QComboBox()
+        self.approval_mode_combo.addItem("Ask — confirm every change", "ask")
+        self.approval_mode_combo.addItem("Autopilot — approve normal writes", "autopilot")
+        self.approval_mode_combo.addItem("Just sudo/root — auto-approve elevated requests", "sudo_only")
+        self.approval_mode_combo.addItem("All — approve every mutation", "all")
+        self.approval_mode_combo.setMinimumWidth(420)
+        self.approval_mode_combo.setToolTip(
+            "Sudo always authenticates locally. Passwords are never stored or sent to the backend."
+        )
+        save_permissions_btn = QPushButton("Save Permissions")
+        save_permissions_btn.clicked.connect(self._save_permission_config)
+        self.permission_status = QLabel("")
+        row = QHBoxLayout()
+        row.addWidget(save_permissions_btn)
+        row.addWidget(self.permission_status)
+        row.addStretch()
+        permission_form.addRow("Approval mode:", self.approval_mode_combo)
+        permission_form.addRow(row)
+        permission_group.setLayout(permission_form)
+        layout.addWidget(permission_group)
+
 
     def _load_current(self):
         # Session
@@ -296,6 +321,9 @@ class SettingsWidget(QWidget):
         if mode_idx >= 0:
             self.tool_mode_combo.setCurrentIndex(mode_idx)
         self.timeout_spin.setValue(int(state.get("request_timeout", 30)))
+        approval_idx = self.approval_mode_combo.findData(state.get("approval_mode", "ask"))
+        if approval_idx >= 0:
+            self.approval_mode_combo.setCurrentIndex(approval_idx)
 
     def _load_models(self):
         """Load model list from backend."""
@@ -442,6 +470,13 @@ class SettingsWidget(QWidget):
         )
         self.tool_status.setStyleSheet("color: #00ff88; font-size: 11px;")
         self.tools_changed.emit(mode, selected)
+
+
+    def _save_permission_config(self):
+        mode = self.approval_mode_combo.currentData() or "ask"
+        set_approval_mode(mode)
+        self.permission_status.setText(f"Saved · {mode}")
+        self.permission_status.setStyleSheet("color: #00ff88; font-size: 11px;")
 
     def _do_login(self):
         base_url = self.base_url_edit.text().strip()

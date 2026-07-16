@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
+import os
 import shutil
 import subprocess
 import sys
@@ -160,3 +161,55 @@ def format_request(risk: ExecutionRisk) -> str:
     if risk.elevation:
         details.append("  Passwort: ausschließlich lokaler sudo-Dialog; nie an Modell oder Backend")
     return "\n".join(details)
+
+
+def approval_is_automatic(mode: str, risk: ExecutionRisk) -> bool:
+    """Return whether a persisted permission mode may approve this risk.
+
+    Destructive/deletion requests remain interactive in ``autopilot`` and
+    ``sudo_only``.  ``all`` is the only mode that also auto-approves them.
+    Sudo authentication itself is never bypassed.
+    """
+    mode = str(mode or "ask").strip().lower()
+    if not risk.needs_approval:
+        return True
+    if mode == "all":
+        return True
+    if mode == "autopilot":
+        return bool(risk.mutation and not risk.elevation and not risk.deletion and not risk.destructive)
+    if mode == "sudo_only":
+        return bool(risk.elevation and not risk.deletion and not risk.destructive)
+    return False
+
+
+def validate_sudo_session_gui(timeout: int = 120) -> tuple[bool, str]:
+    """Authenticate sudo in a real local terminal, then verify cached credentials.
+
+    ai-coder never receives password bytes. The terminal runs ``sudo -v`` and
+    the GUI only observes its exit status.
+    """
+    if shutil.which("sudo") is None:
+        return False, "sudo ist auf diesem System nicht installiert"
+    terminals = [
+        (["x-terminal-emulator", "-e"], shutil.which("x-terminal-emulator")),
+        (["konsole", "-e"], shutil.which("konsole")),
+        (["gnome-terminal", "--wait", "--"], shutil.which("gnome-terminal")),
+        (["xfce4-terminal", "--disable-server", "-e"], shutil.which("xfce4-terminal")),
+        (["xterm", "-e"], shutil.which("xterm")),
+    ]
+    launcher = next((prefix for prefix, path in terminals if path), None)
+    if launcher is None:
+        return False, "kein unterstütztes Terminal für die lokale sudo-Abfrage gefunden"
+    command = ["sudo", "-v"]
+    try:
+        result = subprocess.run([*launcher, *command], timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        return False, "sudo-Authentifizierung hat das Zeitlimit überschritten"
+    except OSError as exc:
+        return False, f"Terminal für sudo konnte nicht gestartet werden: {exc}"
+    if result.returncode != 0:
+        return False, f"sudo-Authentifizierung abgelehnt (Exit {result.returncode})"
+    verify = subprocess.run(["sudo", "-n", "-v"], capture_output=True, text=True, check=False)
+    if verify.returncode != 0:
+        return False, "sudo-Sitzung wurde nicht bestätigt"
+    return True, "sudo-Berechtigung lokal bestätigt"
