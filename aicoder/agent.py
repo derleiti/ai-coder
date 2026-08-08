@@ -87,7 +87,7 @@ def run_agent(
 ) -> int:
     session = load_session()
     state = get_state()
-    request_timeout = int(state.get("request_timeout", 30))
+    request_timeout = int(state.get("request_timeout", 300))
     client = TriForceClient(session.base_url, token=session.token, timeout=request_timeout)
     ws_path = Path(state.get("workspace_root") or ".").resolve()
 
@@ -109,12 +109,11 @@ def run_agent(
             enabled = set(enabled_tool_names)
             tools = [tool for tool in tools if tool.get("name") in enabled]
 
+    # Primary model stays primary. The fallback is only used after an actual
+    # request failure or explicit loop recovery; quick chat must not silently
+    # swap the configured route.
     effective_model = model
     effective_fallback = fallback_model
-    fast_route = quick_chat and fallback_model and fallback_model != model
-    if fast_route:
-        effective_model = fallback_model
-        effective_fallback = None
 
     system = build_system_prompt(tools, str(ws_path))
 

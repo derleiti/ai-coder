@@ -330,7 +330,15 @@ def run_setup(force: bool = False) -> bool:
         fallback = _ask("Fallback-ID", "")
     if fallback and fallback != "(keins)":
         set_fallback(fallback)
-        print(f"  fallback → {_c('green', fallback)}")
+        state = get_state()
+        effective_fallback = state.get("fallback_model") or ""
+        if effective_fallback:
+            print(f"  fallback → {_c('green', effective_fallback)}")
+        else:
+            print(f"  fallback → {_c('dim', 'disabled (same as operator)')}")
+    else:
+        set_fallback("")
+        print(f"  fallback → {_c('dim', 'disabled')}")
 
     print("\n── Swarm-Modus ────────────────────────────")
     swarm_descs = {
@@ -447,7 +455,7 @@ def run_repl(skip_setup: bool = False) -> int:
         ws = state.get("workspace_root") or str(Path.cwd())
         tool_mode = state.get("tool_mode", "on_demand")
         enabled = state.get("enabled_tools")
-        timeout = int(state.get("request_timeout", 30))
+        timeout = int(state.get("request_timeout", 300))
         try:
             session = load_session()
             identity = f"{session.user_id} · {session.tier}"

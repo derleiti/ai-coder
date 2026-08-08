@@ -1,3 +1,19 @@
+## v0.9.5 — Agent Reliability + Long Task Timeout (2026-08-08)
+
+- Harden tool-call parsing for provider responses that omit only trailing JSON object braces inside a complete `<tool_call>` envelope.
+- Keep genuinely truncated tool calls non-executable instead of guessing missing content.
+- Guide large `file_edit` writes into smaller sequential chunks to avoid oversized heredoc generations.
+- Enforce primary/fallback separation and improve fallback/tool compatibility behavior.
+- Raise the default AICoder model request timeout to 300 seconds for long coding and agent tasks.
+- Expand the GUI timeout control to 300 seconds and keep release metadata aligned across Debian, AUR, and the Windows installer.
+
+## v0.9.2 — Primary Routing + MCP Code Handler Fix (2026-08-08)
+
+- AI Coder keeps the selected primary model for quick chat; fallback is only used after failure or explicit loop recovery.
+- Updated routing regression tests for CLI and GUI semantics.
+- TriForce MCP V4 code handlers now use the maintained `mcp_service` implementations instead of stale `tristar_mcp` imports.
+- NVIDIA free-model routing remains server-side via the unified provider router.
+
 ## v0.9.1 — GUI Approval Broker + Tool Loading Hardening (2026-07-16)
 
 - Preserve complete structured MCP arguments and mutation/destruction metadata through the GUI approval signal.

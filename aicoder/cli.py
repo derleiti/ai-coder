@@ -80,10 +80,27 @@ def cmd_handshake(_: argparse.Namespace) -> int:
 def cmd_tools(_: argparse.Namespace) -> int:
     _, client = session_client()
     data = client.handshake()
-    tools = data.get("tools", [])
+    tools = data.get("tools") or []
+    allowed = data.get("allowed_tools") or []
+
+    # Admin/enterprise handshakes commonly grant the wildcard instead of
+    # embedding the full tool catalog. Resolve it through MCP tools/list so
+    # this command reports the same effective tools as the GUI/agent.
+    if not tools and "*" in allowed:
+        payload = {"jsonrpc": "2.0", "method": "tools/list", "params": {}, "id": 1}
+        listed = client._request(
+            "POST", "/v1/mcp", payload, require_auth=True, _label="tools/list"
+        )
+        tools = listed.get("result", {}).get("tools", [])
+    elif not tools:
+        tools = allowed
+
     print(f"{len(tools)} tools allowed")
-    for t in tools:
-        print(t)
+    for tool in tools:
+        if isinstance(tool, dict):
+            print(tool.get("name", ""))
+        else:
+            print(tool)
     return 0
 
 
@@ -140,7 +157,11 @@ def cmd_model(args: argparse.Namespace) -> int:
 def cmd_fallback(args: argparse.Namespace) -> int:
     if args.value:
         set_fallback(args.value)
-        print(f"fallback → {args.value}")
+        effective = get_state().get("fallback_model") or ""
+        if effective:
+            print(f"fallback → {effective}")
+        else:
+            print("fallback → disabled (same as operator)")
     else:
         state = get_state()
         val = state.get("fallback_model") or "(not set)"
@@ -353,9 +374,13 @@ def cmd_chat(args: argparse.Namespace) -> int:
             elif cmd == "/status":
                 print(f"model={model or 'backend default'}  swarm={swarm}  turns={len(history)}")
             elif cmd == "/fallback" and val:
-                state["fallback_model"] = val
                 set_fallback(val)
-                print(f"fallback → {val}")
+                effective = get_state().get("fallback_model") or ""
+                state["fallback_model"] = effective
+                if effective:
+                    print(f"fallback → {effective}")
+                else:
+                    print("fallback → disabled (same as operator)")
             elif cmd == "/help":
                 print("  /model <n>  /fallback <n>  /swarm <mode>  /status  /clear  /exit")
             elif cmd == "/clear":

@@ -281,9 +281,7 @@ class _AgentWorker(QThread):
 
 
 def _select_chat_route(model: str, fallback: str, quick_chat: bool):
-    """Use the configured fast fallback directly for greetings."""
-    if quick_chat and fallback and fallback != model:
-        return fallback, "", True
+    """Preserve the configured primary route; fallback means fallback."""
     return model, fallback, False
 
 

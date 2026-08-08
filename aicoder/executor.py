@@ -144,6 +144,67 @@ def is_short_confirmation(text: str) -> bool:
     return bool(_SHORT_CONFIRMATION_RE.fullmatch((text or "").strip()))
 
 
+_HEAVY_TASK_RE = re.compile(
+    r"\b(?:build|compile|rebuild|refactor|rewrite|migrat\w*|benchmark|"
+    r"integration\s+test|full\s+test|test\s+suite|repository|repo|kernel|docker|"
+    r"package|packaging|release|deploy|debug\w*|profil\w*|"
+    r"bau\w*|kompil\w*|refaktor\w*|migrier\w*|vollst[aä]ndig\w*|"
+    r"komplett\w*|gesamte\w*|gro(?:ß|ss)\w*|release\w*|paket\w*)\b",
+    re.IGNORECASE,
+)
+
+_SLOW_AGENT_MODEL_HINTS = (
+    "code-agent", "devstral", "codestral", "coder", "reasoning", "thinking",
+)
+
+
+def adaptive_request_timeout(
+    base_timeout: int | float,
+    prompt: str = "",
+    iteration: int = 0,
+    quick_chat: bool = False,
+    model: str | None = None,
+) -> int:
+    """Return a per-model-attempt timeout without slowing unrelated tools.
+
+    The persisted timeout is the user's latency preference for ordinary requests.
+    Agent work gets a larger floor because tool planning/code generation can take
+    materially longer. Heavy tasks and long-running loops get progressively more
+    room, capped at five minutes.
+    """
+    try:
+        base = int(base_timeout)
+    except (TypeError, ValueError):
+        base = 30
+    base = max(10, min(300, base))
+    if quick_chat:
+        return base
+
+    effective = max(base, 60)
+    model_key = (model or "").lower()
+    if any(hint in model_key for hint in _SLOW_AGENT_MODEL_HINTS):
+        effective = max(effective, 120)
+
+    text = prompt or ""
+    if len(text) >= 1500 or _HEAVY_TASK_RE.search(text):
+        effective = max(effective, 180)
+    if iteration >= 3:
+        effective = max(effective, 180)
+    if iteration >= 10:
+        effective = max(effective, 240)
+    return min(300, effective)
+
+
+def chat_with_timeout(client: TriForceClient, timeout: int, **kwargs: Any) -> Dict[str, Any]:
+    """Call chat with a temporary timeout and restore the client's base value."""
+    previous = client.timeout
+    client.timeout = max(10, min(300, int(timeout)))
+    try:
+        return client.chat(**kwargs)
+    finally:
+        client.timeout = previous
+
+
 class AgentLoopGuard:
     """Detect repeated tool/result cycles without limiting productive work."""
 
@@ -314,7 +375,11 @@ LOCAL_FILE_READ_SCHEMA = {
 
 LOCAL_FILE_EDIT_SCHEMA = {
     "name": "file_edit",
-    "description": "Edit a LOCAL file. Use sed, awk, or python/perl one-liners. For new files use tee or cat >.",
+    "description": (
+        "Edit a LOCAL file. Use sed, awk, or python/perl one-liners. "
+        "For new files use tee or cat >. Keep each file_edit command under about 6000 characters; "
+        "for larger files split the write across multiple calls (first cat >, then cat >> chunks)."
+    ),
     "inputSchema": {
         "type": "object",
         "properties": {
@@ -520,6 +585,9 @@ You are ai-coder — autonomous coding and DevOps agent on AILinux/TriForce (api
   abandon the task or repeat the same failing command unchanged.
 - After a change, verify the exact local result with lint, test, file_read,
   file_tree, or local_exec as appropriate. Use remote health only for backend work.
+- Keep file_edit tool calls compact. If generated file content would make the command
+  longer than about 6000 characters, split it into sequential chunks instead of one
+  giant heredoc; use > for the first chunk and >> for following chunks, verifying after.
 - When done: start reply with DONE:
 
 ## OS: {os_name}
@@ -726,11 +794,29 @@ def _normalize_tool_call(value: Any) -> Optional[dict]:
 
 
 def _append_json_calls(calls: list[dict], raw: str) -> bool:
-    """Parse one JSON object/list and append any valid tool calls."""
+    """Parse one JSON object/list and append any valid tool calls.
+
+    Some OpenAI-compatible providers occasionally omit one or two trailing
+    object braces inside an otherwise complete <tool_call> envelope. Repair
+    only that narrow case: add missing closing braces at the end and accept
+    the repair only when the result becomes valid JSON. Never guess missing
+    strings, commas, arrays, or truncated tool-call bodies.
+    """
+    text = raw.strip()
     try:
-        value = json.loads(raw.strip())
+        value = json.loads(text)
     except (json.JSONDecodeError, TypeError):
-        return False
+        value = None
+        if isinstance(text, str) and text.startswith("{"):
+            opens = text.count("{") - text.count("}")
+            if 0 < opens <= 2:
+                repaired = text + ("}" * opens)
+                try:
+                    value = json.loads(repaired)
+                except (json.JSONDecodeError, TypeError):
+                    value = None
+        if value is None:
+            return False
     values = value if isinstance(value, list) else [value]
     added = False
     for item in values:

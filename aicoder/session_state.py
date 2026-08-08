@@ -21,7 +21,7 @@ _DEFAULTS: Dict[str, Any] = {
     # full agent available for actual work.  None means "all discovered tools".
     "tool_mode": "on_demand",
     "enabled_tools": None,
-    "request_timeout": 30,
+    "request_timeout": 300,
     # ask: confirm every mutation; autopilot: safe writes only; sudo_only:
     # automatically approve elevated requests after local sudo auth; all: all mutations.
     "approval_mode": "ask",
@@ -69,12 +69,18 @@ def get_state() -> Dict[str, Any]:
 def set_model(model: str) -> None:
     d = _load_raw()
     d["selected_model"] = model
+    # A fallback identical to the primary can never recover a failed request.
+    # Clear it centrally so CLI, GUI and setup all share the same invariant.
+    if d.get("fallback_model") == model:
+        d["fallback_model"] = ""
     _save_raw(d)
 
 
 def set_fallback(model: str) -> None:
     d = _load_raw()
-    d["fallback_model"] = model
+    # Empty string explicitly disables fallback. Identical primary/fallback is
+    # normalized to disabled instead of presenting a fake recovery path.
+    d["fallback_model"] = "" if model == d.get("selected_model") else model
     _save_raw(d)
 
 
@@ -106,7 +112,7 @@ def set_approval_mode(mode: str) -> None:
 
 def set_request_timeout(seconds: int) -> None:
     d = _load_raw()
-    d["request_timeout"] = max(10, min(180, int(seconds)))
+    d["request_timeout"] = max(10, min(300, int(seconds)))
     _save_raw(d)
 
 

@@ -78,7 +78,7 @@ class TokenExpiredError(ClientError):
 
 
 class TriForceClient:
-    def __init__(self, base_url: str, token: Optional[str] = None, timeout: int = 60):
+    def __init__(self, base_url: str, token: Optional[str] = None, timeout: int = 300):
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.timeout = timeout

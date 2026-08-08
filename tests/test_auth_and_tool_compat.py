@@ -114,6 +114,23 @@ class ToolCallCompatibilityTests(unittest.TestCase):
             [{"name": "code_search", "arguments": {"query": "oauth"}}],
         )
 
+    def test_tool_call_repairs_missing_outer_brace(self):
+        # Observed from mistral-code-agent: complete XML envelope, but the JSON
+        # closes arguments and omits only the final outer object brace.
+        text = (
+            "<tool_call>\n"
+            "{\"name\":\"file_edit\",\"arguments\":{\"command\":\"cat > ~/x << 'EOF'\\nhello\\nEOF\"}\n"
+            "</tool_call>"
+        )
+        self.assertEqual(
+            parse_tool_calls(text),
+            [{"name": "file_edit", "arguments": {"command": "cat > ~/x << 'EOF'\nhello\nEOF"}}],
+        )
+
+    def test_truncated_unclosed_tool_call_is_not_guessed(self):
+        text = "<tool_call>\n{\"name\":\"file_edit\",\"arguments\":{\"command\":\"cat > ~/x << 'EOF'\\nhello"
+        self.assertEqual(parse_tool_calls(text), [])
+
     def test_hermes_function_shape(self):
         text = '<function=health>{}</function>'
         self.assertEqual(parse_tool_calls(text), [{"name": "health", "arguments": {}}])
@@ -136,14 +153,15 @@ class FastChatTests(unittest.TestCase):
         self.assertFalse(is_simple_chat_message("Hi, prüfe bitte den OAuth-Code"))
         self.assertFalse(is_simple_chat_message("Warum ist das Modell langsam?"))
 
-    def test_greeting_uses_fast_fallback_directly(self):
+    def test_greeting_preserves_primary_and_fallback(self):
+        expected = ("anthropic/slow", "ollama/llama3.2:latest", False)
         self.assertEqual(
             _select_chat_route("anthropic/slow", "ollama/llama3.2:latest", True),
-            ("ollama/llama3.2:latest", "", True),
+            expected,
         )
         self.assertEqual(
             _select_chat_route("anthropic/slow", "ollama/llama3.2:latest", False),
-            ("anthropic/slow", "ollama/llama3.2:latest", False),
+            expected,
         )
 
 
@@ -302,7 +320,7 @@ class ReplRegressionTests(unittest.TestCase):
             pass
         self.assertEqual(target.getvalue(), "")
 
-    def test_cli_greeting_skips_discovery_and_uses_fast_model(self):
+    def test_cli_greeting_skips_discovery_and_preserves_primary(self):
         client = MagicMock()
         client.chat.return_value = {
             "response": "Hello",
@@ -336,8 +354,8 @@ class ReplRegressionTests(unittest.TestCase):
             result = cli_agent.run_agent("hi", "anthropic/slow", "ollama/fast")
         self.assertEqual(result, 0)
         discover.assert_not_called()
-        self.assertEqual(client.chat.call_args.kwargs["model"], "ollama/fast")
-        self.assertIsNone(client.chat.call_args.kwargs["fallback_model"])
+        self.assertEqual(client.chat.call_args.kwargs["model"], "anthropic/slow")
+        self.assertEqual(client.chat.call_args.kwargs["fallback_model"], "ollama/fast")
         self.assertIsNone(client.chat.call_args.kwargs["tools"])
 
     def test_repl_conversation_is_reused_and_action_gets_one_tool_nudge(self):
