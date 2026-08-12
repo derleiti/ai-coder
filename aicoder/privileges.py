@@ -145,7 +145,7 @@ def format_request(risk: ExecutionRisk) -> str:
     if risk.reasons:
         details.append(f"  Risiko  : {'; '.join(risk.reasons)}")
     if risk.elevation:
-        details.append("  Passwort: ausschließlich lokaler sudo-Dialog; nie an Modell oder Backend")
+        details.append("  Status  : Root/sudo ist im Coding-only-Profil deaktiviert")
     return "\n".join(details)
 
 

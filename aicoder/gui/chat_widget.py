@@ -76,7 +76,7 @@ class _AgentWorker(QThread):
         self._approval_event.set()
 
     def _gui_approval(self, tool_name: str, args: dict) -> bool:
-        """Approval callback for risky writes; elevation stays terminal-only."""
+        """Approval callback for risky workspace writes."""
         approval_args = dict(args)
         # Preserve the complete, security-enriched argument map. Structured MCP
         # writes often have no command string; dropping metadata here made the
