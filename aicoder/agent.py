@@ -16,16 +16,18 @@ from .executor import (
     AgentLoopGuard, agent_checkpoint,
     is_destructive, load_tools, build_system_prompt,
     normalize_tool_calls, parse_tool_calls, strip_tool_calls, trim_messages, run_tool,
+    format_untrusted_tool_results,
     is_action_request, is_short_confirmation, is_simple_chat_message,
     # Re-export for backwards compat (GUI imports these)
-    AGENT_TOOLS, LOCAL_EXEC_SCHEMA, SYSTEM_TEMPLATE as SYSTEM,
+    AGENT_TOOLS, SYSTEM_TEMPLATE as SYSTEM,
     FALLBACK_TOOLS as _FALLBACK_TOOLS, OS_NAME, OS_INSTRUCTIONS,
 )
 from .history import record as history_record
 from .privileges import (
-    approval_is_automatic, assess_execution, format_request, validate_sudo_session,
+    approval_is_automatic, assess_execution, format_request,
 )
 from .session_state import get_state
+from .tool_policy import require_allowed_tool
 from .ui import (
     AgentSpinner, C,
     print_header, print_task, print_thought,
@@ -35,21 +37,17 @@ from .ui import (
 
 
 def _cli_approval(tool_name: str, args: dict) -> bool:
-    """Explain and approve one risky local action in the terminal.
-
-    Sudo authentication is intentionally delegated to the local TTY. Password
-    bytes never pass through ai-coder, its audit log, the model, or TriForce.
-    """
+    """Explain and approve one risky workspace action in the terminal."""
     cmd = args.get("command", "")
     risk = assess_execution(tool_name, args, destructive=is_destructive(cmd))
     if not risk.needs_approval:
         return True
 
     mode = get_state().get("approval_mode", "ask")
-    if risk.elevation and not risk.user_reason:
+    if risk.elevation:
         print(
             f"\n{C.BRED}✗ Privilegienanfrage abgelehnt:{C.RESET} "
-            "Das Modell muss einen konkreten Grund mitliefern.",
+            "Das Coding-only-Profil führt keine sudo/root-Aktionen aus.",
             file=sys.stderr,
         )
         return False
@@ -69,12 +67,6 @@ def _cli_approval(tool_name: str, args: dict) -> bool:
             print("  Abgelehnt.", file=sys.stderr)
             return False
 
-    if risk.sudo:
-        print("  sudo authentifiziert jetzt direkt im lokalen Terminal.", file=sys.stderr)
-        ok, message = validate_sudo_session()
-        color = C.BGREEN if ok else C.BRED
-        print(f"  {color}{message}{C.RESET}", file=sys.stderr)
-        return ok
     return True
 
 
@@ -159,6 +151,9 @@ def run_agent(
     must_use_tools = bool(tools) and (
         is_action_request(initial_prompt) or pending_continuation
     )
+    allowed_tool_names = {
+        str(tool.get("name")) for tool in tools if tool.get("name")
+    }
 
     for i in range(MAX_ITERATIONS):
         messages.append({"role": "user", "content": current_input})
@@ -237,6 +232,13 @@ def run_agent(
             targs = call.get("arguments", {})
             print_tool_call(tname, targs, i)
 
+            allowed, reason = require_allowed_tool(tname, allowed_tool_names)
+            if not allowed:
+                tr, is_err = f"{tname}: blocked — {reason}", True
+                print_tool_result(tname, tr, 0.0, error=True)
+                tool_results.append(f"Tool {tname} result:\n{tr}")
+                continue
+
             risk = assess_execution(
                 tname, targs,
                 destructive=is_destructive(targs.get("command", "")),
@@ -249,6 +251,7 @@ def run_agent(
                         approval_fn=lambda _name, _args: False,
                         model=model_used,
                         iteration=i,
+                        allowed_tools=allowed_tool_names,
                     )
                     t_elapsed = 0.0
                 else:
@@ -259,6 +262,7 @@ def run_agent(
                             approval_fn=lambda _name, _args: True,
                             model=model_used,
                             iteration=i,
+                            allowed_tools=allowed_tool_names,
                         )
                         t_elapsed = time.time() - t_start
             else:
@@ -269,6 +273,7 @@ def run_agent(
                         approval_fn=_cli_approval,
                         model=model_used,
                         iteration=i,
+                        allowed_tools=allowed_tool_names,
                     )
                     t_elapsed = time.time() - t_start
 
@@ -300,7 +305,7 @@ def run_agent(
                     "type 'continue' to resume with a different approach."
                 )
                 messages.append({"role": "assistant", "content": response})
-                messages.append({"role": "user", "content": "\n\n".join(tool_results)})
+                messages.append({"role": "user", "content": format_untrusted_tool_results(tool_results)})
                 full_response = stop_reason
                 print_error(stop_reason)
                 break
@@ -309,7 +314,7 @@ def run_agent(
             tool_results.append(agent_checkpoint(i + 1))
 
         messages.append({"role": "assistant", "content": response})
-        current_input = "\n\n".join(tool_results)
+        current_input = format_untrusted_tool_results(tool_results)
 
         if response.strip().upper().startswith("DONE:"):
             print_final(response, model_used, total_latency, i+1, fallback_used)
@@ -327,6 +332,21 @@ def run_agent(
         conversation[:] = [
             dict(message) for message in messages[1:]
         ][-MAX_CONTEXT_MESSAGES:]
+
+    swarm_mode = state.get("swarm_mode", "off")
+    if swarm_mode == "auto":
+        from .swarm_runner import should_auto_swarm
+        swarm_mode = "review" if should_auto_swarm(initial_prompt) else "off"
+    if swarm_mode in {"on", "review"} and full_response and not full_response.startswith("Agent safety pause"):
+        from .swarm_runner import run_swarm_review
+        run_swarm_review(
+            original_task=initial_prompt,
+            operator_response=full_response,
+            operator_model=model_used,
+            fallback_model=state.get("fallback_model"),
+            system_prompt=system,
+            client=client,
+        )
 
     try:
         history_record(kind="ask", prompt=initial_prompt,

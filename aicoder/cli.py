@@ -2,7 +2,7 @@ from __future__ import annotations
 import argparse, json, os, sys, textwrap, time
 from getpass import getpass
 from typing import Any, Dict
-from .client import ClientError, TriForceClient
+from .client import ClientError, TriForceClient, model_identifier
 from .config import DEFAULT_BASE_URL, Session, delete_session, load_session, save_session
 from .docs_context import context_summary, read_agents_md
 from .history import record as history_record, get_history, clear_history
@@ -12,6 +12,7 @@ from .session_state import (
 )
 from .status import Spinner, phase_label
 from .workspace import workspace_snapshot
+from .tool_policy import filter_tool_catalog, require_allowed_tool
 
 
 def parse_kv_pairs(pairs: list[str]) -> Dict[str, Any]:
@@ -78,6 +79,7 @@ def cmd_handshake(_: argparse.Namespace) -> int:
 
 
 def cmd_tools(_: argparse.Namespace) -> int:
+    from .executor import AGENT_TOOLS
     _, client = session_client()
     data = client.handshake()
     tools = data.get("tools") or []
@@ -94,6 +96,11 @@ def cmd_tools(_: argparse.Namespace) -> int:
         tools = listed.get("result", {}).get("tools", [])
     elif not tools:
         tools = allowed
+
+    if tools and isinstance(tools[0], dict):
+        tools = filter_tool_catalog(tools, AGENT_TOOLS)
+    else:
+        tools = [name for name in tools if name in AGENT_TOOLS and require_allowed_tool(name, AGENT_TOOLS)[0]]
 
     print(f"{len(tools)} tools allowed")
     for tool in tools:
@@ -120,17 +127,32 @@ def cmd_workspace(args: argparse.Namespace) -> int:
 
 
 def cmd_mcp(args: argparse.Namespace) -> int:
+    from .agent import _cli_approval
+    from .executor import AGENT_TOOLS, load_tools, run_tool
+
     _, client = session_client()
     arguments = parse_kv_pairs(args.arg or [])
+    allowed, reason = require_allowed_tool(args.tool, AGENT_TOOLS)
+    if not allowed:
+        print(f"Error: {reason}", file=sys.stderr)
+        return 2
+    # Populate backend mutation annotations before routing through the same
+    # approval/audit path as GUI and agent calls.
+    load_tools(client)
     state = get_state()
     # Show active context before running
     swarm = state.get('swarm_mode', 'off')
     _print_header(state)
     label = phase_label(args.mode or swarm)
     with Spinner(label):
-        data = client.mcp_call(args.tool, arguments)
-    print_json(data)
-    return 0
+        output, is_error = run_tool(
+            client, args.tool, arguments,
+            approval_fn=_cli_approval,
+            model="user/direct-mcp",
+            allowed_tools=set(AGENT_TOOLS),
+        )
+    print(output)
+    return 1 if is_error else 0
 
 
 def cmd_status_demo(args: argparse.Namespace) -> int:
@@ -363,6 +385,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
             elif cmd == "/model" and val:
                 model = val
                 set_model(val)
+                state = get_state()
                 print(f"model → {val}")
             elif cmd == "/swarm" and val:
                 try:
@@ -438,6 +461,17 @@ def cmd_chat(args: argparse.Namespace) -> int:
         meta += "]"
         print(meta)
         print()
+
+        if _cs in {"on", "review"}:
+            from .swarm_runner import run_swarm_review
+            run_swarm_review(
+                original_task=user_input,
+                operator_response=resp,
+                operator_model=model_used,
+                fallback_model=fallback,
+                system_prompt=system_prompt,
+                client=client,
+            )
 
         history.append({"user": user_input, "assistant": resp})
         try:
@@ -529,7 +563,7 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
     print(f"Broadcasting (top_n={top_n}, providers={params.get('only_providers','all')})...", file=sys.stderr)
     with Spinner("swarming..."):
         try:
-            raw = client.mcp_call("swarm_broadcast", params)
+            raw = client.mcp_call("swarm_broadcast", params, allow_internal=True)
         except ClientError as e:
             print(f"Error: {e}", file=sys.stderr)
             return 1
@@ -555,76 +589,12 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
 
 
 def cmd_shell(args: argparse.Namespace) -> int:
-    """Run shell command via MCP binary_exec/shell.
-
-    Kurzbefehle: aicoder shell uptime
-                 aicoder shell df -h
-                 aicoder shell systemctl status triforce
-                 aicoder shell --raw "ps aux | grep python"  (via shell tool)
-    """
-    _, client = session_client()
-    cmd_parts = list(args.cmd) if args.cmd else []
-    if not cmd_parts:
-        # Ohne Argumente: liste verfuegbare Programme
-        with Spinner("working..."):
-            raw = client.mcp_call("binary_exec", {"action": "list"})
-        content = raw.get("result", {}).get("content", [{}])[0].get("text", "")
-        try:
-            data = json.loads(content)
-            bins = sorted(data.get("binaries", {}).keys())
-            print(f"{len(bins)} available programs:")
-            print("  ".join(bins))
-        except Exception:
-            print(content)
-        return 0
-
-    use_raw = getattr(args, "raw", False)
-
-    if use_raw:
-        # Raw shell execution via shell tool
-        cmd_str = " ".join(cmd_parts)
-        print(f"$ {cmd_str}", file=sys.stderr)
-        with Spinner("working..."):
-            try:
-                raw = client.mcp_call("shell", {"command": cmd_str})
-            except ClientError as e:
-                print(f"Error: {e}", file=sys.stderr)
-                return 1
-    else:
-        # binary_exec: erstes Token = Programm, Rest = Argumente
-        program = cmd_parts[0]
-        arguments = cmd_parts[1:]
-        params: dict = {
-            "action": "run",
-            "program": program,
-            "arguments": arguments,
-            "elevated": getattr(args, "elevated", False),
-            "timeout": getattr(args, "timeout", 30),
-        }
-        wd = getattr(args, "cwd", None)
-        if wd:
-            params["work_dir"] = wd
-        print(f"$ {program} {' '.join(arguments)}", file=sys.stderr)
-        with Spinner("working..."):
-            try:
-                raw = client.mcp_call("binary_exec", params)
-            except ClientError as e:
-                print(f"Error: {e}", file=sys.stderr)
-                return 1
-
-    content = raw.get("result", {}).get("content", [{}])[0].get("text", "")
-    try:
-        data = json.loads(content)
-        out = data.get("stdout", "") or data.get("output", "") or data.get("result", "") or content
-        err = data.get("stderr", "")
-        rc = int(data.get("returncode", data.get("exit_code", data.get("rc", 0))) or 0)
-    except Exception:
-        out, err, rc = content, "", 0
-    if out:
-        print(out)
-    if err:
-        print(err, file=sys.stderr)
-    return rc
+    """Retained as a compatibility stub; shell execution is out of scope."""
+    print(
+        "Error: remote shell/binary execution is disabled by the ai-coder coding-only policy.",
+        file=sys.stderr,
+    )
+    return 2
 
 
 
@@ -648,7 +618,8 @@ def cmd_sysinfo(args: argparse.Namespace) -> int:
             if p in cmds:
                 cmds = {p: cmds[p]}
             else:
-                cmds = {"cmd": [p]}
+                print(f"Error: unknown read-only probe: {p}", file=sys.stderr)
+                return 2
         for label, cmd in cmds.items():
             if label == "cpu":
                 # CPU kompakt
@@ -671,61 +642,15 @@ def cmd_sysinfo(args: argparse.Namespace) -> int:
                 print(f"  {label}: {e}")
         return 0
 
-    # Remote: safe_probe via MCP
-    _, client = session_client()
-    action = getattr(args, "action", "overview")
-    params: dict = {"action": action}
-    probe = getattr(args, "probe", None)
-    if probe:
-        params["probe"] = probe
-    service = getattr(args, "service", None)
-    if service:
-        params["service"] = service
-    print("\033[2m(Backend-Server: Hetzner/ailinux — nicht lokaler Rechner)\033[0m", file=sys.stderr)
-    with Spinner("working..."):
-        try:
-            raw = client.mcp_call("safe_probe", params)
-        except ClientError as e:
-            print(f"Error: {e}", file=sys.stderr)
-            return 1
-    content = raw.get("result", {}).get("content", [{}])[0].get("text", "")
-    try:
-        print_json(json.loads(content))
-    except Exception:
-        print(content)
-    return 0
+    # Remote infrastructure probing is outside the coding-client scope.
+    print("Error: remote system probing is disabled; use --local for local read-only stats.", file=sys.stderr)
+    return 2
 
 
 def cmd_service(args: argparse.Namespace) -> int:
-    """Manage systemd service locally (subprocess, not MCP)."""
-    import subprocess as _sp
-    action = args.action
-    service = getattr(args, "service", None)
-
-    if action == "list":
-        r = _sp.run(["systemctl", "list-units", "--type=service",
-                     "--state=running", "--no-pager", "--no-legend"],
-                    capture_output=True, text=True, timeout=10)
-        print(r.stdout.rstrip() or r.stderr.rstrip())
-        return r.returncode
-
-    if not service:
-        print(f"Error: specify service. Example: aicoder service {action} triforce",
-              file=sys.stderr)
-        return 1
-
-    if action == "logs":
-        n = getattr(args, "lines", 50)
-        cmd = ["journalctl", "-u", service, f"-n{n}", "--no-pager"]
-    else:
-        cmd = ["systemctl", action, service]
-
-    print(f"$ {' '.join(cmd)}", file=sys.stderr)
-    r = _sp.run(cmd, capture_output=True, text=True, timeout=30)
-    out = (r.stdout or r.stderr or "").rstrip()
-    if out:
-        print(out)
-    return r.returncode
+    """Retained as a compatibility stub; service management is out of scope."""
+    print("Error: service management is disabled by the ai-coder coding-only policy.", file=sys.stderr)
+    return 2
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -861,7 +786,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-tokens", dest="max_tokens", type=int, default=200)
     p.set_defaults(func=cmd_broadcast)
 
-    p = sub.add_parser("shell", help="Run command via MCP binary_exec (no args: list)")
+    p = sub.add_parser("shell", help="Disabled compatibility stub (coding-only policy)")
     p.add_argument("cmd", nargs="*")
     p.add_argument("--raw", "-r", action="store_true", help="Shell tool instead of binary_exec (pipes etc.)")
     p.add_argument("--elevated", "-e", action="store_true")
@@ -870,7 +795,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_shell)
 
 
-    p = sub.add_parser("sysinfo", help="System overview: --local = this machine, else backend server")
+    p = sub.add_parser("sysinfo", help="Read-only local system overview (--local required)")
     p.add_argument("action", nargs="?", default="overview",
                    choices=["overview","run","service_status","journal","list"])
     p.add_argument("--probe", default=None)
@@ -878,7 +803,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--local", "-l", action="store_true", help="Local stats (this machine, no MCP)")
     p.set_defaults(func=cmd_sysinfo)
 
-    p = sub.add_parser("service", help="Manage systemd service")
+    p = sub.add_parser("service", help="Disabled compatibility stub (coding-only policy)")
     p.add_argument("action", choices=["status","start","stop","restart","logs","list"])
     p.add_argument("service", nargs="?", default=None)
     p.add_argument("--lines", type=int, default=50)
@@ -926,7 +851,10 @@ def cmd_models(args: argparse.Namespace) -> int:
     session, client = session_client()
     with Spinner("working..."):
         data = client._request("GET", "/v1/client/models", require_auth=True, _label="models")
-    models = data.get("models", [])
+    models = [
+        model_id for item in data.get("models", [])
+        if (model_id := model_identifier(item))
+    ]
     tier = data.get("tier", "?")
     count = data.get("model_count", len(models))
 
@@ -961,11 +889,12 @@ def cmd_models(args: argparse.Namespace) -> int:
 
 def cmd_mcp_list(_: argparse.Namespace) -> int:
     """Tabular list of all allowed MCP tools."""
+    from .executor import AGENT_TOOLS
     _, client = session_client()
     payload = {"jsonrpc": "2.0", "method": "tools/list", "params": {}, "id": 1}
     with Spinner("working..."):
         data = client._request("POST", "/v1/mcp", payload, require_auth=True, _label="tools/list")
-    tools = data.get("result", {}).get("tools", [])
+    tools = filter_tool_catalog(data.get("result", {}).get("tools", []), AGENT_TOOLS)
     print(f"{'Name':<35} {'Description'}")
     print("─" * 80)
     for t in tools:

@@ -48,5 +48,8 @@ Option B ist sauberer für Multi-Client-Szenarien.
 
 ## Status
 
-Noch nicht umgesetzt. ai-coder muss aktuell selbst darauf achten,  
-keine Admin-Tools aufzurufen (durch AGENTS.md-Regeln).
+Der lokale Client erzwingt seit der Security-Härtung eine zentrale Coding-
+Allowlist für GUI, Agent und direkte MCP-Aufrufe. Der Backend-Status ist in
+diesem Repository nicht verifizierbar. Serverseitiges `client_profile=ai_coder`
+bleibt erforderlich, damit manipulierte oder ältere Clients ebenfalls nur den
+minimalen Scope erhalten.

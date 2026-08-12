@@ -518,7 +518,9 @@ def run_repl(skip_setup: bool = False) -> int:
             elif cmd == "/model":
                 if val:
                     set_model(val)
-                    model = val
+                    refreshed = get_state()
+                    model = refreshed.get("selected_model")
+                    fallback = refreshed.get("fallback_model")
                     print(f"  model → {val}")
                 else:
                     new = model_picker_interactive(current_model=model or "")
@@ -528,8 +530,8 @@ def run_repl(skip_setup: bool = False) -> int:
                         print(f"  model → {cyan(model)}")
             elif cmd == "/fallback" and val:
                 set_fallback(val)
-                fallback = val
-                print(f"  fallback → {val}")
+                fallback = get_state().get("fallback_model") or ""
+                print(f"  fallback → {fallback or 'disabled'}")
             elif cmd == "/swarm" and val:
                 try:
                     set_swarm(val)
@@ -557,7 +559,7 @@ def run_repl(skip_setup: bool = False) -> int:
                 print("  Tab          Slash-Kommandos vervollständigen")
             elif cmd == "/permissions":
                 if val:
-                    aliases = {"manual": "ask", "auto": "autopilot", "sudo": "sudo_only", "root": "sudo_only"}
+                    aliases = {"manual": "ask", "auto": "autopilot"}
                     requested = aliases.get(val.strip().lower(), val.strip().lower())
                     try:
                         set_approval_mode(requested)
@@ -569,34 +571,22 @@ def run_repl(skip_setup: bool = False) -> int:
                     print(f"  Lokale Berechtigungsrichtlinie · aktiv: {active}")
                     print("  ask        jede Änderung einzeln bestätigen")
                     print("  autopilot  normale Schreibzugriffe automatisch; sudo/delete weiter bestätigen")
-                    print("  sudo_only  nur root/sudo automatisch; lokale sudo-Authentifizierung bleibt Pflicht")
-                    print("  all        alle Mutationen automatisch; sudo-Authentifizierung bleibt Pflicht")
-                    print("  Passwort   wird nie gelesen, gespeichert oder an TriForce gesendet")
-                    print("  Setzen: /permissions ask|autopilot|sudo_only|all")
+                    print("  all        Workspace-Schreibzugriffe automatisch; Löschen weiter bestätigen")
+                    print("  root/sudo  im Coding-only-Profil grundsätzlich deaktiviert")
+                    print("  Setzen: /permissions ask|autopilot|all")
             elif cmd == "/shell":
-                if val:
-                    import subprocess, time as _t
-                    _t0 = _t.time()
-                    # NOTE: shell=True is intentional here — this is an explicit user-shell mode
-                    # (not model-generated commands). User types commands directly in /shell.
-                    r = subprocess.run(val, shell=True, capture_output=True, text=True, timeout=60)
-                    _dur = _t.time() - _t0
-                    out = (r.stdout or "") + (r.stderr or "")
-                    if r.stdout: print(r.stdout.rstrip())
-                    if r.stderr: print(r.stderr.rstrip(), file=sys.stderr)
-                    try:
-                        from . import audit
-                        audit.log_tool(tool_name="repl_shell", arguments={"command": val}, result=out[:2000], duration_s=_dur, is_error=r.returncode != 0, model="user/repl")
-                    except Exception: pass
-                else:
-                    print("  Bsp: /shell uptime")
+                print("  /shell ist im Coding-only-Profil deaktiviert.")
             elif cmd == "/models":
                 try:
                     from .client import TriForceClient
                     s = load_session()
                     c = TriForceClient(s.base_url, token=s.token, timeout=10)
                     data = c._request("GET", "/v1/client/models", require_auth=True, _label="models")
-                    models = sorted(data.get("models", []))
+                    from .client import model_identifier
+                    models = sorted(
+                        model_id for item in data.get("models", [])
+                        if (model_id := model_identifier(item))
+                    )
                     tier = data.get("tier", "?")
                     groups: dict = {}
                     for m in models:
@@ -609,7 +599,7 @@ def run_repl(skip_setup: bool = False) -> int:
                     print(f"  Fehler: {e}")
             elif cmd == "/help":
                 print("  /model <n> · /fallback <n> · /swarm <m> · /models · /status")
-                print("  /shell <cmd> · /setup · /new · /clear · /keys · /permissions · /exit")
+                print("  /setup · /new · /clear · /keys · /permissions · /exit")
             else:
                 print(f"  Unbekannt: {cmd}  — /help für Hilfe")
             continue

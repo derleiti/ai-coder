@@ -1,19 +1,20 @@
 """chat_history.py — SQLite-based persistent chat sessions for ai-coder."""
 from __future__ import annotations
 import json
+import os
 import sqlite3
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .config import CONFIG_DIR
+from .config import CONFIG_DIR, ensure_config_dir
 
 DB_PATH = CONFIG_DIR / "chat_history.db"
 
 
 def _connect() -> sqlite3.Connection:
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_config_dir()
     conn = sqlite3.connect(str(DB_PATH))
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("""
@@ -40,6 +41,14 @@ def _connect() -> sqlite3.Connection:
         ON messages(session_id, id)
     """)
     conn.commit()
+    try:
+        os.chmod(DB_PATH, 0o600)
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(str(DB_PATH) + suffix)
+            if sidecar.exists():
+                os.chmod(sidecar, 0o600)
+    except OSError:
+        pass
     return conn
 
 

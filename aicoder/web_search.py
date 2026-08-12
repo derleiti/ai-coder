@@ -1,13 +1,15 @@
 """web_search.py — Local web search + fetch for ai-coder when MCP is unavailable."""
 from __future__ import annotations
 import json
+import ipaddress
+import socket
 from . import __version__
 import re
 from typing import Tuple
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 
 # Use stdlib only — no extra dependencies
-from urllib.request import urlopen, Request
+from urllib.request import urlopen, Request, build_opener, HTTPRedirectHandler
 from urllib.error import URLError, HTTPError
 
 
@@ -18,11 +20,38 @@ _HEADERS = {
 _TIMEOUT = 15
 
 
+def _validate_public_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("only absolute http/https URLs are allowed")
+    if parsed.username or parsed.password:
+        raise ValueError("credentials in URLs are not allowed")
+    host = parsed.hostname.rstrip(".").lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        raise ValueError("local/private hosts are not allowed")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    if not addresses:
+        raise ValueError("host did not resolve")
+    for entry in addresses:
+        address = ipaddress.ip_address(entry[4][0])
+        if not address.is_global:
+            raise ValueError(f"non-public address is not allowed: {address}")
+
+
+class _PublicOnlyRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _validate_public_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def web_fetch(url: str, max_chars: int = 8000) -> Tuple[str, bool]:
     """Fetch a URL and return plain text content. Returns (text, is_error)."""
     try:
+        _validate_public_url(url)
         req = Request(url, headers=_HEADERS)
-        with urlopen(req, timeout=_TIMEOUT) as resp:
+        opener = build_opener(_PublicOnlyRedirectHandler())
+        with opener.open(req, timeout=_TIMEOUT) as resp:
             content_type = resp.headers.get("Content-Type", "")
             raw = resp.read(max_chars * 2)  # read extra, we'll trim
 

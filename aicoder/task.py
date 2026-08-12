@@ -21,6 +21,7 @@ from .docs_context import read_agents_md
 from .session_state import get_state
 from .history import record as history_record
 from .status import Spinner, phase_label
+from .executor import atomic_write_text
 
 TASK_SYSTEM_SUFFIX = """
 You are ai-coder in task mode — precise code modification on AILinux/TriForce.
@@ -33,6 +34,14 @@ Rules:
 - Never truncate. Return full file.
 - If unsure about API/version: search first, never guess.
 - Smallest change that solves the task.
+"""
+
+MULTIFILE_OUTPUT_SUFFIX = """
+Multiple files were supplied. Return every modified file in exactly this form:
+--- FILE: <the exact input path> ---
+<complete file content>
+--- END: <the exact input path> ---
+Do not omit unchanged input files and do not add markdown fences.
 """
 
 
@@ -91,7 +100,10 @@ def run_task(
 
     # System prompt: AGENTS.md + task instructions
     agents_content = "" if no_agents else (read_agents_md(workspace) or "")
-    system_prompt = (agents_content + "\n\n" + TASK_SYSTEM_SUFFIX).strip()
+    task_instructions = TASK_SYSTEM_SUFFIX
+    if len(file_paths) > 1:
+        task_instructions += MULTIFILE_OUTPUT_SUFFIX
+    system_prompt = (agents_content + "\n\n" + task_instructions).strip()
 
     # Read files
     files_content: list[tuple[str, str]] = []
@@ -107,15 +119,8 @@ def run_task(
         print("Fehler: Keine lesbaren Dateien.", file=sys.stderr)
         return 1
 
-    # Project context: nur wenn kein AGENTS.md im System-Prompt (verhindert Dopplung)
+    # --no-agents is authoritative: do not re-inject AGENTS.md through user data.
     context = ""
-    if workspace and no_agents:
-        try:
-            ctx_path = Path(workspace) / "AGENTS.md"
-            if ctx_path.exists():
-                context = ctx_path.read_text(encoding="utf-8")[:1500]
-        except Exception:
-            pass
 
     prompt = _build_prompt(task, files_content, context)
 
@@ -141,9 +146,24 @@ def run_task(
             fallback_model=fallback_model,
         )
 
-    response = result.get("response", "").strip()
+    response = str(result.get("response", "") or "")
+    if apply and response == "":
+        print("Fehler: Modell hat leeren Dateiinhalt geliefert; Apply wurde blockiert.", file=sys.stderr)
+        return 1
     model_used = result.get("model", effective_model or "?")
     latency = result.get("latency_ms")
+
+    # Swarm is advisory and never writes. Review the operator output before any
+    # optional local apply confirmation.
+    if _effective_swarm in {"on", "review"}:
+        from .swarm_runner import run_swarm_review
+        run_swarm_review(
+            original_task=task,
+            operator_response=response,
+            operator_model=effective_model,
+            fallback_model=state.get("fallback_model"),
+            system_prompt=system_prompt if not no_agents else None,
+        )
 
     # History
     try:
@@ -171,7 +191,7 @@ def run_task(
         else:
             confirm = input("Änderungen schreiben? [y/N] ").strip().lower()
             if confirm == "y":
-                orig_path.write_text(response, encoding="utf-8")
+                atomic_write_text(orig_path, response)
                 print(f"✓ {orig_path} aktualisiert")
             else:
                 print("Abgebrochen.")
@@ -187,17 +207,6 @@ def run_task(
         print()
 
     print(f"[{model_used} · {latency or '?'}ms]", file=sys.stderr)
-
-    # Swarm Review: Fallback bewertet den Output
-    if _effective_swarm == "review" and not apply:
-        from .swarm_runner import run_swarm_review
-        run_swarm_review(
-            original_task=task,
-            operator_response=response,
-            operator_model=effective_model,
-            fallback_model=state.get("fallback_model"),
-            system_prompt=system_prompt if not no_agents else None,
-        )
 
     return 0
 
@@ -219,7 +228,7 @@ def _apply_multifile(
         return
     for fname, content in blocks:
         fname = fname.strip()
-        new_content = content.strip()
+        new_content = content
         safe_fname = Path(fname).name
         if ".." in fname or fname.startswith("/"):
             print(f"WARN: suspicious path {fname!r} -- using basename {safe_fname!r}")
@@ -242,7 +251,7 @@ def _apply_multifile(
             continue
         confirm = input(f"Schreiben? {p.name} [y/N] ").strip().lower()
         if confirm == "y":
-            p.write_text(new_content, encoding="utf-8")
+            atomic_write_text(p, new_content)
             print(f"✓ {p} aktualisiert")
         else:
             print("Übersprungen.")

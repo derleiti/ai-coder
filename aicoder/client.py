@@ -10,17 +10,8 @@ from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
 from . import __version__
+from .tool_policy import CODING_MCP_TOOLS, require_allowed_tool
 USER_AGENT = f"ai-coder/{__version__} (AILinux Coding Client)"
-
-# ── Force IPv4 (IPv6 broken on Hetzner/CF, causes 30-60s hangs) ──
-import socket
-_orig_getaddrinfo = socket.getaddrinfo
-def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
-    """Force IPv4 to avoid IPv6 timeout on broken AAAA records."""
-    if family == 0:
-        family = socket.AF_INET
-    return _orig_getaddrinfo(host, port, family, type, proto, flags)
-socket.getaddrinfo = _ipv4_getaddrinfo
 
 # ── Connection pool (keep-alive) ──────────────────────────────
 _POOL = None
@@ -75,6 +66,62 @@ class ClientError(RuntimeError):
 class TokenExpiredError(ClientError):
     """Raised when JWT token is expired and no auto-refresh is possible."""
     pass
+
+
+def _normalize_chat_response(data: Any) -> Dict[str, Any]:
+    """Normalize TriForce plus common OpenAI/Anthropic-compatible envelopes."""
+    if not isinstance(data, dict):
+        raise ClientError(f"Chat backend returned {type(data).__name__}, expected object")
+    if data.get("error") is not None and not data.get("response"):
+        raise ClientError(
+            f"Chat backend error: {json.dumps(data['error'], ensure_ascii=False, default=str)}"
+        )
+    if "response" in data:
+        return data
+
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        message = choices[0].get("message", {})
+        if isinstance(message, dict):
+            normalized = dict(data)
+            normalized["response"] = str(message.get("content") or "")
+            if isinstance(message.get("tool_calls"), list):
+                normalized["tool_calls"] = message["tool_calls"]
+            return normalized
+
+    content = data.get("content")
+    if isinstance(content, list):
+        texts: list[str] = []
+        calls: list[dict] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text" and isinstance(block.get("text"), str):
+                texts.append(block["text"])
+            elif block.get("type") in {"tool_use", "tool_call"}:
+                calls.append({
+                    "name": block.get("name"),
+                    "arguments": block.get("input", block.get("arguments", {})),
+                })
+        normalized = dict(data)
+        normalized["response"] = "\n".join(texts)
+        if calls:
+            normalized["tool_calls"] = calls
+        return normalized
+
+    raise ClientError("Chat backend response contains no response, choices, or content")
+
+
+def model_identifier(value: Any) -> str:
+    """Return a stable model id from string or catalogue-object variants."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("id", "model", "name", "model_id"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate:
+                return candidate
+    return ""
 
 
 class TriForceClient:
@@ -244,7 +291,18 @@ class TriForceClient:
     def handshake(self) -> Dict[str, Any]:
         return self._request("GET", "/v1/auth/client/handshake", require_auth=True, _label="handshake")
 
-    def mcp_call(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    def mcp_call(
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        *,
+        allow_internal: bool = False,
+    ) -> Dict[str, Any]:
+        allowed, reason = require_allowed_tool(
+            tool_name, CODING_MCP_TOOLS, allow_internal=allow_internal,
+        )
+        if not allowed:
+            raise ClientError(reason)
         payload = {
             "jsonrpc": "2.0",
             "method": "tools/call",
@@ -254,7 +312,24 @@ class TriForceClient:
             },
             "id": 1,
         }
-        return self._request("POST", "/v1/mcp", payload, require_auth=True, _label=tool_name)
+        response = self._request(
+            "POST", "/v1/mcp", payload, require_auth=True,
+            _label=tool_name, _retries=0,
+        )
+        if isinstance(response, dict) and response.get("error") is not None:
+            raise ClientError(
+                f"MCP {tool_name} failed: "
+                f"{json.dumps(response['error'], ensure_ascii=False, default=str)}"
+            )
+        if not isinstance(response, dict):
+            raise ClientError(f"MCP {tool_name} returned a non-object response")
+        # Accept the legacy gateway shape while presenting one JSON-RPC shape
+        # to the rest of the client.
+        if "result" not in response and "content" in response:
+            response = {"jsonrpc": "2.0", "id": response.get("id", 1), "result": response}
+        if "result" not in response:
+            raise ClientError(f"MCP {tool_name} response contains neither result nor error")
+        return response
 
     def list_models(self) -> list:
         """Fetch available models from /v1/client/models."""
@@ -308,17 +383,29 @@ class TriForceClient:
             payload["tools"] = tools
             payload["tool_choice"] = tool_choice
         try:
-            return self._request(
+            return _normalize_chat_response(self._request(
                 "POST", "/v1/client/chat", payload, require_auth=True,
                 _label=f"chat/{model or 'default'}", _retries=0,
-            )
+            ))
+        except TokenExpiredError:
+            raise
         except ClientError as e:
             if fallback_model and fallback_model != model:
+                # Authentication/authorization and other client-side 4xx errors
+                # cannot be repaired by selecting another model.
+                message = str(e)
+                if "HTTP 4" in message and "HTTP 408" not in message and "HTTP 429" not in message:
+                    raise
                 import sys
                 print(f"\n[FALLBACK: {model} failed → {fallback_model}]", file=sys.stderr)
                 payload["model"] = fallback_model
-                return self._request(
+                fallback_result = _normalize_chat_response(self._request(
                     "POST", "/v1/client/chat", payload, require_auth=True,
                     _label=f"chat/{fallback_model}(fallback)", _retries=0,
-                )
+                ))
+                if isinstance(fallback_result, dict):
+                    fallback_result = dict(fallback_result)
+                    fallback_result["fallback_used"] = True
+                    fallback_result.setdefault("primary_model", model)
+                return fallback_result
             raise

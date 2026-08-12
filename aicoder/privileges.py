@@ -1,16 +1,12 @@
-"""Risk classification and local privilege acquisition for agent commands.
+"""Risk classification for local and MCP-backed agent operations.
 
-The model may request elevation, but only the local user can grant it. No
-password is accepted by ai-coder or sent to TriForce; ``sudo`` owns the TTY.
+The coding-only client never grants elevation. Mutation approval controls
+ordinary workspace changes only; sudo/root requests are rejected by callers.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 import re
-import os
-import shutil
-import subprocess
-import sys
 from typing import Any
 
 
@@ -41,8 +37,9 @@ _PROTECTED_PATH_RE = re.compile(
 # a tool happens to run. Exact names avoid false positives for read helpers.
 _MUTATING_TOOL_NAMES = {
     "file_edit", "file_write", "file_ops", "code_edit", "code_patch",
-    "shell", "task_runner", "custom_exec", "binary_exec",
-    "git_ops", "config_set", "prompt_set", "vault_add",
+    "shell", "task_runner", "custom_exec", "binary_exec", "local_exec",
+    "git_ops", "lint", "test", "devops",
+    "config_set", "prompt_set", "vault_add",
     "memory_store", "memory_clear", "clipboard_write",
     "service_control", "container_control", "remote_task", "mesh_task",
     "agent_start", "agent_stop", "agent_broadcast", "restart",
@@ -79,6 +76,9 @@ class ExecutionRisk:
 def assess_execution(tool_name: str, args: dict[str, Any], *, destructive: bool = False) -> ExecutionRisk:
     """Classify a local tool call without executing or modifying it."""
     command = str(args.get("command") or "").strip()
+    if not command and args.get("path"):
+        operation = str(args.get("operation") or "access").strip()
+        command = f"{operation} {args.get('path')}"
     cwd = str(args.get("cwd") or "").strip()
     normalized_tool = str(tool_name or "").strip().lower()
     # Providers and MCP gateways may namespace tool names (for example
@@ -91,6 +91,7 @@ def assess_execution(tool_name: str, args: dict[str, Any], *, destructive: bool 
     explicit_elevation = sudo_requested or bool(_ELEVATION_PREFIX_RE.match(command))
     deletion = (
         bool(_DELETE_RE.search(command))
+        or bool(re.search(r"(?:^|\s)find\b[^\n]*(?:\s-delete\b|\s-exec(?:dir)?\b|\s-ok(?:dir)?\b)", command, re.IGNORECASE))
         or canonical_tool in _DESTRUCTIVE_TOOL_NAMES
         or metadata_destructive is True
     )
@@ -102,6 +103,8 @@ def assess_execution(tool_name: str, args: dict[str, Any], *, destructive: bool 
         or bool(_CREATE_OR_WRITE_RE.search(command))
         or bool(_PACKAGE_OR_SERVICE_RE.search(command))
         or bool(_GIT_MUTATION_RE.search(command))
+        or bool(re.search(r"\bgit\s+(?:restore|rm|config|worktree|submodule\s+(?:add|deinit|update))\b", command, re.IGNORECASE))
+        or bool(re.search(r"\b(?:npm|pnpm|yarn|pip|pipx)\s+(?:install|uninstall|publish|update|upgrade)\b", command, re.IGNORECASE))
     )
 
     reasons: list[str] = []
@@ -131,23 +134,6 @@ def assess_execution(tool_name: str, args: dict[str, Any], *, destructive: bool 
     )
 
 
-def validate_sudo_session(timeout: int = 120) -> tuple[bool, str]:
-    """Authenticate through sudo's controlling TTY without seeing a password."""
-    if shutil.which("sudo") is None:
-        return False, "sudo ist auf diesem System nicht installiert"
-    if not sys.stdin.isatty() or not sys.stderr.isatty():
-        return False, "sudo-Authentifizierung benötigt einen interaktiven Terminal-REPL"
-    try:
-        result = subprocess.run(["sudo", "-v"], timeout=timeout, check=False)
-    except subprocess.TimeoutExpired:
-        return False, "sudo-Authentifizierung hat das Zeitlimit überschritten"
-    except OSError as exc:
-        return False, f"sudo konnte nicht gestartet werden: {exc}"
-    if result.returncode != 0:
-        return False, f"sudo-Authentifizierung abgelehnt (Exit {result.returncode})"
-    return True, "sudo-Berechtigung lokal bestätigt"
-
-
 def format_request(risk: ExecutionRisk) -> str:
     """Human-readable approval card used by terminal and GUI."""
     title = "PRIVILEGIEN" if risk.elevation else ("LÖSCHEN" if risk.deletion else "SCHREIBZUGRIFF")
@@ -166,50 +152,16 @@ def format_request(risk: ExecutionRisk) -> str:
 def approval_is_automatic(mode: str, risk: ExecutionRisk) -> bool:
     """Return whether a persisted permission mode may approve this risk.
 
-    Destructive/deletion requests remain interactive in ``autopilot`` and
-    ``sudo_only``.  ``all`` is the only mode that also auto-approves them.
-    Sudo authentication itself is never bypassed.
+    Destructive/deletion and elevation requests are never auto-approved.
+    Elevation is rejected outright by the CLI and GUI brokers.
     """
     mode = str(mode or "ask").strip().lower()
     if not risk.needs_approval:
         return True
+    if risk.elevation:
+        return False
     if mode == "all":
-        return True
+        return bool(risk.mutation and not risk.deletion and not risk.destructive)
     if mode == "autopilot":
         return bool(risk.mutation and not risk.elevation and not risk.deletion and not risk.destructive)
-    if mode == "sudo_only":
-        return bool(risk.elevation and not risk.deletion and not risk.destructive)
     return False
-
-
-def validate_sudo_session_gui(timeout: int = 120) -> tuple[bool, str]:
-    """Authenticate sudo in a real local terminal, then verify cached credentials.
-
-    ai-coder never receives password bytes. The terminal runs ``sudo -v`` and
-    the GUI only observes its exit status.
-    """
-    if shutil.which("sudo") is None:
-        return False, "sudo ist auf diesem System nicht installiert"
-    terminals = [
-        (["x-terminal-emulator", "-e"], shutil.which("x-terminal-emulator")),
-        (["konsole", "-e"], shutil.which("konsole")),
-        (["gnome-terminal", "--wait", "--"], shutil.which("gnome-terminal")),
-        (["xfce4-terminal", "--disable-server", "-e"], shutil.which("xfce4-terminal")),
-        (["xterm", "-e"], shutil.which("xterm")),
-    ]
-    launcher = next((prefix for prefix, path in terminals if path), None)
-    if launcher is None:
-        return False, "kein unterstütztes Terminal für die lokale sudo-Abfrage gefunden"
-    command = ["sudo", "-v"]
-    try:
-        result = subprocess.run([*launcher, *command], timeout=timeout, check=False)
-    except subprocess.TimeoutExpired:
-        return False, "sudo-Authentifizierung hat das Zeitlimit überschritten"
-    except OSError as exc:
-        return False, f"Terminal für sudo konnte nicht gestartet werden: {exc}"
-    if result.returncode != 0:
-        return False, f"sudo-Authentifizierung abgelehnt (Exit {result.returncode})"
-    verify = subprocess.run(["sudo", "-n", "-v"], capture_output=True, text=True, check=False)
-    if verify.returncode != 0:
-        return False, "sudo-Sitzung wurde nicht bestätigt"
-    return True, "sudo-Berechtigung lokal bestätigt"

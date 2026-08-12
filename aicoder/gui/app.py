@@ -95,7 +95,7 @@ def run_gui() -> int:
         if reason == QSystemTrayIcon.ActivationReason.Trigger
         else None
     ))
-    tray.setToolTip("ai-coder — Terminal Coding & DevOps Agent")
+    tray.setToolTip("ai-coder — Terminal Coding Agent")
     tray.show()
 
     window.tray = tray

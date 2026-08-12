@@ -20,10 +20,14 @@ aicoder swarm on      # Swarm immer aktiv
 aicoder swarm review  # Swarm nur nach Task (Review)
 ```
 
-## V2-Stand
+## Aktueller Stand
 
-Swarm-Modus wird in `state.json` gespeichert und bei `mcp`-Calls als Spinner-Label genutzt.  
-Echte parallele Swarm-Calls ans Backend: geplant für V3.
+- `on`: Operator und konfiguriertes Advisor-/Fallback-Modell können parallel
+  befragt werden; der Operator bleibt das primäre Ergebnis.
+- `review`: Der Operator läuft zuerst. Erst danach erhält das Advisor-Modell
+  den tatsächlichen Operator-Output zur Prüfung.
+- Ohne separates Fallback-Modell wird kein doppelter Backend-Default-Call erzeugt.
+- Bei Task-Ausgaben ist der Swarm nur beratend und schreibt niemals Dateien.
 
 ## Bekannte Probleme (V1)
 

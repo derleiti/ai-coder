@@ -13,7 +13,7 @@ from ..session_state import (
     set_tool_mode, set_enabled_tools, set_request_timeout,
     set_approval_mode,
 )
-from ..client import TriForceClient
+from ..client import TriForceClient, model_identifier
 from ..executor import load_tools
 
 
@@ -53,7 +53,10 @@ class _ModelLoader(QThread):
                 "GET", "/v1/client/models",
                 require_auth=True, _label="models"
             )
-            models = data.get("models", [])
+            models = [
+                model_id for item in data.get("models", [])
+                if (model_id := model_identifier(item))
+            ]
             tier = data.get("tier", "?")
             self.loaded.emit(models, tier)
         except Exception as e:
@@ -226,11 +229,10 @@ class SettingsWidget(QWidget):
         self.approval_mode_combo = QComboBox()
         self.approval_mode_combo.addItem("Manuell — jede Änderung bestätigen", "ask")
         self.approval_mode_combo.addItem("Autopilot — normale Befehle automatisch freigeben", "autopilot")
-        self.approval_mode_combo.addItem("Nur sudo/root — Root-Anfragen automatisch freigeben", "sudo_only")
-        self.approval_mode_combo.addItem("Alles — sämtliche Änderungen automatisch freigeben", "all")
+        self.approval_mode_combo.addItem("Workspace-Auto — Änderungen automatisch, Löschen weiter bestätigen", "all")
         self.approval_mode_combo.setMinimumWidth(420)
         self.approval_mode_combo.setToolTip(
-            "Root-Befehle öffnen den systemeigenen Polkit-Passwortdialog. Passwörter werden weder von ai-coder gelesen noch gespeichert oder an das Backend gesendet."
+            "Freigaben gelten nur für Workspace-Mutationen. Root-, sudo-, Service- und Shell-Aktionen sind im Coding-only-Profil deaktiviert."
         )
         save_permissions_btn = QPushButton("Berechtigungen speichern")
         save_permissions_btn.clicked.connect(self._save_permission_config)

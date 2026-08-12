@@ -10,7 +10,6 @@ V3: echte parallele Calls via threading + swarm_broadcast MCP.
 """
 import sys
 import threading
-import time
 from typing import Optional
 
 from .client import ClientError, TriForceClient
@@ -41,28 +40,52 @@ def run_swarm_ask(
     mode: str,          # "on" | "review"
     client: Optional[TriForceClient] = None,
 ) -> int:
-    """
-    Run message through operator + fallback in parallel threads.
-    Display both results. Operator output always first.
+    """Run the operator first-class and the fallback only as an advisor.
+
+    ``on`` may ask both models concurrently. ``review`` is necessarily
+    sequential because the advisor reviews the actual operator response.
     """
     if client is None:
         session = load_session()
         client  = TriForceClient(session.base_url, token=session.token)
 
-    op_box  = []
-    fb_box  = []
+    op_box: list = []
+    fb_box: list = []
 
-    label = "swarming..." if mode != "review" else "hiveing..."
+    label = "swarming..." if mode != "review" else "reviewing..."
 
     with Spinner(label):
-        t0 = time.time()
-        t1 = threading.Thread(target=_call, args=(client, message, operator_model,  system_prompt, op_box),  daemon=True)
-        t2 = threading.Thread(target=_call, args=(client, message, fallback_model, system_prompt, fb_box), daemon=True)
-        t1.start()
-        t2.start()
-        t1.join(timeout=90)
-        remaining = max(1, 90 - (time.time() - t0))
-        t2.join(timeout=remaining)
+        if mode == "review":
+            _call(client, message, operator_model, system_prompt, op_box)
+            op_result = op_box[0] if op_box else None
+            if fallback_model and isinstance(op_result, dict):
+                review_prompt = (
+                    "Act only as an advisor. Review the operator response for factual "
+                    "errors, security risks, missing verification, and conflicts with the "
+                    "original request. Do not execute tools.\n\n"
+                    f"Original request:\n{message[:4000]}\n\n"
+                    f"Operator response:\n{op_result.get('response', '')[:12000]}"
+                )
+                _call(client, review_prompt, fallback_model, system_prompt, fb_box)
+        elif fallback_model and fallback_model != operator_model:
+            t1 = threading.Thread(
+                target=_call,
+                args=(client, message, operator_model, system_prompt, op_box),
+                daemon=True,
+            )
+            t2 = threading.Thread(
+                target=_call,
+                args=(client, message, fallback_model, system_prompt, fb_box),
+                daemon=True,
+            )
+            t1.start()
+            t2.start()
+            # Network calls own their timeout; wait for completion so no hidden
+            # background request survives after this command returns.
+            t1.join()
+            t2.join()
+        else:
+            _call(client, message, operator_model, system_prompt, op_box)
 
     # Operator result
     op = op_box[0] if op_box else None
@@ -86,18 +109,20 @@ def run_swarm_ask(
         print("  (Timeout)", file=sys.stderr)
 
     print()
-    print("── Swarm/Fallback " + "─" * 32)
+    print("── " + ("Swarm Review " if mode == "review" else "Swarm Advisor ") + "─" * 32)
     if isinstance(fb, Exception):
         print(f"  Fehler: {fb}", file=sys.stderr)
     elif fb:
         print(fb.get("response", ""))
         lat2 = fb.get("latency_ms")
         print(f"\n[{fb.get('model','?')} · {lat2 or '?'}ms]", file=sys.stderr)
-    else:
+    elif not fallback_model:
         print("  (kein Fallback-Modell gesetzt — swarm benötigt fallback)", file=sys.stderr)
+    else:
+        print("  (kein Advisor-Ergebnis)", file=sys.stderr)
 
     print()
-    return 0
+    return 1 if isinstance(op, Exception) or op is None else 0
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +164,7 @@ def run_swarm_review(
     Schickt den Operator-Output als Review-Prompt ans Fallback-Modell.
     Gibt das Review auf stderr aus (non-blocking: ignored on error).
     """
-    if not fallback_model:
+    if not fallback_model or fallback_model == operator_model:
         return
 
     review_prompt = (
@@ -154,13 +179,7 @@ def run_swarm_review(
     box: list = []
 
     try:
-        t = threading.Thread(
-            target=_call,
-            args=(client, review_prompt, fallback_model, system_prompt, box),
-            daemon=True,
-        )
-        t.start()
-        t.join(timeout=60)
+        _call(client, review_prompt, fallback_model, system_prompt, box)
     except Exception:
         return
 

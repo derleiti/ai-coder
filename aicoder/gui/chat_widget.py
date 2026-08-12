@@ -35,6 +35,7 @@ from ..executor import (
     load_tools, build_system_prompt, build_tool_desc,
     normalize_tool_calls, parse_tool_calls, strip_tool_calls, trim_messages, run_tool,
     is_destructive, is_simple_chat_message, MAX_ITERATIONS,
+    format_untrusted_tool_results,
 )
 
 
@@ -91,6 +92,38 @@ class _AgentWorker(QThread):
                 return False  # Agent stopped — reject command
         return self._approval_result
 
+    def _emit_advisor_review(self, original_request: str, response: str, operator_model: str) -> None:
+        """Run the configured swarm as a non-executing post-response advisor."""
+        from ..session_state import get_state
+        from ..swarm_runner import should_auto_swarm
+
+        state = get_state()
+        mode = state.get("swarm_mode", "off")
+        if mode == "auto" and not should_auto_swarm(original_request):
+            return
+        if mode not in {"auto", "on", "review"}:
+            return
+        advisor = self.fallback
+        if not advisor or advisor == operator_model:
+            return
+        prompt = (
+            "Act only as an advisor. Review the operator response for bugs, security "
+            "risks, missing verification, and conflicts with the request. Do not call "
+            "tools.\n\n"
+            f"Request:\n{original_request[:4000]}\n\n"
+            f"Operator response:\n{response[:12000]}"
+        )
+        try:
+            result = self.client.chat(
+                message=prompt, model=advisor, system_prompt=self.system,
+                temperature=0.2, max_tokens=2048,
+            )
+            review = str(result.get("response", "") or "").strip()
+            if review:
+                self.msg.emit("system", review, f"Swarm review · {result.get('model', advisor)}")
+        except Exception as exc:
+            self.msg.emit("system", f"Swarm review unavailable: {exc}", "advisor")
+
     def run(self):
         # GUI-Resilienz: in PyQt6 killt eine unbehandelte Exception in einer
         # QThread.run()-Reimplementation den ganzen Prozess (stiller GUI-Abbruch).
@@ -135,7 +168,7 @@ class _AgentWorker(QThread):
                 self.msg.emit("error", f"Tool-Loading: {e}", "")
                 self.tools = []
                 self.system = (
-                    "Du bist ai-coder, autonomer Coding- und DevOps-Agent auf AILinux/TriForce (api.ailinux.me). "
+                    "Du bist ai-coder, autonomer Coding-Agent auf AILinux/TriForce (api.ailinux.me). "
                     "INIT: current_time pruefen, memory_search, dann handeln. "
                     "Lesen vor Schreiben. Diagnose vor Patch. Kleinste Aenderung zuerst. Sprache: Deutsch."
                 )
@@ -192,6 +225,11 @@ class _AgentWorker(QThread):
             if not calls:
                 messages.append({"role": "assistant", "content": response})
                 self.messages_updated.emit(messages)
+                original = next(
+                    (str(item.get("content", "")) for item in reversed(messages[:-1]) if item.get("role") == "user"),
+                    "",
+                )
+                self._emit_advisor_review(original, response, model_used)
                 self.finished.emit(response, model_used)
                 return
 
@@ -223,6 +261,7 @@ class _AgentWorker(QThread):
                     approval_fn=self._gui_approval,
                     model=model_used,
                     iteration=i,
+                    allowed_tools=allowed_tools,
                 )
                 elapsed = time.time() - t0
 
@@ -255,7 +294,7 @@ class _AgentWorker(QThread):
                         "'continue' to resume with a different approach."
                     )
                     messages.append({"role": "assistant", "content": response})
-                    messages.append({"role": "user", "content": "\n\n".join(tool_results)})
+                    messages.append({"role": "user", "content": format_untrusted_tool_results(tool_results)})
                     self.messages_updated.emit(messages)
                     self.finished.emit(pause, model_used)
                     return
@@ -264,11 +303,16 @@ class _AgentWorker(QThread):
                 tool_results.append(agent_checkpoint(i + 1))
 
             messages.append({"role": "assistant", "content": response})
-            current_input = "\n\n".join(tool_results)
+            current_input = format_untrusted_tool_results(tool_results)
             messages.append({"role": "user", "content": current_input})
 
             if "DONE:" in response[:200].upper():
                 self.messages_updated.emit(messages)
+                original = next(
+                    (str(item.get("content", "")) for item in self.messages if item.get("role") == "user"),
+                    "",
+                )
+                self._emit_advisor_review(original, visible or response, model_used)
                 self.finished.emit(visible or response, model_used)
                 return
 
@@ -668,10 +712,10 @@ class ChatWidget(QWidget):
         mode = get_state().get("approval_mode", "ask")
         automatic = approval_is_automatic(mode, risk)
 
-        if risk.elevation and not risk.user_reason:
+        if risk.elevation:
             QMessageBox.warning(
                 self, "Root request rejected",
-                "Root-/sudo-Anfragen benötigen einen konkreten Grund vom Modell.\n\n"
+                "Das Coding-only-Profil führt keine Root-/sudo-Aktionen aus.\n\n"
                 + format_request(risk),
             )
             if self._worker:
@@ -698,13 +742,6 @@ class ChatWidget(QWidget):
                     self._worker.set_approval(False)
                 self._append_msg("system", f"Tool rejected: {tool_name}", preview[:160])
                 return
-
-        if risk.sudo:
-            self._append_msg(
-                "system",
-                "System authentication will open for this root command.",
-                f"mode={mode} · password handled by Polkit",
-            )
 
         if automatic:
             self._append_msg("system", f"Auto-approved: {tool_name}", f"mode={mode}")

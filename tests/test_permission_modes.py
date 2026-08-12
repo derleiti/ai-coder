@@ -9,7 +9,6 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from aicoder.gui.chat_widget import ChatWidget
-import aicoder.executor as executor
 from aicoder.privileges import approval_is_automatic, assess_execution
 
 
@@ -28,7 +27,7 @@ class ApprovalModeTests(unittest.TestCase):
         self.assertFalse(approval_is_automatic("autopilot", delete))
         self.assertFalse(approval_is_automatic("autopilot", sudo))
 
-    def test_sudo_only_approves_root_but_not_normal_writes_or_deletes(self):
+    def test_legacy_sudo_only_mode_approves_nothing(self):
         write = assess_execution("file_edit", {"command": "touch note.txt"})
         sudo = assess_execution("local_exec", {
             "command": "apt update", "sudo": True, "reason": "refresh packages",
@@ -37,18 +36,18 @@ class ApprovalModeTests(unittest.TestCase):
             "command": "rm /etc/example", "sudo": True, "reason": "remove config",
         })
         self.assertFalse(approval_is_automatic("sudo_only", write))
-        self.assertTrue(approval_is_automatic("sudo_only", sudo))
+        self.assertFalse(approval_is_automatic("sudo_only", sudo))
         self.assertFalse(approval_is_automatic("sudo_only", delete))
 
-    def test_all_approves_every_classified_mutation(self):
-        for risk in (
-            assess_execution("file_edit", {"command": "touch note.txt"}),
-            assess_execution("local_exec", {"command": "rm note.txt"}),
-            assess_execution("local_exec", {
-                "command": "apt update", "sudo": True, "reason": "refresh packages",
-            }),
-        ):
-            self.assertTrue(approval_is_automatic("all", risk))
+    def test_all_approves_workspace_writes_but_not_delete_or_root(self):
+        write = assess_execution("file_edit", {"command": "touch note.txt"})
+        delete = assess_execution("local_exec", {"command": "rm note.txt"})
+        self.assertTrue(approval_is_automatic("all", write))
+        self.assertFalse(approval_is_automatic("all", delete))
+        root = assess_execution("local_exec", {
+            "command": "apt update", "sudo": True, "reason": "refresh packages",
+        })
+        self.assertFalse(approval_is_automatic("all", root))
 
 
 class GuiSudoApprovalTests(unittest.TestCase):
@@ -56,7 +55,7 @@ class GuiSudoApprovalTests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
-    def test_gui_root_request_uses_local_terminal_authentication(self):
+    def test_gui_rejects_root_request_even_with_reason(self):
         widget = ChatWidget.__new__(ChatWidget)
         widget._worker = MagicMock()
         widget._append_msg = MagicMock()
@@ -66,12 +65,12 @@ class GuiSudoApprovalTests(unittest.TestCase):
             "reason": "refresh package metadata",
         }
         with (
-            patch("aicoder.gui.chat_widget.get_state", return_value={"approval_mode": "sudo_only"}),
-            patch.object(QMessageBox, "question") as question,
+            patch("aicoder.gui.chat_widget.get_state", return_value={"approval_mode": "all"}),
+            patch.object(QMessageBox, "warning") as warning,
         ):
             ChatWidget._on_approval_needed(widget, "local_exec", args)
-        question.assert_not_called()
-        widget._worker.set_approval.assert_called_once_with(True)
+        warning.assert_called_once()
+        widget._worker.set_approval.assert_called_once_with(False)
 
     def test_gui_rejects_root_request_without_reason_before_auth(self):
         widget = ChatWidget.__new__(ChatWidget)
@@ -85,73 +84,6 @@ class GuiSudoApprovalTests(unittest.TestCase):
                 "command": "apt update", "sudo": True,
             })
         widget._worker.set_approval.assert_called_once_with(False)
-
-
-class GuiRootExecutionTests(unittest.TestCase):
-    def test_graphical_root_command_uses_pkexec(self):
-        completed = MagicMock(returncode=0, stdout="ok\n", stderr="")
-        with (
-            patch.object(executor.sys.stdin, "isatty", return_value=False),
-            patch.dict(os.environ, {"DISPLAY": ":0"}, clear=False),
-            patch.object(executor.shutil, "which", return_value="/usr/bin/pkexec"),
-            patch.object(executor, "_ensure_graphical_polkit_agent", return_value=(True, "ok")) as ensure,
-            patch.object(executor.subprocess, "run", return_value=completed) as run,
-        ):
-            result, is_error = executor.run_local_exec({
-                "command": "apt update", "sudo": True,
-            })
-        self.assertFalse(is_error)
-        self.assertEqual(result, "ok\n")
-        ensure.assert_called_once_with()
-        self.assertEqual(run.call_args.args[0], ["pkexec", "apt", "update"])
-
-    def test_graphical_root_redirect_runs_in_pkexec_shell(self):
-        completed = MagicMock(returncode=0, stdout="", stderr="")
-        with (
-            patch.object(executor.sys.stdin, "isatty", return_value=False),
-            patch.dict(os.environ, {"WAYLAND_DISPLAY": "wayland-0"}, clear=False),
-            patch.object(executor.shutil, "which", return_value="/usr/bin/pkexec"),
-            patch.object(executor, "_ensure_graphical_polkit_agent", return_value=(True, "ok")) as ensure,
-            patch.object(executor.subprocess, "run", return_value=completed) as run,
-        ):
-            result, is_error = executor.run_local_exec({
-                "command": "printf enabled > /etc/aicoder.conf", "sudo": True,
-            })
-        self.assertFalse(is_error)
-        self.assertEqual(result, "(no output)")
-        ensure.assert_called_once_with()
-        self.assertEqual(
-            run.call_args.args[0],
-            ["pkexec", "sh", "-c", "printf enabled > /etc/aicoder.conf"],
-        )
-
-
-    def test_graphical_root_stops_when_polkit_agent_is_unavailable(self):
-        with (
-            patch.object(executor.sys.stdin, "isatty", return_value=False),
-            patch.dict(os.environ, {"DISPLAY": ":0"}, clear=False),
-            patch.object(executor.shutil, "which", return_value="/usr/bin/pkexec"),
-            patch.object(
-                executor, "_ensure_graphical_polkit_agent",
-                return_value=(False, "kein grafischer Polkit-Authentifizierungsagent installiert"),
-            ),
-            patch.object(executor.subprocess, "run") as run,
-        ):
-            result, is_error = executor.run_local_exec({
-                "command": "apt update", "sudo": True,
-            })
-        self.assertTrue(is_error)
-        self.assertIn("kein grafischer Polkit", result)
-        run.assert_not_called()
-
-    def test_terminal_root_command_keeps_sudo(self):
-        completed = MagicMock(returncode=0, stdout="", stderr="")
-        with (
-            patch.object(executor.sys.stdin, "isatty", return_value=True),
-            patch.object(executor.subprocess, "run", return_value=completed) as run,
-        ):
-            executor.run_local_exec({"command": "id", "sudo": True})
-        self.assertEqual(run.call_args.args[0], ["sudo", "--", "id"])
 
 
 if __name__ == "__main__":

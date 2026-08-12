@@ -19,6 +19,22 @@
   Anthropic / Gemini / Ollama / Groq / ...
 ```
 
+## Agent-/Tool-Datenfluss
+
+```text
+User prompt
+  → /v1/client/chat (Systemregeln + aktivierte Tool-Schemas)
+  → native oder kompatibel normalisierte Tool-Calls
+  → zentrale lokale Tool-Policy (deny forbidden + per-run allowlist)
+  → lokale typisierte Workspace-Capability ODER JSON-RPC /v1/mcp
+  → als untrusted markiertes Tool-Ergebnis
+  → nächster Operator-Turn
+```
+
+GUI, CLI-Agent und direkte `aicoder mcp`-Aufrufe verwenden dieselbe Policy.
+Lokale Lese-/Editierwerkzeuge akzeptieren keine Shell-Kommandos. Admin-, Ops-,
+Remote-, Vault-, Service- und Shell-Werkzeuge werden vor dem Netzwerk blockiert.
+
 ## Lokale Dateien
 
 ```
@@ -61,3 +77,9 @@
   "id": 1
 }
 ```
+
+MCP-Tool-Aufrufe werden auf Transportebene nicht automatisch wiederholt.
+Read-only-Aufrufe dürfen im Executor einmal wiederholt werden; mutierende Aufrufe
+nie, solange das Backend keinen Idempotency-Key-Vertrag bereitstellt. JSON-RPC
+`error`, MCP `isError`, mehrere Textblöcke und `structuredContent` werden
+normalisiert ausgewertet.

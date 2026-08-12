@@ -1,3 +1,19 @@
+## Unreleased — Unified Tool Policy and MCP Hardening
+
+- Enforce one coding-only tool policy across CLI agent, GUI, direct MCP calls,
+  and the low-level MCP client; forbidden admin/ops/shell scopes fail closed.
+- Replace model-facing local shell commands with typed, workspace-confined file,
+  tree, search, edit, and read-only Git capabilities.
+- Normalize JSON-RPC errors, MCP `isError`, multi-block content and
+  `structuredContent`; disable transport retries for tool calls and prevent
+  mutation retries after ambiguous timeouts.
+- Mark tool output as untrusted model input, redact nested audit secrets, use
+  private atomic config writes, and protect SQLite chat-history permissions.
+- Make fallback reporting deterministic and align `on`/`review` swarm behavior
+  with the documented operator/advisor hierarchy.
+- Add end-to-end regression coverage for policy bypasses, typed local tools,
+  MCP protocol variants, retry safety, fallback, swarm, and redaction.
+
 ## v0.9.5 — Agent Reliability + Long Task Timeout (2026-08-08)
 
 - Harden tool-call parsing for provider responses that omit only trailing JSON object braces inside a complete `<tool_call>` envelope.

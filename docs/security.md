@@ -6,6 +6,8 @@
 - Auch bei Admin-Login: Scope bleibt Coding
 - Read-first: Dateien lesen vor Schreiben
 - Keine destruktiven Ops ohne explizite Bestätigung
+- Modell-Tools werden durch eine zentrale Allowlist technisch erzwungen
+- Lokale Dateiwerkzeuge sind auf `workspace_root` begrenzt und shell-frei
 
 ## Gespeicherte Credentials
 
@@ -32,3 +34,7 @@ ai-coder darf folgende Backend-Tools NICHT aufrufen:
 Aktuell ergibt Login einen vollen Client-Token mit Zugriff auf alle Tools.  
 Ziel: ai-coder soll als eigener `client_profile = ai_coder` laufen.  
 Details: `docs/backend_scope.md`
+
+Der Client erzwingt seinen Coding-Scope zusätzlich lokal. Das ersetzt keine
+serverseitige Autorisierung, verhindert aber, dass ein Modell, ein Text-Parser
+oder ein direkter CLI-Aufruf verbotene Toolnamen an `/v1/mcp` weiterleitet.

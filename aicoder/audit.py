@@ -1,6 +1,6 @@
 """
 audit.py — Persistent audit log for all tool executions.
-Every local_exec and MCP tool call is recorded with timestamp,
+Every local capability and MCP tool call is recorded with timestamp,
 command, result, duration, and error status.
 
 Storage: ~/.config/ai-coder/audit.jsonl (append-only, one JSON per line)
@@ -10,7 +10,9 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict
+
+from .config import ensure_config_dir
 
 AUDIT_DIR = Path.home() / ".config/ai-coder"
 AUDIT_FILE = AUDIT_DIR / "audit.jsonl"
@@ -21,6 +23,15 @@ _SECRET_PATTERNS = (
     "password", "passwd", "token", "bearer", "secret", "api_key",
     "authorization", "private_key", "client_secret", "access_token",
 )
+_SENSITIVE_KEYS = {item.replace("_", "") for item in _SECRET_PATTERNS}
+_INLINE_SECRET_RE = __import__("re").compile(
+    r"(?i)\b(password|passwd|token|bearer|secret|api[_-]?key|authorization|"
+    r"private[_-]?key|client[_-]?secret|access[_-]?token)\b(\s*[:=]\s*|\s+)([^\s]+)"
+)
+
+
+def _redact_inline(value: str) -> str:
+    return _INLINE_SECRET_RE.sub(lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]", value)
 
 def _redact_result(result: str) -> str:
     """Redact lines that likely contain secrets from logged output."""
@@ -48,7 +59,7 @@ def log_tool(
 ) -> None:
     """Append a tool execution record to the audit log."""
     try:
-        AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+        ensure_config_dir()
         entry = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "tool": tool_name,
@@ -60,28 +71,33 @@ def log_tool(
             "iteration": iteration,
             "session": session_id,
         }
-        audit_existed = AUDIT_FILE.exists()
         with open(AUDIT_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        if not audit_existed:
-            try:
-                os.chmod(AUDIT_FILE, 0o600)
-            except OSError:
-                pass
+        try:
+            os.chmod(AUDIT_FILE, 0o600)
+        except OSError:
+            pass
     except Exception:
         pass  # Audit logging must never crash the agent
 
 
 def _sanitize_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
-    """Keep full args for local_exec (audit trail), truncate large MCP args."""
-    if tool_name == "local_exec":
-        return dict(args)  # Full command logged — this is the whole point
-    # For MCP tools, truncate large values
-    out = {}
-    for k, v in args.items():
-        sv = str(v)
-        out[k] = sv[:500] if len(sv) > 500 else v
-    return out
+    """Recursively redact sensitive values and bound the audit payload."""
+
+    def clean(key: str, value: Any) -> Any:
+        normalized = key.lower().replace("_", "").replace("-", "")
+        if normalized in _SENSITIVE_KEYS:
+            return "[REDACTED]"
+        if isinstance(value, dict):
+            return {str(k): clean(str(k), v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [clean(key, item) for item in value[:100]]
+        if isinstance(value, str):
+            redacted = _redact_inline(value)
+            return redacted[:2000] if tool_name == "local_exec" else redacted[:500]
+        return value
+
+    return {str(key): clean(str(key), value) for key, value in args.items()}
 
 
 def get_recent(n: int = 50) -> list[Dict[str, Any]]:

@@ -1,15 +1,15 @@
 from __future__ import annotations
-import json, os, threading
+import json, threading
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from .config import CONFIG_DIR
+from .config import CONFIG_DIR, atomic_write_private
 
 STATE_FILE = CONFIG_DIR / "state.json"
 
 SWARM_MODES = {"off", "auto", "on", "review"}
 TOOL_MODES = {"off", "on_demand", "always"}
-APPROVAL_MODES = {"ask", "autopilot", "sudo_only", "all"}
+APPROVAL_MODES = {"ask", "autopilot", "all"}
 DEFAULT_FALLBACK_MODEL = "ollama/llama3.2:latest"
 
 _DEFAULTS: Dict[str, Any] = {
@@ -22,23 +22,33 @@ _DEFAULTS: Dict[str, Any] = {
     "tool_mode": "on_demand",
     "enabled_tools": None,
     "request_timeout": 300,
-    # ask: confirm every mutation; autopilot: safe writes only; sudo_only:
-    # automatically approve elevated requests after local sudo auth; all: all mutations.
+    # ask: confirm every mutation; autopilot: safe writes only; all: all mutations.
     "approval_mode": "ask",
 }
 
 # In-memory cache — vermeidet wiederholte Disk-Reads im Agent-Loop
 _cache: Dict[str, Any] | None = None
+_cache_stamp: tuple[str, int, int] | None = None
 _lock = threading.Lock()  # thread-safe cache access (GUI + Worker threads)
 
 
+def _state_stamp() -> tuple[str, int, int]:
+    try:
+        stat = STATE_FILE.stat()
+        return str(STATE_FILE), stat.st_mtime_ns, stat.st_size
+    except OSError:
+        return str(STATE_FILE), -1, -1
+
+
 def _load_raw() -> Dict[str, Any]:
-    global _cache
+    global _cache, _cache_stamp
     with _lock:
-        if _cache is not None:
+        stamp = _state_stamp()
+        if _cache is not None and _cache_stamp == stamp:
             return dict(_cache)
         if not STATE_FILE.exists():
             _cache = dict(_DEFAULTS)
+            _cache_stamp = stamp
             return dict(_cache)
         try:
             data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
@@ -46,20 +56,23 @@ def _load_raw() -> Dict[str, Any]:
             # still means that the user intentionally disabled fallback.
             if data.get("fallback_model") is None:
                 data["fallback_model"] = DEFAULT_FALLBACK_MODEL
+            if data.get("approval_mode") not in APPROVAL_MODES:
+                data["approval_mode"] = "ask"
             _cache = {**_DEFAULTS, **data}
+            _cache_stamp = stamp
             return dict(_cache)
         except Exception:
             _cache = dict(_DEFAULTS)
+            _cache_stamp = stamp
             return dict(_cache)
 
 
 def _save_raw(data: Dict[str, Any]) -> None:
-    global _cache
+    global _cache, _cache_stamp
     with _lock:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        STATE_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        os.chmod(STATE_FILE, 0o600)
+        atomic_write_private(STATE_FILE, json.dumps(data, indent=2))
         _cache = dict(data)
+        _cache_stamp = _state_stamp()
 
 
 def get_state() -> Dict[str, Any]:

@@ -27,6 +27,7 @@ from aicoder.repl_input import COMMANDS, ReplInput
 from aicoder.ui import AgentSpinner
 from aicoder.privileges import assess_execution
 import aicoder.executor as executor
+import aicoder.repl_input as repl_input_module
 
 
 def _unsigned_token(exp: int) -> str:
@@ -303,6 +304,11 @@ class ReplRegressionTests(unittest.TestCase):
         basic_input.assert_called_once_with("> ")
 
     def test_enhanced_input_falls_back_to_memory_when_history_is_read_only(self):
+        if repl_input_module.PromptSession is None:
+            repl = ReplInput(Path("/read-only/history"), lambda: "")
+            self.assertFalse(repl.enhanced)
+            self.assertFalse(repl.persistent_history)
+            return
         with patch.object(Path, "open", side_effect=OSError("read only")):
             repl = ReplInput(Path("/read-only/history"), lambda: "")
         self.assertTrue(repl.enhanced)
@@ -496,56 +502,23 @@ class PrivilegeBrokerTests(unittest.TestCase):
         approval.assert_called_once()
         client.mcp_call.assert_called_once()
 
-    def test_sudo_redirect_runs_inside_elevated_shell(self):
-        completed = MagicMock(returncode=0, stdout="", stderr="")
-        with patch.object(executor.subprocess, "run", return_value=completed) as run:
-            result, is_error = executor.run_local_exec({
-                "command": "printf enabled > /etc/aicoder.conf",
-                "sudo": True,
-            })
-        self.assertFalse(is_error)
-        self.assertEqual(result, "(no output)")
-        self.assertEqual(
-            run.call_args.args[0],
-            ["sudo", "--", "sh", "-c", "printf enabled > /etc/aicoder.conf"],
-        )
-        self.assertFalse(run.call_args.kwargs["shell"])
-
-    def test_shell_free_local_command_expands_home_paths(self):
-        completed = MagicMock(returncode=0, stdout="ok\n", stderr="")
-        with patch.object(executor.subprocess, "run", return_value=completed) as run:
-            result, is_error = executor.run_local_exec({
-                "command": "ls -la ~/Documents",
-                "cwd": "~/",
-            })
-        self.assertFalse(is_error)
-        self.assertEqual(result, "ok\n")
-        self.assertEqual(
-            run.call_args.args[0],
-            ["ls", "-la", os.path.expanduser("~/Documents")],
-        )
-        self.assertEqual(run.call_args.kwargs["cwd"], os.path.expanduser("~/"))
-        self.assertFalse(run.call_args.kwargs["shell"])
-
-    def test_cli_sudo_approval_validates_locally_after_consent(self):
+    def test_cli_sudo_request_is_always_rejected(self):
         args = {
             "command": "install -m 644 app.conf /etc/app.conf",
             "sudo": True,
             "reason": "Installiere die bestätigte Konfiguration",
         }
         with (
-            patch("builtins.input", return_value="j"),
-            patch.object(cli_agent, "validate_sudo_session", return_value=(True, "ok")) as validate,
+            patch("builtins.input") as prompt,
             contextlib.redirect_stdout(io.StringIO()),
             contextlib.redirect_stderr(io.StringIO()),
         ):
-            self.assertTrue(cli_agent._cli_approval("file_edit", args))
-        validate.assert_called_once_with()
+            self.assertFalse(cli_agent._cli_approval("file_edit", args))
+        prompt.assert_not_called()
 
     def test_cli_rejects_unexplained_elevation_request(self):
         with (
             patch("builtins.input") as prompt,
-            patch.object(cli_agent, "validate_sudo_session") as validate,
             contextlib.redirect_stderr(io.StringIO()),
         ):
             allowed = cli_agent._cli_approval(
@@ -553,7 +526,6 @@ class PrivilegeBrokerTests(unittest.TestCase):
             )
         self.assertFalse(allowed)
         prompt.assert_not_called()
-        validate.assert_not_called()
 
 
 if __name__ == "__main__":
