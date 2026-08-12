@@ -64,6 +64,12 @@ Remote-, Vault-, Service- und Shell-Werkzeuge werden vor dem Netzwerk blockiert.
 | Handshake | GET | /v1/auth/client/handshake |
 | MCP-Call | POST | /v1/mcp |
 
+Der Client sendet bei allen Requests `X-Client-Profile: ai-coder`. Das Backend
+verwendet dieses Profil ausschließlich zur Einschränkung: `tools/list` und
+`tools/call` werden auf denselben kanonischen Coding-Tool-Vertrag begrenzt, den
+der Client lokal nochmals durchsetzt. Das Profil gewährt keine zusätzlichen
+Rechte.
+
 ## MCP-Call Format (JSON-RPC 2.0)
 
 ```json

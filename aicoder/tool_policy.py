@@ -33,7 +33,10 @@ FORBIDDEN_EXACT = {
     "remote_task",
     "mesh_task",
     "restart",
+    "memory_clear",
 }
+
+_FORBIDDEN_NAMESPACES = {prefix.rstrip("_") for prefix in FORBIDDEN_PREFIXES}
 
 # Explicit client features which are safe to call directly but are never
 # advertised to an operator model as executable project tools.
@@ -60,10 +63,17 @@ def canonical_tool_name(name: str) -> str:
 
 def forbidden_reason(name: str) -> str | None:
     """Explain why *name* is outside the coding-client capability scope."""
-    canonical = canonical_tool_name(name)
+    normalized = str(name or "").strip().lower()
+    parts = [part for part in re.split(r"[./:]", normalized) if part]
+    canonical = parts[-1] if parts else ""
     if canonical in FORBIDDEN_EXACT:
         return f"tool '{name}' is disabled by the ai-coder coding-only policy"
-    if any(canonical.startswith(prefix) for prefix in FORBIDDEN_PREFIXES):
+    if any(
+        part in _FORBIDDEN_NAMESPACES
+        or any(part.startswith(prefix) for prefix in FORBIDDEN_PREFIXES)
+        or any(part.startswith(prefix.replace("_", "-")) for prefix in FORBIDDEN_PREFIXES)
+        for part in parts
+    ):
         return f"tool '{name}' belongs to a forbidden admin/ops scope"
     return None
 

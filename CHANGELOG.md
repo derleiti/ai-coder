@@ -13,6 +13,8 @@
   with the documented operator/advisor hierarchy.
 - Add end-to-end regression coverage for policy bypasses, typed local tools,
   MCP protocol variants, retry safety, fallback, swarm, and redaction.
+- Keep client and TriForce on one tested, restrictive `ai-coder` MCP contract;
+  alias normalization, Swarm calls, and login role fields now match end to end.
 
 ## v0.9.5 — Agent Reliability + Long Task Timeout (2026-08-08)
 

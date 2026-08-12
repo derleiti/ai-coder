@@ -28,7 +28,8 @@ class ToolPolicyIntegrationTests(unittest.TestCase):
         for name in (
             "admin_users", "vault_keys", "mail_send", "notify_send",
             "restart_backend", "service_control", "remote_task", "shell",
-            "task_runner", "binary_exec", "local_exec", "devops",
+            "task_runner", "binary_exec", "local_exec", "devops", "memory_clear",
+            "remote.search", "admin:health", "mcp/vault.keys",
         ):
             with self.subTest(name=name):
                 allowed, reason = require_allowed_tool(name, None)
@@ -121,6 +122,15 @@ class LocalCapabilityTests(unittest.TestCase):
 
 
 class McpProtocolTests(unittest.TestCase):
+    def test_login_normalizes_the_backend_account_role_contract(self):
+        client = TriForceClient("https://example.invalid")
+        with patch.object(
+            client, "_request",
+            return_value={"token": "opaque", "tier": "pro", "client_id": "client-1"},
+        ):
+            result = client.login("user@example.invalid", "secret")
+        self.assertEqual(result["account_role"], "pro")
+
     def test_client_announces_the_restrictive_backend_profile(self):
         client = TriForceClient("https://example.invalid", token="opaque")
         with patch.object(client, "_do_request", return_value={}) as request:
@@ -176,6 +186,16 @@ class McpProtocolTests(unittest.TestCase):
         text, error = executor.run_mcp_tool(client, "health", {})
         self.assertFalse(error)
         self.assertIn('"ok": true', text)
+
+    def test_backend_annotations_drive_transport_independent_approval(self):
+        read_only = executor._tool_security_metadata({
+            "name": "future_read", "annotations": {"readOnlyHint": True},
+        })
+        mutating = executor._tool_security_metadata({
+            "name": "future_write", "annotations": {"readOnlyHint": False},
+        })
+        self.assertEqual(read_only, (False, None))
+        self.assertEqual(mutating, (True, None))
 
 
 class FallbackAndSwarmTests(unittest.TestCase):

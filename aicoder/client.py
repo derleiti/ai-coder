@@ -284,6 +284,9 @@ class TriForceClient:
         token = result.get("token")
         if not token:
             raise ClientError(f"Login fehlgeschlagen: {result}")
+        # Older TriForce deployments expose only tier; current deployments also
+        # return the concrete client account role. Keep one stable client shape.
+        result.setdefault("account_role", result.get("role") or result.get("tier", "unknown"))
         self.token = token
         return result
 
