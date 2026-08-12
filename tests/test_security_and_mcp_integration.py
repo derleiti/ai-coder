@@ -12,10 +12,15 @@ import aicoder.agent as cli_agent
 import aicoder.executor as executor
 from aicoder import audit
 from aicoder import clipboard, web_search
-from aicoder.client import ClientError, TokenExpiredError, TriForceClient
+from aicoder.client import CLIENT_PROFILE, ClientError, TokenExpiredError, TriForceClient
 from aicoder.privileges import assess_execution
 from aicoder.swarm_runner import run_swarm_ask
-from aicoder.tool_policy import filter_tool_catalog, require_allowed_tool
+from aicoder.tool_policy import (
+    CODING_MCP_TOOLS,
+    INTERNAL_MCP_TOOLS,
+    filter_tool_catalog,
+    require_allowed_tool,
+)
 
 
 class ToolPolicyIntegrationTests(unittest.TestCase):
@@ -116,6 +121,25 @@ class LocalCapabilityTests(unittest.TestCase):
 
 
 class McpProtocolTests(unittest.TestCase):
+    def test_client_announces_the_restrictive_backend_profile(self):
+        client = TriForceClient("https://example.invalid", token="opaque")
+        with patch.object(client, "_do_request", return_value={}) as request:
+            client._request("GET", "/v1/auth/verify", require_auth=True)
+        headers = request.call_args.args[2]
+        self.assertEqual(headers["X-Client-Profile"], CLIENT_PROFILE)
+
+    def test_frontend_mcp_contract_matches_backend_canonical_profile(self):
+        expected = {
+            "code_read", "code_search", "code_tree",
+            "dev_analyze", "dev_debug", "dev_lint", "dev_links",
+            "dev_refactor", "dev_summarize",
+            "doc_read", "doc_search",
+            "health", "search", "crawl",
+            "memory_search", "memory_store",
+            "models", "specialist", "prompts", "swarm_broadcast",
+        }
+        self.assertEqual(set(CODING_MCP_TOOLS) | set(INTERNAL_MCP_TOOLS), expected)
+
     def test_client_blocks_forbidden_tool_before_network(self):
         client = TriForceClient("https://example.invalid", token="opaque")
         with patch.object(client, "_request") as request:

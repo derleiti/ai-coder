@@ -42,12 +42,12 @@ INTERNAL_MCP_TOOLS = {"swarm_broadcast"}
 # Single source of truth for MCP capabilities which an operator model or direct
 # coding-client command may invoke. Local capabilities live in executor.py.
 CODING_MCP_TOOLS = frozenset({
-    "code_read", "code_search", "code_tree", "debug",
+    "code_read", "code_search", "code_tree",
     "dev_analyze", "dev_debug", "dev_lint", "dev_links",
     "dev_refactor", "dev_summarize",
     "doc_read", "doc_search",
     "health", "search", "crawl",
-    "memory_search", "memory_store", "memory_clear",
+    "memory_search", "memory_store",
     "models", "specialist", "prompts",
 })
 

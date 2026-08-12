@@ -12,6 +12,7 @@ from urllib.request import Request, urlopen
 from . import __version__
 from .tool_policy import CODING_MCP_TOOLS, require_allowed_tool
 USER_AGENT = f"ai-coder/{__version__} (AILinux Coding Client)"
+CLIENT_PROFILE = "ai-coder"
 
 # ── Connection pool (keep-alive) ──────────────────────────────
 _POOL = None
@@ -176,6 +177,7 @@ class TriForceClient:
             "Accept": "application/json",
             "Content-Type": "application/json",
             "User-Agent": USER_AGENT,
+            "X-Client-Profile": CLIENT_PROFILE,
         }
         if require_auth:
             if not self.token:
