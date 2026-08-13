@@ -1,5 +1,7 @@
 ## v0.9.6 — Unified Tool Policy and MCP Hardening (2026-08-13)
 
+- Expose only the canonical MCP `search` tool; remove the obsolete DuckDuckGo
+  local search and the synthetic `web_search` alias from model-facing tools.
 - Enforce one coding-only tool policy across CLI agent, GUI, direct MCP calls,
   and the low-level MCP client; forbidden admin/ops/shell scopes fail closed.
 - Replace model-facing local shell commands with typed, workspace-confined file,

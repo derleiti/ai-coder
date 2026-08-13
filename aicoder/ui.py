@@ -98,7 +98,7 @@ TOOL_STYLE: dict[str, tuple[str, str]] = {
     "system_info":  (ARROW_CYCLE,   C.BBLUE),
     "git":          (BRAILLE_CYCLE, C.BMAGENTA),
     "git_ops":      (BRAILLE_CYCLE, C.BMAGENTA),
-    "web_search":   (DOTS_CYCLE,    C.BCYAN),
+    "search":       (DOTS_CYCLE,    C.BCYAN),
     "fetch":        (DOTS_CYCLE,    C.BCYAN),
     "dev_analyze":  (PULSE_CYCLE,   C.BYELLOW),
     "dev_debug":    (PULSE_CYCLE,   C.BRED),

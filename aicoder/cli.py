@@ -13,7 +13,6 @@ from .session_state import (
 from .status import Spinner, phase_label
 from .workspace import workspace_snapshot
 from .tool_policy import (
-    expand_tool_catalog_aliases,
     filter_tool_catalog,
     require_allowed_tool,
 )
@@ -103,7 +102,6 @@ def cmd_tools(_: argparse.Namespace) -> int:
 
     if tools and isinstance(tools[0], dict):
         tools = filter_tool_catalog(tools, AGENT_TOOLS)
-        tools = expand_tool_catalog_aliases(tools, AGENT_TOOLS)
     else:
         tools = [name for name in tools if name in AGENT_TOOLS and require_allowed_tool(name, AGENT_TOOLS)[0]]
 
@@ -900,7 +898,6 @@ def cmd_mcp_list(_: argparse.Namespace) -> int:
     with Spinner("working..."):
         data = client._request("POST", "/v1/mcp", payload, require_auth=True, _label="tools/list")
     tools = filter_tool_catalog(data.get("result", {}).get("tools", []), AGENT_TOOLS)
-    tools = expand_tool_catalog_aliases(tools, AGENT_TOOLS)
     print(f"{'Name':<35} {'Description'}")
     print("─" * 80)
     for t in tools:

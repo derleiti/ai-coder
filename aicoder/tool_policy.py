@@ -49,16 +49,10 @@ CODING_MCP_TOOLS = frozenset({
     "dev_analyze", "dev_debug", "dev_lint", "dev_links",
     "dev_refactor", "dev_summarize",
     "doc_read", "doc_search",
-    "health", "search", "web_search", "crawl",
+    "health", "search", "crawl",
     "memory_search", "memory_store",
     "models", "specialist", "prompts",
 })
-
-# Model-facing compatibility names which the backend accepts but omits from
-# its canonical (v5) tools/list inventory. Keep the canonical tool as well so
-# existing prompts and clients remain compatible.
-MCP_TOOL_ALIASES = {"web_search": "search"}
-
 
 def canonical_tool_name(name: str) -> str:
     """Return the non-namespaced leaf used for policy classification."""
@@ -138,28 +132,4 @@ def filter_tool_catalog(tools: Iterable[dict], allowed_names: Iterable[str]) -> 
         ok, _ = require_allowed_tool(name, allowed)
         if ok:
             result.append(normalized)
-    return result
-
-
-def expand_tool_catalog_aliases(
-    tools: Iterable[dict], allowed_names: Iterable[str],
-) -> list[dict]:
-    """Add explicitly supported model-facing aliases to a filtered catalogue."""
-    result = [dict(tool) for tool in tools if isinstance(tool, dict)]
-    allowed = set(allowed_names)
-    by_name = {
-        str(tool.get("name")): tool for tool in result
-        if isinstance(tool.get("name"), str)
-    }
-    for alias, canonical in MCP_TOOL_ALIASES.items():
-        if alias not in allowed or alias in by_name or canonical not in by_name:
-            continue
-        cloned = dict(by_name[canonical])
-        cloned["name"] = alias
-        cloned["description"] = (
-            f"Web-search compatibility name for {canonical}. "
-            + str(cloned.get("description") or "")
-        ).strip()
-        result.append(cloned)
-        by_name[alias] = cloned
     return result

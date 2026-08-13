@@ -1,4 +1,4 @@
-"""web_search.py — Local web search + fetch for ai-coder when MCP is unavailable."""
+"""Local URL fetch support for ai-coder."""
 from __future__ import annotations
 import json
 import ipaddress
@@ -6,10 +6,10 @@ import socket
 from . import __version__
 import re
 from typing import Tuple
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import urlparse
 
 # Use stdlib only — no extra dependencies
-from urllib.request import urlopen, Request, build_opener, HTTPRedirectHandler
+from urllib.request import Request, build_opener, HTTPRedirectHandler
 from urllib.error import URLError, HTTPError
 
 
@@ -84,42 +84,3 @@ def web_fetch(url: str, max_chars: int = 8000) -> Tuple[str, bool]:
         return f"URL Error: {e.reason} — {url}", True
     except Exception as e:
         return f"web_fetch error: {e}", True
-
-
-def web_search_duckduckgo(query: str, max_results: int = 5) -> Tuple[str, bool]:
-    """Search via DuckDuckGo HTML (no API key needed). Returns (results_text, is_error)."""
-    try:
-        url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
-        req = Request(url, headers={
-            **_HEADERS,
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
-        })
-        with urlopen(req, timeout=_TIMEOUT) as resp:
-            html = resp.read(50000).decode("utf-8", errors="replace")
-
-        # Parse results from DDG HTML
-        results = []
-        # DDG wraps results in <a class="result__a" href="...">title</a>
-        # and <a class="result__snippet">snippet</a>
-        links = re.findall(
-            r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
-            html, re.DOTALL,
-        )
-        snippets = re.findall(
-            r'class="result__snippet"[^>]*>(.*?)</a>',
-            html, re.DOTALL,
-        )
-
-        for i, (href, title) in enumerate(links[:max_results]):
-            title_clean = re.sub(r"<[^>]+>", "", title).strip()
-            snippet = ""
-            if i < len(snippets):
-                snippet = re.sub(r"<[^>]+>", "", snippets[i]).strip()
-            results.append(f"{i+1}. {title_clean}\n   {href}\n   {snippet}")
-
-        if not results:
-            return f"No results found for: {query}", False
-
-        return "\n\n".join(results), False
-    except Exception as e:
-        return f"web_search error: {e}", True

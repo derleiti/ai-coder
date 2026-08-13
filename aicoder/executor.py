@@ -27,7 +27,6 @@ from .privileges import assess_execution
 from .session_state import get_state
 from .tool_policy import (
     CODING_MCP_TOOLS,
-    expand_tool_catalog_aliases,
     filter_tool_catalog,
     require_allowed_tool,
 )
@@ -374,18 +373,6 @@ LOCAL_CLIPBOARD_WRITE_SCHEMA = {
     }
 }
 
-LOCAL_WEB_SEARCH_SCHEMA = {
-    "name": "web_search_local",
-    "description": "Search the web locally via DuckDuckGo (no API key needed).",
-    "inputSchema": {
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "Search query"},
-        },
-        "required": ["query"]
-    }
-}
-
 LOCAL_WEB_FETCH_SCHEMA = {
     "name": "web_fetch_local",
     "description": "Fetch and extract text from a URL locally.",
@@ -409,7 +396,6 @@ LOCAL_TOOL_SCHEMAS = [
     LOCAL_TEST_SCHEMA,
     LOCAL_CLIPBOARD_READ_SCHEMA,
     LOCAL_CLIPBOARD_WRITE_SCHEMA,
-    LOCAL_WEB_SEARCH_SCHEMA,
     LOCAL_WEB_FETCH_SCHEMA,
 ]
 
@@ -435,7 +421,7 @@ You are ai-coder — an autonomous coding agent on AILinux/TriForce (api.ailinux
 - REMOTE READ/ANALYZE: code_read, code_search, code_tree on the TriForce backend.
 - WRITE/MODIFY: use file_edit with path + operation + typed content fields.
 - BACKEND CONNECTIVITY: health (READ-ONLY)
-- SEARCH: memory_search (first!) → web_search/search → crawl
+- SEARCH: memory_search (first!) → search → crawl
 - MODELS: models, specialist (info only)
 - STUCK >2 rounds: Stop guessing. Use memory_search, then search, then ask user.
 
@@ -578,8 +564,6 @@ def load_tools(client: TriForceClient, force_refresh: bool = False) -> list[dict
         print(f"  \033[33m  → Agent läuft mit {len(FALLBACK_TOOLS)} Fallback-Tools (eingeschränkt)\033[0m", file=sys.stderr)
         print(f"  \033[33m  → Backend erreichbar? Versuch: aicoder mcp health\033[0m", file=sys.stderr)
         mcp_tools = FALLBACK_TOOLS
-
-    mcp_tools = expand_tool_catalog_aliases(mcp_tools, AGENT_TOOLS)
 
     result = LOCAL_TOOL_SCHEMAS + mcp_tools
     _tool_security_hints = {
@@ -1159,9 +1143,6 @@ def run_tool(
     elif name == "clipboard_write":
         from .clipboard import clipboard_write
         result, is_error = clipboard_write(args.get("text", ""))
-    elif name == "web_search_local":
-        from .web_search import web_search_duckduckgo
-        result, is_error = web_search_duckduckgo(args.get("query", ""))
     elif name == "web_fetch_local":
         from .web_search import web_fetch
         result, is_error = web_fetch(args.get("url", ""))

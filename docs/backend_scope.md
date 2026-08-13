@@ -14,7 +14,7 @@ ai-coder soll einen eigenen eingeschränkten Scope haben:
 - code_read, code_search, code_tree, code_edit
 - dev_analyze, dev_debug, dev_lint, dev_refactor, dev_summarize
 - file_ops (read/list/find — kein shell-write ohne Review)
-- search, fetch, web_search
+- search (kanonische Websuche), web_fetch_local (lokaler URL-Abruf)
 - memory_search, memory_store (user-scoped)
 - git_ops (read: status, log, diff — kein push)
 

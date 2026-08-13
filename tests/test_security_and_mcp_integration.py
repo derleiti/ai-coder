@@ -19,7 +19,6 @@ from aicoder.session_state import migrate_enabled_tools
 from aicoder.tool_policy import (
     CODING_MCP_TOOLS,
     INTERNAL_MCP_TOOLS,
-    expand_tool_catalog_aliases,
     filter_tool_catalog,
     require_allowed_tool,
 )
@@ -64,13 +63,39 @@ class ToolPolicyIntegrationTests(unittest.TestCase):
             [{"name": "code_read", "inputSchema": {}}],
         )
 
-    def test_web_search_alias_is_added_from_canonical_search_schema(self):
-        tools = expand_tool_catalog_aliases(
-            [{"name": "search", "description": "Search", "inputSchema": {}}],
-            {"search", "web_search"},
+    def test_only_canonical_search_is_allowed(self):
+        catalog = [
+            {"name": "search", "description": "Search", "inputSchema": {}},
+            {"name": "web_search", "description": "Legacy search", "inputSchema": {}},
+        ]
+        self.assertEqual(
+            [tool["name"] for tool in filter_tool_catalog(catalog, CODING_MCP_TOOLS)],
+            ["search"],
         )
-        self.assertEqual([tool["name"] for tool in tools], ["search", "web_search"])
-        self.assertEqual(tools[1]["inputSchema"], {})
+
+    def test_loaded_catalog_exposes_exactly_one_search_tool(self):
+        client = MagicMock()
+        client.base_url = "https://example.invalid"
+        client.token = "opaque"
+        client._request.return_value = {
+            "result": {"tools": [{
+                "name": "search",
+                "description": "Unified search",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+            }]},
+        }
+        with (
+            patch.object(executor, "_tool_cache", None),
+            patch.object(executor, "_tool_cache_ts", 0),
+            patch.object(executor, "_tool_cache_key", None),
+            patch.object(executor, "_tool_security_hints", {}),
+        ):
+            names = [tool["name"] for tool in executor.load_tools(client)]
+        self.assertEqual([name for name in names if "search" in name], ["search"])
 
     def test_cli_agent_cannot_execute_a_tool_when_tool_mode_is_off(self):
         client = MagicMock()
@@ -168,7 +193,7 @@ class McpProtocolTests(unittest.TestCase):
             "dev_analyze", "dev_debug", "dev_lint", "dev_links",
             "dev_refactor", "dev_summarize",
             "doc_read", "doc_search",
-            "health", "search", "web_search", "crawl",
+            "health", "search", "crawl",
             "memory_search", "memory_store",
             "models", "specialist", "prompts", "swarm_broadcast",
         }
