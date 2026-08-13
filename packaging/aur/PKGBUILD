@@ -1,8 +1,8 @@
 # Maintainer: Markus Leitermann <admin@ailinux.me>
 pkgname=aicoder
-pkgver=0.9.5
+pkgver=0.9.6
 pkgrel=1
-pkgdesc="Terminal Coding & DevOps Agent for AILinux/TriForce — 630+ models, GUI, Connection Pooling"
+pkgdesc="Coding agent for AILinux/TriForce with GUI and restrictive MCP access"
 arch=('x86_64')
 url="https://github.com/derleiti/ai-coder"
 license=('MIT')

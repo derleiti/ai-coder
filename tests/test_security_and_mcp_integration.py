@@ -15,6 +15,7 @@ from aicoder import clipboard, web_search
 from aicoder.client import CLIENT_PROFILE, ClientError, TokenExpiredError, TriForceClient
 from aicoder.privileges import assess_execution
 from aicoder.swarm_runner import run_swarm_ask
+from aicoder.session_state import migrate_enabled_tools
 from aicoder.tool_policy import (
     CODING_MCP_TOOLS,
     INTERNAL_MCP_TOOLS,
@@ -24,6 +25,20 @@ from aicoder.tool_policy import (
 
 
 class ToolPolicyIntegrationTests(unittest.TestCase):
+    def test_legacy_all_tools_snapshot_migrates_to_dynamic_all(self):
+        legacy = [
+            "agents", "clipboard_read", "clipboard_write", "code_grep", "code_read",
+            "code_search", "code_tree", "dev_analyze", "dev_debug", "dev_links",
+            "dev_lint", "dev_refactor", "dev_summarize", "devops", "doc_read",
+            "doc_search", "file_edit", "file_read", "file_tree", "git", "health",
+            "lint", "local_exec", "logs", "logs_errors", "logs_stats",
+            "memory_search", "memory_store", "models", "ollama_list", "ollama_status",
+            "remote_hosts", "remote_status", "search", "status", "test", "vault_keys",
+            "vault_status", "web_fetch_local", "web_search_local",
+        ]
+        self.assertIsNone(migrate_enabled_tools(legacy))
+        self.assertEqual(migrate_enabled_tools(["file_read", "test"]), ["file_read", "test"])
+
     def test_forbidden_scopes_and_aliases_are_denied(self):
         for name in (
             "admin_users", "vault_keys", "mail_send", "notify_send",

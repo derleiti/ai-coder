@@ -1,4 +1,4 @@
-## Unreleased — Unified Tool Policy and MCP Hardening
+## v0.9.6 — Unified Tool Policy and MCP Hardening (2026-08-13)
 
 - Enforce one coding-only tool policy across CLI agent, GUI, direct MCP calls,
   and the low-level MCP client; forbidden admin/ops/shell scopes fail closed.
@@ -15,6 +15,8 @@
   MCP protocol variants, retry safety, fallback, swarm, and redaction.
 - Keep client and TriForce on one tested, restrictive `ai-coder` MCP contract;
   alias normalization, Swarm calls, and login role fields now match end to end.
+- Migrate the obsolete persisted 40-tool snapshot to the current dynamic
+  coding-only catalog so newly supported safe tools are visible after upgrade.
 
 ## v0.9.5 — Agent Reliability + Long Task Timeout (2026-08-08)
 

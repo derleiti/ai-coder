@@ -26,6 +26,34 @@ _DEFAULTS: Dict[str, Any] = {
     "approval_mode": "ask",
 }
 
+# Before the coding-only policy was centralized, the Settings UI persisted
+# "Select all" as a concrete snapshot. That snapshot now contains removed
+# admin/ops tools and omits newly introduced safe tools, so filtering it against
+# the current catalogue produces the misleading 27/40 state. Migrate only this
+# exact historical all-tools snapshot; real custom selections remain untouched.
+_LEGACY_ALL_TOOLS = frozenset({
+    "agents", "clipboard_read", "clipboard_write", "code_grep", "code_read",
+    "code_search", "code_tree", "dev_analyze", "dev_debug", "dev_links",
+    "dev_lint", "dev_refactor", "dev_summarize", "devops", "doc_read",
+    "doc_search", "file_edit", "file_read", "file_tree", "git", "health",
+    "lint", "local_exec", "logs", "logs_errors", "logs_stats",
+    "memory_search", "memory_store", "models", "ollama_list", "ollama_status",
+    "remote_hosts", "remote_status", "search", "status", "test", "vault_keys",
+    "vault_status", "web_fetch_local", "web_search_local",
+})
+
+
+def migrate_enabled_tools(value: Any) -> Optional[list[str]]:
+    """Convert the obsolete explicit 'all tools' snapshot back to its meaning."""
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        return []
+    normalized = [str(name) for name in value if isinstance(name, str) and name]
+    if frozenset(normalized) == _LEGACY_ALL_TOOLS:
+        return None
+    return normalized
+
 # In-memory cache — vermeidet wiederholte Disk-Reads im Agent-Loop
 _cache: Dict[str, Any] | None = None
 _cache_stamp: tuple[str, int, int] | None = None
@@ -58,6 +86,7 @@ def _load_raw() -> Dict[str, Any]:
                 data["fallback_model"] = DEFAULT_FALLBACK_MODEL
             if data.get("approval_mode") not in APPROVAL_MODES:
                 data["approval_mode"] = "ask"
+            data["enabled_tools"] = migrate_enabled_tools(data.get("enabled_tools"))
             _cache = {**_DEFAULTS, **data}
             _cache_stamp = stamp
             return dict(_cache)

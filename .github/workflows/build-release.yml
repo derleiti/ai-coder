@@ -136,9 +136,10 @@ jobs:
           Installed-Size: ${SIZE}
           Maintainer: Markus Leitermann <admin@ailinux.me>
           Homepage: https://ailinux.me/ai-coder/
-          Description: ai-coder — Terminal Coding & DevOps Agent
-           Autonomer Terminal-Agent fuer AILinux / TriForce Backend.
-           659+ KI-Modelle, 134 MCP-Tools, Swarm-Modus, PyQt6 GUI.
+          Depends: libc6
+          Description: ai-coder — coding agent for AILinux and TriForce
+           Coding-only Terminal-Agent mit PyQt6 GUI und restriktivem MCP-Zugriff.
+           Admin-, Infrastruktur-, Service- und Shell-Werkzeuge sind ausgeschlossen.
           EOF
           # control muss linksbündig sein
           sed -i 's/^          //' pkg/DEBIAN/control

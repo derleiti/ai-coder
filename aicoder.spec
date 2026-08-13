@@ -3,7 +3,7 @@ block_cipher = None
 
 a = Analysis(
     ['aicoder_main.py'],
-    pathex=['/home/zombie/ai-coder'],
+    pathex=['.'],
     binaries=[],
     datas=[],
     hiddenimports=[

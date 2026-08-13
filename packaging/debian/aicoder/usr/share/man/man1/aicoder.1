@@ -1,19 +1,25 @@
-.TH AICODER 1 "2026" "0.9.2" "AILinux Tools"
+.TH AICODER 1 "2026" "0.9.6" "AILinux Tools"
 .SH NAME
-aicoder \- Terminal Coding & DevOps Agent (AILinux/TriForce)
+aicoder \- Coding-Agent für AILinux und TriForce
 .SH SYNOPSIS
 .B aicoder
 [\fICOMMAND\fR] [\fIOPTIONS\fR]
 .SH DESCRIPTION
-Terminalbasierter autonomer Agent. Ohne Argumente startet Setup+REPL.
+Terminalbasierter Coding-Agent mit optionaler PyQt6-Oberfläche.
+Ohne Argumente startet der Setup-Assistent mit anschließendem Agent-REPL.
 .SH COMMANDS
-ask, chat, task, review, agent, shell, sudo, sysinfo, service,
-model, fallback, swarm, status, models, broadcast, hist, init
+login, logout, whoami, handshake, tools, profile, workspace, mcp,
+ask, chat, task, review, agent, model, fallback, swarm, status,
+models, mcp-list, broadcast, hist, init, gui
+.SH SECURITY
+Der Coding-only MCP-Vertrag erlaubt ausschließlich Coding-, Recherche- und
+Workspace-Werkzeuge. Admin-, Infrastruktur-, Service-, Remote- und
+Shell-Ausführung ist deaktiviert.
 .SH EXAMPLES
 .B aicoder
 (Setup + Agent-REPL)
 .br
-.B aicoder agent "Zeige Docker-Status"
+.B aicoder agent "Analysiere die Tests und behebe den Fehler"
 .br
 .B aicoder ask "Was macht diese Funktion?" --model groq/llama-3.3-70b-versatile
 .SH AUTHOR
