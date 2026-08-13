@@ -25,7 +25,12 @@ from .config import load_session
 from .docs_context import read_agents_md
 from .privileges import assess_execution
 from .session_state import get_state
-from .tool_policy import CODING_MCP_TOOLS, filter_tool_catalog, require_allowed_tool
+from .tool_policy import (
+    CODING_MCP_TOOLS,
+    expand_tool_catalog_aliases,
+    filter_tool_catalog,
+    require_allowed_tool,
+)
 from . import audit
 
 def _safe_int_env(key: str, default: int, lo: int = 1, hi: int = 200) -> int:
@@ -430,7 +435,7 @@ You are ai-coder — an autonomous coding agent on AILinux/TriForce (api.ailinux
 - REMOTE READ/ANALYZE: code_read, code_search, code_tree on the TriForce backend.
 - WRITE/MODIFY: use file_edit with path + operation + typed content fields.
 - BACKEND CONNECTIVITY: health (READ-ONLY)
-- SEARCH: memory_search (first!) → search → crawl
+- SEARCH: memory_search (first!) → web_search/search → crawl
 - MODELS: models, specialist (info only)
 - STUCK >2 rounds: Stop guessing. Use memory_search, then search, then ask user.
 
@@ -573,6 +578,8 @@ def load_tools(client: TriForceClient, force_refresh: bool = False) -> list[dict
         print(f"  \033[33m  → Agent läuft mit {len(FALLBACK_TOOLS)} Fallback-Tools (eingeschränkt)\033[0m", file=sys.stderr)
         print(f"  \033[33m  → Backend erreichbar? Versuch: aicoder mcp health\033[0m", file=sys.stderr)
         mcp_tools = FALLBACK_TOOLS
+
+    mcp_tools = expand_tool_catalog_aliases(mcp_tools, AGENT_TOOLS)
 
     result = LOCAL_TOOL_SCHEMAS + mcp_tools
     _tool_security_hints = {

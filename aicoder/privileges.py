@@ -41,6 +41,7 @@ _MUTATING_TOOL_NAMES = {
     "git_ops", "lint", "test", "devops",
     "config_set", "prompt_set", "vault_add",
     "memory_store", "memory_clear", "clipboard_write",
+    "crawl", "crawl_url",
     "service_control", "container_control", "remote_task", "mesh_task",
     "agent_start", "agent_stop", "agent_broadcast", "restart",
     "ollama_pull", "ollama_delete", "package_manager",
