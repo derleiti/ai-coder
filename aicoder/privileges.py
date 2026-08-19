@@ -36,7 +36,7 @@ _PROTECTED_PATH_RE = re.compile(
 # execute both local tools and MCP tools, so approval must not depend on where
 # a tool happens to run. Exact names avoid false positives for read helpers.
 _MUTATING_TOOL_NAMES = {
-    "file_edit", "file_write", "file_ops", "code_edit", "code_patch",
+    "file_edit", "directory_create", "file_write", "file_ops", "code_edit", "code_patch",
     "shell", "task_runner", "custom_exec", "binary_exec", "local_exec",
     "git_ops", "lint", "test", "devops",
     "config_set", "prompt_set", "vault_add",

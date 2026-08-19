@@ -162,6 +162,35 @@ class LocalCapabilityTests(unittest.TestCase):
                 _, outside_error = executor.run_file_read({"path": "../outside.txt"})
                 self.assertTrue(outside_error)
 
+    def test_directory_create_creates_nested_directory_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with patch.object(executor, "get_state", return_value={"workspace_root": str(root)}):
+                result, error = executor.run_directory_create({"path": "pac-man/assets"})
+                self.assertFalse(error, result)
+                self.assertTrue((root / "pac-man" / "assets").is_dir())
+                result, error = executor.run_directory_create({"path": "pac-man/assets"})
+                self.assertFalse(error, result)
+                self.assertIn("already exists", result)
+
+    def test_directory_create_rejects_existing_file_and_workspace_escape(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "pac-man").write_text("not a directory", encoding="utf-8")
+            with patch.object(executor, "get_state", return_value={"workspace_root": str(root)}):
+                result, error = executor.run_directory_create({"path": "pac-man"})
+                self.assertTrue(error)
+                self.assertIn("not a directory", result)
+                _, outside_error = executor.run_directory_create({"path": "../outside"})
+                self.assertTrue(outside_error)
+
+    def test_directory_create_is_advertised_as_mutating_local_tool(self):
+        names = {tool["name"] for tool in executor.LOCAL_TOOL_SCHEMAS}
+        self.assertIn("directory_create", names)
+        risk = assess_execution("directory_create", {"path": "pac-man"})
+        self.assertTrue(risk.needs_approval)
+        self.assertTrue(risk.mutation)
+
     def test_read_tool_no_longer_accepts_a_command_string(self):
         with tempfile.TemporaryDirectory() as temp:
             with patch.object(executor, "get_state", return_value={"workspace_root": temp}):

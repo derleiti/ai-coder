@@ -59,6 +59,48 @@ class WorkspaceEscapeTests(unittest.TestCase):
             self.assertFalse(is_error)
             self.assertEqual(result, "inside")
 
+    def test_directory_create_inside_workspace_uses_normal_write_approval(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            approvals = []
+
+            def approve(name, args):
+                approvals.append((name, dict(args)))
+                return True
+
+            with patch.dict(os.environ, {ACTIVE_WORKSPACE_ENV: str(root)}):
+                result, is_error = run_tool(
+                    MagicMock(), "directory_create", {"path": "pac-man"},
+                    approval_fn=approve,
+                    allowed_tools={"directory_create"},
+                )
+            self.assertFalse(is_error, result)
+            self.assertTrue((root / "pac-man").is_dir())
+            self.assertEqual(len(approvals), 1)
+            self.assertNotIn("_workspace_escape", approvals[0][1])
+
+    def test_directory_create_outside_workspace_requires_scope_approval(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "workspace"
+            root.mkdir()
+            outside = base / "pac-man"
+            approvals = []
+
+            def approve(name, args):
+                approvals.append((name, dict(args)))
+                return True
+
+            with patch.dict(os.environ, {ACTIVE_WORKSPACE_ENV: str(root)}):
+                result, is_error = run_tool(
+                    MagicMock(), "directory_create", {"path": str(outside)},
+                    approval_fn=approve,
+                    allowed_tools={"directory_create"},
+                )
+            self.assertFalse(is_error, result)
+            self.assertTrue(outside.is_dir())
+            self.assertEqual(approvals[0][1]["_workspace_escape"], str(outside.resolve()))
+
     def test_outside_read_requires_explicit_approval_then_runs_once(self):
         with tempfile.TemporaryDirectory() as temp:
             base = Path(temp)

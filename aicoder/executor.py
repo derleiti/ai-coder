@@ -337,7 +337,8 @@ LOCAL_FILE_EDIT_SCHEMA = {
     "name": "file_edit",
     "description": (
         "Create, replace, append to, or perform an exact text replacement in a LOCAL "
-        "UTF-8 file. Paths outside the active workspace trigger explicit one-time local scope approval."
+        "UTF-8 FILE (not a directory). To create a folder/directory, use directory_create. "
+        "Paths outside the active workspace trigger explicit one-time local scope approval."
     ),
     "inputSchema": {
         "type": "object",
@@ -350,6 +351,23 @@ LOCAL_FILE_EDIT_SCHEMA = {
             "reason": {"type": "string", "description": "Why this write or privileged action is necessary"},
         },
         "required": ["path", "operation"]
+    }
+}
+
+LOCAL_DIRECTORY_CREATE_SCHEMA = {
+    "name": "directory_create",
+    "description": (
+        "Create a LOCAL directory, including missing parent directories. "
+        "Use this for folders/directories; file_edit creates files only. "
+        "Paths outside the active workspace trigger explicit one-time local scope approval."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Workspace-relative directory path"},
+            "reason": {"type": "string", "description": "Why this directory is needed"},
+        },
+        "required": ["path"]
     }
 }
 
@@ -460,6 +478,7 @@ LOCAL_TOOL_SCHEMAS = [
     LOCAL_SKILL_READ_SCHEMA,
     LOCAL_FILE_READ_SCHEMA,
     LOCAL_FILE_EDIT_SCHEMA,
+    LOCAL_DIRECTORY_CREATE_SCHEMA,
     LOCAL_FILE_TREE_SCHEMA,
     LOCAL_CODE_SEARCH_SCHEMA,
     LOCAL_GIT_SCHEMA,
@@ -494,7 +513,8 @@ You are ai-coder — an autonomous coding agent on AILinux/TriForce (api.ailinux
 ## When to use which:
 - LOCAL READ/ANALYZE: file_read, file_tree, code_grep on the user's machine.
 - REMOTE READ/ANALYZE: code_read, code_search, code_tree on the TriForce backend.
-- WRITE/MODIFY: use file_edit with path + operation + typed content fields.
+- CREATE DIRECTORIES: use directory_create. Never use file_edit on a directory path.
+- WRITE/MODIFY FILES: use file_edit with path + operation + typed content fields.
 - BACKEND CONNECTIVITY: health (READ-ONLY)
 - SKILLS: when a catalogued skill matches the task, call skill_read(name) before acting.
 - SUBAGENTS: use subagent_run for bounded analysis/review/debug/planning when a second reasoning pass adds value.
@@ -506,7 +526,7 @@ You are ai-coder — an autonomous coding agent on AILinux/TriForce (api.ailinux
 ## SECURITY MODEL:
 - MCP read tools provide coding, documentation, search, memory, and model information.
 - LOCAL tools are typed capabilities. Never place shell commands in read-tool fields.
-- All code changes use file_edit and require local confirmation.
+- All local mutations use typed write tools (directory_create/file_edit) and require local confirmation.
 - Git is read-only. Admin, service, remote execution, package-management and raw-shell
   tools are unavailable in this coding client.
 - Never ask for, print, store, or transmit a password or access token.
@@ -938,7 +958,7 @@ def _workspace_path(
 
 def _workspace_escape_target(tool_name: str, args: dict) -> Path | None:
     field = "cwd" if tool_name in {"git", "lint", "test"} else "path"
-    if tool_name not in {"file_read", "file_edit", "file_tree", "code_grep", "git", "lint", "test"}:
+    if tool_name not in {"file_read", "file_edit", "directory_create", "file_tree", "code_grep", "git", "lint", "test"}:
         return None
     value = args.get(field) or "."
     resolved, inside = path_within_workspace(str(value), _workspace_root())
@@ -1034,6 +1054,25 @@ def run_file_edit(args: dict) -> Tuple[str, bool]:
         return f"updated {_display_workspace_path(path)}", False
     except Exception as exc:
         return f"file_edit error: {exc}", True
+
+
+def run_directory_create(args: dict) -> Tuple[str, bool]:
+    try:
+        if not isinstance(args.get("path"), str) or not args.get("path"):
+            return "directory_create error: path is required", True
+        path = _workspace_path(
+            args.get("path"),
+            must_exist=False,
+            allow_outside=bool(args.get("_workspace_escape_approved")),
+        )
+        if path.exists():
+            if path.is_dir():
+                return f"directory already exists: {_display_workspace_path(path)}", False
+            return f"directory_create error: path exists and is not a directory: {path}", True
+        path.mkdir(parents=True, exist_ok=False)
+        return f"created directory {_display_workspace_path(path)}", False
+    except Exception as exc:
+        return f"directory_create error: {exc}", True
 
 
 def run_file_tree(args: dict) -> Tuple[str, bool]:
@@ -1311,6 +1350,8 @@ def run_tool(
         result, is_error = run_file_read(execution_args)
     elif name == "file_edit":
         result, is_error = run_file_edit(execution_args)
+    elif name == "directory_create":
+        result, is_error = run_directory_create(execution_args)
     elif name == "file_tree":
         result, is_error = run_file_tree(execution_args)
     elif name == "code_grep":

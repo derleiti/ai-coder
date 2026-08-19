@@ -475,8 +475,12 @@ class SettingsWidget(QWidget):
             for row in range(self.tool_list.count())
             if self.tool_list.item(row).checkState() == Qt.CheckState.Checked
         ]
-        # Before discovery, keep None (= all) rather than accidentally saving [].
-        selected = names if self.tool_list.count() else get_state().get("enabled_tools")
+        # None means dynamic "all tools", so future capabilities are picked up too.
+        # Preserve the previous value before discovery rather than accidentally saving [].
+        if self.tool_list.count():
+            selected = None if len(names) == self.tool_list.count() else names
+        else:
+            selected = get_state().get("enabled_tools")
         set_tool_mode(mode)
         set_enabled_tools(selected)
         self.tool_status.setText(
