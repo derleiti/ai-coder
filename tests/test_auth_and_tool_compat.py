@@ -14,10 +14,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtWidgets import QApplication
 
-from aicoder.client import ClientError, TriForceClient, _decode_jwt_exp
+from aicoder.client import ClientError, TriForceClient, _decode_jwt_exp, _normalize_chat_response
 from aicoder.config import Session
 from aicoder.executor import (
-    is_action_request, is_simple_chat_message, normalize_tool_calls, parse_tool_calls,
+    is_action_request, is_simple_chat_message, merge_tool_calls, normalize_tool_calls, parse_tool_calls,
 )
 from aicoder.gui.chat_widget import _AgentWorker, _select_chat_route
 import aicoder.gui.settings_widget as settings_widget
@@ -91,21 +91,108 @@ class AuthCompatibilityTests(unittest.TestCase):
 
 
 class ToolCallCompatibilityTests(unittest.TestCase):
-    def test_structured_openai_tool_calls(self):
+    def test_structured_openai_compatible_tool_calls_preserve_id(self):
         self.assertEqual(
             normalize_tool_calls([{
                 "id": "call_1",
                 "type": "function",
                 "function": {"name": "health", "arguments": "{}"},
             }]),
+            [{"name": "health", "arguments": {}, "id": "call_1", "raw_type": "function"}],
+        )
+
+    def test_openai_responses_function_call_preserves_call_id(self):
+        normalized = _normalize_chat_response({
+            "output": [
+                {"type": "message", "content": [{"type": "output_text", "text": "Checking"}]},
+                {"type": "function_call", "call_id": "call_resp_1", "name": "health", "arguments": "{}"},
+            ]
+        })
+        self.assertEqual(normalized["response"], "Checking")
+        self.assertEqual(
+            normalize_tool_calls(normalized["tool_calls"]),
+            [{
+                "name": "health", "arguments": {}, "id": "call_resp_1",
+                "provider": "openai", "raw_type": "function_call",
+            }],
+        )
+
+    def test_anthropic_tool_use_preserves_id(self):
+        normalized = _normalize_chat_response({
+            "content": [
+                {"type": "text", "text": "Checking"},
+                {"type": "tool_use", "id": "toolu_1", "name": "health", "input": {}},
+            ]
+        })
+        self.assertEqual(normalized["response"], "Checking")
+        self.assertEqual(
+            normalize_tool_calls(normalized["tool_calls"]),
+            [{
+                "name": "health", "arguments": {}, "id": "toolu_1",
+                "provider": "anthropic", "raw_type": "tool_use",
+            }],
+        )
+
+    def test_gemini_function_call_preserves_id_and_signature(self):
+        normalized = _normalize_chat_response({
+            "candidates": [{"content": {"parts": [
+                {"text": "Checking"},
+                {
+                    "functionCall": {"id": "gem_1", "name": "health", "args": {}},
+                    "thoughtSignature": "opaque-signature",
+                },
+            ]}}]
+        })
+        self.assertEqual(normalized["response"], "Checking")
+        self.assertEqual(
+            normalize_tool_calls(normalized["tool_calls"]),
+            [{
+                "name": "health", "arguments": {}, "id": "gem_1",
+                "provider": "gemini",
+                "metadata": {"thoughtSignature": "opaque-signature"},
+            }],
+        )
+
+    def test_ollama_message_tool_calls_are_normalized(self):
+        normalized = _normalize_chat_response({
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"function": {"name": "health", "arguments": {}}}],
+            }
+        })
+        self.assertEqual(normalized["response"], "")
+        self.assertEqual(
+            normalize_tool_calls(normalized["tool_calls"]),
             [{"name": "health", "arguments": {}}],
         )
+
+    def test_native_and_text_tool_call_are_deduplicated_without_losing_id(self):
+        native = normalize_tool_calls([{
+            "id": "call_1", "type": "function",
+            "function": {"name": "health", "arguments": "{}"},
+        }])
+        textual = parse_tool_calls('<tool_call>{"name":"health","arguments":{}}</tool_call>')
+        merged = merge_tool_calls(native, textual)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["id"], "call_1")
+
+    def test_parallel_tool_calls_preserve_order_and_ids(self):
+        calls = normalize_tool_calls([
+            {"id": "call_a", "type": "function", "function": {"name": "health", "arguments": "{}"}},
+            {"id": "call_b", "type": "function", "function": {"name": "code_read", "arguments": "{\"path\":\"README.md\"}"}},
+        ])
+        self.assertEqual([call["name"] for call in calls], ["health", "code_read"])
+        self.assertEqual([call["id"] for call in calls], ["call_a", "call_b"])
 
     def test_native_openai_shape(self):
         text = '<tool_call>{"type":"function","function":{"name":"code_read","arguments":"{\\"path\\":\\"README.md\\"}"}}</tool_call>'
         self.assertEqual(
             parse_tool_calls(text),
-            [{"name": "code_read", "arguments": {"path": "README.md"}}],
+            [{
+                "name": "code_read", "arguments": {"path": "README.md"},
+                "raw_type": "function",
+            }],
         )
 
     def test_mistral_shape(self):
@@ -295,6 +382,13 @@ class ReplRegressionTests(unittest.TestCase):
         self.assertEqual(repeats, [1, 2, 3, 4, 5, 6])
         guard.reset()
         self.assertEqual(guard.observe(calls, ["new result"]), 1)
+
+    def test_loop_guard_ignores_provider_call_id_churn(self):
+        guard = executor.AgentLoopGuard()
+        first = [{"name": "health", "arguments": {}, "id": "call_1"}]
+        second = [{"name": "health", "arguments": {}, "id": "call_2"}]
+        self.assertEqual(guard.observe(first, ["same result"]), 1)
+        self.assertEqual(guard.observe(second, ["same result"]), 2)
 
     def test_basic_input_fallback_remains_usable(self):
         repl = ReplInput.__new__(ReplInput)

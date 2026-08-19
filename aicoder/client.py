@@ -69,8 +69,23 @@ class TokenExpiredError(ClientError):
     pass
 
 
+def _content_text(value: Any) -> str:
+    """Extract visible text without destroying structured provider blocks."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") in {"text", "output_text"} and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        return "\n".join(parts)
+    return ""
+
+
 def _normalize_chat_response(data: Any) -> Dict[str, Any]:
-    """Normalize TriForce plus common OpenAI/Anthropic-compatible envelopes."""
+    """Normalize common provider envelopes while preserving raw tool-call identity."""
     if not isinstance(data, dict):
         raise ClientError(f"Chat backend returned {type(data).__name__}, expected object")
     if data.get("error") is not None and not data.get("response"):
@@ -80,16 +95,38 @@ def _normalize_chat_response(data: Any) -> Dict[str, Any]:
     if "response" in data:
         return data
 
+    # OpenAI Chat Completions and compatible APIs (Mistral, Groq, etc.).
     choices = data.get("choices")
     if isinstance(choices, list) and choices and isinstance(choices[0], dict):
         message = choices[0].get("message", {})
         if isinstance(message, dict):
             normalized = dict(data)
-            normalized["response"] = str(message.get("content") or "")
+            normalized["response"] = _content_text(message.get("content"))
             if isinstance(message.get("tool_calls"), list):
                 normalized["tool_calls"] = message["tool_calls"]
             return normalized
 
+    # OpenAI Responses API: text and function calls are sibling output items.
+    output = data.get("output")
+    if isinstance(output, list):
+        texts: list[str] = []
+        calls: list[dict] = []
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "message":
+                text = _content_text(item.get("content"))
+                if text:
+                    texts.append(text)
+            elif item.get("type") in {"function_call", "tool_call"}:
+                calls.append(dict(item))
+        normalized = dict(data)
+        normalized["response"] = "\n".join(texts)
+        if calls:
+            normalized["tool_calls"] = calls
+        return normalized
+
+    # Anthropic Messages API. Keep tool_use blocks intact so their IDs survive.
     content = data.get("content")
     if isinstance(content, list):
         texts: list[str] = []
@@ -100,17 +137,48 @@ def _normalize_chat_response(data: Any) -> Dict[str, Any]:
             if block.get("type") == "text" and isinstance(block.get("text"), str):
                 texts.append(block["text"])
             elif block.get("type") in {"tool_use", "tool_call"}:
-                calls.append({
-                    "name": block.get("name"),
-                    "arguments": block.get("input", block.get("arguments", {})),
-                })
+                calls.append(dict(block))
         normalized = dict(data)
         normalized["response"] = "\n".join(texts)
         if calls:
             normalized["tool_calls"] = calls
         return normalized
 
-    raise ClientError("Chat backend response contains no response, choices, or content")
+    # Gemini generateContent. Preserve the complete functionCall payload and
+    # any thought signature attached to its containing part.
+    candidates = data.get("candidates")
+    if isinstance(candidates, list) and candidates and isinstance(candidates[0], dict):
+        parts = ((candidates[0].get("content") or {}).get("parts") or [])
+        texts: list[str] = []
+        calls: list[dict] = []
+        for part in parts if isinstance(parts, list) else []:
+            if not isinstance(part, dict):
+                continue
+            if isinstance(part.get("text"), str):
+                texts.append(part["text"])
+            function_call = part.get("functionCall")
+            if isinstance(function_call, dict):
+                raw_call = {"functionCall": dict(function_call)}
+                for key in ("thoughtSignature", "thought_signature"):
+                    if key in part:
+                        raw_call[key] = part[key]
+                calls.append(raw_call)
+        normalized = dict(data)
+        normalized["response"] = "\n".join(texts)
+        if calls:
+            normalized["tool_calls"] = calls
+        return normalized
+
+    # Ollama and other APIs that return a top-level message object.
+    message = data.get("message")
+    if isinstance(message, dict):
+        normalized = dict(data)
+        normalized["response"] = _content_text(message.get("content"))
+        if isinstance(message.get("tool_calls"), list):
+            normalized["tool_calls"] = message["tool_calls"]
+        return normalized
+
+    raise ClientError("Chat backend response contains no recognized response envelope")
 
 
 def model_identifier(value: Any) -> str:
@@ -340,6 +408,9 @@ class TriForceClient:
         """Fetch available models from /v1/client/models."""
         try:
             data = self._request("GET", "/v1/client/models", require_auth=True, _label="models")
+            details = data.get("model_details") or []
+            if isinstance(details, list) and details:
+                return [m for m in details if isinstance(m, dict)]
             models = data.get("models", [])
             result = []
             for m in models:

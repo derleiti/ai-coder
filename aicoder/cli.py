@@ -1,14 +1,15 @@
 from __future__ import annotations
 import argparse, json, os, sys, textwrap, time
 from getpass import getpass
+from pathlib import Path
 from typing import Any, Dict
 from .client import ClientError, TriForceClient, model_identifier
 from .config import DEFAULT_BASE_URL, Session, delete_session, load_session, save_session
 from .docs_context import context_summary, read_agents_md
 from .history import record as history_record, get_history, clear_history
 from .session_state import (
-    SWARM_MODES, get_state,
-    set_fallback, set_model, set_swarm, set_workspace,
+    RUNTIME_MODES, SWARM_MODES, get_state,
+    set_fallback, set_model, set_runtime_mode, set_swarm, set_workspace,
 )
 from .status import Spinner, phase_label
 from .workspace import workspace_snapshot
@@ -207,6 +208,66 @@ def cmd_swarm(args: argparse.Namespace) -> int:
         print(f"swarm = {state.get('swarm_mode', 'off')}")
     return 0
 
+def cmd_runtime(args: argparse.Namespace) -> int:
+    value = getattr(args, "value", None)
+    if value:
+        try:
+            set_runtime_mode(value)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        print(f"runtime → {value}")
+    else:
+        print(f"runtime = {get_state().get('runtime_mode', 'classic')}")
+    return 0
+
+
+def cmd_skills(args: argparse.Namespace) -> int:
+    from .skills import discover_skills, read_skill
+
+    state = get_state()
+    workspace = str(Path(state.get("workspace_root") or ".").resolve())
+    name = getattr(args, "name", None)
+    if name:
+        text, is_error = read_skill(workspace, name)
+        stream = sys.stderr if is_error else sys.stdout
+        print(text, file=stream)
+        return 1 if is_error else 0
+    skills = discover_skills(workspace)
+    if not skills:
+        print("no skills discovered")
+        return 0
+    for skill in skills:
+        print(f"{skill.name:<24} {skill.scope:<18} {skill.description}")
+    return 0
+
+
+def cmd_plan(args: argparse.Namespace) -> int:
+    from .agent_plan import PlanStore, format_plan
+
+    state = get_state()
+    workspace = str(Path(state.get("workspace_root") or ".").resolve())
+    store = PlanStore()
+    if getattr(args, "clear", False):
+        cleared = store.clear_current(workspace)
+        print("current plan cleared" if cleared else "no current plan")
+        return 0
+    if getattr(args, "list", False):
+        plans = store.list(workspace, limit=getattr(args, "limit", 10))
+        if not plans:
+            print("no plans")
+            return 0
+        for plan in plans:
+            print(f"{plan.id}  {plan.status:<9}  iter={plan.iteration:<3}  {plan.task[:80]}")
+        return 0
+    plan_id = getattr(args, "id", None)
+    plan = store.load(workspace, plan_id) if plan_id else store.load_current(workspace)
+    if plan is None:
+        print("no current plan")
+        return 1
+    print(format_plan(plan))
+    return 0
+
 
 def cmd_status(_: argparse.Namespace) -> int:
     state = get_state()
@@ -221,6 +282,7 @@ def cmd_status(_: argparse.Namespace) -> int:
     print(f"  model    : {model}")
     print(f"  fallback : {fallback}")
     print(f"  swarm    : {swarm}")
+    print(f"  runtime  : {state.get('runtime_mode', 'classic')}")
     print(f"  workspace: {workspace}")
     print(f"  docs     : {ctx['doc_files_found']} file(s) found")
     if ctx.get("agents_md_present"):
@@ -656,6 +718,36 @@ def cmd_service(args: argparse.Namespace) -> int:
     return 2
 
 
+def cmd_remote_node(args: argparse.Namespace) -> int:
+    """Expose the active workspace to TriForce through the read-only preview node."""
+    from .remote_node import run_remote_node
+
+    state = get_state()
+    workspace = state.get("workspace_root")
+    if not workspace:
+        print("Error: remote-node requires an active workspace (aicoder workspace <path>)", file=sys.stderr)
+        return 1
+    allow_writes = bool(getattr(args, "allow_writes", False))
+    profile = "write-preview" if allow_writes else "read-only"
+    print(f"remote-node · {profile} · workspace={workspace}", file=sys.stderr)
+    if allow_writes:
+        print(
+            "Remote file create/exact-replace enabled; backups are mandatory. "
+            "Delete, shell and blind overwrite remain blocked.",
+            file=sys.stderr,
+        )
+    else:
+        print("Ctrl+C stops the remote node. Writes and shell execution are blocked.", file=sys.stderr)
+    try:
+        run_remote_node(allow_writes=allow_writes)
+    except KeyboardInterrupt:
+        return 0
+    except Exception as exc:
+        print(f"remote-node error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="aicoder",
@@ -722,6 +814,21 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("swarm", help=f"Swarm-Modus anzeigen oder setzen ({', '.join(sorted(SWARM_MODES))})")
     p.add_argument("value", nargs="?")
     p.set_defaults(func=cmd_swarm)
+
+    p = sub.add_parser("runtime", help=f"Agent runtime ({', '.join(sorted(RUNTIME_MODES))})")
+    p.add_argument("value", nargs="?")
+    p.set_defaults(func=cmd_runtime)
+
+    p = sub.add_parser("skills", help="List or read native AICoder workflow skills")
+    p.add_argument("name", nargs="?", help="Skill name to read")
+    p.set_defaults(func=cmd_skills)
+
+    p = sub.add_parser("plan", help="Show/list the persistent native-light execution plan")
+    p.add_argument("id", nargs="?", help="Specific plan id (default: current)")
+    p.add_argument("--list", action="store_true", help="List recent plans for the workspace")
+    p.add_argument("--limit", type=int, default=10)
+    p.add_argument("--clear", action="store_true", help="Clear only the current-plan pointer")
+    p.set_defaults(func=cmd_plan)
 
     p = sub.add_parser("status", help="Show active status (model, fallback, swarm, workspace, docs)")
     p.set_defaults(func=cmd_status)
@@ -812,9 +919,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lines", type=int, default=50)
     p.set_defaults(func=cmd_service)
 
+    p = sub.add_parser("remote-node", help="Expose active workspace to TriForce (safe remote preview)")
+    p.add_argument(
+        "--allow-writes", action="store_true",
+        help="Opt in to remote create/exact-replace with mandatory backups",
+    )
+    p.set_defaults(func=cmd_remote_node)
+
     p = sub.add_parser("agent", help="Agent REPL / autonomous terminal agent")
     p.add_argument("prompt", nargs="*", help="Direct prompt (no REPL)")
     p.add_argument("--model", default=None)
+    p.add_argument(
+        "--resume", action="store_true",
+        help="Resume the current persistent native-light plan (implies native-light)",
+    )
+    p.add_argument(
+        "--plan-id", default=None,
+        help="Resume a specific persistent plan id (requires --resume)",
+    )
     p.add_argument("--setup", action="store_true")
     p.add_argument("--verbose", "-v", action="store_true")
     p.set_defaults(func=cmd_agent)
@@ -836,18 +958,25 @@ def cmd_agent(args: argparse.Namespace) -> int:
         run_setup(force=True)
 
     prompt_parts = getattr(args, "prompt", []) or []
-    if prompt_parts:
-        # Direkt-Prompt: kein REPL, einmaliger Agent-Run
+    resume_requested = bool(getattr(args, "resume", False))
+    plan_id = getattr(args, "plan_id", None)
+    if plan_id and not resume_requested:
+        print("Error: --plan-id requires --resume", file=sys.stderr)
+        return 2
+    if prompt_parts or resume_requested:
+        # Direct prompt or explicit process-restart resume: no REPL.
         from .session_state import get_state
         state = get_state()
+        initial_prompt = " ".join(prompt_parts) if prompt_parts else "continue"
         return run_agent(
-            initial_prompt=" ".join(prompt_parts),
+            initial_prompt=initial_prompt,
             model=getattr(args, "model", None) or state.get("selected_model"),
             fallback_model=state.get("fallback_model"),
             verbose=getattr(args, "verbose", False),
+            runtime_mode="native-light" if resume_requested else None,
+            resume_plan_id=(plan_id or "current") if resume_requested else None,
         )
-    else:
-        return run_repl(skip_setup=getattr(args, "setup", False))
+    return run_repl(skip_setup=getattr(args, "setup", False))
 
 def cmd_models(args: argparse.Namespace) -> int:
     """List available models from backend."""

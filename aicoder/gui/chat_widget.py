@@ -33,7 +33,7 @@ from ..executor import (
     AGENT_CHECKPOINT_INTERVAL, STALL_FALLBACK_REPEATS, STALL_NUDGE_REPEATS,
     STALL_RECOVERY_PROMPT, AgentLoopGuard, agent_checkpoint,
     load_tools, build_system_prompt, build_tool_desc,
-    normalize_tool_calls, parse_tool_calls, strip_tool_calls, trim_messages, run_tool,
+    normalize_tool_calls, merge_tool_calls, parse_tool_calls, strip_tool_calls, trim_messages, run_tool,
     is_destructive, is_simple_chat_message, MAX_ITERATIONS,
     format_untrusted_tool_results,
 )
@@ -138,7 +138,101 @@ class _AgentWorker(QThread):
             except Exception:
                 pass
 
+    def _run_native_light_impl(self):
+        from ..agent_runtime import NativeLightRuntime
+
+        state = get_state()
+        messages = list(self.messages)
+        latest_user_index = next(
+            (index for index in range(len(messages) - 1, -1, -1) if messages[index].get("role") == "user"),
+            None,
+        )
+        if latest_user_index is None:
+            self.error.emit("native-light runtime: no user message to execute")
+            return
+        initial_prompt = str(messages[latest_user_index].get("content") or "")
+        prior = [
+            dict(message) for message in messages[1:latest_user_index]
+            if message.get("role") != "system"
+        ]
+        base_timeout = int(state.get("request_timeout", getattr(self.client, "timeout", 300)))
+
+        def on_event(kind: str, payload: dict):
+            if kind == "tools_ready":
+                self.msg.emit(
+                    "system",
+                    f"{int(payload.get('count') or 0)} tools ready in {float(payload.get('elapsed') or 0.0):.2f}s",
+                    "native-light",
+                )
+            elif kind == "plan":
+                plan = payload.get("plan")
+                plan_id = getattr(plan, "id", "")
+                action = str(payload.get("action") or "plan")
+                if plan_id:
+                    self.msg.emit("system", f"Persistent plan {action}: {plan_id}", "native-light")
+            elif kind == "model_response":
+                requested = str(payload.get("requested") or "default")
+                used = str(payload.get("model") or requested)
+                route = used if used == requested else f"{requested} → {used}"
+                self.msg.emit(
+                    "system", f"Model response in {float(payload.get('elapsed_ms') or 0) / 1000.0:.1f}s", route
+                )
+            elif kind == "thought":
+                self.msg.emit("thought", str(payload.get("text") or ""), f"step {payload.get('iteration', '?')}")
+            elif kind == "tool_call":
+                name = str(payload.get("name") or "?")
+                args = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
+                self.msg.emit("tool", f">> {name}({json.dumps(args, ensure_ascii=False)[:200]})", "")
+            elif kind == "tool_result":
+                name = str(payload.get("name") or "?")
+                result = str(payload.get("result") or "")
+                status = f"{'ERROR' if payload.get('is_error') else 'OK'} ({float(payload.get('elapsed') or 0.0):.1f}s)"
+                self.msg.emit("tool_result", result[:2000], f"{name} {status}")
+            elif kind == "model_switch":
+                self.msg.emit(
+                    "system", "Repeated tool loop detected; switching fallback model.",
+                    f"{payload.get('previous', '?')} → {payload.get('model', '?')}",
+                )
+
+        resume_requested = initial_prompt.strip().lower() in {
+            "ja", "ja klar", "klar", "ok", "okay", "mach", "mache",
+            "mach es", "weiter", "fortfahren", "yes", "sure", "go ahead", "continue",
+        }
+        runtime = NativeLightRuntime(
+            client=self.client,
+            initial_prompt=initial_prompt,
+            model=self.model or None,
+            fallback_model=self.fallback or None,
+            workspace_root=str(state.get("workspace_root") or "."),
+            tools=self.tools,
+            system_prompt=self.system,
+            conversation=prior,
+            load_tools_on_start=self.load_tools_on_start,
+            enabled_tool_names=self.enabled_tool_names,
+            quick_chat=self.quick_chat and not resume_requested,
+            approval_fn=self._gui_approval,
+            event_fn=on_event,
+            stop_requested=lambda: self._stopped,
+            resume=resume_requested,
+            base_timeout=base_timeout,
+        )
+        result = runtime.run()
+        self.tools = result.tools
+        self.system = result.system_prompt
+        self.messages = result.messages
+        self.messages_updated.emit(result.messages)
+        if result.status == "failed":
+            self.error.emit(result.error or "native-light runtime failed")
+            return
+        if result.status == "completed":
+            self._emit_advisor_review(initial_prompt, result.response, result.model)
+        self.finished.emit(result.response, result.model)
+
     def _run_impl(self):
+        if get_state().get("runtime_mode", "classic") == "native-light":
+            self._run_native_light_impl()
+            return
+
         messages = self.messages
         model_used = self.model or "default"
         active_model = self.model
@@ -154,7 +248,6 @@ class _AgentWorker(QThread):
                 if self.enabled_tool_names is not None:
                     enabled = set(self.enabled_tool_names)
                     self.tools = [tool for tool in self.tools if tool.get("name") in enabled]
-                from ..session_state import get_state
                 state = get_state()
                 self.system = build_system_prompt(
                     self.tools,
@@ -176,7 +269,6 @@ class _AgentWorker(QThread):
             self.tools = []
 
         if not self.system:
-            from ..session_state import get_state
             self.system = build_system_prompt(self.tools, get_state().get("workspace_root"))
         if messages and messages[0].get("role") == "system":
             messages[0]["content"] = self.system
@@ -211,10 +303,7 @@ class _AgentWorker(QThread):
             self.msg.emit("system", f"Model response in {model_elapsed:.1f}s", route)
 
             native_calls = normalize_tool_calls(result.get("tool_calls") or [])
-            calls = native_calls + [
-                call for call in parse_tool_calls(response)
-                if call not in native_calls
-            ]
+            calls = merge_tool_calls(native_calls, parse_tool_calls(response))
             if native_calls and not response:
                 response = "\n".join(
                     f"<tool_call>{json.dumps(call, ensure_ascii=False)}</tool_call>"
@@ -784,7 +873,14 @@ class ChatWidget(QWidget):
         if not fallback:
             fallback = state.get("fallback_model", "")
 
-        quick_chat = is_simple_chat_message(text)
+        resume_requested = (
+            state.get("runtime_mode", "classic") == "native-light"
+            and text.strip().lower() in {
+                "ja", "ja klar", "klar", "ok", "okay", "mach", "mache",
+                "mach es", "weiter", "fortfahren", "yes", "sure", "go ahead", "continue",
+            }
+        )
+        quick_chat = is_simple_chat_message(text) and not resume_requested
         model, fallback, fast_fallback = _select_chat_route(model, fallback, quick_chat)
         if fast_fallback:
             self._append_msg("system", f"Fast chat model · {model}", "")

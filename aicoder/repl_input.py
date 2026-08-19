@@ -25,7 +25,8 @@ except (ImportError, OSError):
 
 COMMANDS = [
     "/clear", "/exit", "/fallback", "/help", "/keys", "/model",
-    "/models", "/new", "/permissions", "/quit", "/setup", "/status", "/swarm",
+    "/models", "/new", "/permissions", "/plan", "/quit", "/runtime",
+    "/setup", "/status", "/swarm",
 ]
 
 

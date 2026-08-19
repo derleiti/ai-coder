@@ -15,7 +15,7 @@ from .executor import (
     STALL_FALLBACK_REPEATS, STALL_NUDGE_REPEATS, STALL_RECOVERY_PROMPT,
     AgentLoopGuard, agent_checkpoint,
     is_destructive, load_tools, build_system_prompt,
-    normalize_tool_calls, parse_tool_calls, strip_tool_calls, trim_messages, run_tool,
+    normalize_tool_calls, merge_tool_calls, parse_tool_calls, strip_tool_calls, trim_messages, run_tool,
     format_untrusted_tool_results,
     is_action_request, is_short_confirmation, is_simple_chat_message,
     # Re-export for backwards compat (GUI imports these)
@@ -70,15 +70,149 @@ def _cli_approval(tool_name: str, args: dict) -> bool:
     return True
 
 
+def _run_native_light_agent(
+    initial_prompt: str,
+    model: Optional[str],
+    fallback_model: Optional[str],
+    *,
+    conversation: Optional[list[dict]],
+    state: dict,
+    resume_plan_id: Optional[str] = None,
+) -> int:
+    from .agent_runtime import NativeLightRuntime
+
+    session = load_session()
+    request_timeout = int(state.get("request_timeout", 300))
+    client = TriForceClient(session.base_url, token=session.token, timeout=request_timeout)
+    ws_path = Path(state.get("workspace_root") or ".").resolve()
+    resume_requested = is_short_confirmation(initial_prompt) or resume_plan_id is not None
+    quick_chat = is_simple_chat_message(initial_prompt) and not resume_requested
+    tool_mode = state.get("tool_mode", "on_demand")
+    enabled_tool_names = state.get("enabled_tools")
+    should_load_tools = (
+        tool_mode == "always"
+        or (tool_mode == "on_demand" and not quick_chat)
+    ) and enabled_tool_names != []
+
+    header_printed = False
+
+    def on_event(kind: str, payload: dict) -> None:
+        nonlocal header_printed
+        if kind == "run_start":
+            print_header(
+                model=payload.get("model") or "backend-default",
+                fallback=payload.get("fallback") or "",
+                tools=int(payload.get("tools") or 0),
+                workspace=ws_path.name,
+                tool_mode=f"native-light/{tool_mode}",
+                timeout=request_timeout,
+            )
+            print_task(initial_prompt)
+            plan_id = str(payload.get("plan_id") or "")
+            if plan_id:
+                print(f"  {C.DIM}plan {plan_id} · persistent native-light runtime{C.RESET}")
+            header_printed = True
+        elif kind == "thought":
+            print_thought(str(payload.get("text") or ""))
+        elif kind == "tool_call":
+            print_tool_call(
+                str(payload.get("name") or "?"),
+                payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {},
+                max(0, int(payload.get("iteration") or 1) - 1),
+            )
+        elif kind == "tool_result":
+            print_tool_result(
+                str(payload.get("name") or "?"),
+                str(payload.get("result") or ""),
+                float(payload.get("elapsed") or 0.0),
+                error=bool(payload.get("is_error")),
+            )
+        elif kind == "model_switch":
+            print_thought(
+                f"Loop recovery: {payload.get('previous', '?')} → {payload.get('model', '?')}"
+            )
+        elif kind == "final":
+            print_final(
+                response=str(payload.get("response") or ""),
+                model=str(payload.get("model") or "?"),
+                latency_ms=int(payload.get("latency_ms") or 0),
+                total_iters=int(payload.get("iterations") or 0),
+                fallback_used=bool(payload.get("fallback_used")),
+            )
+        elif kind == "error":
+            print_error(str(payload.get("message") or "native-light runtime failed"))
+        elif kind == "paused":
+            print_error(str(payload.get("reason") or "native-light runtime paused"))
+
+    runtime = NativeLightRuntime(
+        client=client,
+        initial_prompt=initial_prompt,
+        model=model,
+        fallback_model=fallback_model,
+        workspace_root=str(ws_path),
+        tools=None if should_load_tools else [],
+        load_tools_on_start=should_load_tools,
+        enabled_tool_names=enabled_tool_names,
+        quick_chat=quick_chat,
+        approval_fn=_cli_approval,
+        event_fn=on_event,
+        conversation=conversation,
+        resume=resume_requested,
+        resume_plan_id=resume_plan_id,
+        base_timeout=request_timeout,
+    )
+    result = runtime.run()
+    if not header_printed:
+        print_header(
+            model=model or "backend-default", fallback=fallback_model or "", tools=0,
+            workspace=ws_path.name, tool_mode=f"native-light/{tool_mode}", timeout=request_timeout,
+        )
+        print_task(initial_prompt)
+
+    swarm_mode = state.get("swarm_mode", "off")
+    if swarm_mode == "auto":
+        from .swarm_runner import should_auto_swarm
+        swarm_mode = "review" if should_auto_swarm(initial_prompt) else "off"
+    if swarm_mode in {"on", "review"} and result.response and result.status == "completed":
+        from .swarm_runner import run_swarm_review
+        run_swarm_review(
+            original_task=initial_prompt,
+            operator_response=result.response,
+            operator_model=result.model,
+            fallback_model=state.get("fallback_model"),
+            system_prompt=result.system_prompt,
+            client=client,
+        )
+
+    try:
+        history_record(
+            kind="ask", prompt=initial_prompt, response=result.response,
+            model=result.model, latency_ms=result.latency_ms,
+        )
+    except Exception:
+        pass
+    return 1 if result.status == "failed" else 0
+
+
 def run_agent(
     initial_prompt: str,
     model: Optional[str],
     fallback_model: Optional[str],
     verbose: bool = False,
     conversation: Optional[list[dict]] = None,
+    runtime_mode: Optional[str] = None,
+    resume_plan_id: Optional[str] = None,
 ) -> int:
-    session = load_session()
     state = get_state()
+    effective_runtime = runtime_mode or state.get("runtime_mode", "classic")
+    if effective_runtime == "native-light":
+        return _run_native_light_agent(
+            initial_prompt, model, fallback_model,
+            conversation=conversation, state=state,
+            resume_plan_id=resume_plan_id,
+        )
+
+    session = load_session()
     request_timeout = int(state.get("request_timeout", 300))
     client = TriForceClient(session.base_url, token=session.token, timeout=request_timeout)
     ws_path = Path(state.get("workspace_root") or ".").resolve()
@@ -187,10 +321,7 @@ def run_agent(
         full_response = response
 
         native_calls = normalize_tool_calls(result.get("tool_calls") or [])
-        calls = native_calls + [
-            call for call in parse_tool_calls(response)
-            if call not in native_calls
-        ]
+        calls = merge_tool_calls(native_calls, parse_tool_calls(response))
         if native_calls and not response:
             response = "\n".join(
                 f"<tool_call>{json.dumps(call, ensure_ascii=False)}</tool_call>"

@@ -18,7 +18,7 @@ from typing import Optional
 from .config import CONFIG_DIR, DEFAULT_BASE_URL, Session, load_session, save_session
 from .session_state import (
     SWARM_MODES, APPROVAL_MODES, get_state,
-    set_approval_mode, set_fallback, set_model, set_swarm, set_workspace,
+    set_approval_mode, set_fallback, set_model, set_runtime_mode, set_swarm, set_workspace,
 )
 from .ui import C, bold, dim, cyan, green, yellow, red, magenta, white, panel, term_width, reset_live_line
 from .repl_input import COMMANDS, PromptCancelled, ReplInput
@@ -441,7 +441,8 @@ def run_repl(skip_setup: bool = False) -> int:
         active_model = current.get("selected_model") or "backend"
         mode = current.get("tool_mode", "on_demand")
         approval = current.get("approval_mode", "ask")
-        return f"  {active_model} · tools:{mode} · approvals:{approval} · swarm:{current.get('swarm_mode', 'off')}"
+        runtime = current.get("runtime_mode", "classic")
+        return f"  {active_model} · runtime:{runtime} · tools:{mode} · approvals:{approval} · swarm:{current.get('swarm_mode', 'off')}"
 
     repl_input = ReplInput(CONFIG_DIR / "history", _toolbar)
     conversation: list[dict] = []
@@ -471,7 +472,8 @@ def run_repl(skip_setup: bool = False) -> int:
         print(f"  {dim('operator ')} {cyan(model or '(backend default)')}")
         print(f"  {dim('fallback ')} {dim(fallback or '—')}")
         approval_mode = state.get("approval_mode", "ask")
-        print(f"  {dim('runtime  ')} tools={cyan(tool_mode)} · enabled={cyan('all' if enabled is None else str(len(enabled)))} · "
+        runtime_mode = state.get("runtime_mode", "classic")
+        print(f"  {dim('runtime  ')} mode={cyan(runtime_mode)} · tools={cyan(tool_mode)} · enabled={cyan('all' if enabled is None else str(len(enabled)))} · "
               f"approvals={cyan(approval_mode)} · swarm={cyan(swarm)} · timeout={cyan(str(timeout)+'s')}")
         print(f"  {dim('workspace')} {dim(ws)}")
         print(f"  {C.DIM}{rule}{C.RESET}")
@@ -479,7 +481,7 @@ def run_repl(skip_setup: bool = False) -> int:
             print(f"  {dim('Enter send · Alt+Enter newline · Ctrl+C clear/cancel · Ctrl+R history · Tab commands')}")
         else:
             print(f"  {yellow('Basic input mode')} {dim('· install prompt-toolkit for multiline editing and safe repaint')}")
-        print(f"  {dim('/help commands · /keys shortcuts · /permissions policy · /new context · /exit')}")
+        print(f"  {dim('/help commands · /runtime native-light · /plan · /permissions · /new · /exit')}")
         print(f"  {C.DIM}{rule}{C.RESET}")
 
     _print_repl_header()
@@ -541,6 +543,34 @@ def run_repl(skip_setup: bool = False) -> int:
                     print(f"  Fehler: {e}")
             elif cmd == "/status":
                 _print_repl_header()
+            elif cmd == "/runtime":
+                if val:
+                    try:
+                        set_runtime_mode(val.strip())
+                        print(f"  runtime → {val.strip()}")
+                        _print_repl_header()
+                    except ValueError as e:
+                        print(f"  Fehler: {e}")
+                else:
+                    print(f"  runtime = {get_state().get('runtime_mode', 'classic')}")
+            elif cmd == "/plan":
+                from .agent_plan import PlanStore, format_plan
+                workspace = str(Path(get_state().get("workspace_root") or ".").resolve())
+                store = PlanStore()
+                if val.strip().lower() == "clear":
+                    print("  current plan cleared" if store.clear_current(workspace) else "  no current plan")
+                elif val.strip().lower() == "list":
+                    plans = store.list(workspace, limit=10)
+                    if not plans:
+                        print("  no plans")
+                    for plan in plans:
+                        print(f"  {plan.id}  {plan.status:<9} iter={plan.iteration:<3} {plan.task[:60]}")
+                else:
+                    plan = store.load_current(workspace)
+                    if plan is None:
+                        print("  no current plan")
+                    else:
+                        print("\n" + format_plan(plan))
             elif cmd == "/clear":
                 if sys.stdout.isatty():
                     print("\033[2J\033[H", end="")
@@ -599,6 +629,7 @@ def run_repl(skip_setup: bool = False) -> int:
                     print(f"  Fehler: {e}")
             elif cmd == "/help":
                 print("  /model <n> · /fallback <n> · /swarm <m> · /models · /status")
+                print("  /runtime classic|native-light · /plan [list|clear]")
                 print("  /setup · /new · /clear · /keys · /permissions · /exit")
             else:
                 print(f"  Unbekannt: {cmd}  — /help für Hilfe")

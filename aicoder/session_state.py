@@ -10,6 +10,7 @@ STATE_FILE = CONFIG_DIR / "state.json"
 SWARM_MODES = {"off", "auto", "on", "review"}
 TOOL_MODES = {"off", "on_demand", "always"}
 APPROVAL_MODES = {"ask", "autopilot", "all"}
+RUNTIME_MODES = {"classic", "native-light"}
 DEFAULT_FALLBACK_MODEL = "ollama/llama3.2:latest"
 
 _DEFAULTS: Dict[str, Any] = {
@@ -24,6 +25,8 @@ _DEFAULTS: Dict[str, Any] = {
     "request_timeout": 300,
     # ask: confirm every mutation; autopilot: safe writes only; all: all mutations.
     "approval_mode": "ask",
+    # native-light is opt-in until the shared runtime has broader field coverage.
+    "runtime_mode": "classic",
 }
 
 # Before the coding-only policy was centralized, the Settings UI persisted
@@ -86,6 +89,8 @@ def _load_raw() -> Dict[str, Any]:
                 data["fallback_model"] = DEFAULT_FALLBACK_MODEL
             if data.get("approval_mode") not in APPROVAL_MODES:
                 data["approval_mode"] = "ask"
+            if data.get("runtime_mode") not in RUNTIME_MODES:
+                data["runtime_mode"] = "classic"
             data["enabled_tools"] = migrate_enabled_tools(data.get("enabled_tools"))
             _cache = {**_DEFAULTS, **data}
             _cache_stamp = stamp
@@ -155,6 +160,15 @@ def set_approval_mode(mode: str) -> None:
 def set_request_timeout(seconds: int) -> None:
     d = _load_raw()
     d["request_timeout"] = max(10, min(300, int(seconds)))
+    _save_raw(d)
+
+def set_runtime_mode(mode: str) -> None:
+    if mode not in RUNTIME_MODES:
+        raise ValueError(
+            f"Ungültiger Runtime-Modus '{mode}'. Erlaubt: {', '.join(sorted(RUNTIME_MODES))}"
+        )
+    d = _load_raw()
+    d["runtime_mode"] = mode
     _save_raw(d)
 
 
