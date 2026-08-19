@@ -1,7 +1,7 @@
 [Desktop Entry]
 Comment[de_DE]=
 Comment=
-Exec="/bin/python" "/home/zombie/ai-coder/aicoder_main.py" "gui"
+Exec=/bin/python '/home/zombie/ai-coder/aicoder_main.py gui'
 GenericName[de_DE]=
 GenericName=
 MimeType=

@@ -1,10 +1,19 @@
 [Desktop Entry]
-Name=ai-coder GUI
+Categories=Development;
+Comment[de_DE]=AILinux Coding Agent — GUI mit sicherem MCP-Zugriff
 Comment=AILinux Coding Agent — GUI mit sicherem MCP-Zugriff
 Exec=aicoder gui
-Icon=applications-development
-Terminal=false
-Type=Application
-Categories=Development;
+GenericName[de_DE]=
+GenericName=
+Icon=utilities-terminal
 Keywords=ai;coding;agent;llm;ailinux;
+MimeType=
+Name[de_DE]=ai-coder GUI
+Name=ai-coder GUI
+Path=
 StartupNotify=true
+Terminal=false
+TerminalOptions=
+Type=Application
+X-KDE-SubstituteUID=false
+X-KDE-Username=
