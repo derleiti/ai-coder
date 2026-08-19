@@ -4,32 +4,23 @@ agent.py — CLI Agent runner. Uses shared executor for tool execution.
 """
 import json
 import sys
-import time
-from pathlib import Path
 from typing import Optional
 
-from .client import ClientError, TriForceClient
+from .client import TriForceClient
 from .config import load_session
 from .executor import (
-    AGENT_CHECKPOINT_INTERVAL, MAX_CONTEXT_MESSAGES, MAX_ITERATIONS,
-    STALL_FALLBACK_REPEATS, STALL_NUDGE_REPEATS, STALL_RECOVERY_PROMPT,
-    AgentLoopGuard, agent_checkpoint,
-    is_destructive, load_tools, build_system_prompt,
-    normalize_tool_calls, merge_tool_calls, parse_tool_calls, strip_tool_calls, trim_messages, run_tool,
-    format_untrusted_tool_results,
-    is_action_request, is_short_confirmation, is_simple_chat_message,
-    # Re-export for backwards compat (GUI imports these)
-    AGENT_TOOLS, SYSTEM_TEMPLATE as SYSTEM,
-    FALLBACK_TOOLS as _FALLBACK_TOOLS, OS_NAME, OS_INSTRUCTIONS,
+    AGENT_TOOLS, FALLBACK_TOOLS as _FALLBACK_TOOLS, OS_INSTRUCTIONS, OS_NAME,
+    SYSTEM_TEMPLATE as SYSTEM, is_destructive, is_short_confirmation,
+    is_simple_chat_message, run_tool as run_tool, should_load_tools,
 )
 from .history import record as history_record
 from .privileges import (
     approval_is_automatic, assess_execution, format_request,
 )
-from .session_state import get_state
-from .tool_policy import require_allowed_tool
+from .session_state import DEFAULT_RUNTIME_MODE, get_state
+from .workspace import active_workspace
 from .ui import (
-    AgentSpinner, C,
+    C,
     print_header, print_task, print_thought,
     print_tool_call, print_tool_result, print_final,
     print_error,
@@ -40,7 +31,9 @@ def _cli_approval(tool_name: str, args: dict) -> bool:
     """Explain and approve one risky workspace action in the terminal."""
     cmd = args.get("command", "")
     risk = assess_execution(tool_name, args, destructive=is_destructive(cmd))
-    if not risk.needs_approval:
+    scope_target = str(args.get("_workspace_escape") or "")
+    scope_root = str(args.get("_workspace_root") or "")
+    if not risk.needs_approval and not scope_target:
         return True
 
     mode = get_state().get("approval_mode", "ask")
@@ -52,12 +45,16 @@ def _cli_approval(tool_name: str, args: dict) -> bool:
         )
         return False
 
-    automatic = approval_is_automatic(mode, risk)
+    automatic = approval_is_automatic(mode, risk) and not scope_target
     if automatic:
         print(f"\n{C.BGREEN}✓ Automatisch freigegeben ({mode}){C.RESET}", file=sys.stderr)
     else:
         print(f"\n{C.BYELLOW}{C.BOLD}◆ Lokale Freigabe erforderlich{C.RESET}", file=sys.stderr)
     print(format_request(risk), file=sys.stderr)
+    if scope_target:
+        print(f"  Scope   : Workspace verlassen", file=sys.stderr)
+        print(f"  Root    : {scope_root}", file=sys.stderr)
+        print(f"  Ziel    : {scope_target}", file=sys.stderr)
     if not automatic:
         try:
             confirm = input("  Einmal erlauben? [y/N] ").strip().lower()
@@ -70,6 +67,35 @@ def _cli_approval(tool_name: str, args: dict) -> bool:
     return True
 
 
+
+def _json_default(value):
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        return to_dict()
+    return str(value)
+
+
+def _headless_approval(tool_name: str, args: dict) -> bool:
+    risk = assess_execution(
+        tool_name, args, destructive=is_destructive(str(args.get("command", "")))
+    )
+    if args.get("_workspace_escape"):
+        return False
+    if not risk.needs_approval:
+        return True
+    if risk.elevation:
+        return False
+    mode = get_state().get("approval_mode", "ask")
+    return approval_is_automatic(mode, risk)
+
+
+def _native_exit_code(status: str) -> int:
+    if status == "completed":
+        return 0
+    if status == "paused":
+        return 3
+    return 1
+
 def _run_native_light_agent(
     initial_prompt: str,
     model: Optional[str],
@@ -78,33 +104,42 @@ def _run_native_light_agent(
     conversation: Optional[list[dict]],
     state: dict,
     resume_plan_id: Optional[str] = None,
+    json_output: bool = False,
+    json_events: bool = False,
+    persistent_plan: bool = True,
 ) -> int:
     from .agent_runtime import NativeLightRuntime
 
     session = load_session()
     request_timeout = int(state.get("request_timeout", 300))
     client = TriForceClient(session.base_url, token=session.token, timeout=request_timeout)
-    ws_path = Path(state.get("workspace_root") or ".").resolve()
-    resume_requested = is_short_confirmation(initial_prompt) or resume_plan_id is not None
+    ws_path = active_workspace(state.get("workspace_root"))
+    resume_requested = persistent_plan and (
+        is_short_confirmation(initial_prompt) or resume_plan_id is not None
+    )
     quick_chat = is_simple_chat_message(initial_prompt) and not resume_requested
+    runtime_label = "native-light" if persistent_plan else "classic"
     tool_mode = state.get("tool_mode", "on_demand")
     enabled_tool_names = state.get("enabled_tools")
-    should_load_tools = (
-        tool_mode == "always"
-        or (tool_mode == "on_demand" and not quick_chat)
+    should_load_tools_now = should_load_tools(
+        tool_mode, initial_prompt, resume=resume_requested
     ) and enabled_tool_names != []
 
     header_printed = False
 
     def on_event(kind: str, payload: dict) -> None:
         nonlocal header_printed
+        if json_events:
+            print(json.dumps({"type": kind, **payload}, ensure_ascii=False, default=_json_default))
+        if json_output or json_events:
+            return
         if kind == "run_start":
             print_header(
                 model=payload.get("model") or "backend-default",
                 fallback=payload.get("fallback") or "",
                 tools=int(payload.get("tools") or 0),
                 workspace=ws_path.name,
-                tool_mode=f"native-light/{tool_mode}",
+                tool_mode=f"{runtime_label}/{tool_mode}",
                 timeout=request_timeout,
             )
             print_task(initial_prompt)
@@ -150,22 +185,23 @@ def _run_native_light_agent(
         model=model,
         fallback_model=fallback_model,
         workspace_root=str(ws_path),
-        tools=None if should_load_tools else [],
-        load_tools_on_start=should_load_tools,
+        tools=None if should_load_tools_now else [],
+        load_tools_on_start=should_load_tools_now,
         enabled_tool_names=enabled_tool_names,
         quick_chat=quick_chat,
-        approval_fn=_cli_approval,
+        approval_fn=_headless_approval if (json_output or json_events) else _cli_approval,
         event_fn=on_event,
         conversation=conversation,
+        persistent_plan=persistent_plan,
         resume=resume_requested,
-        resume_plan_id=resume_plan_id,
+        resume_plan_id=resume_plan_id if persistent_plan else None,
         base_timeout=request_timeout,
     )
     result = runtime.run()
-    if not header_printed:
+    if not header_printed and not (json_output or json_events):
         print_header(
             model=model or "backend-default", fallback=fallback_model or "", tools=0,
-            workspace=ws_path.name, tool_mode=f"native-light/{tool_mode}", timeout=request_timeout,
+            workspace=ws_path.name, tool_mode=f"{runtime_label}/{tool_mode}", timeout=request_timeout,
         )
         print_task(initial_prompt)
 
@@ -173,7 +209,12 @@ def _run_native_light_agent(
     if swarm_mode == "auto":
         from .swarm_runner import should_auto_swarm
         swarm_mode = "review" if should_auto_swarm(initial_prompt) else "off"
-    if swarm_mode in {"on", "review"} and result.response and result.status == "completed":
+    if (
+        not (json_output or json_events)
+        and swarm_mode in {"on", "review"}
+        and result.response
+        and result.status == "completed"
+    ):
         from .swarm_runner import run_swarm_review
         run_swarm_review(
             original_task=initial_prompt,
@@ -191,6 +232,20 @@ def _run_native_light_agent(
         )
     except Exception:
         pass
+    if json_output or json_events:
+        print(json.dumps({
+            "type": "result",
+            "status": result.status,
+            "response": result.response,
+            "model": result.model,
+            "plan_id": result.plan_id,
+            "iterations": result.iterations,
+            "latency_ms": result.latency_ms,
+            "fallback_used": result.fallback_used,
+            "error": result.error,
+        }, ensure_ascii=False))
+    if persistent_plan:
+        return _native_exit_code(result.status)
     return 1 if result.status == "failed" else 0
 
 
@@ -202,287 +257,18 @@ def run_agent(
     conversation: Optional[list[dict]] = None,
     runtime_mode: Optional[str] = None,
     resume_plan_id: Optional[str] = None,
+    json_output: bool = False,
+    json_events: bool = False,
 ) -> int:
     state = get_state()
-    effective_runtime = runtime_mode or state.get("runtime_mode", "classic")
-    if effective_runtime == "native-light":
-        return _run_native_light_agent(
-            initial_prompt, model, fallback_model,
-            conversation=conversation, state=state,
-            resume_plan_id=resume_plan_id,
-        )
-
-    session = load_session()
-    request_timeout = int(state.get("request_timeout", 300))
-    client = TriForceClient(session.base_url, token=session.token, timeout=request_timeout)
-    ws_path = Path(state.get("workspace_root") or ".").resolve()
-
-    # A greeting must not pay for MCP discovery.  REPL and GUI now use the same
-    # on-demand policy and the same enabled-tools selection from Settings.
-    quick_chat = is_simple_chat_message(initial_prompt)
-    tool_mode = state.get("tool_mode", "on_demand")
-    enabled_tool_names = state.get("enabled_tools")
-    should_load_tools = (
-        tool_mode == "always"
-        or (tool_mode == "on_demand" and not quick_chat)
-    ) and enabled_tool_names != []
-
-    tools = []
-    if should_load_tools:
-        with AgentSpinner("discovering selected tools", color=C.DIM):
-            tools = load_tools(client)
-        if enabled_tool_names is not None:
-            enabled = set(enabled_tool_names)
-            tools = [tool for tool in tools if tool.get("name") in enabled]
-
-    # Primary model stays primary. The fallback is only used after an actual
-    # request failure or explicit loop recovery; quick chat must not silently
-    # swap the configured route.
-    effective_model = model
-    effective_fallback = fallback_model
-
-    system = build_system_prompt(tools, str(ws_path))
-
-    # Header
-    print_header(
-        model=effective_model or "backend-default",
-        fallback=effective_fallback or "",
-        tools=len(tools),
-        workspace=ws_path.name,
-        tool_mode="skipped (fast chat)" if not should_load_tools and quick_chat else tool_mode,
-        timeout=request_timeout,
+    effective_runtime = runtime_mode or state.get("runtime_mode", DEFAULT_RUNTIME_MODE)
+    if json_output or json_events:
+        effective_runtime = "native-light"
+    return _run_native_light_agent(
+        initial_prompt, model, fallback_model,
+        conversation=conversation, state=state,
+        resume_plan_id=resume_plan_id,
+        json_output=json_output,
+        json_events=json_events,
+        persistent_plan=(effective_runtime == "native-light"),
     )
-    print_task(initial_prompt)
-
-    # Keep one conversation for the lifetime of the interactive REPL.  A
-    # direct `aicoder agent <prompt>` call still gets a fresh list by default.
-    prior_context = [
-        dict(message) for message in (conversation or [])
-        if message.get("role") != "system"
-    ]
-    messages: list[dict] = [
-        {"role": "system", "content": system},
-        *prior_context[-MAX_CONTEXT_MESSAGES:],
-    ]
-    current_input = initial_prompt
-    full_response = ""
-    model_used = effective_model or "?"
-    total_latency = 0
-    fallback_used = False
-    tool_was_called = False
-    tool_nudge_sent = False
-    loop_guard = AgentLoopGuard()
-
-    pending_continuation = False
-    if is_short_confirmation(initial_prompt):
-        for message in reversed(prior_context):
-            content = str(message.get("content", ""))
-            if message.get("role") == "assistant" and content.lstrip().upper().startswith("DONE:"):
-                break
-            if message.get("role") == "user" and not content.startswith("Tool "):
-                pending_continuation = is_action_request(content)
-                break
-    must_use_tools = bool(tools) and (
-        is_action_request(initial_prompt) or pending_continuation
-    )
-    allowed_tool_names = {
-        str(tool.get("name")) for tool in tools if tool.get("name")
-    }
-
-    for i in range(MAX_ITERATIONS):
-        messages.append({"role": "user", "content": current_input})
-        messages = trim_messages(messages)
-
-        label = "thinking" if i == 0 else f"step {i+1}"
-
-        with AgentSpinner(label, color=C.CYAN):
-            t0 = time.time()
-            try:
-                result = client.chat(
-                    messages=messages,
-                    model=effective_model,
-                    fallback_model=effective_fallback,
-                    temperature=0.3,
-                    max_tokens=256 if quick_chat else 4096,
-                    tools=tools if should_load_tools else None,
-                    tool_choice="auto",
-                )
-            except (ClientError, RuntimeError) as e:
-                print_error(str(e))
-                return 1
-            llm_ms = int((time.time() - t0) * 1000)
-
-        response = result.get("response", "").strip()
-        model_used = result.get("model", effective_model or "?")
-        lat = result.get("latency_ms") or llm_ms
-        total_latency += lat
-        if result.get("fallback_used"):
-            fallback_used = True
-        full_response = response
-
-        native_calls = normalize_tool_calls(result.get("tool_calls") or [])
-        calls = merge_tool_calls(native_calls, parse_tool_calls(response))
-        if native_calls and not response:
-            response = "\n".join(
-                f"<tool_call>{json.dumps(call, ensure_ascii=False)}</tool_call>"
-                for call in native_calls
-            )
-        visible = strip_tool_calls(response)
-
-        if visible and calls:
-            print_thought(visible)
-
-        if not calls:
-            if must_use_tools and not tool_was_called and not tool_nudge_sent:
-                if response:
-                    print_thought(response)
-                messages.append({"role": "assistant", "content": response})
-                current_input = (
-                    "Continue the requested task now. No tool has been used yet. "
-                    "Inspect the real local state with the most specific available tool, "
-                    "then perform and verify the task. Do not only repeat a plan or ask "
-                    "for generic confirmation. If execution is impossible, name the exact blocker."
-                )
-                tool_nudge_sent = True
-                continue
-            messages.append({"role": "assistant", "content": response})
-            print_final(
-                response=response,
-                model=model_used,
-                latency_ms=total_latency,
-                total_iters=i + 1,
-                fallback_used=fallback_used,
-            )
-            break
-
-        # Tool loop
-        tool_was_called = True
-        tool_results = []
-        for call in calls:
-            tname = call.get("name", "?")
-            targs = call.get("arguments", {})
-            print_tool_call(tname, targs, i)
-
-            allowed, reason = require_allowed_tool(tname, allowed_tool_names)
-            if not allowed:
-                tr, is_err = f"{tname}: blocked — {reason}", True
-                print_tool_result(tname, tr, 0.0, error=True)
-                tool_results.append(f"Tool {tname} result:\n{tr}")
-                continue
-
-            risk = assess_execution(
-                tname, targs,
-                destructive=is_destructive(targs.get("command", "")),
-            )
-            if risk.needs_approval:
-                approved = _cli_approval(tname, targs)
-                if not approved:
-                    tr, is_err = run_tool(
-                        client, tname, targs,
-                        approval_fn=lambda _name, _args: False,
-                        model=model_used,
-                        iteration=i,
-                        allowed_tools=allowed_tool_names,
-                    )
-                    t_elapsed = 0.0
-                else:
-                    with AgentSpinner(tname, tool=tname):
-                        t_start = time.time()
-                        tr, is_err = run_tool(
-                            client, tname, targs,
-                            approval_fn=lambda _name, _args: True,
-                            model=model_used,
-                            iteration=i,
-                            allowed_tools=allowed_tool_names,
-                        )
-                        t_elapsed = time.time() - t_start
-            else:
-                with AgentSpinner(tname, tool=tname):
-                    t_start = time.time()
-                    tr, is_err = run_tool(
-                        client, tname, targs,
-                        approval_fn=_cli_approval,
-                        model=model_used,
-                        iteration=i,
-                        allowed_tools=allowed_tool_names,
-                    )
-                    t_elapsed = time.time() - t_start
-
-            print_tool_result(tname, tr, t_elapsed, error=is_err)
-            tool_results.append(f"Tool {tname} result:\n{tr}")
-
-        repeats = loop_guard.observe(calls, tool_results)
-        if repeats == STALL_NUDGE_REPEATS:
-            tool_results.append(STALL_RECOVERY_PROMPT)
-
-        if repeats >= STALL_FALLBACK_REPEATS:
-            fallback_candidate = effective_fallback
-            if fallback_candidate and fallback_candidate != model_used:
-                print_thought(
-                    f"Tool loop detected; switching operator to fallback {fallback_candidate}."
-                )
-                tool_results.append(
-                    f"Loop recovery: switch to {fallback_candidate} and continue the task "
-                    "with a different approach. Do not repeat the prior call."
-                )
-                effective_model = fallback_candidate
-                effective_fallback = None
-                fallback_used = True
-                loop_guard.reset()
-            else:
-                stop_reason = (
-                    "Agent paused because the same tool operation kept repeating without "
-                    "progress. The conversation context is preserved; correct the task or "
-                    "type 'continue' to resume with a different approach."
-                )
-                messages.append({"role": "assistant", "content": response})
-                messages.append({"role": "user", "content": format_untrusted_tool_results(tool_results)})
-                full_response = stop_reason
-                print_error(stop_reason)
-                break
-
-        if (i + 1) % AGENT_CHECKPOINT_INTERVAL == 0:
-            tool_results.append(agent_checkpoint(i + 1))
-
-        messages.append({"role": "assistant", "content": response})
-        current_input = format_untrusted_tool_results(tool_results)
-
-        if response.strip().upper().startswith("DONE:"):
-            print_final(response, model_used, total_latency, i+1, fallback_used)
-            break
-    else:
-        if current_input:
-            messages.append({"role": "user", "content": current_input})
-        full_response = (
-            "Agent safety pause after an unusually long run. The task context is "
-            "preserved; type 'continue' to resume."
-        )
-        print_error(full_response)
-
-    if conversation is not None:
-        conversation[:] = [
-            dict(message) for message in messages[1:]
-        ][-MAX_CONTEXT_MESSAGES:]
-
-    swarm_mode = state.get("swarm_mode", "off")
-    if swarm_mode == "auto":
-        from .swarm_runner import should_auto_swarm
-        swarm_mode = "review" if should_auto_swarm(initial_prompt) else "off"
-    if swarm_mode in {"on", "review"} and full_response and not full_response.startswith("Agent safety pause"):
-        from .swarm_runner import run_swarm_review
-        run_swarm_review(
-            original_task=initial_prompt,
-            operator_response=full_response,
-            operator_model=model_used,
-            fallback_model=state.get("fallback_model"),
-            system_prompt=system,
-            client=client,
-        )
-
-    try:
-        history_record(kind="ask", prompt=initial_prompt,
-                       response=full_response, model=model_used,
-                       latency_ms=total_latency)
-    except Exception:
-        pass
-    return 0

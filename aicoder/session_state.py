@@ -11,6 +11,7 @@ SWARM_MODES = {"off", "auto", "on", "review"}
 TOOL_MODES = {"off", "on_demand", "always"}
 APPROVAL_MODES = {"ask", "autopilot", "all"}
 RUNTIME_MODES = {"classic", "native-light"}
+DEFAULT_RUNTIME_MODE = "native-light"
 DEFAULT_FALLBACK_MODEL = "ollama/llama3.2:latest"
 
 _DEFAULTS: Dict[str, Any] = {
@@ -25,8 +26,8 @@ _DEFAULTS: Dict[str, Any] = {
     "request_timeout": 300,
     # ask: confirm every mutation; autopilot: safe writes only; all: all mutations.
     "approval_mode": "ask",
-    # native-light is opt-in until the shared runtime has broader field coverage.
-    "runtime_mode": "classic",
+    # Native agent engine is the default; classic remains an explicit compatibility mode.
+    "runtime_mode": DEFAULT_RUNTIME_MODE,
 }
 
 # Before the coding-only policy was centralized, the Settings UI persisted
@@ -90,7 +91,7 @@ def _load_raw() -> Dict[str, Any]:
             if data.get("approval_mode") not in APPROVAL_MODES:
                 data["approval_mode"] = "ask"
             if data.get("runtime_mode") not in RUNTIME_MODES:
-                data["runtime_mode"] = "classic"
+                data["runtime_mode"] = DEFAULT_RUNTIME_MODE
             data["enabled_tools"] = migrate_enabled_tools(data.get("enabled_tools"))
             _cache = {**_DEFAULTS, **data}
             _cache_stamp = stamp

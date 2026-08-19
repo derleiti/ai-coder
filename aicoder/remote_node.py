@@ -37,6 +37,7 @@ from .executor import (
     run_git_read,
 )
 from .session_state import get_state
+from .workspace import active_workspace
 
 REMOTE_READ_TOOLS = {
     "client_file_read",
@@ -344,7 +345,7 @@ class RemoteNode:
                 "server_version": __version__,
                 "client": "aicoder",
                 "mode": "full",
-                "workspace": str(state.get("workspace_root") or ""),
+                "workspace": str(active_workspace(state.get("workspace_root"))),
                 "remote_profile": self.remote_profile,
             },
         }))
@@ -390,9 +391,7 @@ class RemoteNode:
 
     async def run(self) -> None:
         state = get_state()
-        workspace = state.get("workspace_root")
-        if not workspace:
-            raise RuntimeError("remote-node requires an active workspace: aicoder workspace <path>")
+        workspace = str(active_workspace(state.get("workspace_root")))
         try:
             import websockets
         except ImportError as exc:

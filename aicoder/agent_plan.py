@@ -321,8 +321,9 @@ def resume_prompt_context(plan: AgentPlan, user_input: str = "") -> str:
         f"Resume persistent plan {plan.id}.\n"
         f"Original task: {plan.task[:3000]}\n"
         f"Previous pause: {plan.pause_reason or 'none recorded'}\n"
-        "The prior process context is intentionally not trusted or replayed. Re-inspect the "
-        "current workspace before any new mutation, continue only unfinished work, and perform "
-        "post-change verification before DONE."
+        "A bounded sanitized conversation checkpoint may have been restored, but raw tool output "
+        "and incomplete provider tool protocol are intentionally not replayed. Re-inspect the current "
+        "workspace before any new mutation, continue only unfinished work, and perform post-change "
+        "verification before DONE."
         f"{suffix}"
     )

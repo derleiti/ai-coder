@@ -5,6 +5,35 @@ from typing import Any, Dict
 
 IGNORE_DIRS = {".git", ".venv", "__pycache__", "node_modules", ".mypy_cache", ".pytest_cache"}
 
+ACTIVE_WORKSPACE_ENV = "AICODER_ACTIVE_WORKSPACE"
+
+
+def active_workspace(configured: str | None = None) -> Path:
+    """Return the process-local workspace, preferring the directory AICoder started in."""
+    raw = os.environ.get(ACTIVE_WORKSPACE_ENV) or configured or os.getcwd()
+    return Path(raw).expanduser().resolve(strict=False)
+
+
+def activate_workspace(path: str | Path | None = None) -> Path:
+    """Set the process-local workspace without requiring a Git repository."""
+    root = Path(path or os.getcwd()).expanduser().resolve(strict=False)
+    if not root.exists() or not root.is_dir():
+        raise ValueError(f"workspace is not an existing directory: {root}")
+    os.environ[ACTIVE_WORKSPACE_ENV] = str(root)
+    return root
+
+
+def path_within_workspace(value: str | Path, root: str | Path | None = None) -> tuple[Path, bool]:
+    workspace = active_workspace(str(root) if root is not None else None)
+    raw = Path(str(value or ".")).expanduser()
+    candidate = raw if raw.is_absolute() else workspace / raw
+    resolved = candidate.resolve(strict=False)
+    try:
+        resolved.relative_to(workspace)
+        return resolved, True
+    except ValueError:
+        return resolved, False
+
 def detect_git_root(start: Path) -> Path | None:
     cur = start.resolve()
     for p in [cur, *cur.parents]:

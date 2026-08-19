@@ -249,16 +249,17 @@ class SettingsWidget(QWidget):
         layout.addWidget(permission_group)
 
         # --- Tools Group ---
-        tools_group = QGroupBox("Tools — loaded on demand")
+        tools_group = QGroupBox("Tools")
         tools_layout = QVBoxLayout()
 
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("Mode:"))
         self.tool_mode_combo = QComboBox()
         self.tool_mode_combo.addItem("Off — chat only", "off")
-        self.tool_mode_combo.addItem("On demand — skip greetings", "on_demand")
+        self.tool_mode_combo.addItem("On demand — smart workspace detection", "on_demand")
         self.tool_mode_combo.addItem("Always — every request", "always")
         self.tool_mode_combo.setMinimumWidth(260)
+        self.tool_mode_combo.currentIndexChanged.connect(self._save_tool_mode_only)
         mode_row.addWidget(self.tool_mode_combo)
         self.tool_search = QLineEdit()
         self.tool_search.setPlaceholderText("Filter tools...")
@@ -459,6 +460,13 @@ class SettingsWidget(QWidget):
         state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
         for row in range(self.tool_list.count()):
             self.tool_list.item(row).setCheckState(state)
+
+    def _save_tool_mode_only(self):
+        mode = self.tool_mode_combo.currentData() or "on_demand"
+        set_tool_mode(mode)
+        self.tool_status.setText(f"Mode saved · {mode}")
+        self.tool_status.setStyleSheet("color: #00ff88; font-size: 11px;")
+        self.tools_changed.emit(mode, get_state().get("enabled_tools"))
 
     def _save_tool_config(self):
         mode = self.tool_mode_combo.currentData() or "on_demand"

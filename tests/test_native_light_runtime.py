@@ -13,6 +13,34 @@ from aicoder.gui.chat_widget import _AgentWorker
 
 
 class NativeLightPlanTests(unittest.TestCase):
+    def test_compatibility_runtime_does_not_create_persistent_plan(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            store = PlanStore(root / "plans")
+            client = MagicMock()
+            client.timeout = 30
+            client.chat.return_value = {"response": "DONE: classic", "model": "test/model"}
+            runtime = NativeLightRuntime(
+                client=client,
+                initial_prompt="Explain current state",
+                model="test/model",
+                fallback_model=None,
+                workspace_root=str(workspace),
+                tools=[],
+                load_tools_on_start=False,
+                plan_store=store,
+                persistent_plan=False,
+                base_timeout=30,
+            )
+
+            result = runtime.run()
+
+            self.assertEqual(result.status, "completed")
+            self.assertFalse(result.plan_id)
+            self.assertIsNone(store.load_current(str(workspace)))
+
     def test_plan_store_persists_current_plan_per_workspace(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

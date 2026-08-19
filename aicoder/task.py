@@ -20,6 +20,7 @@ from .config import load_session
 from .docs_context import read_agents_md
 from .session_state import get_state
 from .history import record as history_record
+from .workspace import active_workspace
 from .status import Spinner, phase_label
 from .executor import atomic_write_text
 
@@ -96,7 +97,7 @@ def run_task(
 
     effective_model = model or state.get("selected_model") or None
     swarm = state.get("swarm_mode", "off")
-    workspace = state.get("workspace_root")
+    workspace = str(active_workspace(state.get("workspace_root")))
 
     # System prompt: AGENTS.md + task instructions
     agents_content = "" if no_agents else (read_agents_md(workspace) or "")

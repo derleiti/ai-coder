@@ -17,10 +17,11 @@ from typing import Optional
 
 from .config import CONFIG_DIR, DEFAULT_BASE_URL, Session, load_session, save_session
 from .session_state import (
-    SWARM_MODES, APPROVAL_MODES, get_state,
-    set_approval_mode, set_fallback, set_model, set_runtime_mode, set_swarm, set_workspace,
+    SWARM_MODES, APPROVAL_MODES, DEFAULT_RUNTIME_MODE, get_state,
+    set_approval_mode, set_fallback, set_model, set_runtime_mode, set_swarm, set_tool_mode, set_workspace,
 )
 from .ui import C, bold, dim, cyan, green, yellow, red, magenta, white, panel, term_width, reset_live_line
+from .workspace import active_workspace
 from .repl_input import COMMANDS, PromptCancelled, ReplInput
 
 
@@ -356,7 +357,7 @@ def run_setup(force: bool = False) -> bool:
         print(f"  swarm → {_c('green', swarm)}")
 
     print("\n── Workspace ──────────────────────────────")
-    ws_default = state.get("workspace_root") or str(Path.cwd())
+    ws_default = str(active_workspace(state.get("workspace_root")))
     workspace = _ask("Projekt-Verzeichnis", ws_default)
     if workspace:
         Path(workspace).mkdir(parents=True, exist_ok=True)
@@ -434,14 +435,14 @@ def run_repl(skip_setup: bool = False) -> int:
     model    = state.get("selected_model")
     fallback = state.get("fallback_model")
     swarm    = state.get("swarm_mode","off")
-    ws       = state.get("workspace_root") or str(Path.cwd())
+    ws       = str(active_workspace(state.get("workspace_root")))
 
     def _toolbar() -> str:
         current = get_state()
         active_model = current.get("selected_model") or "backend"
         mode = current.get("tool_mode", "on_demand")
         approval = current.get("approval_mode", "ask")
-        runtime = current.get("runtime_mode", "classic")
+        runtime = current.get("runtime_mode", DEFAULT_RUNTIME_MODE)
         return f"  {active_model} · runtime:{runtime} · tools:{mode} · approvals:{approval} · swarm:{current.get('swarm_mode', 'off')}"
 
     repl_input = ReplInput(CONFIG_DIR / "history", _toolbar)
@@ -453,7 +454,7 @@ def run_repl(skip_setup: bool = False) -> int:
         model = state.get("selected_model")
         fallback = state.get("fallback_model")
         swarm = state.get("swarm_mode", "off")
-        ws = state.get("workspace_root") or str(Path.cwd())
+        ws = str(active_workspace(state.get("workspace_root")))
         tool_mode = state.get("tool_mode", "on_demand")
         enabled = state.get("enabled_tools")
         timeout = int(state.get("request_timeout", 300))
@@ -472,7 +473,7 @@ def run_repl(skip_setup: bool = False) -> int:
         print(f"  {dim('operator ')} {cyan(model or '(backend default)')}")
         print(f"  {dim('fallback ')} {dim(fallback or '—')}")
         approval_mode = state.get("approval_mode", "ask")
-        runtime_mode = state.get("runtime_mode", "classic")
+        runtime_mode = state.get("runtime_mode", DEFAULT_RUNTIME_MODE)
         print(f"  {dim('runtime  ')} mode={cyan(runtime_mode)} · tools={cyan(tool_mode)} · enabled={cyan('all' if enabled is None else str(len(enabled)))} · "
               f"approvals={cyan(approval_mode)} · swarm={cyan(swarm)} · timeout={cyan(str(timeout)+'s')}")
         print(f"  {dim('workspace')} {dim(ws)}")
@@ -481,7 +482,7 @@ def run_repl(skip_setup: bool = False) -> int:
             print(f"  {dim('Enter send · Alt+Enter newline · Ctrl+C clear/cancel · Ctrl+R history · Tab commands')}")
         else:
             print(f"  {yellow('Basic input mode')} {dim('· install prompt-toolkit for multiline editing and safe repaint')}")
-        print(f"  {dim('/help commands · /runtime native-light · /plan · /permissions · /new · /exit')}")
+        print(f"  {dim('/help · /command <name> [args] · /runtime native-light · /plan · /new · /exit')}")
         print(f"  {C.DIM}{rule}{C.RESET}")
 
     _print_repl_header()
@@ -543,6 +544,17 @@ def run_repl(skip_setup: bool = False) -> int:
                     print(f"  Fehler: {e}")
             elif cmd == "/status":
                 _print_repl_header()
+            elif cmd == "/tools":
+                if val:
+                    try:
+                        set_tool_mode(val.strip())
+                        print(f"  tools → {val.strip()}")
+                        _print_repl_header()
+                    except ValueError as e:
+                        print(f"  Fehler: {e}")
+                else:
+                    print(f"  tools = {get_state().get('tool_mode', 'on_demand')}")
+                    print("  set: /tools off|on_demand|always")
             elif cmd == "/runtime":
                 if val:
                     try:
@@ -552,10 +564,54 @@ def run_repl(skip_setup: bool = False) -> int:
                     except ValueError as e:
                         print(f"  Fehler: {e}")
                 else:
-                    print(f"  runtime = {get_state().get('runtime_mode', 'classic')}")
+                    print(f"  runtime = {get_state().get('runtime_mode', DEFAULT_RUNTIME_MODE)}")
+            elif cmd == "/guidelines":
+                from .guidelines import load_guidelines
+                workspace = str(active_workspace(get_state().get("workspace_root")))
+                rows = load_guidelines(workspace)
+                if not rows:
+                    print("  no guidelines discovered")
+                for scope, text in rows:
+                    print(f"\n  [{scope}]\n{text}")
+            elif cmd == "/commands":
+                from .commands import discover_commands
+                workspace = str(active_workspace(get_state().get("workspace_root")))
+                commands = discover_commands(workspace)
+                if not commands:
+                    print("  no commands discovered")
+                for item in commands:
+                    print(f"  {item.name:<20} {item.scope:<18} {item.description}")
+            elif cmd == "/command":
+                from .commands import expand_command
+                command_parts = val.split(None, 1)
+                if not command_parts:
+                    print("  usage: /command <name> [arguments]")
+                else:
+                    command_name = command_parts[0]
+                    command_args = command_parts[1] if len(command_parts) > 1 else ""
+                    expanded, is_error = expand_command(
+                        str(active_workspace(get_state().get("workspace_root"))),
+                        command_name,
+                        command_args,
+                    )
+                    if is_error:
+                        print(f"  {expanded}")
+                    else:
+                        try:
+                            run_agent(
+                                initial_prompt=expanded,
+                                model=model,
+                                fallback_model=fallback,
+                                conversation=conversation,
+                                runtime_mode="native-light",
+                            )
+                        except KeyboardInterrupt:
+                            print(f"\n{_c('yellow','[unterbrochen]')}")
+                        except Exception as e:
+                            print(f"\n[Fehler] {e}", file=sys.stderr)
             elif cmd == "/plan":
                 from .agent_plan import PlanStore, format_plan
-                workspace = str(Path(get_state().get("workspace_root") or ".").resolve())
+                workspace = str(active_workspace(get_state().get("workspace_root")))
                 store = PlanStore()
                 if val.strip().lower() == "clear":
                     print("  current plan cleared" if store.clear_current(workspace) else "  no current plan")
@@ -629,7 +685,8 @@ def run_repl(skip_setup: bool = False) -> int:
                     print(f"  Fehler: {e}")
             elif cmd == "/help":
                 print("  /model <n> · /fallback <n> · /swarm <m> · /models · /status")
-                print("  /runtime classic|native-light · /plan [list|clear]")
+                print("  /runtime classic|native-light · /tools off|on_demand|always · /plan [list|clear]")
+                print("  /commands · /command <name> [args] · /guidelines")
                 print("  /setup · /new · /clear · /keys · /permissions · /exit")
             else:
                 print(f"  Unbekannt: {cmd}  — /help für Hilfe")

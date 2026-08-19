@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from .agent_journal import ContinuationJournalStore
 from .agent_plan import AgentPlan, PlanStore, plan_prompt_context, resume_prompt_context
 from .client import ClientError, TriForceClient
 from .executor import (
@@ -91,6 +92,8 @@ class NativeLightRuntime:
     event_fn: RuntimeEventFn | None = None
     stop_requested: StopFn | None = None
     plan_store: PlanStore = field(default_factory=PlanStore)
+    journal_store: ContinuationJournalStore | None = None
+    persistent_plan: bool = True
     resume: bool = False
     resume_plan_id: str | None = None
     base_timeout: int = 300
@@ -116,6 +119,8 @@ class NativeLightRuntime:
         return self.tools
 
     def _prepare_plan(self) -> tuple[AgentPlan | None, bool]:
+        if not self.persistent_plan:
+            return None, False
         if self.quick_chat and not self.resume:
             return None, False
         plan: AgentPlan | None = None
@@ -159,6 +164,44 @@ class NativeLightRuntime:
     def _save_plan(self, plan: AgentPlan | None) -> None:
         if plan is not None:
             self.plan_store.save(plan)
+
+    def _journal(self) -> ContinuationJournalStore:
+        if self.journal_store is not None:
+            return self.journal_store
+        return ContinuationJournalStore(self.plan_store.root.parent / "journals")
+
+    def _save_journal(
+        self,
+        plan: AgentPlan | None,
+        messages: list[dict],
+        *,
+        pending_input: str = "",
+        tool_batches: list[dict[str, Any]] | None = None,
+    ) -> None:
+        if plan is None or plan.status == "completed":
+            return
+        try:
+            self._journal().save_checkpoint(
+                plan_id=plan.id,
+                workspace=plan.workspace,
+                messages=messages,
+                pending_input=pending_input,
+                tool_batches=tool_batches or [],
+            )
+            plan.record_event("journal", "Continuation checkpoint saved")
+            self._save_plan(plan)
+        except (OSError, ValueError, TypeError):
+            # Journal persistence must never corrupt or abort the execution plan.
+            plan.record_event("journal", "Continuation checkpoint could not be saved", is_error=True)
+            self._save_plan(plan)
+
+    def _clear_journal(self, plan: AgentPlan | None) -> None:
+        if plan is None:
+            return
+        try:
+            self._journal().clear(plan.workspace, plan.id)
+        except (OSError, ValueError):
+            pass
 
     def _record_tool_progress(
         self,
@@ -233,6 +276,7 @@ class NativeLightRuntime:
                 plan.set_step("verify", "skipped", "No successful verification tool observed")
         plan.record_event("complete", "Agent run completed")
         self._save_plan(plan)
+        self._clear_journal(plan)
 
     def _pause_plan(self, plan: AgentPlan | None, reason: str, response: str = "") -> None:
         if plan is None:
@@ -272,6 +316,19 @@ class NativeLightRuntime:
             dict(message) for message in (self.conversation or [])
             if message.get("role") != "system"
         ]
+        journal_batches: list[dict[str, Any]] = []
+        if resumed and plan is not None:
+            try:
+                journal = self._journal().load(plan.workspace, plan.id)
+            except (OSError, ValueError):
+                journal = None
+            if journal is not None:
+                journal_batches = [dict(item) for item in journal.tool_batches if isinstance(item, dict)]
+                if not prior_context:
+                    prior_context = journal.resume_messages()
+                plan.record_event("journal", "Continuation checkpoint restored")
+                self._save_plan(plan)
+                self._emit("journal", action="restored", messages=len(journal.messages), tool_batches=len(journal_batches))
         messages: list[dict] = [
             {"role": "system", "content": system},
             *prior_context[-MAX_CONTEXT_MESSAGES:],
@@ -328,6 +385,7 @@ class NativeLightRuntime:
             if self._stopped():
                 reason = "Agent stopped by user"
                 self._pause_plan(plan, reason)
+                self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
                 self._emit("paused", reason=reason)
                 return AgentRunResult(
                     "paused", reason, model_used, messages, tools, system,
@@ -368,6 +426,7 @@ class NativeLightRuntime:
             except (ClientError, RuntimeError) as exc:
                 reason = str(exc)
                 self._fail_plan(plan, reason)
+                self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
                 self._emit("error", message=reason)
                 return AgentRunResult(
                     "failed", "", model_used, messages, tools, system,
@@ -406,12 +465,14 @@ class NativeLightRuntime:
                         current_input = _VERIFICATION_REQUIRED_PROMPT
                         verification_nudge_sent = True
                         self._emit("verification_required", iteration=i + 1)
+                        self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
                         continue
                     reason = (
                         "Agent paused: state changed successfully, but the model did not "
                         "perform a successful post-change verification after being prompted."
                     )
                     self._pause_plan(plan, reason, response)
+                    self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
                     self._emit("paused", reason=reason)
                     if self.conversation is not None:
                         self.conversation[:] = [dict(message) for message in messages[1:]][-MAX_CONTEXT_MESSAGES:]
@@ -431,6 +492,7 @@ class NativeLightRuntime:
                         "for generic confirmation. If execution is impossible, name the exact blocker."
                     )
                     tool_nudge_sent = True
+                    self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
                     continue
                 messages.append({"role": "assistant", "content": response})
                 self._complete_plan(
@@ -453,10 +515,12 @@ class NativeLightRuntime:
 
             tool_was_called = True
             tool_results: list[str] = []
+            batch_records: list[dict[str, Any]] = []
             for call in calls:
                 if self._stopped():
                     reason = "Agent stopped by user"
                     self._pause_plan(plan, reason, response)
+                    self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
                     self._emit("paused", reason=reason)
                     return AgentRunResult(
                         "paused", reason, model_used, messages, tools, system,
@@ -519,6 +583,22 @@ class NativeLightRuntime:
                     plan, name, args, tool_result, is_error, mutation_seen,
                 )
                 verification_seen = verification_seen or verified_now
+                batch_records.append({
+                    "id": str(call.get("id") or ""),
+                    "name": name,
+                    "provider": str(call.get("provider") or ""),
+                    "raw_type": str(call.get("raw_type") or ""),
+                    "metadata": call.get("metadata") if isinstance(call.get("metadata"), dict) else {},
+                    "arguments": args,
+                    "is_error": bool(is_error),
+                })
+
+            if batch_records:
+                journal_batches.append({
+                    "iteration": starting_plan_iteration + i + 1,
+                    "calls": batch_records,
+                })
+                journal_batches = journal_batches[-20:]
 
             repeats = loop_guard.observe(calls, tool_results)
             if repeats == STALL_NUDGE_REPEATS:
@@ -547,6 +627,7 @@ class NativeLightRuntime:
                     messages.append({"role": "assistant", "content": response})
                     messages.append({"role": "user", "content": format_untrusted_tool_results(tool_results)})
                     self._pause_plan(plan, reason, response)
+                    self._save_journal(plan, messages, tool_batches=journal_batches)
                     self._emit("paused", reason=reason)
                     if self.conversation is not None:
                         self.conversation[:] = [dict(message) for message in messages[1:]][-MAX_CONTEXT_MESSAGES:]
@@ -561,6 +642,7 @@ class NativeLightRuntime:
 
             messages.append({"role": "assistant", "content": response})
             current_input = format_untrusted_tool_results(tool_results)
+            self._save_journal(plan, messages, tool_batches=journal_batches)
 
             if response.strip().upper().startswith("DONE:"):
                 if mutation_seen and not verification_seen:
@@ -574,6 +656,7 @@ class NativeLightRuntime:
                         "without a successful post-change verification."
                     )
                     self._pause_plan(plan, reason, visible or response)
+                    self._save_journal(plan, messages, tool_batches=journal_batches)
                     self._emit("paused", reason=reason)
                     if self.conversation is not None:
                         self.conversation[:] = [dict(message) for message in messages[1:]][-MAX_CONTEXT_MESSAGES:]
@@ -607,6 +690,7 @@ class NativeLightRuntime:
             "preserved; resume it with 'continue'."
         )
         self._pause_plan(plan, reason)
+        self._save_journal(plan, messages, tool_batches=journal_batches)
         self._emit("paused", reason=reason)
         if self.conversation is not None:
             self.conversation[:] = [dict(message) for message in messages[1:]][-MAX_CONTEXT_MESSAGES:]

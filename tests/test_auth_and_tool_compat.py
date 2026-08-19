@@ -304,7 +304,7 @@ class GuiToolModeTests(unittest.TestCase):
             "test", "", [{"name": "health", "inputSchema": {}}], "simple",
             load_tools_on_start=True,
         )
-        with patch("aicoder.gui.chat_widget.run_tool", return_value=("healthy", False)) as execute:
+        with patch("aicoder.agent_runtime.run_tool", return_value=("healthy", False)) as execute:
             worker.run()
         execute.assert_called_once()
 
@@ -317,7 +317,7 @@ class GuiToolModeTests(unittest.TestCase):
             "test", "", [], "simple",
             load_tools_on_start=False, quick_chat=True,
         )
-        with patch("aicoder.gui.chat_widget.load_tools") as discover:
+        with patch("aicoder.agent_runtime.load_tools") as discover:
             worker.run()
         discover.assert_not_called()
         self.assertEqual(worker.tools, [])
@@ -334,7 +334,7 @@ class GuiToolModeTests(unittest.TestCase):
             "test", "", [], "simple",
             load_tools_on_start=False,
         )
-        with patch("aicoder.gui.chat_widget.run_tool") as execute:
+        with patch("aicoder.agent_runtime.run_tool") as execute:
             worker.run()
         execute.assert_not_called()
 
@@ -445,7 +445,7 @@ class ReplRegressionTests(unittest.TestCase):
             patch.object(cli_agent, "load_session", return_value=session),
             patch.object(cli_agent, "get_state", return_value=state),
             patch.object(cli_agent, "TriForceClient", return_value=client),
-            patch.object(cli_agent, "load_tools") as discover,
+            patch("aicoder.agent_runtime.load_tools") as discover,
             patch.object(cli_agent, "print_header"),
             patch.object(cli_agent, "print_task"),
             patch.object(cli_agent, "print_final"),
@@ -473,6 +473,7 @@ class ReplRegressionTests(unittest.TestCase):
             "tool_mode": "always",
             "enabled_tools": None,
             "request_timeout": 30,
+            "runtime_mode": "classic",
         }
         session = Session(
             base_url="https://example.invalid",
@@ -490,8 +491,8 @@ class ReplRegressionTests(unittest.TestCase):
             patch.object(cli_agent, "load_session", return_value=session),
             patch.object(cli_agent, "get_state", return_value=state),
             patch.object(cli_agent, "TriForceClient", return_value=client),
-            patch.object(cli_agent, "load_tools", return_value=[executor.LOCAL_FILE_TREE_SCHEMA]),
-            patch.object(cli_agent, "run_tool", return_value=("documents", False)) as execute,
+            patch("aicoder.agent_runtime.load_tools", return_value=[executor.LOCAL_FILE_TREE_SCHEMA]),
+            patch("aicoder.agent_runtime.run_tool", return_value=("documents", False)) as execute,
             patch.object(cli_agent, "print_header"),
             patch.object(cli_agent, "print_task"),
             patch.object(cli_agent, "print_thought"),
@@ -527,7 +528,7 @@ class ReplRegressionTests(unittest.TestCase):
             "operator", "fallback", [{"name": "health", "inputSchema": {}}], "simple",
             load_tools_on_start=True,
         )
-        with patch("aicoder.gui.chat_widget.run_tool", return_value=("same result", False)):
+        with patch("aicoder.agent_runtime.run_tool", return_value=("same result", False)):
             worker.run()
         self.assertEqual(client.chat.call_count, 7)
         self.assertEqual(client.chat.call_args_list[6].kwargs["model"], "fallback")

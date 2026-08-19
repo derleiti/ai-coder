@@ -8,11 +8,11 @@ from .config import DEFAULT_BASE_URL, Session, delete_session, load_session, sav
 from .docs_context import context_summary, read_agents_md
 from .history import record as history_record, get_history, clear_history
 from .session_state import (
-    RUNTIME_MODES, SWARM_MODES, get_state,
-    set_fallback, set_model, set_runtime_mode, set_swarm, set_workspace,
+    RUNTIME_MODES, DEFAULT_RUNTIME_MODE, SWARM_MODES, TOOL_MODES, get_state,
+    set_fallback, set_model, set_runtime_mode, set_swarm, set_tool_mode, set_workspace,
 )
 from .status import Spinner, phase_label
-from .workspace import workspace_snapshot
+from .workspace import activate_workspace, active_workspace, workspace_snapshot
 from .tool_policy import (
     filter_tool_catalog,
     require_allowed_tool,
@@ -122,10 +122,9 @@ def cmd_profile(_: argparse.Namespace) -> int:
 
 
 def cmd_workspace(args: argparse.Namespace) -> int:
-    snap = workspace_snapshot(args.path)
-    # persist workspace root in state if it's a real git repo
-    if snap.get("git_root"):
-        set_workspace(snap["git_root"])
+    root = activate_workspace(args.path)
+    set_workspace(str(root))
+    snap = workspace_snapshot(str(root))
     print_json(snap)
     return 0
 
@@ -208,6 +207,20 @@ def cmd_swarm(args: argparse.Namespace) -> int:
         print(f"swarm = {state.get('swarm_mode', 'off')}")
     return 0
 
+
+def cmd_tool_mode(args: argparse.Namespace) -> int:
+    value = getattr(args, "value", None)
+    if value:
+        try:
+            set_tool_mode(value)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        print(f"tool-mode → {value}")
+    else:
+        print(f"tool-mode = {get_state().get('tool_mode', 'on_demand')}")
+    return 0
+
 def cmd_runtime(args: argparse.Namespace) -> int:
     value = getattr(args, "value", None)
     if value:
@@ -218,7 +231,7 @@ def cmd_runtime(args: argparse.Namespace) -> int:
             return 1
         print(f"runtime → {value}")
     else:
-        print(f"runtime = {get_state().get('runtime_mode', 'classic')}")
+        print(f"runtime = {get_state().get('runtime_mode', DEFAULT_RUNTIME_MODE)}")
     return 0
 
 
@@ -226,7 +239,7 @@ def cmd_skills(args: argparse.Namespace) -> int:
     from .skills import discover_skills, read_skill
 
     state = get_state()
-    workspace = str(Path(state.get("workspace_root") or ".").resolve())
+    workspace = str(active_workspace(state.get("workspace_root")))
     name = getattr(args, "name", None)
     if name:
         text, is_error = read_skill(workspace, name)
@@ -242,11 +255,69 @@ def cmd_skills(args: argparse.Namespace) -> int:
     return 0
 
 
+
+def cmd_guidelines(args: argparse.Namespace) -> int:
+    from .guidelines import load_guidelines
+
+    state = get_state()
+    workspace = str(active_workspace(state.get("workspace_root")))
+    rows = load_guidelines(workspace)
+    if not rows:
+        print("no guidelines discovered")
+        return 0
+    for scope, text in rows:
+        print(f"## {scope}\n{text}\n")
+    return 0
+
+
+def cmd_commands(args: argparse.Namespace) -> int:
+    from .commands import discover_commands, read_command
+
+    state = get_state()
+    workspace = str(active_workspace(state.get("workspace_root")))
+    name = getattr(args, "name", None)
+    if name:
+        text, is_error = read_command(workspace, name)
+        print(text, file=sys.stderr if is_error else sys.stdout)
+        return 1 if is_error else 0
+    commands = discover_commands(workspace)
+    if not commands:
+        print("no commands discovered")
+        return 0
+    for command in commands:
+        print(f"{command.name:<24} {command.scope:<18} {command.description}")
+    return 0
+
+
+def cmd_command(args: argparse.Namespace) -> int:
+    from .agent import run_agent
+    from .commands import expand_command
+
+    state = get_state()
+    workspace = str(active_workspace(state.get("workspace_root")))
+    text, is_error = expand_command(
+        workspace,
+        str(getattr(args, "name", "") or ""),
+        " ".join(getattr(args, "arguments", []) or []),
+    )
+    if is_error:
+        print(text, file=sys.stderr)
+        return 1
+    return run_agent(
+        initial_prompt=text,
+        model=getattr(args, "model", None) or state.get("selected_model"),
+        fallback_model=state.get("fallback_model"),
+        verbose=getattr(args, "verbose", False),
+        runtime_mode="native-light",
+        json_output=bool(getattr(args, "json_out", False)),
+        json_events=bool(getattr(args, "json_events", False)),
+    )
+
 def cmd_plan(args: argparse.Namespace) -> int:
     from .agent_plan import PlanStore, format_plan
 
     state = get_state()
-    workspace = str(Path(state.get("workspace_root") or ".").resolve())
+    workspace = str(active_workspace(state.get("workspace_root")))
     store = PlanStore()
     if getattr(args, "clear", False):
         cleared = store.clear_current(workspace)
@@ -266,23 +337,32 @@ def cmd_plan(args: argparse.Namespace) -> int:
         print("no current plan")
         return 1
     print(format_plan(plan))
+    try:
+        from .agent_journal import ContinuationJournalStore
+        journal = ContinuationJournalStore(store.root.parent / "journals").load(workspace, plan.id)
+    except (OSError, ValueError):
+        journal = None
+    if journal is not None:
+        print(f"journal=present  messages={len(journal.messages)}  tool_batches={len(journal.tool_batches)}")
+    else:
+        print("journal=none")
     return 0
 
 
 def cmd_status(_: argparse.Namespace) -> int:
     state = get_state()
-    ctx = context_summary(state.get("workspace_root"))
+    ctx = context_summary(str(active_workspace(state.get("workspace_root"))))
 
     model = state.get("selected_model") or "(not set)"
     fallback = state.get("fallback_model") or "(not set)"
     swarm = state.get("swarm_mode", "off")
-    workspace = state.get("workspace_root") or ctx.get("project_root") or "(not set)"
+    workspace = str(active_workspace(state.get("workspace_root")))
 
     print("── ai-coder status ──────────────────────────────")
     print(f"  model    : {model}")
     print(f"  fallback : {fallback}")
     print(f"  swarm    : {swarm}")
-    print(f"  runtime  : {state.get('runtime_mode', 'classic')}")
+    print(f"  runtime  : {state.get('runtime_mode', DEFAULT_RUNTIME_MODE)}")
     print(f"  workspace: {workspace}")
     print(f"  docs     : {ctx['doc_files_found']} file(s) found")
     if ctx.get("agents_md_present"):
@@ -359,7 +439,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
         return 1
 
     # System prompt: AGENTS.md from workspace
-    workspace = state.get("workspace_root")
+    workspace = str(active_workspace(state.get("workspace_root")))
     system_prompt = None
     if not getattr(args, "no_agents", False):
         system_prompt = read_agents_md(workspace)
@@ -417,7 +497,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
     model = _resolve_model(state, getattr(args, "model", None))
     swarm = state.get("swarm_mode", "off")
 
-    workspace = state.get("workspace_root")
+    workspace = str(active_workspace(state.get("workspace_root")))
     system_prompt = None
     if not getattr(args, "no_agents", False):
         system_prompt = read_agents_md(workspace)
@@ -723,10 +803,7 @@ def cmd_remote_node(args: argparse.Namespace) -> int:
     from .remote_node import run_remote_node
 
     state = get_state()
-    workspace = state.get("workspace_root")
-    if not workspace:
-        print("Error: remote-node requires an active workspace (aicoder workspace <path>)", file=sys.stderr)
-        return 1
+    workspace = str(active_workspace(state.get("workspace_root")))
     allow_writes = bool(getattr(args, "allow_writes", False))
     profile = "write-preview" if allow_writes else "read-only"
     print(f"remote-node · {profile} · workspace={workspace}", file=sys.stderr)
@@ -815,6 +892,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("value", nargs="?")
     p.set_defaults(func=cmd_swarm)
 
+
+    p = sub.add_parser("tool-mode", help=f"Tool discovery mode ({', '.join(sorted(TOOL_MODES))})")
+    p.add_argument("value", nargs="?")
+    p.set_defaults(func=cmd_tool_mode)
+
     p = sub.add_parser("runtime", help=f"Agent runtime ({', '.join(sorted(RUNTIME_MODES))})")
     p.add_argument("value", nargs="?")
     p.set_defaults(func=cmd_runtime)
@@ -822,6 +904,24 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("skills", help="List or read native AICoder workflow skills")
     p.add_argument("name", nargs="?", help="Skill name to read")
     p.set_defaults(func=cmd_skills)
+
+
+    p = sub.add_parser("guidelines", help="Show effective native AICoder guidelines")
+    p.set_defaults(func=cmd_guidelines)
+
+    p = sub.add_parser("commands", help="List or read native AICoder prompt commands")
+    p.add_argument("name", nargs="?", help="Command name to read")
+    p.set_defaults(func=cmd_commands)
+
+    p = sub.add_parser("command", help="Run a native AICoder prompt command")
+    p.add_argument("name", help="Command name")
+    p.add_argument("arguments", nargs="*", help="Arguments passed to $ARGUMENTS/{{args}}")
+    p.add_argument("--model", default=None)
+    p.add_argument("--verbose", "-v", action="store_true")
+    headless = p.add_mutually_exclusive_group()
+    headless.add_argument("--json", dest="json_out", action="store_true", help="Headless final JSON output")
+    headless.add_argument("--json-events", action="store_true", help="Headless NDJSON runtime events")
+    p.set_defaults(func=cmd_command)
 
     p = sub.add_parser("plan", help="Show/list the persistent native-light execution plan")
     p.add_argument("id", nargs="?", help="Specific plan id (default: current)")
@@ -939,6 +1039,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--setup", action="store_true")
     p.add_argument("--verbose", "-v", action="store_true")
+    headless = p.add_mutually_exclusive_group()
+    headless.add_argument("--json", dest="json_out", action="store_true", help="Headless final JSON output")
+    headless.add_argument("--json-events", action="store_true", help="Headless NDJSON runtime events")
     p.set_defaults(func=cmd_agent)
 
 
@@ -963,6 +1066,10 @@ def cmd_agent(args: argparse.Namespace) -> int:
     if plan_id and not resume_requested:
         print("Error: --plan-id requires --resume", file=sys.stderr)
         return 2
+    headless_requested = bool(getattr(args, "json_out", False) or getattr(args, "json_events", False))
+    if headless_requested and not (prompt_parts or resume_requested):
+        print("Error: headless agent mode requires a prompt or --resume", file=sys.stderr)
+        return 2
     if prompt_parts or resume_requested:
         # Direct prompt or explicit process-restart resume: no REPL.
         from .session_state import get_state
@@ -975,6 +1082,8 @@ def cmd_agent(args: argparse.Namespace) -> int:
             verbose=getattr(args, "verbose", False),
             runtime_mode="native-light" if resume_requested else None,
             resume_plan_id=(plan_id or "current") if resume_requested else None,
+            json_output=bool(getattr(args, "json_out", False)),
+            json_events=bool(getattr(args, "json_events", False)),
         )
     return run_repl(skip_setup=getattr(args, "setup", False))
 
@@ -1102,6 +1211,9 @@ def _run_gui() -> int:
 
 
 def main() -> int:
+    # The directory AICoder is launched from is the active process workspace.
+    # Persisted workspace state must never silently override an explicit shell cwd.
+    activate_workspace()
     # Kein Argument → Setup-Wizard + Agent-REPL starten
     if len(sys.argv) == 1:
         from .setup import run_repl

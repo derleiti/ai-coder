@@ -25,6 +25,7 @@ from .config import load_session
 from .docs_context import read_agents_md
 from .privileges import assess_execution
 from .session_state import get_state
+from .workspace import active_workspace, path_within_workspace
 from .tool_policy import (
     CODING_MCP_TOOLS,
     filter_tool_catalog,
@@ -100,6 +101,46 @@ def is_action_request(text: str) -> bool:
 def is_short_confirmation(text: str) -> bool:
     """Return true when a REPL message clearly continues the prior task."""
     return bool(_SHORT_CONFIRMATION_RE.fullmatch((text or "").strip()))
+
+_TOOL_STATE_NOUNS = r"(?:repo(?:sitory)?|project|projekt|workspace|file|files|datei|dateien|ordner|folder|directory|branch|commit|diff|codebase|source|quellcode|config|configuration|build|test|tests|log|logs)"
+_TOOL_STATE_POINTERS = r"(?:this|that|my|our|current|here|local|dies(?:e|er|es|em)|mein(?:e|er|es|em)?|unser(?:e|er|es|em)?|aktuell(?:e|er|es|em)?|hier|lokal(?:e|er|es|em)?)"
+_TOOL_STATE_RE = re.compile(
+    rf"(?:\b{_TOOL_STATE_POINTERS}\b.{{0,50}}\b{_TOOL_STATE_NOUNS}\b|"
+    rf"\b{_TOOL_STATE_NOUNS}\b.{{0,50}}\b{_TOOL_STATE_POINTERS}\b)",
+    re.IGNORECASE,
+)
+_TOOL_PATH_RE = re.compile(
+    r"(?:^|\s)(?:\.{0,2}/|~/|/[A-Za-z0-9_.-]+/|[A-Za-z0-9_.-]+\.(?:py|js|ts|tsx|jsx|rs|go|java|kt|c|cc|cpp|h|hpp|toml|yaml|yml|json|md|sh|txt))",
+    re.IGNORECASE,
+)
+_TOOL_FAILURE_RE = re.compile(
+    r"\b(?:traceback|stack\s*trace|failing\s+tests?|test\s+fail(?:s|ed|ing)?|build\s+fail(?:s|ed|ing)?|"
+    r"error\s+in|fehler\s+in|tests?\s+schlagen?\s+fehl|build\s+schl[aä]gt\s+fehl)\b",
+    re.IGNORECASE,
+)
+
+def is_tool_relevant_message(text: str) -> bool:
+    """Conservative signal that a prompt likely depends on real workspace/tool state."""
+    value = (text or "").strip()
+    if not value or is_simple_chat_message(value):
+        return False
+    if is_action_request(value) or is_short_confirmation(value):
+        return True
+    return bool(
+        _TOOL_STATE_RE.search(value)
+        or _TOOL_PATH_RE.search(value)
+        or _TOOL_FAILURE_RE.search(value)
+    )
+
+
+def should_load_tools(tool_mode: str, prompt: str, *, resume: bool = False) -> bool:
+    """Central tool-discovery policy shared by CLI and GUI."""
+    mode = str(tool_mode or "on_demand")
+    if mode == "off":
+        return False
+    if mode == "always":
+        return True
+    return bool(resume or is_tool_relevant_message(prompt))
 
 
 _HEAVY_TASK_RE = re.compile(
@@ -235,7 +276,7 @@ if IS_TERMUX:
     OS_INSTRUCTIONS = """- Typed file tools use Android/Termux paths.
 - No sudo, package-management, service, or raw-shell tools are available.
 - Home: /data/data/com.termux/files/home
-- Keep all project operations inside the active workspace."""
+- The launch directory is the active workspace. Paths outside it require an explicit one-time local workspace-boundary approval."""
 elif IS_WINDOWS:
     OS_INSTRUCTIONS = """- Use Windows paths in typed local tool arguments.
 - No PowerShell, sudo, package-management, service, or raw-shell tools are available."""
@@ -280,7 +321,7 @@ LOCAL_SKILL_READ_SCHEMA = {
 
 LOCAL_FILE_READ_SCHEMA = {
     "name": "file_read",
-    "description": "Read a UTF-8 LOCAL file inside the active workspace.",
+    "description": "Read a UTF-8 LOCAL file. Paths outside the active workspace trigger explicit one-time local scope approval.",
     "inputSchema": {
         "type": "object",
         "properties": {
@@ -296,7 +337,7 @@ LOCAL_FILE_EDIT_SCHEMA = {
     "name": "file_edit",
     "description": (
         "Create, replace, append to, or perform an exact text replacement in a LOCAL "
-        "UTF-8 file inside the active workspace."
+        "UTF-8 file. Paths outside the active workspace trigger explicit one-time local scope approval."
     ),
     "inputSchema": {
         "type": "object",
@@ -314,7 +355,7 @@ LOCAL_FILE_EDIT_SCHEMA = {
 
 LOCAL_FILE_TREE_SCHEMA = {
     "name": "file_tree",
-    "description": "Show a bounded LOCAL directory tree inside the active workspace.",
+    "description": "Show a bounded LOCAL directory tree. Outside-workspace paths require explicit one-time local scope approval.",
     "inputSchema": {
         "type": "object",
         "properties": {
@@ -327,7 +368,7 @@ LOCAL_FILE_TREE_SCHEMA = {
 
 LOCAL_CODE_SEARCH_SCHEMA = {
     "name": "code_grep",
-    "description": "Regex-search text files inside the active workspace.",
+    "description": "Regex-search LOCAL text files. Outside-workspace paths require explicit one-time local scope approval.",
     "inputSchema": {
         "type": "object",
         "properties": {
@@ -342,7 +383,7 @@ LOCAL_CODE_SEARCH_SCHEMA = {
 
 LOCAL_GIT_SCHEMA = {
     "name": "git",
-    "description": "Read-only Git inspection in the active workspace.",
+    "description": "Read-only Git inspection. Outside-workspace cwd requires explicit one-time local scope approval.",
     "inputSchema": {
         "type": "object",
         "properties": {
@@ -434,6 +475,7 @@ LOCAL_TOOL_NAMES = {t["name"] for t in LOCAL_TOOL_SCHEMAS}
 
 SYSTEM_TEMPLATE = """\
 You are ai-coder — an autonomous coding agent on AILinux/TriForce (api.ailinux.me).
+{guidelines}
 {agents_md}
 {skills}
 
@@ -651,7 +693,9 @@ def build_system_prompt(tools: list[dict], workspace_root: Optional[str] = None)
         pass
 
     agents_md = read_agents_md(str(ws_path)) or ""
+    from .guidelines import render_guidelines
     from .skills import render_skill_catalog
+    guideline_text = render_guidelines(str(ws_path))
     skill_catalog = render_skill_catalog(str(ws_path))
     # Operational project instructions have priority over generated guidance.
     # Keep a generous bound while avoiding an unbounded prompt from a malformed
@@ -660,6 +704,7 @@ def build_system_prompt(tools: list[dict], workspace_root: Optional[str] = None)
 
     tool_str = build_tool_desc(tools)[:4000]
     return SYSTEM_TEMPLATE.format(
+        guidelines=(guideline_text + "\n") if guideline_text else "",
         agents_md=("## AGENTS.md\n" + agents_short) if agents_short else "",
         skills=("\n" + skill_catalog) if skill_catalog else "",
         tools=tool_str,
@@ -877,21 +922,34 @@ def format_untrusted_tool_results(results: list[str]) -> str:
 
 
 def _workspace_root() -> Path:
-    return Path(get_state().get("workspace_root") or ".").resolve()
+    return active_workspace(get_state().get("workspace_root"))
 
 
-def _workspace_path(value: Any, *, must_exist: bool = True) -> Path:
-    root = _workspace_root()
-    raw = Path(str(value or ".")).expanduser()
-    candidate = raw if raw.is_absolute() else root / raw
-    resolved = candidate.resolve(strict=False)
-    try:
-        resolved.relative_to(root)
-    except ValueError as exc:
-        raise ValueError(f"path is outside the active workspace: {value}") from exc
+def _workspace_path(
+    value: Any, *, must_exist: bool = True, allow_outside: bool = False
+) -> Path:
+    resolved, inside = path_within_workspace(str(value or "."), _workspace_root())
+    if not inside and not allow_outside:
+        raise ValueError(f"path is outside the active workspace: {value}")
     if must_exist and not resolved.exists():
         raise FileNotFoundError(f"path does not exist: {value}")
     return resolved
+
+
+def _workspace_escape_target(tool_name: str, args: dict) -> Path | None:
+    field = "cwd" if tool_name in {"git", "lint", "test"} else "path"
+    if tool_name not in {"file_read", "file_edit", "file_tree", "code_grep", "git", "lint", "test"}:
+        return None
+    value = args.get(field) or "."
+    resolved, inside = path_within_workspace(str(value), _workspace_root())
+    return None if inside else resolved
+
+
+def _display_workspace_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(_workspace_root()))
+    except ValueError:
+        return str(path)
 
 
 def atomic_write_text(path: Path, content: str) -> None:
@@ -918,7 +976,7 @@ def run_file_read(args: dict) -> Tuple[str, bool]:
     try:
         if not isinstance(args.get("path"), str) or not args.get("path"):
             return "file_read error: path is required", True
-        path = _workspace_path(args.get("path"))
+        path = _workspace_path(args.get("path"), allow_outside=bool(args.get("_workspace_escape_approved")))
         if not path.is_file():
             return f"file_read error: not a file: {path}", True
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -936,7 +994,7 @@ def run_file_edit(args: dict) -> Tuple[str, bool]:
     try:
         if not isinstance(args.get("path"), str) or not args.get("path"):
             return "file_edit error: path is required", True
-        path = _workspace_path(args.get("path"), must_exist=False)
+        path = _workspace_path(args.get("path"), must_exist=False, allow_outside=bool(args.get("_workspace_escape_approved")))
         operation = str(args.get("operation") or "").lower()
         exists = path.exists()
         if exists and not path.is_file():
@@ -973,14 +1031,14 @@ def run_file_edit(args: dict) -> Tuple[str, bool]:
             atomic_write_text(path, original.replace(old, new, 1))
         else:
             return "file_edit error: operation must be create, write, append, or replace", True
-        return f"updated {path.relative_to(_workspace_root())}", False
+        return f"updated {_display_workspace_path(path)}", False
     except Exception as exc:
         return f"file_edit error: {exc}", True
 
 
 def run_file_tree(args: dict) -> Tuple[str, bool]:
     try:
-        root = _workspace_path(args.get("path") or ".")
+        root = _workspace_path(args.get("path") or ".", allow_outside=bool(args.get("_workspace_escape_approved")))
         if not root.is_dir():
             return f"file_tree error: not a directory: {root}", True
         max_depth = max(1, min(8, int(args.get("max_depth") or 3)))
@@ -1011,7 +1069,7 @@ def run_code_grep(args: dict) -> Tuple[str, bool]:
         if not pattern:
             return "code_grep error: pattern is required", True
         regex = re.compile(pattern)
-        root = _workspace_path(args.get("path") or ".")
+        root = _workspace_path(args.get("path") or ".", allow_outside=bool(args.get("_workspace_escape_approved")))
         glob = str(args.get("glob") or "*")
         limit = max(1, min(500, int(args.get("max_results") or 200)))
         paths = [root] if root.is_file() else root.rglob(glob)
@@ -1024,7 +1082,7 @@ def run_code_grep(args: dict) -> Tuple[str, bool]:
                     continue
                 for number, line in enumerate(path.read_text(encoding="utf-8", errors="strict").splitlines(), 1):
                     if regex.search(line):
-                        matches.append(f"{path.relative_to(_workspace_root())}:{number}:{line[:500]}")
+                        matches.append(f"{_display_workspace_path(path)}:{number}:{line[:500]}")
                         if len(matches) >= limit:
                             return "\n".join(matches) + "\n… result limit reached", False
             except (OSError, UnicodeError):
@@ -1047,7 +1105,7 @@ def run_git_read(args: dict) -> Tuple[str, bool]:
     if any(item in denied or item.startswith("--output=") for item in raw_args):
         return "git error: mutating or output-writing argument rejected", True
     try:
-        cwd = _workspace_path(args.get("cwd") or ".")
+        cwd = _workspace_path(args.get("cwd") or ".", allow_outside=bool(args.get("_workspace_escape_approved")))
         command = [
             "git", "--no-pager",
             "-c", "diff.external=",
@@ -1096,7 +1154,7 @@ def run_checked_project_command(tool_name: str, args: dict) -> Tuple[str, bool]:
         if argv[2] not in modules[tool_name]:
             return f"{tool_name} error: Python module '{argv[2]}' is not allowed", True
     try:
-        cwd = _workspace_path(args.get("cwd") or ".")
+        cwd = _workspace_path(args.get("cwd") or ".", allow_outside=bool(args.get("_workspace_escape_approved")))
         completed = subprocess.run(argv, shell=False, cwd=str(cwd), capture_output=True, text=True, timeout=120)
         output = (completed.stdout or "") + (completed.stderr or "")
         return output[:12000] or "(no output)", completed.returncode != 0
@@ -1196,8 +1254,13 @@ def run_tool(
         approval_args["_mutating"] = mutating_hint
     if isinstance(destructive_hint, bool):
         approval_args["_destructive"] = destructive_hint
+    escape_target = _workspace_escape_target(name, args)
+    if escape_target is not None:
+        approval_args["_workspace_escape"] = str(escape_target)
+        approval_args["_workspace_root"] = str(_workspace_root())
     risk = assess_execution(name, approval_args, destructive=is_destructive(cmd))
-    if risk.needs_approval:
+    needs_scope_approval = escape_target is not None
+    if risk.needs_approval or needs_scope_approval:
         if approval_fn is not None:
             if not approval_fn(name, approval_args):
                 result = f"{name}: aborted by user"
@@ -1212,12 +1275,20 @@ def run_tool(
                 f"\033[31m⚠ BLOCKED (write/privilege without approval): {name} {cmd[:120]}\033[0m",
                 file=_sys.stderr,
             )
-            result = f"{name}: blocked — write or privilege requires explicit approval"
+            result = (
+                f"{name}: blocked — workspace escape requires explicit approval"
+                if needs_scope_approval
+                else f"{name}: blocked — write or privilege requires explicit approval"
+            )
             audit.log_tool(
                 tool_name=name, arguments=args, result=result, duration_s=0,
                 is_error=True, model=model, iteration=iteration,
             )
             return result, True
+
+    execution_args = dict(args)
+    if needs_scope_approval:
+        execution_args["_workspace_escape_approved"] = True
 
     # Route local tools (all execute via subprocess on client machine)
     _is_local = name in LOCAL_TOOL_NAMES
@@ -1237,17 +1308,17 @@ def run_tool(
         from .skills import read_skill
         result, is_error = read_skill(_workspace_root(), str(args.get("name") or ""))
     elif name == "file_read":
-        result, is_error = run_file_read(args)
+        result, is_error = run_file_read(execution_args)
     elif name == "file_edit":
-        result, is_error = run_file_edit(args)
+        result, is_error = run_file_edit(execution_args)
     elif name == "file_tree":
-        result, is_error = run_file_tree(args)
+        result, is_error = run_file_tree(execution_args)
     elif name == "code_grep":
-        result, is_error = run_code_grep(args)
+        result, is_error = run_code_grep(execution_args)
     elif name == "git":
-        result, is_error = run_git_read(args)
+        result, is_error = run_git_read(execution_args)
     elif name in {"lint", "test"}:
-        result, is_error = run_checked_project_command(name, args)
+        result, is_error = run_checked_project_command(name, execution_args)
     elif name == "clipboard_read":
         from .clipboard import clipboard_read
         result, is_error = clipboard_read()
