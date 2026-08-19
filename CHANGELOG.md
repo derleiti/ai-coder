@@ -1,3 +1,11 @@
+## v0.9.8b1 — Directory Tool Beta (2026-08-20)
+
+- Add a typed `directory_create` local capability for creating project directories and missing parents.
+- Make `file_edit` explicitly file-only so agents no longer misuse it for folder creation.
+- Apply workspace-boundary approval and mutation classification to directory creation.
+- Preserve dynamic "all tools" selection in the GUI so newly added safe capabilities become available automatically.
+- Unify package metadata at `0.9.8b1` and make the GitHub release workflow prerelease-aware.
+
 ## v0.9.6 — Unified Tool Policy and MCP Hardening (2026-08-13)
 
 - Expose only the canonical MCP `search` tool; remove the obsolete DuckDuckGo
