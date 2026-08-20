@@ -11,6 +11,7 @@ from aicoder.executor import (
     LOCAL_FILE_EDIT_SCHEMA,
     LOCAL_FILE_READ_SCHEMA,
     LOCAL_SKILL_READ_SCHEMA,
+    LOCAL_TEST_SCHEMA,
     build_system_prompt,
     run_tool,
 )
@@ -166,6 +167,10 @@ class SkillRuntimeTests(unittest.TestCase):
                     "response": '<tool_call>{"name":"file_read","arguments":{"path":"x.txt"}}</tool_call>',
                     "model": "test/model",
                 },
+                {
+                    "response": '<tool_call>{"name":"test","arguments":{"command":"python3 -m unittest"}}</tool_call>',
+                    "model": "test/model",
+                },
                 {"response": "DONE: verified", "model": "test/model"},
             ]
             runtime = NativeLightRuntime(
@@ -174,7 +179,7 @@ class SkillRuntimeTests(unittest.TestCase):
                 model="test/model",
                 fallback_model=None,
                 workspace_root=str(workspace),
-                tools=[LOCAL_SKILL_READ_SCHEMA, LOCAL_FILE_EDIT_SCHEMA, LOCAL_FILE_READ_SCHEMA],
+                tools=[LOCAL_SKILL_READ_SCHEMA, LOCAL_FILE_EDIT_SCHEMA, LOCAL_FILE_READ_SCHEMA, LOCAL_TEST_SCHEMA],
                 load_tools_on_start=True,
                 approval_fn=lambda _name, _args: True,
                 plan_store=store,
@@ -186,7 +191,7 @@ class SkillRuntimeTests(unittest.TestCase):
 
             self.assertEqual(result.status, "completed")
             executed_names = [call.args[1] for call in run.call_args_list]
-            self.assertEqual(executed_names, ["skill_read", "file_read"])
+            self.assertEqual(executed_names, ["skill_read", "file_read", "test"])
             self.assertTrue(any(
                 "require a fresh successful read/check" in str(message.get("content", ""))
                 for message in result.messages

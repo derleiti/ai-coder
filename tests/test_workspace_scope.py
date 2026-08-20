@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -167,6 +168,95 @@ class WorkspaceEscapeTests(unittest.TestCase):
         }
         with patch("aicoder.agent.get_state", return_value={"approval_mode": "all"}):
             self.assertFalse(_headless_approval("file_read", args))
+
+
+    def test_local_binary_exec_runs_in_workspace_and_reports_exit_code(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            approvals = []
+            with patch.dict(os.environ, {ACTIVE_WORKSPACE_ENV: str(root)}):
+                result, is_error = run_tool(
+                    MagicMock(), "binary_exec",
+                    {"program": sys.executable, "arguments": ["-c", "print('local-ok')"], "work_dir": "."},
+                    approval_fn=lambda name, args: approvals.append((name, dict(args))) or True,
+                    allowed_tools={"binary_exec"},
+                )
+            self.assertFalse(is_error, result)
+            self.assertIn("local-ok", result)
+            self.assertIn("exit_code=0", result)
+            self.assertEqual(approvals[0][0], "binary_exec")
+
+    def test_local_execution_outside_workspace_requires_scope_approval(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / "workspace"
+            outside = base / "outside"
+            root.mkdir(); outside.mkdir()
+            approvals = []
+            with patch.dict(os.environ, {ACTIVE_WORKSPACE_ENV: str(root)}):
+                result, is_error = run_tool(
+                    MagicMock(), "binary_exec",
+                    {"program": sys.executable, "arguments": ["-c", "import os; print(os.getcwd())"], "work_dir": str(outside)},
+                    approval_fn=lambda name, args: approvals.append((name, dict(args))) or True,
+                    allowed_tools={"binary_exec"},
+                )
+            self.assertFalse(is_error, result)
+            self.assertIn(str(outside.resolve()), result)
+            self.assertEqual(approvals[0][1]["_workspace_escape"], str(outside.resolve()))
+
+    def test_binary_file_read_is_rejected_without_dumping_contents(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = root / "module.so"
+            target.write_bytes(b"\x7fELF\x00secret-binary-data")
+            with patch.dict(os.environ, {ACTIVE_WORKSPACE_ENV: str(root)}):
+                result, is_error = run_tool(
+                    MagicMock(), "file_read", {"path": "module.so"},
+                    approval_fn=lambda *_: True, allowed_tools={"file_read"},
+                )
+            self.assertTrue(is_error)
+            self.assertIn("binary file", result)
+            self.assertNotIn("secret-binary-data", result)
+
+    def test_gui_startup_honors_persisted_workspace_instead_of_launcher_cwd(self):
+        import os
+        from aicoder import cli
+        from aicoder.workspace import ACTIVE_WORKSPACE_ENV
+
+        with tempfile.TemporaryDirectory() as configured, tempfile.TemporaryDirectory() as launcher:
+            previous = os.environ.pop(ACTIVE_WORKSPACE_ENV, None)
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(launcher)
+                with patch("aicoder.cli.get_state", return_value={"workspace_root": configured}):
+                    root = cli._activate_startup_workspace(["aicoder", "gui"])
+                self.assertEqual(root, Path(configured).resolve())
+                self.assertEqual(Path(os.environ[ACTIVE_WORKSPACE_ENV]), Path(configured).resolve())
+            finally:
+                os.chdir(old_cwd)
+                if previous is None:
+                    os.environ.pop(ACTIVE_WORKSPACE_ENV, None)
+                else:
+                    os.environ[ACTIVE_WORKSPACE_ENV] = previous
+
+    def test_cli_startup_keeps_explicit_launch_cwd(self):
+        import os
+        from aicoder import cli
+        from aicoder.workspace import ACTIVE_WORKSPACE_ENV
+
+        with tempfile.TemporaryDirectory() as launcher:
+            previous = os.environ.pop(ACTIVE_WORKSPACE_ENV, None)
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(launcher)
+                root = cli._activate_startup_workspace(["aicoder", "agent"])
+                self.assertEqual(root, Path(launcher).resolve())
+            finally:
+                os.chdir(old_cwd)
+                if previous is None:
+                    os.environ.pop(ACTIVE_WORKSPACE_ENV, None)
+                else:
+                    os.environ[ACTIVE_WORKSPACE_ENV] = previous
 
 
 if __name__ == "__main__":

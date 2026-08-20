@@ -55,34 +55,29 @@ class GuiSudoApprovalTests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
-    def test_gui_rejects_root_request_even_with_reason(self):
+    def test_gui_root_request_requires_manual_yes_even_in_all_mode(self):
         widget = ChatWidget.__new__(ChatWidget)
         widget._worker = MagicMock()
         widget._append_msg = MagicMock()
-        args = {
-            "command": "apt update",
-            "sudo": True,
-            "reason": "refresh package metadata",
-        }
+        args = {"command": "sudo true", "reason": "privileged diagnostic"}
         with (
             patch("aicoder.gui.chat_widget.get_state", return_value={"approval_mode": "all"}),
-            patch.object(QMessageBox, "warning") as warning,
+            patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes) as question,
         ):
-            ChatWidget._on_approval_needed(widget, "local_exec", args)
-        warning.assert_called_once()
-        widget._worker.set_approval.assert_called_once_with(False)
+            ChatWidget._on_approval_needed(widget, "shell", args)
+        question.assert_called_once()
+        widget._worker.set_approval.assert_called_once_with(True)
 
-    def test_gui_rejects_root_request_without_reason_before_auth(self):
+    def test_gui_root_request_can_be_rejected(self):
         widget = ChatWidget.__new__(ChatWidget)
         widget._worker = MagicMock()
         widget._append_msg = MagicMock()
         with (
-            patch("aicoder.gui.chat_widget.get_state", return_value={"approval_mode": "all"}),
-            patch.object(QMessageBox, "warning"),
+            patch("aicoder.gui.chat_widget.get_state", return_value={"approval_mode": "autopilot"}),
+            patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.No) as question,
         ):
-            ChatWidget._on_approval_needed(widget, "local_exec", {
-                "command": "apt update", "sudo": True,
-            })
+            ChatWidget._on_approval_needed(widget, "shell", {"command": "sudo true"})
+        question.assert_called_once()
         widget._worker.set_approval.assert_called_once_with(False)
 
 

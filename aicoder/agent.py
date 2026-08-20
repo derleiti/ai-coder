@@ -37,14 +37,6 @@ def _cli_approval(tool_name: str, args: dict) -> bool:
         return True
 
     mode = get_state().get("approval_mode", "ask")
-    if risk.elevation:
-        print(
-            f"\n{C.BRED}✗ Privilegienanfrage abgelehnt:{C.RESET} "
-            "Das Coding-only-Profil führt keine sudo/root-Aktionen aus.",
-            file=sys.stderr,
-        )
-        return False
-
     automatic = approval_is_automatic(mode, risk) and not scope_target
     if automatic:
         print(f"\n{C.BGREEN}✓ Automatisch freigegeben ({mode}){C.RESET}", file=sys.stderr)
@@ -121,9 +113,14 @@ def _run_native_light_agent(
     runtime_label = "native-light" if persistent_plan else "classic"
     tool_mode = state.get("tool_mode", "on_demand")
     enabled_tool_names = state.get("enabled_tools")
-    should_load_tools_now = should_load_tools(
-        tool_mode, initial_prompt, resume=resume_requested
-    ) and enabled_tool_names != []
+    tools_requested = should_load_tools(tool_mode, initial_prompt, resume=resume_requested)
+    should_load_tools_now = tools_requested and enabled_tool_names != []
+    tools_unavailable_reason = ""
+    if tools_requested and enabled_tool_names == []:
+        tools_unavailable_reason = (
+            "No tools are enabled. Complete tool onboarding in Settings by loading and "
+            "selecting tools before running an action task."
+        )
 
     header_printed = False
 
@@ -147,6 +144,19 @@ def _run_native_light_agent(
             if plan_id:
                 print(f"  {C.DIM}plan {plan_id} · persistent native-light runtime{C.RESET}")
             header_printed = True
+        elif kind == "model_without_tool_support":
+            # Silently dropping the tools would look exactly like the bug this
+            # guard replaces, so always say which model cannot use them.
+            model_name = payload.get("model") or "?"
+            alt = str(payload.get("alternative") or "")
+            print(
+                f"\n{C.BYELLOW}◆ {model_name} kann keine Tool-Calls{C.RESET} — "
+                f"{payload.get('tool_count') or 0} Tools werden nicht mitgesendet.",
+                file=sys.stderr,
+            )
+            if alt:
+                print(f"  Tool-fähige Variante: {C.BOLD}{alt}{C.RESET}", file=sys.stderr)
+                print(f"  Wechseln mit: aicoder model {alt}", file=sys.stderr)
         elif kind == "thought":
             print_thought(str(payload.get("text") or ""))
         elif kind == "tool_call":
@@ -196,6 +206,8 @@ def _run_native_light_agent(
         resume=resume_requested,
         resume_plan_id=resume_plan_id if persistent_plan else None,
         base_timeout=request_timeout,
+        max_output_tokens=int(state.get("max_output_tokens", 16384)),
+        tools_unavailable_reason=tools_unavailable_reason,
     )
     result = runtime.run()
     if not header_printed and not (json_output or json_events):

@@ -1,7 +1,7 @@
 """Risk classification for local and MCP-backed agent operations.
 
 The coding-only client never grants elevation. Mutation approval controls
-ordinary workspace changes only; sudo/root requests are rejected by callers.
+ordinary workspace changes; elevated requests always require explicit interactive approval.
 """
 from __future__ import annotations
 
@@ -146,7 +146,7 @@ def format_request(risk: ExecutionRisk) -> str:
     if risk.reasons:
         details.append(f"  Risiko  : {'; '.join(risk.reasons)}")
     if risk.elevation:
-        details.append("  Status  : Root/sudo ist im Coding-only-Profil deaktiviert")
+        details.append("  Status  : Root/sudo erfordert immer eine ausdrückliche Einmal-Freigabe")
     return "\n".join(details)
 
 
@@ -154,7 +154,7 @@ def approval_is_automatic(mode: str, risk: ExecutionRisk) -> bool:
     """Return whether a persisted permission mode may approve this risk.
 
     Destructive/deletion and elevation requests are never auto-approved.
-    Elevation is rejected outright by the CLI and GUI brokers.
+    Elevation is never auto-approved; interactive brokers may grant it once.
     """
     mode = str(mode or "ask").strip().lower()
     if not risk.needs_approval:

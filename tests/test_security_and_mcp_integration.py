@@ -42,14 +42,25 @@ class ToolPolicyIntegrationTests(unittest.TestCase):
     def test_forbidden_scopes_and_aliases_are_denied(self):
         for name in (
             "admin_users", "vault_keys", "mail_send", "notify_send",
-            "restart_backend", "service_control", "remote_task", "shell",
-            "task_runner", "binary_exec", "local_exec", "devops", "memory_clear",
+            "restart_backend", "service_control", "remote_task",
+            "local_exec", "devops", "memory_clear",
             "remote.search", "admin:health", "mcp/vault.keys",
         ):
             with self.subTest(name=name):
                 allowed, reason = require_allowed_tool(name, None)
                 self.assertFalse(allowed)
                 self.assertTrue(reason)
+
+    def test_local_execution_names_are_allowed_for_runtime_but_not_mcp_catalog(self):
+        for name in ("shell", "binary_exec", "task_runner"):
+            allowed, reason = require_allowed_tool(name, {name})
+            self.assertTrue(allowed, reason)
+        catalog = [
+            {"name": "shell", "inputSchema": {}},
+            {"name": "binary_exec", "inputSchema": {}},
+            {"name": "task_runner", "inputSchema": {}},
+        ]
+        self.assertEqual(filter_tool_catalog(catalog, CODING_MCP_TOOLS), [])
 
     def test_catalog_filter_is_fail_closed_for_malformed_and_forbidden_tools(self):
         catalog = [
@@ -190,6 +201,19 @@ class LocalCapabilityTests(unittest.TestCase):
         risk = assess_execution("directory_create", {"path": "pac-man"})
         self.assertTrue(risk.needs_approval)
         self.assertTrue(risk.mutation)
+
+    def test_local_execution_tools_are_advertised(self):
+        names = {tool["name"] for tool in executor.LOCAL_TOOL_SCHEMAS}
+        self.assertTrue({"shell", "binary_exec", "task_runner"}.issubset(names))
+
+    def test_file_read_rejects_binary_content(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "module.so").write_bytes(b"\x7fELF\x00binary")
+            with patch.object(executor, "get_state", return_value={"workspace_root": str(root)}):
+                result, error = executor.run_file_read({"path": "module.so"})
+        self.assertTrue(error)
+        self.assertIn("binary file", result)
 
     def test_read_tool_no_longer_accepts_a_command_string(self):
         with tempfile.TemporaryDirectory() as temp:

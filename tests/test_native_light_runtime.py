@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -105,6 +107,56 @@ class NativeLightPlanTests(unittest.TestCase):
             self.assertEqual(statuses["inspect"], "completed")
             self.assertEqual(statuses["implement"], "completed")
             self.assertEqual(statuses["verify"], "completed")
+
+    def test_file_read_after_mutation_does_not_count_as_behavior_verification(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            store = PlanStore(root / "plans")
+            plan = store.create("Change behavior", str(workspace), "test/model")
+            runtime = NativeLightRuntime(
+                client=MagicMock(), initial_prompt="x", model="test/model",
+                fallback_model=None, workspace_root=str(workspace), plan_store=store,
+            )
+            mutated, verified = runtime._record_tool_progress(
+                plan, "file_edit", {"path": "x.py", "operation": "write"},
+                "updated x.py", False, False,
+            )
+            self.assertTrue(mutated)
+            mutated, verified = runtime._record_tool_progress(
+                plan, "file_read", {"path": "x.py"}, "print(1)", False, mutated,
+            )
+            self.assertTrue(mutated)
+            self.assertFalse(verified)
+            loaded = store.load(str(workspace), plan.id)
+            self.assertEqual(
+                next(step.status for step in loaded.steps if step.id == "verify"),
+                "in_progress",
+            )
+
+    def test_user_rejected_tool_pauses_run_immediately(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp)
+            client = MagicMock()
+            client.timeout = 30
+            client.chat.return_value = {
+                "response": '<tool_call>{"name":"file_edit","arguments":{"path":"x.txt","operation":"write","content":"x"}}</tool_call>',
+                "model": "test/model",
+            }
+            runtime = NativeLightRuntime(
+                client=client, initial_prompt="write x", model="test/model",
+                fallback_model=None, workspace_root=str(workspace),
+                tools=[LOCAL_FILE_EDIT_SCHEMA], load_tools_on_start=True,
+                approval_fn=lambda _name, _args: False, persistent_plan=False,
+                base_timeout=30,
+            )
+
+            result = runtime.run()
+
+            self.assertEqual(result.status, "paused")
+            self.assertIn("user rejected file_edit", result.response)
+            self.assertEqual(client.chat.call_count, 1)
 
     def test_runtime_pauses_instead_of_claiming_done_without_verification(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -317,6 +369,10 @@ class NativeLightPlanTests(unittest.TestCase):
                     "response": '<tool_call>{"name":"file_read","arguments":{"path":"x.txt"}}</tool_call>',
                     "model": "test/model",
                 },
+                {
+                    "response": '<tool_call>{"name":"test","arguments":{"command":"python3 -m unittest"}}</tool_call>',
+                    "model": "test/model",
+                },
                 {"response": "DONE: existing mutation verified", "model": "test/model"},
             ]
             runtime = NativeLightRuntime(
@@ -325,7 +381,7 @@ class NativeLightPlanTests(unittest.TestCase):
                 model="test/model",
                 fallback_model=None,
                 workspace_root=str(workspace),
-                tools=[LOCAL_FILE_EDIT_SCHEMA, LOCAL_FILE_READ_SCHEMA],
+                tools=[LOCAL_FILE_EDIT_SCHEMA, LOCAL_FILE_READ_SCHEMA, LOCAL_TEST_SCHEMA],
                 load_tools_on_start=True,
                 approval_fn=lambda _name, _args: True,
                 plan_store=store,
@@ -336,8 +392,8 @@ class NativeLightPlanTests(unittest.TestCase):
                 result = runtime.run()
 
             self.assertEqual(result.status, "completed")
-            self.assertEqual(run_tool.call_count, 1)
-            self.assertEqual(run_tool.call_args.args[1], "file_read")
+            self.assertEqual(run_tool.call_count, 2)
+            self.assertEqual([call.args[1] for call in run_tool.call_args_list], ["file_read", "test"])
             self.assertTrue(any(
                 "require a fresh successful read/check" in str(message.get("content", ""))
                 for message in result.messages
@@ -373,6 +429,49 @@ class NativeLightPlanTests(unittest.TestCase):
             self.assertNotIn("RAW_SECRET_TOOL_OUTPUT", combined)
             self.assertNotIn("RAW_SECRET_LAST_RESPONSE", combined)
             self.assertIn("tool:file_read (ok)", system_context)
+
+
+    def test_action_with_empty_enabled_tools_fails_before_model_call(self):
+        client = MagicMock()
+        client.timeout = 30
+        runtime = NativeLightRuntime(
+            client=client,
+            initial_prompt="Create a game in ~/games",
+            model="test/model",
+            fallback_model=None,
+            workspace_root=".",
+            tools=[],
+            load_tools_on_start=False,
+            tools_unavailable_reason="No tools are enabled. Complete tool onboarding in Settings.",
+            persistent_plan=False,
+        )
+        result = runtime.run()
+        self.assertEqual(result.status, "failed")
+        self.assertIn("No tools are enabled", result.error)
+        client.chat.assert_not_called()
+
+    def test_stop_interrupts_wait_for_blocking_model_call(self):
+        stop_event = threading.Event()
+        client = MagicMock()
+        client.timeout = 30
+        def slow_chat(**_kwargs):
+            time.sleep(2.0)
+            return {"response": "too late", "model": "test/model"}
+        client.chat.side_effect = slow_chat
+        runtime = NativeLightRuntime(
+            client=client, initial_prompt="Inspect the workspace", model="test/model",
+            fallback_model=None, workspace_root=".", tools=[], load_tools_on_start=False,
+            stop_requested=stop_event.is_set, persistent_plan=False, base_timeout=30,
+        )
+        timer = threading.Timer(0.15, stop_event.set)
+        timer.start()
+        started = time.monotonic()
+        result = runtime.run()
+        elapsed = time.monotonic() - started
+        timer.join()
+        self.assertEqual(result.status, "paused")
+        self.assertIn("stopped by user", result.response.lower())
+        self.assertLess(elapsed, 0.8)
 
 
 class NativeLightGuiTests(unittest.TestCase):

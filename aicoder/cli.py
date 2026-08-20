@@ -1210,10 +1210,19 @@ def _run_gui() -> int:
         return 1
 
 
+def _activate_startup_workspace(argv: list[str] | None = None) -> Path:
+    """Choose startup workspace without letting a GUI launcher cwd override settings."""
+    args = list(sys.argv if argv is None else argv)
+    if len(args) > 1 and args[1] == "gui":
+        configured = str(get_state().get("workspace_root") or "").strip()
+        return activate_workspace(configured or os.getcwd())
+    return activate_workspace()
+
+
 def main() -> int:
-    # The directory AICoder is launched from is the active process workspace.
-    # Persisted workspace state must never silently override an explicit shell cwd.
-    activate_workspace()
+    # CLI/REPL intentionally use the launch cwd as workspace. GUI launchers often
+    # start from the source/install directory, so GUI must honor persisted settings.
+    _activate_startup_workspace()
     # Kein Argument → Setup-Wizard + Agent-REPL starten
     if len(sys.argv) == 1:
         from .setup import run_repl

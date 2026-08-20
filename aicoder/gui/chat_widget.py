@@ -46,6 +46,7 @@ class _AgentWorker(QThread):
     def __init__(
         self, client, messages_array, model, fallback, tools, system_prompt,
         load_tools_on_start=True, enabled_tool_names=None, quick_chat=False,
+        tools_unavailable_reason="",
     ):
         super().__init__()
         self.client = client
@@ -57,6 +58,7 @@ class _AgentWorker(QThread):
         self.load_tools_on_start = load_tools_on_start
         self.enabled_tool_names = enabled_tool_names
         self.quick_chat = quick_chat
+        self.tools_unavailable_reason = str(tools_unavailable_reason or "")
         # Approval mechanism: threading.Event + result flag
         self._approval_event = threading.Event()
         self._approval_result = False
@@ -161,6 +163,13 @@ class _AgentWorker(QThread):
                     f"{int(payload.get('count') or 0)} tools ready in {float(payload.get('elapsed') or 0.0):.2f}s",
                     runtime_label,
                 )
+            elif kind == "model_without_tool_support":
+                _alt = str(payload.get("alternative") or "")
+                _msg = (f"{payload.get('model') or '?'} kann keine Tool-Calls — "
+                        f"{payload.get('tool_count') or 0} Tools werden nicht gesendet.")
+                if _alt:
+                    _msg += f" Tool-fähige Variante: {_alt}"
+                self.msg.emit("system", _msg, runtime_label)
             elif kind == "plan":
                 plan = payload.get("plan")
                 plan_id = getattr(plan, "id", "")
@@ -213,6 +222,8 @@ class _AgentWorker(QThread):
             persistent_plan=persistent_plan,
             resume=resume_requested,
             base_timeout=base_timeout,
+            max_output_tokens=int(state.get("max_output_tokens", 16384)),
+            tools_unavailable_reason=self.tools_unavailable_reason,
         )
         result = runtime.run()
         self.tools = result.tools
@@ -619,16 +630,6 @@ class ChatWidget(QWidget):
         scope_root = str(args.get("_workspace_root") or "")
         automatic = approval_is_automatic(mode, risk) and not scope_target
 
-        if risk.elevation:
-            QMessageBox.warning(
-                self, "Root request rejected",
-                "Das Coding-only-Profil führt keine Root-/sudo-Aktionen aus.\n\n"
-                + format_request(risk),
-            )
-            if self._worker:
-                self._worker.set_approval(False)
-            return
-
         if not automatic:
             if scope_target:
                 title = "Leave active workspace — allow once?"
@@ -713,9 +714,14 @@ class ChatWidget(QWidget):
         if self.settings_ref and hasattr(self.settings_ref, "get_tool_mode"):
             tool_mode = self.settings_ref.get_tool_mode()
             enabled_tool_names = self.settings_ref.get_enabled_tool_names()
-        should_load_tools_now = should_load_tools(
-            tool_mode, text, resume=resume_requested
-        ) and enabled_tool_names != []
+        tools_requested = should_load_tools(tool_mode, text, resume=resume_requested)
+        should_load_tools_now = tools_requested and enabled_tool_names != []
+        tools_unavailable_reason = ""
+        if tools_requested and enabled_tool_names == []:
+            tools_unavailable_reason = (
+                "No tools are enabled. Open Settings, load the available tools, and select "
+                "the tools AICoder may use before running this task."
+            )
         self._start_activity(model, should_load_tools_now)
 
         if should_load_tools_now and self._tools is None:
@@ -753,6 +759,7 @@ class ChatWidget(QWidget):
             load_tools_on_start=should_load_tools_now,
             enabled_tool_names=enabled_tool_names,
             quick_chat=quick_chat,
+            tools_unavailable_reason=tools_unavailable_reason,
         )
         self._worker.msg.connect(self._on_agent_msg)
         self._worker.finished.connect(self._on_response)

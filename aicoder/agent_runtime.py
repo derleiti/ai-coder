@@ -6,14 +6,19 @@ runtime events, so future skills/subagents can extend one loop instead of two.
 from __future__ import annotations
 
 import json
+import queue
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
 from .agent_journal import ContinuationJournalStore
+from .model_capabilities import supports_tools, tool_capable_alternative
 from .agent_plan import AgentPlan, PlanStore, plan_prompt_context, resume_prompt_context
 from .client import ClientError, TriForceClient
+from .evidence_memory import ProjectEvidenceStore
+from .failure_tracking import FailureTracker
 from .executor import (
     AGENT_CHECKPOINT_INTERVAL,
     MAX_CONTEXT_MESSAGES,
@@ -21,6 +26,8 @@ from .executor import (
     STALL_FALLBACK_REPEATS,
     STALL_NUDGE_REPEATS,
     STALL_RECOVERY_PROMPT,
+    RESEARCH_RECOVERY_PROMPT,
+    REPEATED_ERROR_RECOVERY_PROMPT,
     AgentLoopGuard,
     adaptive_request_timeout,
     agent_checkpoint,
@@ -47,10 +54,13 @@ ApprovalFn = Callable[[str, dict], bool]
 StopFn = Callable[[], bool]
 
 _VERIFY_TOOLS = {
-    "test", "lint", "git", "file_read", "code_grep",
-    "code_read", "code_search", "dev_lint", "dev_analyze",
+    "test", "lint", "dev_lint", "dev_analyze",
+    "shell", "binary_exec", "task_runner",
 }
-_INSPECTION_TOOLS = _VERIFY_TOOLS | {"file_tree", "code_tree"}
+_INSPECTION_TOOLS = {
+    "git", "file_read", "code_grep", "code_read", "code_search",
+    "file_tree", "code_tree",
+}
 
 _VERIFICATION_REQUIRED_PROMPT = (
     "Verification required: a state-changing tool succeeded, but no successful "
@@ -97,6 +107,10 @@ class NativeLightRuntime:
     resume: bool = False
     resume_plan_id: str | None = None
     base_timeout: int = 300
+    max_output_tokens: int = 16384
+    tools_unavailable_reason: str = ""
+    max_iterations: int = MAX_ITERATIONS
+    _tool_capability_warned: bool = False
 
     def _emit(self, kind: str, **payload: Any) -> None:
         if self.event_fn is not None:
@@ -104,6 +118,52 @@ class NativeLightRuntime:
 
     def _stopped(self) -> bool:
         return bool(self.stop_requested and self.stop_requested())
+
+    def _chat_interruptibly(self, model_client, timeout: int, **kwargs: Any) -> dict[str, Any]:
+        """Run one blocking model request while allowing cooperative cancellation."""
+        if self.stop_requested is None:
+            return chat_with_timeout(model_client, timeout, **kwargs)
+
+        result_queue: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+        def invoke() -> None:
+            try:
+                result_queue.put((True, chat_with_timeout(model_client, timeout, **kwargs)))
+            except Exception as exc:
+                result_queue.put((False, exc))
+
+        thread = threading.Thread(target=invoke, name="aicoder-model-call", daemon=True)
+        thread.start()
+        while thread.is_alive():
+            if self._stopped():
+                raise InterruptedError("Agent stopped by user")
+            thread.join(0.1)
+        ok, value = result_queue.get()
+        if ok:
+            return value
+        raise value
+
+    def _tools_for_request(self, tools: list[dict] | None, model: str | None) -> list[dict] | None:
+        """Tool payload for one request, suppressed for chat-only models.
+
+        Several providers answer a tool-carrying request from a chat-only model
+        with an empty completion, which surfaces as an agent that silently does
+        nothing. Drop the tools instead and say so once, naming a route of the
+        same model that does support tool calling when one exists.
+        """
+        if not tools or not self.load_tools_on_start:
+            return None
+        if supports_tools(self.client, model):
+            return tools
+        if not self._tool_capability_warned:
+            self._tool_capability_warned = True
+            self._emit(
+                "model_without_tool_support",
+                model=model or "?",
+                alternative=tool_capable_alternative(self.client, model) or "",
+                tool_count=len(tools),
+            )
+        return None
 
     def _prepare_tools(self) -> list[dict]:
         if self.tools is None and self.load_tools_on_start:
@@ -228,18 +288,13 @@ class NativeLightRuntime:
             return mutation_seen, False
 
         verification_seen = False
-        if name in _INSPECTION_TOOLS:
-            # Security classification is intentionally conservative: lint/test
-            # may create caches and therefore require approval. Plan semantics
-            # treat them as verification/inspection rather than implementation.
+        if name in _VERIFY_TOOLS:
+            plan.set_step("inspect", "completed", f"Checked executable state via {name}")
             if mutation_seen:
                 plan.set_step("verify", "completed", f"Verified via {name}")
                 verification_seen = True
-            else:
-                plan.set_step("inspect", "completed", f"Checked state via {name}")
-                plan.set_step("implement", "skipped", "No state mutation required")
-                plan.set_step("verify", "completed", f"Verification task completed via {name}")
-                verification_seen = True
+        elif name in _INSPECTION_TOOLS:
+            plan.set_step("inspect", "completed", f"Checked state via {name}")
         elif risk.mutation or risk.destructive:
             mutation_seen = True
             plan.set_step("inspect", "completed", "Relevant state inspected before mutation")
@@ -300,6 +355,14 @@ class NativeLightRuntime:
         workspace = str(Path(self.workspace_root or ".").resolve())
         self.workspace_root = workspace
         tools = self._prepare_tools()
+        if self.tools_unavailable_reason:
+            reason = self.tools_unavailable_reason
+            self._emit("error", message=reason)
+            return AgentRunResult(
+                "failed", "", str(self.model or "?"), [], tools,
+                self.system_prompt or build_system_prompt(tools, workspace),
+                error=reason,
+            )
         try:
             plan, resumed = self._prepare_plan()
         except ValueError as exc:
@@ -353,6 +416,15 @@ class NativeLightRuntime:
         fresh_inspection_after_resume = not resumed
         starting_plan_iteration = plan.iteration if plan is not None else 0
         loop_guard = AgentLoopGuard()
+        failure_tracker = FailureTracker()
+        evidence_store = None
+        run_file_reads: set[tuple[str, int, int]] = set()
+        try:
+            evidence_store = ProjectEvidenceStore(self.workspace_root)
+            self._emit("evidence_ready", **evidence_store.health())
+        except Exception as exc:
+            # Memory is an optimization, never a prerequisite for coding.
+            self._emit("evidence_unavailable", error=f"{type(exc).__name__}: {exc}")
 
         pending_continuation = False
         if is_short_confirmation(self.initial_prompt):
@@ -381,7 +453,8 @@ class NativeLightRuntime:
             resumed=resumed,
         )
 
-        for i in range(MAX_ITERATIONS):
+        iteration_limit = max(1, min(MAX_ITERATIONS, int(self.max_iterations or MAX_ITERATIONS)))
+        for i in range(iteration_limit):
             if self._stopped():
                 reason = "Agent stopped by user"
                 self._pause_plan(plan, reason)
@@ -412,16 +485,27 @@ class NativeLightRuntime:
             self._emit("model_start", iteration=i + 1, timeout=timeout, model=active_model or "")
             started = time.monotonic()
             try:
-                result = chat_with_timeout(
+                request_tools = self._tools_for_request(tools, active_model)
+                result = self._chat_interruptibly(
                     model_client,
                     timeout,
                     messages=messages,
                     model=active_model,
                     fallback_model=active_fallback,
                     temperature=0.3,
-                    max_tokens=256 if self.quick_chat else 4096,
-                    tools=tools if self.load_tools_on_start else None,
+                    max_tokens=256 if self.quick_chat else self.max_output_tokens,
+                    tools=request_tools,
                     tool_choice="auto",
+                )
+            except InterruptedError:
+                reason = "Agent stopped by user"
+                self._pause_plan(plan, reason)
+                self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
+                self._emit("paused", reason=reason)
+                return AgentRunResult(
+                    "paused", reason, model_used, messages, tools, system,
+                    iterations=i, latency_ms=total_latency,
+                    fallback_used=fallback_used, plan_id=plan.id if plan else "",
                 )
             except (ClientError, RuntimeError) as exc:
                 reason = str(exc)
@@ -516,6 +600,8 @@ class NativeLightRuntime:
             tool_was_called = True
             tool_results: list[str] = []
             batch_records: list[dict[str, Any]] = []
+            batch_failure_repeats = 0
+            batch_failure_category = ""
             for call in calls:
                 if self._stopped():
                     reason = "Agent stopped by user"
@@ -552,6 +638,41 @@ class NativeLightRuntime:
                     elapsed = 0.0
                 else:
                     started_tool = time.monotonic()
+                    recall_key = None
+                    if name == "file_read" and evidence_store is not None:
+                        raw_path = str(args.get("path") or "")
+                        recall_key = (
+                            raw_path,
+                            max(1, int(args.get("start_line") or 1)),
+                            max(0, int(args.get("end_line") or 0)),
+                        )
+                        if recall_key in run_file_reads:
+                            try:
+                                _, unchanged = evidence_store.inspect_file(*recall_key)
+                            except Exception:
+                                unchanged = False
+                            if unchanged:
+                                tool_result = (
+                                    "UNCHANGED EVIDENCE ALREADY AVAILABLE IN THIS RUN. "
+                                    "Recall the prior file_read result or request a different range "
+                                    "with a concrete reason."
+                                )
+                                is_error = False
+                                elapsed = time.monotonic() - started_tool
+                                self._emit("evidence_recall", path=raw_path, start_line=recall_key[1], end_line=recall_key[2])
+                                tool_results.append(f"Tool {name} result:\n{tool_result}")
+                                mutation_seen, verified_now = self._record_tool_progress(
+                                    plan, name, args, tool_result, is_error, mutation_seen,
+                                )
+                                verification_seen = verification_seen or verified_now
+                                batch_records.append({
+                                    "id": str(call.get("id") or ""), "name": name,
+                                    "provider": str(call.get("provider") or ""),
+                                    "raw_type": str(call.get("raw_type") or ""),
+                                    "metadata": call.get("metadata") if isinstance(call.get("metadata"), dict) else {},
+                                    "arguments": args, "is_error": False,
+                                })
+                                continue
                     if name == "subagent_run":
                         from .subagents import run_subagent
                         tool_result, is_error = run_subagent(
@@ -560,6 +681,13 @@ class NativeLightRuntime:
                             role=str(args.get("role") or "analyze"),
                             context=str(args.get("context") or ""),
                             model=active_model or model_used,
+                            execution_client=self.client,
+                            tools=[tool for tool in tools if tool.get("name") != "subagent_run"],
+                            workspace_root=self.workspace_root,
+                            approval_fn=self.approval_fn,
+                            enabled_tool_names=self.enabled_tool_names,
+                            fallback_model=active_fallback,
+                            stop_requested=self.stop_requested,
                         )
                     else:
                         tool_result, is_error = run_tool(
@@ -579,6 +707,40 @@ class NativeLightRuntime:
                     is_error=is_error, elapsed=elapsed,
                 )
                 tool_results.append(f"Tool {name} result:\n{tool_result}")
+                if not is_error and name == "file_read" and evidence_store is not None:
+                    try:
+                        raw_path = str(args.get("path") or "")
+                        key = (
+                            raw_path,
+                            max(1, int(args.get("start_line") or 1)),
+                            max(0, int(args.get("end_line") or 0)),
+                        )
+                        evidence_store.inspect_file(*key)
+                        run_file_reads.add(key)
+                    except Exception as exc:
+                        self._emit("evidence_record_failed", evidence_kind="file", error=f"{type(exc).__name__}: {exc}")
+                failure = failure_tracker.observe(tool_result, is_error)
+                if failure is not None:
+                    if evidence_store is not None:
+                        try:
+                            evidence_store.remember_failure(failure.category, failure.signature, failure.count)
+                        except Exception as exc:
+                            self._emit("evidence_record_failed", evidence_kind="failure", error=f"{type(exc).__name__}: {exc}")
+                    if failure.count > batch_failure_repeats:
+                        batch_failure_repeats = failure.count
+                        batch_failure_category = failure.category
+                if is_error and str(tool_result).strip().endswith(": aborted by user"):
+                    reason = f"Agent paused because the user rejected {name}."
+                    messages.append({"role": "assistant", "content": response})
+                    messages.append({"role": "user", "content": format_untrusted_tool_results(tool_results)})
+                    self._pause_plan(plan, reason, response)
+                    self._save_journal(plan, messages, tool_batches=journal_batches)
+                    self._emit("paused", reason=reason)
+                    return AgentRunResult(
+                        "paused", reason, model_used, messages, tools, system,
+                        iterations=i + 1, latency_ms=total_latency,
+                        fallback_used=fallback_used, plan_id=plan.id if plan else "",
+                    )
                 mutation_seen, verified_now = self._record_tool_progress(
                     plan, name, args, tool_result, is_error, mutation_seen,
                 )
@@ -601,8 +763,50 @@ class NativeLightRuntime:
                 journal_batches = journal_batches[-20:]
 
             repeats = loop_guard.observe(calls, tool_results)
-            if repeats == STALL_NUDGE_REPEATS:
-                tool_results.append(STALL_RECOVERY_PROMPT)
+            all_failed = bool(batch_records) and all(record.get("is_error") for record in batch_records)
+            research_tools = {
+                name for name in ("memory_search", "search", "crawl", "web_fetch_local")
+                if name in allowed_tool_names
+            }
+            if batch_failure_category == "persistent_dependency" and batch_failure_repeats >= 3:
+                tool_results.append(
+                    "Dependency circuit open: the same transient dependency failure exceeded "
+                    "its retry budget. Do not call the same failing dependency again in this "
+                    "run unless new evidence indicates recovery. Use an alternative provider/tool, "
+                    "continue with independent local evidence, or report the blocker."
+                )
+                self._emit(
+                    "failure_circuit_open", iteration=i + 1, category=batch_failure_category,
+                    repeats=batch_failure_repeats,
+                )
+            elif batch_failure_repeats == 2:
+                tool_results.append(
+                    REPEATED_ERROR_RECOVERY_PROMPT
+                    + f" Failure category: {batch_failure_category}. The same underlying failure "
+                    "has recurred even if the surrounding tool call changed."
+                )
+                self._emit(
+                    "failure_replan", iteration=i + 1, category=batch_failure_category,
+                    repeats=batch_failure_repeats,
+                )
+            elif batch_failure_repeats >= 3 and research_tools & {"search", "crawl", "web_fetch_local"}:
+                tool_results.append(RESEARCH_RECOVERY_PROMPT)
+                self._emit(
+                    "research_recovery", iteration=i + 1, tools=sorted(research_tools),
+                    category=batch_failure_category,
+                )
+            elif all_failed and repeats == 2:
+                tool_results.append(REPEATED_ERROR_RECOVERY_PROMPT)
+            elif repeats == STALL_NUDGE_REPEATS:
+                if research_tools & {"search", "crawl", "web_fetch_local"}:
+                    tool_results.append(RESEARCH_RECOVERY_PROMPT)
+                    self._emit(
+                        "research_recovery",
+                        iteration=i + 1,
+                        tools=sorted(research_tools),
+                    )
+                else:
+                    tool_results.append(STALL_RECOVERY_PROMPT)
 
             if repeats >= STALL_FALLBACK_REPEATS:
                 if active_fallback and active_fallback != model_used:
@@ -696,6 +900,6 @@ class NativeLightRuntime:
             self.conversation[:] = [dict(message) for message in messages[1:]][-MAX_CONTEXT_MESSAGES:]
         return AgentRunResult(
             "paused", reason, model_used, messages, tools, system,
-            iterations=MAX_ITERATIONS, latency_ms=total_latency,
+            iterations=iteration_limit, latency_ms=total_latency,
             fallback_used=fallback_used, plan_id=plan.id if plan else "",
         )

@@ -22,9 +22,6 @@ FORBIDDEN_PREFIXES = (
 # Equivalent aliases are included even when AGENTS.md names only the historical
 # MCP tool.  Renaming a remote shell must not bypass the coding-client scope.
 FORBIDDEN_EXACT = {
-    "shell",
-    "task_runner",
-    "binary_exec",
     "custom_exec",
     "local_exec",
     "devops",
@@ -42,11 +39,16 @@ _FORBIDDEN_NAMESPACES = {prefix.rstrip("_") for prefix in FORBIDDEN_PREFIXES}
 # advertised to an operator model as executable project tools.
 INTERNAL_MCP_TOOLS = {"swarm_broadcast"}
 
+# These names are exposed by the AICoder runtime as LOCAL capabilities.
+# They must never be dispatched to the remote TriForce MCP transport.
+LOCAL_ONLY_TOOLS = frozenset({"shell", "binary_exec", "task_runner"})
+
 # Single source of truth for MCP capabilities which an operator model or direct
 # coding-client command may invoke. Local capabilities live in executor.py.
 CODING_MCP_TOOLS = frozenset({
-    "code_read", "code_search", "code_tree",
-    "dev_analyze", "dev_debug", "dev_lint", "dev_links",
+    "code_read",
+    "code_search", "code_tree", "dev_analyze",
+    "dev_debug", "dev_lint", "dev_links",
     "dev_refactor", "dev_summarize",
     "doc_read", "doc_search",
     "health", "search", "crawl",

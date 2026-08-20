@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -11,6 +12,7 @@ from aicoder.executor import (
     LOCAL_FILE_EDIT_SCHEMA,
     LOCAL_FILE_READ_SCHEMA,
     LOCAL_SUBAGENT_SCHEMA,
+    LOCAL_TEST_SCHEMA,
     run_tool,
 )
 from aicoder.subagents import MAX_SUBAGENT_CONTEXT, MAX_SUBAGENT_TASK, run_subagent
@@ -73,6 +75,11 @@ class _ResumeTransport:
         if self.main_calls == 3:
             return {
                 "response": '<tool_call>{"name":"file_read","arguments":{"path":"x.txt"}}</tool_call>',
+                "model": "test/model",
+            }
+        if self.main_calls == 4:
+            return {
+                "response": '<tool_call>{"name":"test","arguments":{"command":"python3 -m unittest"}}</tool_call>',
                 "model": "test/model",
             }
         return {"response": "DONE: verified", "model": "test/model"}
@@ -139,7 +146,89 @@ class SubagentUnitTests(unittest.TestCase):
         self.assertEqual(kwargs["tool_choice"], "none")
 
 
+class _ToolCapableSubagentTransport:
+    def __init__(self):
+        self.timeout = 30
+        self.calls = []
+        self.main_calls = 0
+        self.child_calls = 0
+
+    def chat(self, **kwargs):
+        self.calls.append(dict(kwargs))
+        names = {str(tool.get("name")) for tool in (kwargs.get("tools") or [])}
+        if "subagent_run" in names:
+            self.main_calls += 1
+            if self.main_calls == 1:
+                return {
+                    "response": '<tool_call>{"name":"subagent_run","arguments":{"role":"debug","task":"Inspect x.txt and report what it contains"}}</tool_call>',
+                    "model": "test/model",
+                }
+            return {"response": "DONE: parent received child result", "model": "test/model"}
+        self.child_calls += 1
+        if self.child_calls == 1:
+            return {
+                "response": '<tool_call>{"name":"file_read","arguments":{"path":"x.txt"}}</tool_call>',
+                "model": "test/model",
+            }
+        return {"response": "DONE: child inspected x.txt", "model": "test/model"}
+
+
+
+
 class SubagentRuntimeTests(unittest.TestCase):
+    def test_debug_subagent_inherits_parent_tools_without_recursive_subagent(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp) / "workspace"
+            workspace.mkdir()
+            (workspace / "x.txt").write_text("real state", encoding="utf-8")
+            client = MagicMock()
+            client.timeout = 30
+            transport = _ToolCapableSubagentTransport()
+            runtime = NativeLightRuntime(
+                client=client, model_client=transport, initial_prompt="Delegate debugging",
+                model="test/model", fallback_model=None, workspace_root=str(workspace),
+                tools=[LOCAL_SUBAGENT_SCHEMA, LOCAL_FILE_READ_SCHEMA],
+                load_tools_on_start=True, plan_store=PlanStore(Path(temp) / "plans"),
+                base_timeout=30,
+            )
+            with patch("aicoder.agent_runtime.run_tool", return_value=("real state", False)) as local_run:
+                result = runtime.run()
+
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(local_run.call_count, 1)
+            self.assertEqual(local_run.call_args.args[1], "file_read")
+            child_calls = [call for call in transport.calls if call.get("tools") and
+                           "subagent_run" not in {tool.get("name") for tool in call["tools"]}]
+            self.assertTrue(child_calls)
+            self.assertTrue(all("subagent_run" not in {tool.get("name") for tool in call["tools"]}
+                                for call in child_calls))
+            self.assertTrue(any("file_read" in {tool.get("name") for tool in call["tools"]}
+                                for call in child_calls))
+
+    def test_debug_subagent_inherits_parent_fallback_and_stop_callback(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp) / "workspace"
+            workspace.mkdir()
+            transport = MagicMock()
+            client = MagicMock()
+            client.timeout = 30
+            stop = lambda: False
+            with patch("aicoder.agent_runtime.NativeLightRuntime") as child_runtime:
+                child_runtime.return_value.run.return_value = SimpleNamespace(
+                    response="child done", error="", model="child/model",
+                    status="completed", iterations=1,
+                )
+                result, error = run_subagent(
+                    transport, task="inspect", role="debug", model="primary/model",
+                    execution_client=client, tools=[LOCAL_FILE_READ_SCHEMA],
+                    workspace_root=str(workspace), fallback_model="fallback/model",
+                    stop_requested=stop,
+                )
+            self.assertFalse(error, result)
+            kwargs = child_runtime.call_args.kwargs
+            self.assertEqual(kwargs["fallback_model"], "fallback/model")
+            self.assertIs(kwargs["stop_requested"], stop)
+
     def test_native_runtime_uses_model_transport_and_does_not_execute_subagent_tool_markup(self):
         with tempfile.TemporaryDirectory() as temp:
             workspace = Path(temp) / "workspace"
@@ -197,7 +286,7 @@ class SubagentRuntimeTests(unittest.TestCase):
                 model="test/model",
                 fallback_model=None,
                 workspace_root=str(workspace),
-                tools=[LOCAL_SUBAGENT_SCHEMA, LOCAL_FILE_EDIT_SCHEMA, LOCAL_FILE_READ_SCHEMA],
+                tools=[LOCAL_SUBAGENT_SCHEMA, LOCAL_FILE_EDIT_SCHEMA, LOCAL_FILE_READ_SCHEMA, LOCAL_TEST_SCHEMA],
                 load_tools_on_start=True,
                 approval_fn=lambda _name, _args: True,
                 plan_store=store,
@@ -209,7 +298,7 @@ class SubagentRuntimeTests(unittest.TestCase):
 
             self.assertEqual(result.status, "completed")
             executed = [call.args[1] for call in local_run.call_args_list]
-            self.assertEqual(executed, ["file_read"])
+            self.assertEqual(executed, ["file_read", "test"])
             self.assertTrue(any(
                 "require a fresh successful read/check" in str(message.get("content", ""))
                 for message in result.messages
