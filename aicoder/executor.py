@@ -26,6 +26,7 @@ from .config import load_session
 from .docs_context import read_agents_md
 from .privileges import assess_execution
 from .session_state import get_state
+from .settings_tools import TOOL_SCHEMAS as SETTINGS_TOOL_SCHEMAS
 from .workspace import active_workspace, path_within_workspace
 from .tool_policy import (
     CODING_MCP_TOOLS,
@@ -576,6 +577,7 @@ LOCAL_TOOL_SCHEMAS = [
     LOCAL_CLIPBOARD_READ_SCHEMA,
     LOCAL_CLIPBOARD_WRITE_SCHEMA,
     LOCAL_WEB_FETCH_SCHEMA,
+    *SETTINGS_TOOL_SCHEMAS,
 ]
 
 # Names of all local tools (for dispatch in run_tool)
@@ -1542,6 +1544,11 @@ def run_tool(
     # broker. This keeps GUI and REPL behaviour identical.
     cmd = args.get("command", "")
     approval_args = dict(args)
+    if name in {"settings_apply_patch", "settings_reset"}:
+        from .settings_tools import security_change_requested
+        approval_args["_mutating"] = True
+        if security_change_requested(name, args):
+            approval_args["_security_change"] = True
     mutating_hint, destructive_hint = _tool_security_hints.get(name, (None, None))
     if isinstance(mutating_hint, bool):
         approval_args["_mutating"] = mutating_hint
@@ -1629,6 +1636,9 @@ def run_tool(
     elif name == "web_fetch_local":
         from .web_search import web_fetch
         result, is_error = web_fetch(args.get("url", ""))
+    elif name.startswith("settings_"):
+        from .settings_tools import run as run_settings_tool
+        result, is_error = run_settings_tool(name, execution_args)
     elif _is_local:
         result, is_error = f"{name}: no safe local handler is registered", True
     else:

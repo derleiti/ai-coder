@@ -12,6 +12,7 @@ from .session_state import (
     set_fallback, set_model, set_runtime_mode, set_swarm, set_tool_mode, set_workspace,
 )
 from .status import Spinner, phase_label
+from . import settings as settings_core
 from .workspace import activate_workspace, active_workspace, workspace_snapshot
 from .tool_policy import (
     filter_tool_catalog,
@@ -235,6 +236,167 @@ def cmd_runtime(args: argparse.Namespace) -> int:
     return 0
 
 
+def _setting_value_for_output(key: str, state: dict[str, Any]) -> Any:
+    spec = settings_core.REGISTRY[key]
+    return "***" if spec.sensitive else state.get(key, spec.default)
+
+
+def _settings_help_epilog() -> str:
+    lines = ["Canonical settings:"]
+    for key in sorted(settings_core.REGISTRY, key=lambda k: (settings_core.REGISTRY[k].group, k)):
+        spec = settings_core.REGISTRY[key]
+        details = [f"type={spec.type}", f"default={spec.default!r}"]
+        choices = spec.choice_list()
+        if choices:
+            details.append("choices=" + ",".join(choices))
+        if spec.aliases:
+            details.append("aliases=" + ",".join(spec.aliases))
+        if spec.minimum is not None or spec.maximum is not None:
+            details.append(f"range={spec.minimum!r}..{spec.maximum!r}")
+        if spec.security_impact:
+            details.append("SECURITY-IMPACT")
+        lines.append(f"  {key}: {'; '.join(details)}")
+        lines.append(f"    {spec.description}")
+    return "\n".join(lines)
+
+
+def _settings_payload() -> list[dict[str, Any]]:
+    state = settings_core.STORE.load()
+    rows: list[dict[str, Any]] = []
+    for key in sorted(settings_core.REGISTRY, key=lambda k: (settings_core.REGISTRY[k].group, k)):
+        spec = settings_core.REGISTRY[key]
+        rows.append({
+            "key": key,
+            "value": _setting_value_for_output(key, state),
+            "default": spec.default,
+            "type": spec.type,
+            "group": spec.group,
+            "choices": spec.choice_list(),
+            "aliases": list(spec.aliases),
+            "description": spec.description,
+            "sensitive": spec.sensitive,
+            "mutable": spec.mutable,
+            "restart_required": spec.restart_required,
+            "security_impact": spec.security_impact,
+        })
+    return rows
+
+
+def cmd_settings(args: argparse.Namespace) -> int:
+    action = getattr(args, "settings_action", None) or "list"
+    try:
+        if action == "list":
+            rows = _settings_payload()
+            if getattr(args, "json_out", False):
+                print(json.dumps(rows, indent=2, ensure_ascii=False, sort_keys=True))
+                return 0
+            for row in rows:
+                value = row["value"]
+                choices = f" choices={','.join(row['choices'])}" if row["choices"] else ""
+                print(f"{row['key']:<22} = {value!s:<24} [{row['type']}] {row['description']}{choices}")
+            return 0
+
+        if action == "get":
+            key = settings_core.resolve_key(args.key)
+            spec = settings_core.REGISTRY[key]
+            value = "***" if spec.sensitive else settings_core.STORE.get(key)
+            if getattr(args, "json_out", False):
+                print(json.dumps({"key": key, "value": value}, ensure_ascii=False, sort_keys=True))
+            else:
+                print(f"{key} = {value}")
+            return 0
+
+        if action == "set":
+            key = settings_core.resolve_key(args.key)
+            spec = settings_core.REGISTRY[key]
+            if not spec.mutable:
+                raise settings_core.SettingsError(f"'{key}' is read-only.")
+            value = settings_core.coerce(key, args.value)
+            saved = settings_core.STORE.set(key, value)
+            shown = "***" if spec.sensitive else saved.get(key)
+            print(f"{key} → {shown}")
+            if spec.restart_required:
+                print("note: restart required for all consumers to use this value", file=sys.stderr)
+            return 0
+
+        if action == "reset":
+            if getattr(args, "all", False):
+                settings_core.STORE.reset_all()
+                print("settings → defaults")
+                return 0
+            if not getattr(args, "key", None):
+                raise settings_core.SettingsError("settings reset requires KEY or --all")
+            key = settings_core.resolve_key(args.key)
+            saved = settings_core.STORE.reset(key)
+            spec = settings_core.REGISTRY[key]
+            shown = "***" if spec.sensitive else saved.get(key)
+            print(f"{key} → {shown}")
+            return 0
+
+        if action == "explain":
+            data = settings_core.describe(args.key)
+            if getattr(args, "json_out", False):
+                print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+                return 0
+            print(f"{data['key']} [{data['type']}] · group={data['group']}")
+            print(data["description"])
+            print(f"current: {data['value']}")
+            print(f"default: {data['default']}")
+            if data["choices"]:
+                print(f"choices: {', '.join(data['choices'])}")
+            if data["aliases"]:
+                print(f"aliases: {', '.join(data['aliases'])}")
+            print(f"mutable={data['mutable']} restart_required={data['restart_required']} security_impact={data['security_impact']}")
+            return 0
+
+        if action == "schema":
+            data = settings_core.schema()
+            print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+            return 0
+
+        if action == "doctor":
+            path = settings_core.STORE.path
+            state = settings_core.STORE.load()
+            issues: list[str] = []
+            mode = None
+            if path.exists():
+                try:
+                    mode = oct(path.stat().st_mode & 0o777)
+                    if mode != "0o600":
+                        issues.append(f"permissions are {mode}, expected 0o600")
+                except OSError as exc:
+                    issues.append(f"cannot stat state file: {exc}")
+            corrupt = sorted(str(x) for x in path.parent.glob(path.name + ".corrupt-*")) if path.parent.exists() else []
+            if corrupt:
+                issues.append(f"{len(corrupt)} quarantined corrupt state file(s) present")
+            payload = {
+                "path": str(path),
+                "exists": path.exists(),
+                "permissions": mode,
+                "schema_version": state.get("_schema_version", settings_core.SCHEMA_VERSION),
+                "settings_count": len(settings_core.REGISTRY),
+                "issues": issues,
+                "ok": not issues,
+            }
+            if getattr(args, "json_out", False):
+                print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+            else:
+                print(f"state: {payload['path']}")
+                print(f"schema: {payload['schema_version']} · settings: {payload['settings_count']} · permissions: {mode or 'not created'}")
+                if issues:
+                    for issue in issues:
+                        print(f"WARN: {issue}")
+                else:
+                    print("OK")
+            return 0 if not issues else 1
+    except settings_core.SettingsError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    print(f"Error: unknown settings action {action}", file=sys.stderr)
+    return 2
+
+
 def cmd_skills(args: argparse.Namespace) -> int:
     from .skills import discover_skills, read_skill
 
@@ -352,19 +514,20 @@ def cmd_plan(args: argparse.Namespace) -> int:
 def cmd_status(_: argparse.Namespace) -> int:
     state = get_state()
     ctx = context_summary(str(active_workspace(state.get("workspace_root"))))
-
-    model = state.get("selected_model") or "(not set)"
-    fallback = state.get("fallback_model") or "(not set)"
-    swarm = state.get("swarm_mode", "off")
     workspace = str(active_workspace(state.get("workspace_root")))
 
     print("── ai-coder status ──────────────────────────────")
-    print(f"  model    : {model}")
-    print(f"  fallback : {fallback}")
-    print(f"  swarm    : {swarm}")
-    print(f"  runtime  : {state.get('runtime_mode', DEFAULT_RUNTIME_MODE)}")
-    print(f"  workspace: {workspace}")
-    print(f"  docs     : {ctx['doc_files_found']} file(s) found")
+    for key in sorted(settings_core.REGISTRY, key=lambda k: (settings_core.REGISTRY[k].group, k)):
+        spec = settings_core.REGISTRY[key]
+        if spec.sensitive:
+            continue
+        value = state.get(key, spec.default)
+        if key == "workspace_root":
+            value = workspace
+        elif key == "enabled_tools":
+            value = "all" if value is None else ("none" if value == [] else ",".join(value))
+        print(f"  {key:<20}: {value if value is not None else '(not set)'}")
+    print(f"  docs                 : {ctx['doc_files_found']} file(s) found")
     if ctx.get("agents_md_present"):
         print("  AGENTS.md: ✓ present")
     else:
@@ -835,6 +998,8 @@ def build_parser() -> argparse.ArgumentParser:
           aicoder model anthropic/claude-sonnet-4
           aicoder fallback gemini/gemini-2.0-flash
           aicoder swarm auto
+          aicoder settings list
+          aicoder settings explain approval_mode
           aicoder status
           aicoder ask "Was macht diese Funktion?"
           aicoder task "Add docstrings" -f datei.py --dry-run
@@ -900,6 +1065,48 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("runtime", help=f"Agent runtime ({', '.join(sorted(RUNTIME_MODES))})")
     p.add_argument("value", nargs="?")
     p.set_defaults(func=cmd_runtime)
+
+    p = sub.add_parser(
+        "settings",
+        help="List, explain and change all AICoder runtime settings",
+        description="Schema-driven settings shared by CLI, REPL, GUI and agent tools.",
+        epilog=_settings_help_epilog(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    settings_sub = p.add_subparsers(dest="settings_action")
+    p.set_defaults(func=cmd_settings, settings_action="list", json_out=False)
+
+    sp = settings_sub.add_parser("list", help="List every setting with effective value and schema metadata")
+    sp.add_argument("--json", dest="json_out", action="store_true")
+    sp.set_defaults(func=cmd_settings)
+
+    sp = settings_sub.add_parser("get", help="Read one setting")
+    sp.add_argument("key")
+    sp.add_argument("--json", dest="json_out", action="store_true")
+    sp.set_defaults(func=cmd_settings)
+
+    sp = settings_sub.add_parser("set", help="Set one setting; enabled_tools accepts all, none, or comma-separated names")
+    sp.add_argument("key")
+    sp.add_argument("value")
+    sp.set_defaults(func=cmd_settings)
+
+    sp = settings_sub.add_parser("reset", help="Reset one setting or the full registry to defaults")
+    sp.add_argument("key", nargs="?")
+    sp.add_argument("--all", action="store_true")
+    sp.set_defaults(func=cmd_settings)
+
+    sp = settings_sub.add_parser("explain", help="Explain one setting, including defaults, choices and aliases")
+    sp.add_argument("key")
+    sp.add_argument("--json", dest="json_out", action="store_true")
+    sp.set_defaults(func=cmd_settings)
+
+    sp = settings_sub.add_parser("schema", help="Emit the complete settings schema as deterministic JSON")
+    sp.add_argument("--json", dest="json_out", action="store_true", help="Compatibility flag; schema output is always JSON")
+    sp.set_defaults(func=cmd_settings)
+
+    sp = settings_sub.add_parser("doctor", help="Validate settings storage, schema and file permissions")
+    sp.add_argument("--json", dest="json_out", action="store_true")
+    sp.set_defaults(func=cmd_settings)
 
     p = sub.add_parser("skills", help="List or read native AICoder workflow skills")
     p.add_argument("name", nargs="?", help="Skill name to read")

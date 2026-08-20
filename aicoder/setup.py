@@ -23,6 +23,7 @@ from .session_state import (
 from .ui import C, bold, dim, cyan, green, yellow, red, magenta, white, panel, term_width, reset_live_line
 from .workspace import active_workspace
 from .repl_input import COMMANDS, PromptCancelled, ReplInput
+from . import settings as settings_core
 
 
 
@@ -418,6 +419,66 @@ def _setup_readline():
     readline.parse_and_bind("tab: complete")
 
 
+def _repl_settings_command(value: str) -> int:
+    """Handle /settings through the same canonical registry/store as CLI and GUI."""
+    parts = (value or "").split(None, 2)
+    action = parts[0].lower() if parts else "list"
+    try:
+        if action in {"list", "ls"}:
+            state = settings_core.STORE.load()
+            for key in sorted(settings_core.REGISTRY, key=lambda k: (settings_core.REGISTRY[k].group, k)):
+                spec = settings_core.REGISTRY[key]
+                if spec.sensitive:
+                    shown = "***"
+                else:
+                    shown = state.get(key, spec.default)
+                    if key == "enabled_tools":
+                        shown = "all" if shown is None else ("none" if shown == [] else ",".join(shown))
+                print(f"  {key:<22} = {shown}")
+            return 0
+        if action == "get" and len(parts) >= 2:
+            key = settings_core.resolve_key(parts[1])
+            spec = settings_core.REGISTRY[key]
+            shown = "***" if spec.sensitive else settings_core.STORE.get(key)
+            print(f"  {key} = {shown}")
+            return 0
+        if action == "set" and len(parts) >= 3:
+            key = settings_core.resolve_key(parts[1])
+            spec = settings_core.REGISTRY[key]
+            if not spec.mutable:
+                raise settings_core.SettingsError(f"'{key}' is read-only.")
+            value_to_set = settings_core.coerce(key, parts[2])
+            saved = settings_core.STORE.set(key, value_to_set)
+            shown = "***" if spec.sensitive else saved.get(key)
+            print(f"  {key} → {shown}")
+            return 0
+        if action == "reset" and len(parts) >= 2:
+            key = settings_core.resolve_key(parts[1])
+            saved = settings_core.STORE.reset(key)
+            spec = settings_core.REGISTRY[key]
+            shown = "***" if spec.sensitive else saved.get(key)
+            print(f"  {key} → {shown}")
+            return 0
+        if action in {"explain", "describe"} and len(parts) >= 2:
+            data = settings_core.describe(parts[1])
+            print(f"  {data['key']} [{data['type']}] · group={data['group']}")
+            print(f"  {data['description']}")
+            print(f"  current={data['value']} · default={data['default']}")
+            if data["choices"]:
+                print(f"  choices={','.join(data['choices'])}")
+            if data["aliases"]:
+                print(f"  aliases={','.join(data['aliases'])}")
+            if data["security_impact"]:
+                print("  security-impacting setting")
+            return 0
+    except settings_core.SettingsError as exc:
+        print(f"  Fehler: {exc}")
+        return 2
+
+    print("  usage: /settings [list|get KEY|set KEY VALUE|reset KEY|explain KEY]")
+    return 2
+
+
 def run_repl(skip_setup: bool = False) -> int:
     """
     Interaktiver Agent-REPL.
@@ -555,6 +616,12 @@ def run_repl(skip_setup: bool = False) -> int:
                 else:
                     print(f"  tools = {get_state().get('tool_mode', 'on_demand')}")
                     print("  set: /tools off|on_demand|always")
+            elif cmd == "/settings":
+                _repl_settings_command(val)
+                state = get_state()
+                model = state.get("selected_model")
+                fallback = state.get("fallback_model")
+                swarm = state.get("swarm_mode", "off")
             elif cmd == "/runtime":
                 if val:
                     try:
@@ -685,7 +752,7 @@ def run_repl(skip_setup: bool = False) -> int:
                     print(f"  Fehler: {e}")
             elif cmd == "/help":
                 print("  /model <n> · /fallback <n> · /swarm <m> · /models · /status")
-                print("  /runtime classic|native-light · /tools off|on_demand|always · /plan [list|clear]")
+                print("  /runtime classic|native-light · /tools off|on_demand|always · /settings · /plan [list|clear]")
                 print("  /commands · /command <name> [args] · /guidelines")
                 print("  /setup · /new · /clear · /keys · /permissions · /exit")
             else:

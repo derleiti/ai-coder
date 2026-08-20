@@ -637,6 +637,8 @@ class ChatWidget(QWidget):
                 title = "Destructive operation — allow once?"
             elif risk.elevation:
                 title = "Root operation — authenticate and allow once?"
+            elif risk.security_change:
+                title = "Security setting change — allow once?"
             elif risk.mutation:
                 title = "State-changing operation — allow once?"
             else:

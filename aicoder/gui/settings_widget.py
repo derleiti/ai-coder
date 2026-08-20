@@ -5,7 +5,7 @@ from PyQt6.QtWidgets import (
     QLineEdit, QPushButton, QComboBox, QLabel, QGroupBox, QMessageBox,
     QListWidget, QListWidgetItem, QSpinBox, QSizePolicy, QScrollArea,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 
 from ..config import DEFAULT_BASE_URL, Session, load_session, save_session, delete_session
 from ..session_state import (
@@ -14,6 +14,7 @@ from ..session_state import (
     set_approval_mode,
 )
 from ..client import TriForceClient, model_identifier
+from .. import settings as settings_core
 from ..executor import load_tools
 
 
@@ -116,8 +117,15 @@ class SettingsWidget(QWidget):
         self._probe = None
         self._models = []
         self._tools = []
+        self._schema_widgets = {}
+        self._loading_settings = False
+        self._settings_snapshot = None
         self._build_ui()
         self._load_current()
+        self._settings_timer = QTimer(self)
+        self._settings_timer.setInterval(1000)
+        self._settings_timer.timeout.connect(self._refresh_external_settings)
+        self._settings_timer.start()
 
     def _build_ui(self):
         outer = QVBoxLayout(self)
@@ -195,15 +203,18 @@ class SettingsWidget(QWidget):
         model_form.addRow("Model:", self.model_combo)
         model_form.addRow("Fallback:", self.fallback_combo)
 
+        timeout_spec = settings_core.REGISTRY["request_timeout"]
         self.timeout_spin = QSpinBox()
-        self.timeout_spin.setRange(10, 300)
+        self.timeout_spin.setRange(int(timeout_spec.minimum or 0), int(timeout_spec.maximum or 2_147_483_647))
         self.timeout_spin.setSuffix(" s")
-        self.timeout_spin.setToolTip("Maximum wait per model attempt. A configured fallback gets its own attempt.")
+        self.timeout_spin.setToolTip(timeout_spec.description)
         model_form.addRow("Timeout:", self.timeout_spin)
 
-        # Swarm
+        # Swarm — values and help come from the canonical registry.
+        swarm_spec = settings_core.REGISTRY["swarm_mode"]
         self.swarm_combo = QComboBox()
-        self.swarm_combo.addItems(sorted(SWARM_MODES))
+        self.swarm_combo.addItems(swarm_spec.choice_list())
+        self.swarm_combo.setToolTip(swarm_spec.description)
         model_form.addRow("Swarm:", self.swarm_combo)
 
         # Buttons row
@@ -226,14 +237,17 @@ class SettingsWidget(QWidget):
         # --- Permission Group ---
         permission_group = QGroupBox("Berechtigungen und Autopilot")
         permission_form = QFormLayout()
+        approval_spec = settings_core.REGISTRY["approval_mode"]
+        approval_labels = {
+            "ask": "Manuell — jede Änderung bestätigen",
+            "autopilot": "Autopilot — sichere Änderungen automatisch freigeben",
+            "all": "Workspace-Auto — normale Änderungen automatisch freigeben",
+        }
         self.approval_mode_combo = QComboBox()
-        self.approval_mode_combo.addItem("Manuell — jede Änderung bestätigen", "ask")
-        self.approval_mode_combo.addItem("Autopilot — normale Befehle automatisch freigeben", "autopilot")
-        self.approval_mode_combo.addItem("Workspace-Auto — Änderungen automatisch, Löschen weiter bestätigen", "all")
+        for value in approval_spec.choice_list():
+            self.approval_mode_combo.addItem(approval_labels.get(value, value), value)
         self.approval_mode_combo.setMinimumWidth(420)
-        self.approval_mode_combo.setToolTip(
-            "Freigaben gelten nur für Workspace-Mutationen. Root-, sudo-, Service- und Shell-Aktionen sind im Coding-only-Profil deaktiviert."
-        )
+        self.approval_mode_combo.setToolTip(approval_spec.description)
         save_permissions_btn = QPushButton("Berechtigungen speichern")
         save_permissions_btn.clicked.connect(self._save_permission_config)
         self.permission_status = QLabel("Aktueller Modus wird aus state.json geladen")
@@ -244,7 +258,6 @@ class SettingsWidget(QWidget):
         row.addStretch()
         permission_form.addRow("Freigabemodus:", self.approval_mode_combo)
         permission_form.addRow(row)
-        self.approval_mode_combo.currentIndexChanged.connect(self._save_permission_config)
         permission_group.setLayout(permission_form)
         layout.addWidget(permission_group)
 
@@ -254,10 +267,16 @@ class SettingsWidget(QWidget):
 
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("Mode:"))
+        tool_mode_spec = settings_core.REGISTRY["tool_mode"]
+        tool_mode_labels = {
+            "off": "Off — chat only",
+            "on_demand": "On demand — task-aware discovery",
+            "always": "Always — every request",
+        }
         self.tool_mode_combo = QComboBox()
-        self.tool_mode_combo.addItem("Off — chat only", "off")
-        self.tool_mode_combo.addItem("On demand — smart workspace detection", "on_demand")
-        self.tool_mode_combo.addItem("Always — every request", "always")
+        for value in tool_mode_spec.choice_list():
+            self.tool_mode_combo.addItem(tool_mode_labels.get(value, value), value)
+        self.tool_mode_combo.setToolTip(tool_mode_spec.description)
         self.tool_mode_combo.setMinimumWidth(260)
         self.tool_mode_combo.currentIndexChanged.connect(self._save_tool_mode_only)
         mode_row.addWidget(self.tool_mode_combo)
@@ -293,8 +312,180 @@ class SettingsWidget(QWidget):
         tools_group.setLayout(tools_layout)
         layout.addWidget(tools_group, stretch=1)
 
+        # --- Schema-driven settings not represented by the dedicated controls above ---
+        handled = {
+            "selected_model", "fallback_model", "swarm_mode", "tool_mode",
+            "enabled_tools", "request_timeout", "approval_mode",
+        }
+        additional = [
+            spec for key, spec in sorted(settings_core.REGISTRY.items(), key=lambda item: (item[1].group, item[0]))
+            if key not in handled and not spec.sensitive
+        ]
+        if additional:
+            schema_group = QGroupBox("Additional Settings")
+            schema_form = QFormLayout()
+            schema_form.setHorizontalSpacing(14)
+            schema_form.setVerticalSpacing(9)
+            for spec in additional:
+                widget = self._create_schema_widget(spec)
+                widget.setToolTip(spec.description)
+                label = f"{spec.key}{' ⚠' if spec.security_impact else ''}:"
+                schema_form.addRow(label, widget)
+                self._schema_widgets[spec.key] = widget
+            schema_save = QPushButton("Save Additional Settings")
+            schema_save.clicked.connect(self._save_schema_settings)
+            self.schema_status = QLabel("")
+            self.schema_status.setStyleSheet("color: #888; font-size: 11px;")
+            schema_row = QHBoxLayout()
+            schema_row.addWidget(schema_save)
+            schema_row.addWidget(self.schema_status)
+            schema_row.addStretch()
+            schema_form.addRow(schema_row)
+            schema_group.setLayout(schema_form)
+            layout.addWidget(schema_group)
 
 
+    def _create_schema_widget(self, spec):
+        if spec.type == "enum":
+            widget = QComboBox()
+            for value in spec.choice_list():
+                widget.addItem(value, value)
+            return widget
+        if spec.type == "int":
+            widget = QSpinBox()
+            widget.setRange(
+                int(spec.minimum if spec.minimum is not None else -2_147_483_648),
+                int(spec.maximum if spec.maximum is not None else 2_147_483_647),
+            )
+            return widget
+        if spec.type == "bool":
+            widget = QComboBox()
+            widget.addItem("false", False)
+            widget.addItem("true", True)
+            return widget
+        widget = QLineEdit()
+        if spec.type == "list":
+            widget.setPlaceholderText("all, none, or comma-separated values")
+        return widget
+
+    def _schema_widget_value(self, key: str):
+        spec = settings_core.REGISTRY[key]
+        widget = self._schema_widgets[key]
+        if spec.type == "enum":
+            return widget.currentData()
+        if spec.type == "int":
+            return widget.value()
+        if spec.type == "bool":
+            return widget.currentData()
+        return widget.text()
+
+    def _set_schema_widget_value(self, key: str, value):
+        spec = settings_core.REGISTRY[key]
+        widget = self._schema_widgets[key]
+        if spec.type in {"enum", "bool"}:
+            index = widget.findData(value)
+            if index >= 0:
+                widget.setCurrentIndex(index)
+        elif spec.type == "int":
+            widget.setValue(int(value if value is not None else spec.default or 0))
+        elif spec.type == "list":
+            if value is None:
+                widget.setText("all")
+            elif value == []:
+                widget.setText("none")
+            else:
+                widget.setText(",".join(str(item) for item in value))
+        else:
+            widget.setText("" if value is None else str(value))
+
+    def _save_schema_settings(self):
+        if self._loading_settings:
+            return
+        proposed = {}
+        try:
+            for key in self._schema_widgets:
+                proposed[key] = settings_core.coerce(key, self._schema_widget_value(key))
+        except settings_core.SettingsError as exc:
+            self.schema_status.setText(f"Invalid setting: {exc}")
+            self.schema_status.setStyleSheet("color: #ff6b6b; font-size: 11px;")
+            return
+
+        state = get_state()
+        security_changes = [
+            key for key, value in proposed.items()
+            if settings_core.REGISTRY[key].security_impact
+            and state.get(key, settings_core.REGISTRY[key].default) != value
+        ]
+        if security_changes:
+            reply = QMessageBox.question(
+                self,
+                "Security setting change",
+                "These settings change a security boundary and require explicit confirmation:\n"
+                + "\n".join(f"- {key}" for key in security_changes)
+                + "\n\nApply these changes?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                self.schema_status.setText("Not changed")
+                return
+
+        try:
+            settings_core.STORE.update(**proposed)
+        except settings_core.SettingsError as exc:
+            self.schema_status.setText(f"Invalid setting: {exc}")
+            self.schema_status.setStyleSheet("color: #ff6b6b; font-size: 11px;")
+            return
+        current = get_state()
+        self._settings_snapshot = self._state_signature(current)
+        self.schema_status.setText(f"Saved · {len(proposed)} settings")
+        self.schema_status.setStyleSheet("color: #00ff88; font-size: 11px;")
+
+
+    @staticmethod
+    def _state_signature(state: dict) -> tuple:
+        """Stable signature of canonical settings; excludes migration metadata."""
+        return tuple((key, repr(state.get(key, spec.default))) for key, spec in sorted(settings_core.REGISTRY.items()))
+
+    def _apply_state_to_widgets(self, state: dict, *, emit_changes: bool = False):
+        """Apply persisted state without accidentally writing it back through UI signals."""
+        previous = self._settings_snapshot
+        self._loading_settings = True
+        try:
+            self.model_combo.setCurrentText(str(state.get("selected_model") or ""))
+            self.fallback_combo.setCurrentText(str(state.get("fallback_model") or ""))
+            swarm_idx = self.swarm_combo.findText(str(state.get("swarm_mode", settings_core.REGISTRY["swarm_mode"].default)))
+            if swarm_idx >= 0:
+                self.swarm_combo.setCurrentIndex(swarm_idx)
+            mode_idx = self.tool_mode_combo.findData(state.get("tool_mode", settings_core.REGISTRY["tool_mode"].default))
+            if mode_idx >= 0:
+                self.tool_mode_combo.setCurrentIndex(mode_idx)
+            self.timeout_spin.setValue(int(state.get("request_timeout", settings_core.REGISTRY["request_timeout"].default)))
+            approval_idx = self.approval_mode_combo.findData(state.get("approval_mode", settings_core.REGISTRY["approval_mode"].default))
+            if approval_idx >= 0:
+                self.approval_mode_combo.setCurrentIndex(approval_idx)
+            for key, spec in self._schema_widgets.items():
+                self._set_schema_widget_value(key, state.get(key, settings_core.REGISTRY[key].default))
+        finally:
+            self._loading_settings = False
+
+        self._settings_snapshot = self._state_signature(state)
+        if emit_changes and previous is not None:
+            self.selection_changed.emit(
+                str(state.get("selected_model") or ""),
+                str(state.get("fallback_model") or ""),
+            )
+            self.tools_changed.emit(
+                str(state.get("tool_mode", settings_core.REGISTRY["tool_mode"].default)),
+                state.get("enabled_tools"),
+            )
+
+    def _refresh_external_settings(self):
+        """Make CLI/REPL changes visible in a running GUI without a restart."""
+        state = get_state()
+        signature = self._state_signature(state)
+        if signature != self._settings_snapshot:
+            self._apply_state_to_widgets(state, emit_changes=True)
 
     def _load_current(self):
         # Session
@@ -316,21 +507,7 @@ class SettingsWidget(QWidget):
             self.status_label.setStyleSheet("color: #ff6b6b;")
 
         # State
-        state = get_state()
-        if state.get("selected_model"):
-            self.model_combo.setCurrentText(state["selected_model"])
-        if state.get("fallback_model"):
-            self.fallback_combo.setCurrentText(state["fallback_model"])
-        idx = self.swarm_combo.findText(state.get("swarm_mode", "off"))
-        if idx >= 0:
-            self.swarm_combo.setCurrentIndex(idx)
-        mode_idx = self.tool_mode_combo.findData(state.get("tool_mode", "on_demand"))
-        if mode_idx >= 0:
-            self.tool_mode_combo.setCurrentIndex(mode_idx)
-        self.timeout_spin.setValue(int(state.get("request_timeout", 300)))
-        approval_idx = self.approval_mode_combo.findData(state.get("approval_mode", "ask"))
-        if approval_idx >= 0:
-            self.approval_mode_combo.setCurrentIndex(approval_idx)
+        self._apply_state_to_widgets(get_state())
 
     def _load_models(self):
         """Load model list from backend."""
@@ -462,11 +639,15 @@ class SettingsWidget(QWidget):
             self.tool_list.item(row).setCheckState(state)
 
     def _save_tool_mode_only(self):
-        mode = self.tool_mode_combo.currentData() or "on_demand"
+        if self._loading_settings:
+            return
+        mode = self.tool_mode_combo.currentData() or settings_core.REGISTRY["tool_mode"].default
         set_tool_mode(mode)
         self.tool_status.setText(f"Mode saved · {mode}")
         self.tool_status.setStyleSheet("color: #00ff88; font-size: 11px;")
-        self.tools_changed.emit(mode, get_state().get("enabled_tools"))
+        state = get_state()
+        self._settings_snapshot = self._state_signature(state)
+        self.tools_changed.emit(mode, state.get("enabled_tools"))
 
     def _save_tool_config(self):
         mode = self.tool_mode_combo.currentData() or "on_demand"
@@ -487,14 +668,18 @@ class SettingsWidget(QWidget):
             f"Saved · {'all' if selected is None else len(selected)} enabled"
         )
         self.tool_status.setStyleSheet("color: #00ff88; font-size: 11px;")
+        self._settings_snapshot = self._state_signature(get_state())
         self.tools_changed.emit(mode, selected)
 
 
     def _save_permission_config(self):
-        mode = self.approval_mode_combo.currentData() or "ask"
+        if self._loading_settings:
+            return
+        mode = self.approval_mode_combo.currentData() or settings_core.REGISTRY["approval_mode"].default
         set_approval_mode(mode)
         self.permission_status.setText(f"Saved · {mode}")
         self.permission_status.setStyleSheet("color: #00ff88; font-size: 11px;")
+        self._settings_snapshot = self._state_signature(get_state())
 
     def _do_login(self):
         base_url = self.base_url_edit.text().strip()
@@ -553,6 +738,7 @@ class SettingsWidget(QWidget):
         set_request_timeout(self.timeout_spin.value())
         self.model_status.setText("Saved.")
         self.model_status.setStyleSheet("color: #00ff88; font-size: 11px;")
+        self._settings_snapshot = self._state_signature(get_state())
         self.selection_changed.emit(model, fallback)
 
     def get_current_model(self) -> str:

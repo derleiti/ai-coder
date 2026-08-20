@@ -39,7 +39,7 @@ _MUTATING_TOOL_NAMES = {
     "file_edit", "directory_create", "file_write", "file_ops", "code_edit", "code_patch",
     "shell", "task_runner", "custom_exec", "binary_exec", "local_exec",
     "git_ops", "lint", "test", "devops",
-    "config_set", "prompt_set", "vault_add",
+    "config_set", "prompt_set", "vault_add", "settings_apply_patch", "settings_reset",
     "memory_store", "memory_clear", "clipboard_write",
     "crawl", "crawl_url",
     "service_control", "container_control", "remote_task", "mesh_task",
@@ -60,6 +60,7 @@ class ExecutionRisk:
     deletion: bool
     protected_path: bool
     destructive: bool
+    security_change: bool
     reasons: tuple[str, ...]
     command: str
     cwd: str
@@ -67,7 +68,7 @@ class ExecutionRisk:
 
     @property
     def level(self) -> str:
-        if self.elevation or self.destructive or self.deletion:
+        if self.elevation or self.destructive or self.deletion or self.security_change:
             return "high"
         if self.mutation:
             return "write"
@@ -88,6 +89,7 @@ def assess_execution(tool_name: str, args: dict[str, Any], *, destructive: bool 
     canonical_tool = re.split(r"[./:]", normalized_tool)[-1]
     metadata_mutating = args.get("_mutating")
     metadata_destructive = args.get("_destructive")
+    security_change = args.get("_security_change") is True
     sudo_requested = bool(args.get("sudo")) or bool(SUDO_PREFIX_RE.match(command))
     explicit_elevation = sudo_requested or bool(_ELEVATION_PREFIX_RE.match(command))
     deletion = (
@@ -119,15 +121,18 @@ def assess_execution(tool_name: str, args: dict[str, Any], *, destructive: bool 
         reasons.append("geschützter Systempfad betroffen")
     if destructive:
         reasons.append("potenziell destruktives Befehlsmuster")
+    if security_change:
+        reasons.append("Sicherheitsgrenze oder unbeaufsichtigte Berechtigung wird geändert")
 
     return ExecutionRisk(
-        needs_approval=bool(explicit_elevation or mutation or destructive),
+        needs_approval=bool(explicit_elevation or mutation or destructive or security_change),
         elevation=explicit_elevation,
         sudo=sudo_requested,
         mutation=mutation,
         deletion=deletion,
         protected_path=protected_path,
         destructive=destructive,
+        security_change=security_change,
         reasons=tuple(dict.fromkeys(reasons)),
         command=command,
         cwd=cwd,
@@ -147,6 +152,8 @@ def format_request(risk: ExecutionRisk) -> str:
         details.append(f"  Risiko  : {'; '.join(risk.reasons)}")
     if risk.elevation:
         details.append("  Status  : Root/sudo erfordert immer eine ausdrückliche Einmal-Freigabe")
+    if risk.security_change:
+        details.append("  Status  : Sicherheitsänderungen werden niemals automatisch freigegeben")
     return "\n".join(details)
 
 
@@ -159,7 +166,7 @@ def approval_is_automatic(mode: str, risk: ExecutionRisk) -> bool:
     mode = str(mode or "ask").strip().lower()
     if not risk.needs_approval:
         return True
-    if risk.elevation:
+    if risk.elevation or risk.security_change:
         return False
     if mode == "all":
         return bool(risk.mutation and not risk.deletion and not risk.destructive)
