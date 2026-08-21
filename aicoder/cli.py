@@ -222,6 +222,47 @@ def cmd_tool_mode(args: argparse.Namespace) -> int:
         print(f"tool-mode = {get_state().get('tool_mode', 'on_demand')}")
     return 0
 
+def cmd_plugin(args: argparse.Namespace) -> int:
+    from .plugins import discover_plugins, set_plugin_enabled
+    workspace = active_workspace(get_state().get("workspace_root"))
+    action = getattr(args, "plugin_action", None) or "list"
+    registry = discover_plugins(workspace)
+    if action == "paths":
+        config = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "aicoder"
+        print(f"builtin: internal")
+        print(f"user: {config / 'plugins'}")
+        print(f"workspace: {workspace / '.aicoder' / 'plugins'}")
+        return 0
+    plugin_id = getattr(args, "plugin_id", None)
+    if action in {"enable", "disable"}:
+        if registry.get(plugin_id) is None:
+            print(f"Error: unknown plugin: {plugin_id}", file=sys.stderr); return 2
+        set_plugin_enabled(plugin_id, action == "enable")
+        print(f"{plugin_id} → {'enabled' if action == 'enable' else 'disabled'}")
+        return 0
+    if action == "list":
+        for record in registry.all():
+            mode = "provider" if record.executable else "manifest"
+            state = "enabled" if record.enabled else "disabled"
+            print(f"{record.plugin_id:<24} {record.scope:<9} {state:<8} {mode}")
+        return 0
+    records = registry.all() if not plugin_id else [registry.get(plugin_id)]
+    records = [record for record in records if record is not None]
+    if not records:
+        print(f"Error: unknown plugin: {plugin_id}", file=sys.stderr); return 2
+    payload = []
+    for record in records:
+        m = record.manifest
+        payload.append({"id": record.plugin_id, "name": m.name, "version": m.version,
+            "api_version": m.api_version, "scope": record.scope, "enabled": record.enabled,
+            "executable": record.executable, "trusted_builtin": m.trusted_builtin,
+            "capabilities": list(m.capability_groups), "tool_provider": m.tool_provider,
+            "path": str(m.path) if m.path else None, "conflicts": record.conflicts,
+            "diagnostics": record.diagnostics})
+    print(json.dumps(payload[0] if plugin_id else payload, indent=2, ensure_ascii=False, sort_keys=True))
+    return 1 if action == "doctor" and any(item["diagnostics"] for item in payload) else 0
+
+
 def cmd_runtime(args: argparse.Namespace) -> int:
     value = getattr(args, "value", None)
     if value:
@@ -1107,6 +1148,26 @@ def build_parser() -> argparse.ArgumentParser:
     sp = settings_sub.add_parser("doctor", help="Validate settings storage, schema and file permissions")
     sp.add_argument("--json", dest="json_out", action="store_true")
     sp.set_defaults(func=cmd_settings)
+
+    p = sub.add_parser("plugin", help="Discover and manage AICoder plugins")
+    plugin_sub = p.add_subparsers(dest="plugin_action")
+    p.set_defaults(func=cmd_plugin, plugin_action="list")
+    sp = plugin_sub.add_parser("list", help="List effective plugins")
+    sp.set_defaults(func=cmd_plugin)
+    sp = plugin_sub.add_parser("info", help="Show one plugin manifest")
+    sp.add_argument("plugin_id")
+    sp.set_defaults(func=cmd_plugin)
+    sp = plugin_sub.add_parser("enable", help="Enable a plugin")
+    sp.add_argument("plugin_id")
+    sp.set_defaults(func=cmd_plugin)
+    sp = plugin_sub.add_parser("disable", help="Disable a plugin")
+    sp.add_argument("plugin_id")
+    sp.set_defaults(func=cmd_plugin)
+    sp = plugin_sub.add_parser("doctor", help="Validate one plugin or the effective registry")
+    sp.add_argument("plugin_id", nargs="?")
+    sp.set_defaults(func=cmd_plugin)
+    sp = plugin_sub.add_parser("paths", help="Show plugin discovery roots")
+    sp.set_defaults(func=cmd_plugin)
 
     p = sub.add_parser("skills", help="List or read native AICoder workflow skills")
     p.add_argument("name", nargs="?", help="Skill name to read")

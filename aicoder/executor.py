@@ -26,7 +26,7 @@ from .config import load_session
 from .docs_context import read_agents_md
 from .privileges import assess_execution
 from .session_state import get_state
-from .settings_tools import TOOL_SCHEMAS as SETTINGS_TOOL_SCHEMAS
+from .plugins import discover_plugins
 from .workspace import active_workspace, path_within_workspace
 from .tool_policy import (
     CODING_MCP_TOOLS,
@@ -577,7 +577,6 @@ LOCAL_TOOL_SCHEMAS = [
     LOCAL_CLIPBOARD_READ_SCHEMA,
     LOCAL_CLIPBOARD_WRITE_SCHEMA,
     LOCAL_WEB_FETCH_SCHEMA,
-    *SETTINGS_TOOL_SCHEMAS,
 ]
 
 # Names of all local tools (for dispatch in run_tool)
@@ -763,10 +762,13 @@ def load_tools(client: TriForceClient, force_refresh: bool = False) -> list[dict
         print(f"  \033[33m  → Backend erreichbar? Versuch: aicoder mcp health\033[0m", file=sys.stderr)
         mcp_tools = FALLBACK_TOOLS
 
-    # Local execution capabilities intentionally shadow same-named MCP tools: coding
-    # commands must run on the user's AICoder machine/workspace, not on the TriForce server.
-    mcp_tools = [tool for tool in mcp_tools if tool.get("name") not in LOCAL_TOOL_NAMES]
-    result = LOCAL_TOOL_SCHEMAS + mcp_tools
+    # Trusted built-in ToolProviders share the same model-facing catalog. External
+    # providers remain declarative until the later trust/privilege phase.
+    registry = discover_plugins(_workspace_root())
+    provider_tools = registry.tool_schemas()
+    local_names = LOCAL_TOOL_NAMES | {str(tool.get("name") or "") for tool in provider_tools}
+    mcp_tools = [tool for tool in mcp_tools if tool.get("name") not in local_names]
+    result = LOCAL_TOOL_SCHEMAS + provider_tools + mcp_tools
     _tool_security_hints = {
         str(tool.get("name", "")): _tool_security_metadata(tool)
         for tool in result
@@ -1549,6 +1551,15 @@ def run_tool(
         approval_args["_mutating"] = True
         if security_change_requested(name, args):
             approval_args["_security_change"] = True
+    provider = discover_plugins(_workspace_root()).provider_for_tool(name)
+    if provider is not None:
+        provider_security = provider.security_for(name, args)
+        approval_args["_mutating"] = provider_security.mutating
+        approval_args["_destructive"] = provider_security.destructive
+        if provider_security.requires_elevation:
+            approval_args["sudo"] = True
+        if provider_security.security_boundary:
+            approval_args["_security_change"] = True
     mutating_hint, destructive_hint = _tool_security_hints.get(name, (None, None))
     if isinstance(mutating_hint, bool):
         approval_args["_mutating"] = mutating_hint
@@ -1591,7 +1602,8 @@ def run_tool(
         execution_args["_workspace_escape_approved"] = True
 
     # Route local tools (all execute via subprocess on client machine)
-    _is_local = name in LOCAL_TOOL_NAMES
+    _provider = discover_plugins(_workspace_root()).provider_for_tool(name)
+    _is_local = name in LOCAL_TOOL_NAMES or _provider is not None
 
     t_start = time.time()
 
@@ -1636,9 +1648,8 @@ def run_tool(
     elif name == "web_fetch_local":
         from .web_search import web_fetch
         result, is_error = web_fetch(args.get("url", ""))
-    elif name.startswith("settings_"):
-        from .settings_tools import run as run_settings_tool
-        result, is_error = run_settings_tool(name, execution_args)
+    elif (provider := discover_plugins(_workspace_root()).provider_for_tool(name)) is not None:
+        result, is_error = provider.execute(name, execution_args)
     elif _is_local:
         result, is_error = f"{name}: no safe local handler is registered", True
     else:
