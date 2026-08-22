@@ -42,7 +42,7 @@ class AgentJournalTests(unittest.TestCase):
             first = NativeLightRuntime(
                 client=first_client,
                 initial_prompt="Inspect README and continue the migration",
-                model="test/model",
+                model="openrouter/test/model",
                 fallback_model=None,
                 workspace_root=str(workspace),
                 tools=[LOCAL_FILE_READ_SCHEMA],
@@ -50,6 +50,7 @@ class AgentJournalTests(unittest.TestCase):
                 plan_store=plans,
                 journal_store=journals,
                 base_timeout=30,
+                native_openrouter_tool_calling=True,
             )
             with (
                 patch("aicoder.agent_runtime.MAX_ITERATIONS", 1),

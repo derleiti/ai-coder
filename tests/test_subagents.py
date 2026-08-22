@@ -39,7 +39,7 @@ class _RuntimeTransport:
 
     def chat(self, **kwargs):
         self.calls.append(dict(kwargs))
-        if kwargs.get("tools") is None:
+        if not kwargs.get("messages"):
             return {
                 "response": '<tool_call>{"name":"file_edit","arguments":{"path":"owned.txt","operation":"write","content":"bad"}}</tool_call>\nPotential issue found.',
                 "model": "test/model",
@@ -59,7 +59,7 @@ class _ResumeTransport:
         self.main_calls = 0
 
     def chat(self, **kwargs):
-        if kwargs.get("tools") is None:
+        if not kwargs.get("messages"):
             return {"response": "Advisory: consider another write.", "model": "test/model"}
         self.main_calls += 1
         if self.main_calls == 1:
@@ -155,8 +155,9 @@ class _ToolCapableSubagentTransport:
 
     def chat(self, **kwargs):
         self.calls.append(dict(kwargs))
-        names = {str(tool.get("name")) for tool in (kwargs.get("tools") or [])}
-        if "subagent_run" in names:
+        messages = kwargs.get("messages") or []
+        system = str(messages[0].get("content", "")) if messages else str(kwargs.get("system_prompt") or "")
+        if "subagent_run(" in system:
             self.main_calls += 1
             if self.main_calls == 1:
                 return {
@@ -197,12 +198,19 @@ class SubagentRuntimeTests(unittest.TestCase):
             self.assertEqual(result.status, "completed")
             self.assertEqual(local_run.call_count, 1)
             self.assertEqual(local_run.call_args.args[1], "file_read")
-            child_calls = [call for call in transport.calls if call.get("tools") and
-                           "subagent_run" not in {tool.get("name") for tool in call["tools"]}]
+            child_calls = []
+            for call in transport.calls:
+                messages = call.get("messages") or []
+                if not messages:
+                    continue
+                system = str(messages[0].get("content", ""))
+                if "subagent_run(" not in system and "file_read(" in system:
+                    child_calls.append(call)
             self.assertTrue(child_calls)
-            self.assertTrue(all("subagent_run" not in {tool.get("name") for tool in call["tools"]}
+            self.assertTrue(all(call.get("tools") is None for call in transport.calls))
+            self.assertTrue(all("subagent_run(" not in str(call["messages"][0].get("content", ""))
                                 for call in child_calls))
-            self.assertTrue(any("file_read" in {tool.get("name") for tool in call["tools"]}
+            self.assertTrue(any("file_read(" in str(call["messages"][0].get("content", ""))
                                 for call in child_calls))
 
     def test_debug_subagent_inherits_parent_fallback_and_stop_callback(self):

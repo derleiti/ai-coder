@@ -79,11 +79,13 @@ class GuiSettingsSchemaTests(unittest.TestCase):
             tool_mode="always",
             approval_mode="autopilot",
             runtime_mode="classic",
+            native_openrouter_tool_calling=True,
         )
         widget._refresh_external_settings()
         self.assertEqual(widget.model_combo.currentText(), "provider/new-model")
         self.assertEqual(widget.timeout_spin.value(), 180)
         self.assertEqual(widget.tool_mode_combo.currentData(), "always")
+        self.assertTrue(widget.native_openrouter_checkbox.isChecked())
         self.assertEqual(widget.approval_mode_combo.currentData(), "autopilot")
         self.assertEqual(widget._schema_widgets["runtime_mode"].currentData(), "classic")
 

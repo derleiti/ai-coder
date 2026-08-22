@@ -231,6 +231,7 @@ class _AgentWorker(QThread):
             max_output_tokens=int(state.get("max_output_tokens", 16384)),
             tools_unavailable_reason=self.tools_unavailable_reason,
             progressive_tool_disclosure=self.progressive_tool_disclosure,
+            native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
         )
         result = runtime.run()
         self.tools = result.tools

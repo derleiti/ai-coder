@@ -57,8 +57,14 @@ class CapabilityDetectionTests(unittest.TestCase):
             with self.subTest(model=model):
                 self.assertFalse(mc.supports_tools(self.client, model))
 
-    def test_other_function_calling_provider_is_accepted(self):
+    def test_other_function_calling_provider_is_accepted_by_capability_probe(self):
         self.assertTrue(mc.supports_tools(self.client, "mistral/mistral-code-agent-latest"))
+
+    def test_openrouter_capability_probe_can_be_explicitly_enabled(self):
+        self.assertTrue(mc.supports_tools(
+            self.client, "openrouter/nvidia/nemotron-3-ultra-550b-a55b",
+            allow_openrouter=True,
+        ))
 
     def test_boolean_flag_variant_is_understood(self):
         # Not every backend uses the capabilities list.
@@ -100,17 +106,21 @@ class RuntimeGateTests(unittest.TestCase):
             workspace_root="/tmp",
         )
 
-    def test_tools_are_suppressed_for_a_chat_only_model(self):
+    def test_text_only_default_suppresses_native_tools_without_warning(self):
         runtime = self._runtime("nvidia/nvidia/nemotron-3-ultra-550b-a55b")
         events = []
         runtime.event_fn = lambda kind, payload: events.append((kind, payload))
         tools = [{"name": "file_edit"}, {"name": "file_read"}]
         self.assertIsNone(runtime._tools_for_request(tools, runtime.model))
-        self.assertEqual([kind for kind, _ in events], ["model_without_tool_support"])
-        self.assertNotIn("alternative", events[0][1])
+        self.assertEqual(events, [])
 
-    def test_warning_is_emitted_only_once_per_run(self):
-        runtime = self._runtime("nvidia/nvidia/nemotron-3-ultra-550b-a55b")
+    def test_opted_in_openrouter_chat_only_model_warns_only_once(self):
+        client = _FakeClient(CATALOGUE + [{"id": "openrouter/chat-only", "capabilities": ["chat"]}])
+        from aicoder.agent_runtime import NativeLightRuntime
+        runtime = NativeLightRuntime(
+            client=client, initial_prompt="implementiere Tetris", model="openrouter/chat-only",
+            fallback_model=None, workspace_root="/tmp", native_openrouter_tool_calling=True,
+        )
         events = []
         runtime.event_fn = lambda kind, payload: events.append(kind)
         tools = [{"name": "file_edit"}]
@@ -118,15 +128,61 @@ class RuntimeGateTests(unittest.TestCase):
             runtime._tools_for_request(tools, runtime.model)
         self.assertEqual(events.count("model_without_tool_support"), 1)
 
-    def test_openrouter_runtime_never_sends_native_tool_schemas(self):
+    def test_openrouter_runtime_is_text_only_by_default(self):
         runtime = self._runtime("openrouter/nvidia/nemotron-3-ultra-550b-a55b")
         tools = [{"name": "file_edit"}, {"name": "file_read"}]
         self.assertIsNone(runtime._tools_for_request(tools, runtime.model))
 
-    def test_tools_pass_through_for_a_capable_model(self):
+    def test_other_capable_providers_are_text_only_by_default(self):
         runtime = self._runtime("mistral/mistral-code-agent-latest")
         tools = [{"name": "file_edit"}]
+        self.assertIsNone(runtime._tools_for_request(tools, runtime.model))
+
+    def test_openrouter_native_tools_require_explicit_opt_in(self):
+        runtime = self._runtime("openrouter/nvidia/nemotron-3-ultra-550b-a55b")
+        runtime.native_openrouter_tool_calling = True
+        tools = [{"name": "file_edit"}, {"name": "file_read"}]
         self.assertEqual(runtime._tools_for_request(tools, runtime.model), tools)
+
+    def test_opt_in_never_enables_native_tools_for_non_openrouter_provider(self):
+        runtime = self._runtime("mistral/mistral-code-agent-latest")
+        runtime.native_openrouter_tool_calling = True
+        tools = [{"name": "file_edit"}]
+        self.assertIsNone(runtime._tools_for_request(tools, runtime.model))
+
+    def test_text_mode_ignores_unexpected_native_tool_calls(self):
+        from unittest.mock import MagicMock, patch
+        from aicoder.agent_runtime import NativeLightRuntime
+        client = MagicMock()
+        client.timeout = 30
+        client.chat.side_effect = [
+            {
+                "response": "DONE: text path stayed authoritative",
+                "tool_calls": [{"function": {"name": "file_edit", "arguments": "{}"}}],
+                "model": "mistral/mistral-code-agent-latest",
+            }
+        ]
+        runtime = NativeLightRuntime(
+            client=client, initial_prompt="hello",
+            model="mistral/mistral-code-agent-latest", fallback_model=None,
+            workspace_root="/tmp", tools=[{"name":"file_edit","inputSchema":{"type":"object"}}],
+            load_tools_on_start=True, persistent_plan=False,
+        )
+        with patch("aicoder.agent_runtime.run_tool") as execute:
+            result = runtime.run()
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.response, "DONE: text path stayed authoritative")
+        execute.assert_not_called()
+        self.assertIsNone(client.chat.call_args.kwargs["tools"])
+
+    def test_native_openrouter_prompt_removes_text_tool_format(self):
+        from aicoder.executor import build_system_prompt
+        runtime = self._runtime("openrouter/nvidia/nemotron-3-ultra-550b-a55b")
+        runtime.native_openrouter_tool_calling = True
+        base = build_system_prompt([{"name":"file_read","inputSchema":{"type":"object"}}], "/tmp")
+        native = runtime._system_for_tool_protocol(base, native=True)
+        self.assertNotIn("## Tool Call Format (one per response):", native)
+        self.assertIn("Use only the provider-native function/tool calls", native)
 
     def test_empty_tool_list_stays_none(self):
         runtime = self._runtime("mistral/mistral-code-agent-latest")

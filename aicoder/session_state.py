@@ -94,6 +94,10 @@ def set_enabled_tools(names: Optional[list[str]]) -> None:
     _apply(enabled_tools=names)
 
 
+def set_native_openrouter_tool_calling(enabled: bool) -> None:
+    _apply(native_openrouter_tool_calling=bool(enabled))
+
+
 def set_approval_mode(mode: str) -> None:
     _apply(approval_mode=mode)
 

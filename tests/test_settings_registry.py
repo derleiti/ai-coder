@@ -81,6 +81,7 @@ class StoreTests(unittest.TestCase):
 
     def test_missing_file_yields_defaults(self):
         self.assertEqual(self.store.get("tool_mode"), "on_demand")
+        self.assertFalse(self.store.get("native_openrouter_tool_calling"))
         self.assertEqual(self.store.get("runtime_mode"), "native-light")
 
     def test_write_is_owner_only_and_versioned(self):
@@ -98,6 +99,8 @@ class StoreTests(unittest.TestCase):
 
     def test_invalid_value_is_rejected_before_it_reaches_disk(self):
         self.store.set("tool_mode", "always")
+        self.store.set("native_openrouter_tool_calling", True)
+        self.assertTrue(self.store.get("native_openrouter_tool_calling"))
         with self.assertRaises(SettingsError):
             self.store.set("tool_mode", "bogus")
         self.assertEqual(self.store.get("tool_mode"), "always")

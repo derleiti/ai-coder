@@ -3,7 +3,7 @@ from __future__ import annotations
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLineEdit, QPushButton, QComboBox, QLabel, QGroupBox, QMessageBox,
-    QListWidget, QListWidgetItem, QSpinBox, QSizePolicy, QScrollArea,
+    QListWidget, QListWidgetItem, QSpinBox, QSizePolicy, QScrollArea, QCheckBox,
 )
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 
@@ -11,7 +11,7 @@ from ..config import DEFAULT_BASE_URL, Session, load_session, save_session, dele
 from ..session_state import (
     SWARM_MODES, get_state, set_model, set_fallback, set_swarm,
     set_tool_mode, set_enabled_tools, set_request_timeout,
-    set_approval_mode,
+    set_approval_mode, set_native_openrouter_tool_calling,
 )
 from ..client import TriForceClient, model_identifier
 from .. import settings as settings_core
@@ -286,6 +286,15 @@ class SettingsWidget(QWidget):
         mode_row.addWidget(self.tool_search, stretch=1)
         tools_layout.addLayout(mode_row)
 
+        self.native_openrouter_checkbox = QCheckBox(
+            "Enable native OpenRouter function calling (experimental)"
+        )
+        self.native_openrouter_checkbox.setToolTip(
+            settings_core.REGISTRY["native_openrouter_tool_calling"].description
+        )
+        self.native_openrouter_checkbox.stateChanged.connect(self._save_native_openrouter_tool_calling)
+        tools_layout.addWidget(self.native_openrouter_checkbox)
+
         self.tool_list = QListWidget()
         self.tool_list.setMinimumHeight(120)
         self.tool_list.setMaximumHeight(260)
@@ -316,6 +325,7 @@ class SettingsWidget(QWidget):
         handled = {
             "selected_model", "fallback_model", "swarm_mode", "tool_mode",
             "enabled_tools", "request_timeout", "approval_mode",
+            "native_openrouter_tool_calling",
         }
         additional = [
             spec for key, spec in sorted(settings_core.REGISTRY.items(), key=lambda item: (item[1].group, item[0]))
@@ -460,6 +470,9 @@ class SettingsWidget(QWidget):
             mode_idx = self.tool_mode_combo.findData(state.get("tool_mode", settings_core.REGISTRY["tool_mode"].default))
             if mode_idx >= 0:
                 self.tool_mode_combo.setCurrentIndex(mode_idx)
+            self.native_openrouter_checkbox.setChecked(
+                bool(state.get("native_openrouter_tool_calling", False))
+            )
             self.timeout_spin.setValue(int(state.get("request_timeout", settings_core.REGISTRY["request_timeout"].default)))
             approval_idx = self.approval_mode_combo.findData(state.get("approval_mode", settings_core.REGISTRY["approval_mode"].default))
             if approval_idx >= 0:
@@ -648,6 +661,17 @@ class SettingsWidget(QWidget):
         state = get_state()
         self._settings_snapshot = self._state_signature(state)
         self.tools_changed.emit(mode, state.get("enabled_tools"))
+
+    def _save_native_openrouter_tool_calling(self):
+        if self._loading_settings:
+            return
+        enabled = self.native_openrouter_checkbox.isChecked()
+        set_native_openrouter_tool_calling(enabled)
+        self.tool_status.setText(
+            "Native OpenRouter tools enabled" if enabled else "Text tool protocol enabled"
+        )
+        self.tool_status.setStyleSheet("color: #00ff88; font-size: 11px;")
+        self._settings_snapshot = self._state_signature(get_state())
 
     def _save_tool_config(self):
         mode = self.tool_mode_combo.currentData() or "on_demand"

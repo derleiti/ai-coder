@@ -209,6 +209,7 @@ def _run_native_light_agent(
         max_output_tokens=int(state.get("max_output_tokens", 16384)),
         tools_unavailable_reason=tools_unavailable_reason,
         progressive_tool_disclosure=(tool_mode == "on_demand"),
+        native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
     )
     result = runtime.run()
     if not header_printed and not (json_output or json_events):

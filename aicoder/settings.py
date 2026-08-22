@@ -140,6 +140,15 @@ _register(SettingSpec(
     ),
 ))
 _register(SettingSpec(
+    key="native_openrouter_tool_calling", type="bool", default=False,
+    group="tools", aliases=("openrouter_native_tools", "native_openrouter_tools"),
+    description=(
+        "Experimental compatibility switch. AICoder uses its provider-independent "
+        "text tool protocol by default for every model. Enable this only to send "
+        "provider-native tools/tool_choice to OpenRouter models."
+    ),
+))
+_register(SettingSpec(
     key="request_timeout", type="int", default=300, minimum=10, maximum=300,
     group="runtime", aliases=("timeout",),
     description="Seconds to wait for a single LLM request. Unrelated to shell/subprocess timeouts.",

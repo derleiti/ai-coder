@@ -154,6 +154,7 @@ class NativeLightRuntime:
     tools_unavailable_reason: str = ""
     max_iterations: int = MAX_ITERATIONS
     progressive_tool_disclosure: bool = True
+    native_openrouter_tool_calling: bool = False
     tool_budget: int = DEFAULT_TOOL_BUDGET
     max_expansion_rounds: int = MAX_EXPANSION_ROUNDS
     hooks: HookBus = field(default_factory=HookBus)
@@ -192,16 +193,42 @@ class NativeLightRuntime:
             return value
         raise value
 
-    def _tools_for_request(self, tools: list[dict] | None, model: str | None) -> list[dict] | None:
-        """Tool payload for one request, suppressed for chat-only models.
+    def _native_tool_calling_enabled(self, model: str | None) -> bool:
+        return bool(
+            self.native_openrouter_tool_calling
+            and str(model or "").startswith("openrouter/")
+        )
 
-        Several providers answer a tool-carrying request from a chat-only model
-        with an empty completion, which surfaces as an agent that silently does
-        nothing. Suppress only the provider-native schema payload; AICoder text-based tool calling remains available.
+    @staticmethod
+    def _system_for_tool_protocol(system: str, *, native: bool) -> str:
+        if not native:
+            return system
+        text_block = (
+            "## Tool Call Format (one per response):\n"
+            "<tool_call>\n"
+            '{"name": "tool_name", "arguments": {...}}\n'
+            "</tool_call>"
+        )
+        native_block = (
+            "## Tool Calling\n"
+            "Use only the provider-native function/tool calls supplied with this request.\n"
+            "Do not emit <tool_call> markup or manually constructed JSON tool calls in assistant text."
+        )
+        return system.replace(text_block, native_block)
+
+    def _tools_for_request(self, tools: list[dict] | None, model: str | None) -> list[dict] | None:
+        """Return native provider tool schemas only for explicit OpenRouter opt-in.
+
+        The default agent protocol is provider-independent text tool calling for
+        every model. The legacy/native path is preserved behind the experimental
+        ``native_openrouter_tool_calling`` setting so it can be tested without
+        competing with the text protocol during normal runs.
         """
         if not tools or not self.load_tools_on_start:
             return None
-        if supports_tools(self.client, model):
+        if not self._native_tool_calling_enabled(model):
+            return None
+        if supports_tools(self.client, model, allow_openrouter=True):
             # Freeze the active schema set for this model turn. Dynamic expansion
             # mutates the runtime working set only for subsequent turns.
             return list(tools)
@@ -502,7 +529,10 @@ class NativeLightRuntime:
                 error=reason,
             )
         base_system = self.system_prompt or build_system_prompt(tools, workspace)
-        system = self._with_plan_context(base_system, plan)
+        protocol_system = self._system_for_tool_protocol(
+            base_system, native=self._native_tool_calling_enabled(self.model)
+        )
+        system = self._with_plan_context(protocol_system, plan)
 
         prior_context = [
             dict(message) for message in (self.conversation or [])
@@ -600,7 +630,10 @@ class NativeLightRuntime:
                 plan.iteration = starting_plan_iteration + i + 1
                 plan.model = str(active_model or model_used or "")
                 self._save_plan(plan)
-                messages[0]["content"] = self._with_plan_context(base_system, plan)
+                protocol_system = self._system_for_tool_protocol(
+                    base_system, native=self._native_tool_calling_enabled(active_model)
+                )
+                messages[0]["content"] = self._with_plan_context(protocol_system, plan)
                 system = messages[0]["content"]
 
             messages.append({"role": "user", "content": current_input})
@@ -678,11 +711,17 @@ class NativeLightRuntime:
                 model=model_used, requested=active_model or "backend-default",
             )
 
-            native_calls = normalize_tool_calls(result.get("tool_calls") or [])
-            text_calls = parse_tool_calls(response)
-            recovered_calls = [] if text_calls else _recover_unclosed_tool_calls(response)
-            if recovered_calls:
-                self._emit("tool_call_recovered", iteration=i + 1, count=len(recovered_calls))
+            native_mode = self._native_tool_calling_enabled(active_model)
+            if native_mode:
+                native_calls = normalize_tool_calls(result.get("tool_calls") or [])
+                text_calls = []
+                recovered_calls = []
+            else:
+                native_calls = []
+                text_calls = parse_tool_calls(response)
+                recovered_calls = [] if text_calls else _recover_unclosed_tool_calls(response)
+                if recovered_calls:
+                    self._emit("tool_call_recovered", iteration=i + 1, count=len(recovered_calls))
             calls = merge_tool_calls(native_calls, text_calls, recovered_calls)
             if native_calls and not response:
                 response = "\n".join(
@@ -853,7 +892,10 @@ class NativeLightRuntime:
                             str(tool.get("name")) for tool in tools if tool.get("name")
                         }
                         base_system = self.system_prompt or build_system_prompt(tools, workspace)
-                        messages[0]["content"] = self._with_plan_context(base_system, plan)
+                        protocol_system = self._system_for_tool_protocol(
+                            base_system, native=self._native_tool_calling_enabled(active_model)
+                        )
+                        messages[0]["content"] = self._with_plan_context(protocol_system, plan)
                         system = messages[0]["content"]
                     self._emit(
                         "tool_result", name=name, result=tool_result,

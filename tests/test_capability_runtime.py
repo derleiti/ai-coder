@@ -100,11 +100,10 @@ class CapabilityRuntimeTests(unittest.TestCase):
             result=runtime.run()
         self.assertEqual(result.status,"completed")
         self.assertEqual(client.chat.call_count,2)
-        first={t["name"] for t in client.chat.call_args_list[0].kwargs["tools"]}
-        second={t["name"] for t in client.chat.call_args_list[1].kwargs["tools"]}
-        self.assertNotIn("docker_list",first)
-        self.assertIn("docker_list",second)
-        self.assertIn("capability_request",second)
+        self.assertIsNone(client.chat.call_args_list[0].kwargs["tools"])
+        self.assertIsNone(client.chat.call_args_list[1].kwargs["tools"])
+        self.assertIn("docker_list", result.system_prompt)
+        self.assertIn("capability_request", result.system_prompt)
 
 
     def test_resume_capabilities_use_original_plan_task(self):

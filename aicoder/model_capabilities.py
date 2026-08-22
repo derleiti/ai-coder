@@ -125,16 +125,16 @@ def capabilities(client: Any, model: str | None) -> Optional[frozenset[str]]:
     return load_catalogue(client).get(str(model))
 
 
-def supports_tools(client: Any, model: str | None) -> bool:
-    """Whether AICoder should send provider-native tool schemas for this model.
+def supports_tools(client: Any, model: str | None, *, allow_openrouter: bool = False) -> bool:
+    """Whether the selected model advertises provider-native tool support.
 
-    OpenRouter is intentionally pinned to AICoder's text-based tool protocol.
-    Its models may advertise native function calling, but AICoder keeps one
-    provider-independent conversation loop there and does not send native
-    ``tools`` / ``tool_choice`` payloads through OpenRouter.
+    AICoder's agent runtime is text-tool-first. OpenRouter remains pinned to the
+    text protocol unless the explicit experimental setting opts in, in which
+    case callers pass ``allow_openrouter=True`` and this function evaluates the
+    catalogue normally.
     """
     model_id = str(model or "")
-    if model_id.startswith("openrouter/"):
+    if model_id.startswith("openrouter/") and not allow_openrouter:
         return False
     caps = capabilities(client, model)
     if caps is None or not caps:
