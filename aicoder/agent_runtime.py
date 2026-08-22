@@ -708,9 +708,14 @@ class NativeLightRuntime:
                 reason = str(exc)
                 category, _signature, retryable = FailureTracker.classify(reason)
                 if retryable and category == "transient":
+                    retry_after = getattr(exc, "retry_after", None)
+                    wait_hint = (
+                        f" Recommended retry delay: {int(retry_after)}s."
+                        if isinstance(retry_after, int) and retry_after > 0 else ""
+                    )
                     pause_reason = (
                         "Transient model/backend failure after request retries were exhausted: "
-                        f"{reason}"
+                        f"{reason}{wait_hint}"
                     )
                     self._pause_plan(plan, pause_reason)
                     self._save_journal(
@@ -718,6 +723,7 @@ class NativeLightRuntime:
                     )
                     self._emit(
                         "paused", reason=pause_reason, failure_category=category, resumable=True,
+                        retry_after=getattr(exc, "retry_after", None),
                     )
                     return AgentRunResult(
                         "paused", pause_reason, model_used, messages, tools, system,

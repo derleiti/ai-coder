@@ -117,5 +117,38 @@ class RuntimeResilienceTests(unittest.TestCase):
             self.assertEqual(resumed.status, "completed")
 
 
+    def test_chat_sets_keepalive_header(self):
+        client = TriForceClient("http://example.invalid", token="token", timeout=1)
+        with patch.object(client, "_request", return_value={"response": "ok", "model": "m"}) as request:
+            result = client.chat(message="hi", model="m")
+        self.assertEqual(result["response"], "ok")
+        self.assertEqual(request.call_args.kwargs["_extra_headers"], {"X-AICoder-Keepalive": "json"})
+
+    def test_structured_stream_error_preserves_retry_after(self):
+        from aicoder.client import _normalize_chat_response
+        with self.assertRaises(ClientError) as caught:
+            _normalize_chat_response({
+                "error": {"status": 524, "detail": "origin timeout", "retryable": True, "retry_after": 120}
+            })
+        self.assertEqual(caught.exception.status_code, 524)
+        self.assertTrue(caught.exception.retryable)
+        self.assertEqual(caught.exception.retry_after, 120)
+
+    def test_runtime_pause_surfaces_retry_after(self):
+        client = MagicMock()
+        client.timeout = 30
+        client.chat.side_effect = ClientError(
+            "HTTP 524: timeout", status_code=524, retryable=True, retry_after=120
+        )
+        runtime = NativeLightRuntime(
+            client=client, initial_prompt="Inspect workspace", model="test/model",
+            fallback_model=None, workspace_root=".", tools=[], load_tools_on_start=False,
+            persistent_plan=False,
+        )
+        result = runtime.run()
+        self.assertEqual(result.status, "paused")
+        self.assertIn("Recommended retry delay: 120s", result.response)
+
+
 if __name__ == "__main__":
     unittest.main()

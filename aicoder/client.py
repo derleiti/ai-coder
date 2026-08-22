@@ -61,7 +61,35 @@ def _decode_jwt_exp(token: str) -> Optional[int]:
 
 
 class ClientError(RuntimeError):
-    pass
+    def __init__(
+        self, message: str, *, status_code: int | None = None,
+        retryable: bool | None = None, retry_after: int | None = None,
+        payload: Any = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retryable = retryable
+        self.retry_after = retry_after
+        self.payload = payload
+
+
+def _error_metadata(payload: Any, status_code: int | None = None) -> tuple[int | None, bool | None, int | None]:
+    data = payload if isinstance(payload, dict) else {}
+    error = data.get("error") if isinstance(data.get("error"), dict) else data
+    status = error.get("status", error.get("status_code", status_code))
+    try:
+        status = int(status) if status is not None else status_code
+    except (TypeError, ValueError):
+        status = status_code
+    retryable = error.get("retryable")
+    if retryable is None and status is not None:
+        retryable = status in {408, 429, 500, 502, 503, 504, 524}
+    retry_after = error.get("retry_after")
+    try:
+        retry_after = int(retry_after) if retry_after is not None else None
+    except (TypeError, ValueError):
+        retry_after = None
+    return status, bool(retryable) if retryable is not None else None, retry_after
 
 
 class TokenExpiredError(ClientError):
@@ -89,8 +117,11 @@ def _normalize_chat_response(data: Any) -> Dict[str, Any]:
     if not isinstance(data, dict):
         raise ClientError(f"Chat backend returned {type(data).__name__}, expected object")
     if data.get("error") is not None and not data.get("response"):
+        status, retryable, retry_after = _error_metadata(data)
+        detail = data.get("error")
         raise ClientError(
-            f"Chat backend error: {json.dumps(data['error'], ensure_ascii=False, default=str)}"
+            f"Chat backend error: {json.dumps(detail, ensure_ascii=False, default=str)}",
+            status_code=status, retryable=retryable, retry_after=retry_after, payload=data,
         )
     if "response" in data:
         return data
@@ -238,6 +269,7 @@ class TriForceClient:
         require_auth: bool = False,
         _label: str = "",
         _retries: int = 1,
+        _extra_headers: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         url = urljoin(self.base_url + "/", path.lstrip("/"))
         data = None
@@ -247,6 +279,8 @@ class TriForceClient:
             "User-Agent": USER_AGENT,
             "X-Client-Profile": CLIENT_PROFILE,
         }
+        if _extra_headers:
+            headers.update({str(k): str(v) for k, v in _extra_headers.items()})
         if require_auth:
             if not self.token:
                 raise ClientError("Kein Token vorhanden. Erst einloggen.")
@@ -304,7 +338,11 @@ class TriForceClient:
                             raise TokenExpiredError(
                                 f"Token expired (HTTP {resp.status}). Please re-login: aicoder setup"
                             )
-                    raise ClientError(f"HTTP {resp.status}{label} bei {url}: {parsed}")
+                    status, retryable, retry_after = _error_metadata(parsed, resp.status)
+                    raise ClientError(
+                        f"HTTP {resp.status}{label} bei {url}: {parsed}",
+                        status_code=status, retryable=retryable, retry_after=retry_after, payload=parsed,
+                    )
                 raw = resp.data.decode("utf-8")
                 return json.loads(raw) if raw else {}
             except (TokenExpiredError, ClientError):
@@ -337,7 +375,11 @@ class TriForceClient:
                     raise TokenExpiredError(
                         f"Token expired (HTTP {e.code}). Please re-login: aicoder setup"
                     ) from e
-            raise ClientError(f"HTTP {e.code}{label} bei {url}: {parsed}") from e
+            status, retryable, retry_after = _error_metadata(parsed, e.code)
+            raise ClientError(
+                f"HTTP {e.code}{label} bei {url}: {parsed}",
+                status_code=status, retryable=retryable, retry_after=retry_after, payload=parsed,
+            ) from e
         except TimeoutError:
             label = f" [{_label}]" if _label else ""
             raise ClientError(
@@ -469,6 +511,7 @@ class TriForceClient:
             return _normalize_chat_response(self._request(
                 "POST", "/v1/client/chat", payload, require_auth=True,
                 _label=f"chat/{model or 'default'}", _retries=0,
+                _extra_headers={"X-AICoder-Keepalive": "json"},
             ))
         except TokenExpiredError:
             raise
@@ -485,6 +528,7 @@ class TriForceClient:
                 fallback_result = _normalize_chat_response(self._request(
                     "POST", "/v1/client/chat", payload, require_auth=True,
                     _label=f"chat/{fallback_model}(fallback)", _retries=0,
+                    _extra_headers={"X-AICoder-Keepalive": "json"},
                 ))
                 if isinstance(fallback_result, dict):
                     fallback_result = dict(fallback_result)
