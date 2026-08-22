@@ -203,6 +203,85 @@ class NativeLightPlanTests(unittest.TestCase):
                 "in_progress",
             )
 
+    def test_complete_json_in_unclosed_tool_tag_is_recovered_and_executed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp)
+            client = MagicMock()
+            client.timeout = 30
+            client.chat.side_effect = [
+                {"response": '<tool_call>{"name":"file_read","arguments":{"path":"README.md"}}', "model": "test/model"},
+                {"response": "DONE: recovered tool call and finished", "model": "test/model"},
+            ]
+            runtime = NativeLightRuntime(
+                client=client, initial_prompt="Inspect README", model="test/model",
+                fallback_model=None, workspace_root=str(workspace),
+                tools=[LOCAL_FILE_READ_SCHEMA], load_tools_on_start=True,
+                persistent_plan=False, base_timeout=30,
+            )
+            events = []
+            runtime.event_fn = lambda name, payload: events.append((name, payload))
+            with patch("aicoder.agent_runtime.run_tool", return_value=("README contents", False)) as execute:
+                result = runtime.run()
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(result.response, "DONE: recovered tool call and finished")
+            self.assertEqual(execute.call_count, 1)
+            self.assertTrue(any(name == "tool_call_recovered" for name, _ in events))
+
+    def test_truncated_tool_call_gets_one_repair_turn_then_finishes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp)
+            client = MagicMock()
+            client.timeout = 30
+            client.chat.side_effect = [
+                {"response": '<tool_call>{"name":"file_read","arguments":{"path":"README.md"', "model": "test/model"},
+                {"response": '<tool_call>{"name":"file_read","arguments":{"path":"README.md"}}</tool_call>', "model": "test/model"},
+                {"response": "DONE: repaired tool call and finished", "model": "test/model"},
+            ]
+            runtime = NativeLightRuntime(
+                client=client, initial_prompt="Inspect README", model="test/model",
+                fallback_model=None, workspace_root=str(workspace),
+                tools=[LOCAL_FILE_READ_SCHEMA], load_tools_on_start=True,
+                persistent_plan=False, base_timeout=30,
+            )
+            events = []
+            runtime.event_fn = lambda name, payload: events.append((name, payload))
+            with patch("aicoder.agent_runtime.run_tool", return_value=("README contents", False)) as execute:
+                result = runtime.run()
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(result.response, "DONE: repaired tool call and finished")
+            self.assertEqual(execute.call_count, 1)
+            self.assertEqual(client.chat.call_count, 3)
+            self.assertTrue(any(name == "final_response_repair" for name, _ in events))
+
+    def test_empty_response_after_tool_never_completes_and_pauses_after_repair(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            store = PlanStore(root / "plans")
+            client = MagicMock()
+            client.timeout = 30
+            client.chat.side_effect = [
+                {"response": '<tool_call>{"name":"file_read","arguments":{"path":"README.md"}}</tool_call>', "model": "test/model"},
+                {"response": "", "model": "test/model"},
+                {"response": "", "model": "test/model"},
+            ]
+            runtime = NativeLightRuntime(
+                client=client, initial_prompt="Inspect README and summarize", model="test/model",
+                fallback_model=None, workspace_root=str(workspace),
+                tools=[LOCAL_FILE_READ_SCHEMA], load_tools_on_start=True,
+                plan_store=store, base_timeout=30,
+            )
+            with patch("aicoder.agent_runtime.run_tool", return_value=("README contents", False)) as execute:
+                result = runtime.run()
+            self.assertEqual(result.status, "paused")
+            self.assertIn("no usable final response", result.response)
+            self.assertEqual(execute.call_count, 1)
+            plan = store.load_current(str(workspace))
+            self.assertEqual(plan.status, "paused")
+            self.assertEqual(plan.last_response, "")
+            self.assertIn("no usable final response", plan.pause_reason)
+
     def test_duplicate_tool_call_is_blocked_before_second_execution(self):
         with tempfile.TemporaryDirectory() as temp:
             workspace = Path(temp)

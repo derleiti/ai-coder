@@ -74,6 +74,39 @@ _VERIFICATION_REQUIRED_PROMPT = (
     "a read/check/lint/test tool now. Do not report DONE until verification succeeds."
 )
 
+_FINAL_RESPONSE_REPAIR_PROMPT = (
+    "Your previous response was empty or contained an incomplete tool-call envelope. "
+    "Continue from the existing tool results. If another tool is required, emit exactly "
+    "one complete valid tool call. Otherwise finish the user's task with a normal textual "
+    "answer. Do not return an empty response and do not stop after a tool call."
+)
+
+
+def _recover_unclosed_tool_calls(text: str) -> list[dict]:
+    """Recover only complete JSON after an unclosed final <tool_call> tag.
+
+    This is deliberately conservative: truncated or mixed prose/JSON is never guessed.
+    """
+    raw = str(text or "")
+    lowered = raw.lower()
+    start = lowered.rfind("<tool_call>")
+    if start < 0 or "</tool_call>" in lowered[start:]:
+        return []
+    payload = raw[start + len("<tool_call>"):].strip()
+    if not payload:
+        return []
+    try:
+        decoded = json.loads(payload)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return normalize_tool_calls(decoded)
+
+
+def _has_incomplete_tool_markup(text: str) -> bool:
+    lowered = str(text or "").lower()
+    start = lowered.rfind("<tool_call>")
+    return start >= 0 and "</tool_call>" not in lowered[start:]
+
 
 @dataclass
 class AgentRunResult:
@@ -531,6 +564,7 @@ class NativeLightRuntime:
         )
 
         iteration_limit = max(1, min(MAX_ITERATIONS, int(self.max_iterations or MAX_ITERATIONS)))
+        final_response_repair_sent = False
         for i in range(iteration_limit):
             if self._stopped():
                 reason = "Agent stopped by user"
@@ -608,7 +642,11 @@ class NativeLightRuntime:
             )
 
             native_calls = normalize_tool_calls(result.get("tool_calls") or [])
-            calls = merge_tool_calls(native_calls, parse_tool_calls(response))
+            text_calls = parse_tool_calls(response)
+            recovered_calls = [] if text_calls else _recover_unclosed_tool_calls(response)
+            if recovered_calls:
+                self._emit("tool_call_recovered", iteration=i + 1, count=len(recovered_calls))
+            calls = merge_tool_calls(native_calls, text_calls, recovered_calls)
             if native_calls and not response:
                 response = "\n".join(
                     f"<tool_call>{json.dumps(call, ensure_ascii=False)}</tool_call>"
@@ -620,6 +658,35 @@ class NativeLightRuntime:
                 self._emit("thought", text=visible, iteration=i + 1)
 
             if not calls:
+                unusable_final = (not response) or _has_incomplete_tool_markup(response)
+                if unusable_final:
+                    if response:
+                        messages.append({"role": "assistant", "content": response})
+                    if not final_response_repair_sent:
+                        current_input = _FINAL_RESPONSE_REPAIR_PROMPT
+                        final_response_repair_sent = True
+                        self._emit(
+                            "final_response_repair", iteration=i + 1,
+                            reason="empty_response" if not response else "incomplete_tool_call",
+                        )
+                        self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
+                        continue
+                    reason = (
+                        "Agent paused because the model returned no usable final response after "
+                        "a final-response repair request. Existing tool results and plan state "
+                        "were preserved for resume."
+                    )
+                    self._pause_plan(plan, reason, response)
+                    self._save_journal(plan, messages, pending_input=reason, tool_batches=journal_batches)
+                    self._emit("paused", reason=reason)
+                    if self.conversation is not None:
+                        self.conversation[:] = [dict(message) for message in messages[1:]][-MAX_CONTEXT_MESSAGES:]
+                    return AgentRunResult(
+                        "paused", reason, model_used, messages, tools, system,
+                        iterations=i + 1, latency_ms=total_latency,
+                        fallback_used=fallback_used, plan_id=plan.id if plan else "",
+                    )
+
                 if mutation_seen and not verification_seen:
                     messages.append({"role": "assistant", "content": response})
                     if not verification_nudge_sent:
