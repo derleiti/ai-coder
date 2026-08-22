@@ -397,10 +397,51 @@ def cmd_changes(args: argparse.Namespace) -> int:
     if action == "list":
         rows=journal.list(getattr(args,"limit",50))
         print(json.dumps(rows,indent=2,ensure_ascii=False,sort_keys=True)); return 0
-    row=journal.get(str(getattr(args,"change_id","") or ""))
+    change_id=str(getattr(args,"change_id","") or "")
+    row=journal.get(change_id)
     if row is None:
         print("Error: change not found",file=sys.stderr); return 2
-    print(json.dumps(row,indent=2,ensure_ascii=False,sort_keys=True)); return 0
+    if action == "show":
+        print(json.dumps(row,indent=2,ensure_ascii=False,sort_keys=True)); return 0
+
+    metadata=row.get("restore_metadata") if isinstance(row.get("restore_metadata"),dict) else {}
+    kind=str(metadata.get("kind") or "")
+    if not row.get("reversible"):
+        print("Error: change is marked irreversible",file=sys.stderr); return 2
+    approval_args={"reason":f"Rollback change {change_id}","_mutating":True,"_security_change":True}
+    approval_tool="file_edit"
+    if kind in {"restore_file","remove_created_file","remove_created_dir"}:
+        target=str(metadata.get("target") or "")
+        if not target:
+            print("Error: rollback metadata has no target",file=sys.stderr); return 2
+        approval_args.update({"path":target,"operation":"rollback"})
+        if kind in {"remove_created_file","remove_created_dir"}:
+            approval_args["_destructive"]=True
+        if kind == "remove_created_dir":
+            approval_tool="directory_create"
+        from .workspace import path_within_workspace
+        workspace=str(active_workspace(get_state().get("workspace_root")))
+        _resolved,inside=path_within_workspace(target,workspace)
+        if not inside:
+            approval_args["_workspace_escape"]=target
+            approval_args["_workspace_root"]=workspace
+    elif kind == "settings_patch":
+        previous=metadata.get("previous")
+        if not isinstance(previous,dict) or not previous:
+            print("Error: settings rollback metadata is incomplete",file=sys.stderr); return 2
+        approval_tool="settings_apply_patch"
+        approval_args["patch"]=previous
+    else:
+        print(f"Error: unsupported rollback kind: {kind or '?'}",file=sys.stderr); return 2
+
+    from .agent import _cli_approval
+    if not _cli_approval(approval_tool,approval_args):
+        print("Rollback rejected.",file=sys.stderr); return 3
+    try:
+        result=journal.rollback(change_id,approved=True)
+    except (OSError,ValueError,PermissionError,RuntimeError) as exc:
+        print(f"Error: rollback failed: {exc}",file=sys.stderr); return 1
+    print(json.dumps(result,indent=2,ensure_ascii=False,sort_keys=True)); return 0
 
 def cmd_runtime(args: argparse.Namespace) -> int:
     value = getattr(args, "value", None)
@@ -1354,6 +1395,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--limit", type=int, default=50)
     sp.set_defaults(func=cmd_changes)
     sp = changes_sub.add_parser("show", help="Show one change journal record")
+    sp.add_argument("change_id")
+    sp.set_defaults(func=cmd_changes)
+    sp = changes_sub.add_parser("rollback", help="Rollback one reversible change after explicit local approval")
     sp.add_argument("change_id")
     sp.set_defaults(func=cmd_changes)
 
