@@ -268,10 +268,13 @@ class TriForceClient:
             except ClientError as e:
                 last_err = e
                 err_str = str(e)
-                # Don't retry auth errors or 4xx
-                if "HTTP 4" in err_str or "Token expired" in err_str:
+                # Do not retry permanent 4xx/auth errors. 408 and 429 are transient.
+                if (
+                    ("HTTP 4" in err_str and "HTTP 408" not in err_str and "HTTP 429" not in err_str)
+                    or "Token expired" in err_str
+                ):
                     raise
-                # Retry on 5xx, timeout, connection errors
+                # Retry on 5xx, 408/429, timeout, and connection errors.
                 if attempt < _retries:
                     continue
                 raise

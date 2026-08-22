@@ -273,6 +273,26 @@ class WorkspaceEscapeTests(unittest.TestCase):
                     os.environ[ACTIVE_WORKSPACE_ENV] = previous
 
 
+    def test_symlink_inside_workspace_pointing_outside_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            workspace = base / "workspace"
+            outside = base / "outside"
+            workspace.mkdir()
+            outside.mkdir()
+            (outside / "secret.txt").write_text("outside\n", encoding="utf-8")
+            link = workspace / "escape"
+            try:
+                link.symlink_to(outside, target_is_directory=True)
+            except (OSError, NotImplementedError):
+                self.skipTest("symlinks are not available on this platform")
+            from aicoder.workspace import path_within_workspace
+            resolved, allowed = path_within_workspace("escape/secret.txt", root=workspace)
+            self.assertFalse(allowed)
+            self.assertEqual(resolved, (outside / "secret.txt").resolve())
+
+
+
 class LocalCodeToolRoutingTests(unittest.TestCase):
     def test_code_tools_execute_locally_and_never_call_mcp(self):
         with tempfile.TemporaryDirectory() as temp:

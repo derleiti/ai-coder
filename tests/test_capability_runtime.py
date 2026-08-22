@@ -107,5 +107,38 @@ class CapabilityRuntimeTests(unittest.TestCase):
         self.assertIn("capability_request",second)
 
 
+    def test_resume_capabilities_use_original_plan_task(self):
+        import tempfile
+        from pathlib import Path
+        from aicoder.agent_plan import PlanStore
+
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp) / "workspace"
+            workspace.mkdir()
+            store = PlanStore(Path(temp) / "plans")
+            plan = store.create(
+                "Debug failing tests in src/foo.py and verify the fix",
+                str(workspace),
+                "test/model",
+            )
+            plan.status = "paused"
+            store.save(plan)
+            runtime = NativeLightRuntime(
+                client=DummyClient(), initial_prompt="continue", model="test/model",
+                fallback_model=None, workspace_root=str(workspace), plan_store=store,
+                resume=True, resume_plan_id=plan.id, tool_budget=8,
+            )
+            catalog = list(CATALOG) + [
+                {"name": "test", "description": "run tests", "capabilities": ["testing", "debug"], "inputSchema": {"type": "object"}},
+            ]
+            with patch("aicoder.agent_runtime.load_tools", return_value=catalog):
+                tools = runtime._prepare_tools()
+            names = {tool["name"] for tool in tools}
+            self.assertIn("file_read", names)
+            self.assertIn("test", names)
+            self.assertIn("shell", names)
+
+
+
 if __name__ == "__main__":
     unittest.main()

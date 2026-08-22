@@ -223,7 +223,22 @@ class NativeLightRuntime:
                 catalogue = [tool for tool in catalogue if tool.get("name") in enabled]
             self._tool_catalog = list(catalogue)
             if self.progressive_tool_disclosure:
-                resolution = resolve_capabilities(self.initial_prompt, resume=self.resume)
+                capability_prompt = self.initial_prompt
+                if self.resume and self.persistent_plan:
+                    try:
+                        if self.resume_plan_id == "current":
+                            resume_plan = self.plan_store.load_current(self.workspace_root)
+                        elif self.resume_plan_id:
+                            resume_plan = self.plan_store.load(self.workspace_root, self.resume_plan_id)
+                        else:
+                            resume_plan = self.plan_store.load_current(self.workspace_root)
+                    except (OSError, ValueError):
+                        resume_plan = None
+                    if resume_plan is not None and resume_plan.task:
+                        capability_prompt = (
+                            f"{resume_plan.task}\n\nContinuation instruction: {self.initial_prompt}"
+                        )
+                resolution = resolve_capabilities(capability_prompt, resume=self.resume)
                 tools = build_working_set(catalogue, resolution, budget=self.tool_budget)
                 self._emit(
                     "capabilities_ready", capabilities=list(resolution.capabilities),
@@ -624,6 +639,24 @@ class NativeLightRuntime:
                 )
             except (ClientError, RuntimeError) as exc:
                 reason = str(exc)
+                category, _signature, retryable = FailureTracker.classify(reason)
+                if retryable and category == "transient":
+                    pause_reason = (
+                        "Transient model/backend failure after request retries were exhausted: "
+                        f"{reason}"
+                    )
+                    self._pause_plan(plan, pause_reason)
+                    self._save_journal(
+                        plan, messages, pending_input=current_input, tool_batches=journal_batches
+                    )
+                    self._emit(
+                        "paused", reason=pause_reason, failure_category=category, resumable=True,
+                    )
+                    return AgentRunResult(
+                        "paused", pause_reason, model_used, messages, tools, system,
+                        iterations=i + 1, latency_ms=total_latency,
+                        fallback_used=fallback_used, plan_id=plan.id if plan else "",
+                    )
                 self._fail_plan(plan, reason)
                 self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
                 self._emit("error", message=reason)
