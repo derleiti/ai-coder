@@ -81,6 +81,7 @@ class NativeLightRuntime:
     model: str | None
     fallback_model: str | None
     workspace_root: str
+    initial_user_content: Any | None = None
     model_client: ModelTransport | None = None
     tools: list[dict] | None = None
     system_prompt: str | None = None
@@ -400,7 +401,12 @@ class NativeLightRuntime:
                 messages[0]["content"] = self._with_plan_context(base_system, plan)
                 system = messages[0]["content"]
 
-            messages.append({"role": "user", "content": current_input})
+            turn_content = (
+                self.initial_user_content
+                if i == 0 and not resumed and self.initial_user_content is not None
+                else current_input
+            )
+            messages.append({"role": "user", "content": turn_content})
             messages = trim_messages(messages)
             timeout = adaptive_request_timeout(
                 self.base_timeout,

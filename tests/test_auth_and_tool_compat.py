@@ -597,30 +597,30 @@ class PrivilegeBrokerTests(unittest.TestCase):
         approval.assert_called_once()
         client.mcp_call.assert_called_once()
 
-    def test_cli_sudo_request_is_always_rejected(self):
+    def test_cli_sudo_request_requires_manual_yes(self):
         args = {
             "command": "install -m 644 app.conf /etc/app.conf",
             "sudo": True,
             "reason": "Installiere die bestätigte Konfiguration",
         }
         with (
-            patch("builtins.input") as prompt,
+            patch("builtins.input", return_value="y") as prompt,
             contextlib.redirect_stdout(io.StringIO()),
             contextlib.redirect_stderr(io.StringIO()),
         ):
-            self.assertFalse(cli_agent._cli_approval("file_edit", args))
-        prompt.assert_not_called()
+            self.assertTrue(cli_agent._cli_approval("file_edit", args))
+        prompt.assert_called_once()
 
-    def test_cli_rejects_unexplained_elevation_request(self):
+    def test_cli_elevation_request_can_be_rejected(self):
         with (
-            patch("builtins.input") as prompt,
+            patch("builtins.input", return_value="n") as prompt,
             contextlib.redirect_stderr(io.StringIO()),
         ):
             allowed = cli_agent._cli_approval(
                 "local_exec", {"command": "apt update", "sudo": True}
             )
         self.assertFalse(allowed)
-        prompt.assert_not_called()
+        prompt.assert_called_once()
 
 
 if __name__ == "__main__":

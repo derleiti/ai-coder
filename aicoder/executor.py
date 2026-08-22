@@ -25,6 +25,7 @@ from .config import load_session
 from .docs_context import read_agents_md
 from .privileges import assess_execution
 from .session_state import get_state
+from .plugins import discover_plugins, plugin_catalog_stamp
 from .workspace import active_workspace, path_within_workspace
 from .tool_policy import (
     CODING_MCP_TOOLS,
@@ -70,8 +71,8 @@ _ACTION_REQUEST_RE = re.compile(
     r"\b(?:sortier\w*|organisier\w*|r[aä]um\w*|pr[uü]f\w*|test(?:e|en|est|et)?|"
     r"untersuch\w*|analysier\w*|erstell\w*|[aä]nder\w*|bearbeit\w*|"
     r"l[oö]sch\w*|verschieb\w*|kopier\w*|installier\w*|aktualisier\w*|"
-    r"reparier\w*|starte?\w*|stoppe?\w*|f[uü]hr\w*\s+.*\s+aus|"
-    r"sort|organize|clean|check|inspect|test|analyze|create|edit|delete|"
+    r"reparier\w*|konfigurier\w*|setz\w*|starte?\w*|stoppe?\w*|f[uü]hr\w*\s+.*\s+aus|"
+    r"sort|organize|clean|check|inspect|test|analyze|create|edit|delete|configure|set|"
     r"move|copy|install|update|fix|start|stop|restart|run)\b",
     re.IGNORECASE,
 )
@@ -519,6 +520,8 @@ You are ai-coder — an autonomous coding agent on AILinux/TriForce (api.ailinux
 - SKILLS: when a catalogued skill matches the task, call skill_read(name) before acting.
 - SUBAGENTS: use subagent_run for bounded analysis/review/debug/planning when a second reasoning pass adds value.
   The parent remains the sole executor and must verify subagent claims with real tools before mutation.
+- SETTINGS: inspect with settings_list/settings_describe, validate with settings_plan_patch, then use settings_apply_patch.
+  Never edit state.json directly. Security-boundary expansion always requires explicit host/user approval.
 - SEARCH: memory_search (first!) → search → crawl
 - MODELS: models, specialist (info only)
 - STUCK >2 rounds: Stop guessing. Use memory_search, then search, then ask user.
@@ -599,7 +602,7 @@ def is_destructive(cmd: str) -> bool:
 # ── Tool Cache (TTL-based, avoids re-fetching on every agent run) ──
 _tool_cache: list[dict] | None = None
 _tool_cache_ts: float = 0
-_tool_cache_key: tuple[str, str] | None = None
+_tool_cache_key: tuple[str, str, str] | None = None
 _tool_security_hints: dict[str, tuple[bool | None, bool | None]] = {}
 _TOOL_CACHE_TTL = 300  # 5 minutes
 
@@ -634,7 +637,7 @@ def _tool_security_metadata(tool: dict) -> tuple[bool | None, bool | None]:
 def load_tools(client: TriForceClient, force_refresh: bool = False) -> list[dict]:
     """Load MCP tool schemas + local tools. Cached per account for 5 minutes."""
     global _tool_cache, _tool_cache_ts, _tool_cache_key, _tool_security_hints
-    cache_key = _client_tool_cache_key(client)
+    cache_key = (*_client_tool_cache_key(client), plugin_catalog_stamp(_workspace_root()))
     if (
         not force_refresh
         and _tool_cache is not None
@@ -666,7 +669,8 @@ def load_tools(client: TriForceClient, force_refresh: bool = False) -> list[dict
         print(f"  \033[33m  → Backend erreichbar? Versuch: aicoder mcp health\033[0m", file=sys.stderr)
         mcp_tools = FALLBACK_TOOLS
 
-    result = LOCAL_TOOL_SCHEMAS + mcp_tools
+    plugin_tools = discover_plugins(_workspace_root()).tool_schemas()
+    result = LOCAL_TOOL_SCHEMAS + plugin_tools + mcp_tools
     _tool_security_hints = {
         str(tool.get("name", "")): _tool_security_metadata(tool)
         for tool in result
@@ -1297,8 +1301,22 @@ def run_tool(
     if escape_target is not None:
         approval_args["_workspace_escape"] = str(escape_target)
         approval_args["_workspace_root"] = str(_workspace_root())
+
+    plugin_registry = discover_plugins(_workspace_root())
+    plugin_provider = plugin_registry.provider_for_tool(name)
+    plugin_security = plugin_registry.security_for_tool(name, args)
+    if plugin_security is not None:
+        approval_args["_mutating"] = plugin_security.mutating
+        approval_args["_destructive"] = plugin_security.destructive
+        if plugin_security.security_boundary:
+            approval_args["_security_boundary"] = True
+        if plugin_security.requires_elevation:
+            approval_args["_requires_elevation"] = True
+        approval_args.setdefault("reason", str(args.get("reason") or f"Use {name} from ToolProvider"))
+
     risk = assess_execution(name, approval_args, destructive=is_destructive(cmd))
     needs_scope_approval = escape_target is not None
+    settings_confirmed = False
     if risk.needs_approval or needs_scope_approval:
         if approval_fn is not None:
             if not approval_fn(name, approval_args):
@@ -1308,6 +1326,8 @@ def run_tool(
                     is_error=True, model=model, iteration=iteration,
                 )
                 return result, True
+            if risk.security_boundary:
+                settings_confirmed = True
         else:
             import sys as _sys
             print(
@@ -1346,6 +1366,8 @@ def run_tool(
     elif name == "skill_read":
         from .skills import read_skill
         result, is_error = read_skill(_workspace_root(), str(args.get("name") or ""))
+    elif plugin_provider is not None:
+        result, is_error = plugin_registry.execute_tool(name, args, confirmed=settings_confirmed)
     elif name == "file_read":
         result, is_error = run_file_read(execution_args)
     elif name == "file_edit":

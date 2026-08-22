@@ -17,7 +17,8 @@ from typing import Optional
 
 from .config import CONFIG_DIR, DEFAULT_BASE_URL, Session, load_session, save_session
 from .session_state import (
-    SWARM_MODES, APPROVAL_MODES, DEFAULT_RUNTIME_MODE, get_state,
+    SWARM_MODES, APPROVAL_MODES, DEFAULT_RUNTIME_MODE, SETTINGS, get_state,
+    reset_setting, resolve_setting_key, set_setting,
     set_approval_mode, set_fallback, set_model, set_runtime_mode, set_swarm, set_tool_mode, set_workspace,
 )
 from .ui import C, bold, dim, cyan, green, yellow, red, magenta, white, panel, term_width, reset_live_line
@@ -555,6 +556,36 @@ def run_repl(skip_setup: bool = False) -> int:
                 else:
                     print(f"  tools = {get_state().get('tool_mode', 'on_demand')}")
                     print("  set: /tools off|on_demand|always")
+            elif cmd == "/settings":
+                setting_parts = val.split(None, 2)
+                action = setting_parts[0].lower() if setting_parts else "list"
+                try:
+                    if action in {"list", "ls"}:
+                        current = get_state()
+                        for key, spec in SETTINGS.items():
+                            value = current.get(key, spec.default)
+                            if key == "enabled_tools":
+                                value = "all" if value is None else ("none" if value == [] else ",".join(value))
+                            print(f"  {key:<20} = {'' if value is None else value}")
+                    elif action == "get" and len(setting_parts) >= 2:
+                        key = resolve_setting_key(setting_parts[1])
+                        print(f"  {key} = {get_state().get(key, SETTINGS[key].default)}")
+                    elif action == "set" and len(setting_parts) >= 3:
+                        key = resolve_setting_key(setting_parts[1])
+                        updated = set_setting(key, setting_parts[2])
+                        print(f"  {key} → {updated.get(key)}")
+                    elif action == "reset" and len(setting_parts) >= 2:
+                        key = resolve_setting_key(setting_parts[1])
+                        updated = reset_setting(key)
+                        print(f"  {key} → {updated.get(key)}")
+                    else:
+                        print("  usage: /settings [list|get KEY|set KEY VALUE|reset KEY]")
+                except ValueError as exc:
+                    print(f"  Fehler: {exc}")
+                state = get_state()
+                model = state.get("selected_model")
+                fallback = state.get("fallback_model")
+                swarm = state.get("swarm_mode", "off")
             elif cmd == "/runtime":
                 if val:
                     try:
@@ -685,7 +716,7 @@ def run_repl(skip_setup: bool = False) -> int:
                     print(f"  Fehler: {e}")
             elif cmd == "/help":
                 print("  /model <n> · /fallback <n> · /swarm <m> · /models · /status")
-                print("  /runtime classic|native-light · /tools off|on_demand|always · /plan [list|clear]")
+                print("  /runtime classic|native-light · /tools off|on_demand|always · /settings · /plan [list|clear]")
                 print("  /commands · /command <name> [args] · /guidelines")
                 print("  /setup · /new · /clear · /keys · /permissions · /exit")
             else:

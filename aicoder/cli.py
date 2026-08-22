@@ -8,7 +8,9 @@ from .config import DEFAULT_BASE_URL, Session, delete_session, load_session, sav
 from .docs_context import context_summary, read_agents_md
 from .history import record as history_record, get_history, clear_history
 from .session_state import (
-    RUNTIME_MODES, DEFAULT_RUNTIME_MODE, SWARM_MODES, TOOL_MODES, get_state,
+    RUNTIME_MODES, DEFAULT_RUNTIME_MODE, SWARM_MODES, TOOL_MODES, SETTINGS, get_state,
+    list_settings, reset_all_settings, reset_setting, resolve_setting_key, set_setting,
+    settings_doctor, settings_schema,
     set_fallback, set_model, set_runtime_mode, set_swarm, set_tool_mode, set_workspace,
 )
 from .status import Spinner, phase_label
@@ -235,6 +237,191 @@ def cmd_runtime(args: argparse.Namespace) -> int:
     return 0
 
 
+def _format_setting_value(key: str, value: Any) -> str:
+    if key == "enabled_tools":
+        if value is None:
+            return "all"
+        if value == []:
+            return "none"
+        return ",".join(value)
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _settings_help_epilog() -> str:
+    lines = ["Available settings:"]
+    for key, spec in SETTINGS.items():
+        detail = []
+        if spec.choices:
+            detail.append("values=" + ",".join(spec.choices))
+        if spec.minimum is not None or spec.maximum is not None:
+            detail.append(f"range={spec.minimum}..{spec.maximum}")
+        detail.append("default=" + _format_setting_value(key, spec.default))
+        if spec.aliases:
+            detail.append("aliases=" + ",".join(spec.aliases))
+        lines.append(f"  {key:<20} {'; '.join(detail)}")
+        lines.append(f"    {spec.description}")
+    lines.extend([
+        "",
+        "Examples:",
+        "  aicoder settings list --json",
+        "  aicoder settings explain tool_mode",
+        "  aicoder settings set request_timeout 180",
+        "  aicoder settings set enabled_tools git,file_read",
+        "  aicoder settings reset --all",
+        "  aicoder settings schema --json",
+        "  aicoder settings doctor",
+    ])
+    return "\n".join(lines)
+
+
+def cmd_settings(args: argparse.Namespace) -> int:
+    action = getattr(args, "settings_action", None) or "list"
+    try:
+        if action == "list":
+            rows = list_settings()
+            if getattr(args, "json_out", False):
+                print(json.dumps(rows, indent=2, ensure_ascii=False, sort_keys=True))
+            else:
+                for row in rows:
+                    print(f"{row['key']:<20} = {_format_setting_value(row['key'], row['value'])}")
+            return 0
+        if action == "get":
+            key = resolve_setting_key(args.key)
+            row = next(item for item in list_settings() if item["key"] == key)
+            if getattr(args, "json_out", False):
+                print(json.dumps({"key": key, "value": row["value"]}, ensure_ascii=False, sort_keys=True))
+            else:
+                print(f"{key} = {_format_setting_value(key, row['value'])}")
+            return 0
+        if action == "set":
+            key = resolve_setting_key(args.key)
+            state = set_setting(key, args.value)
+            print(f"{key} -> {_format_setting_value(key, state.get(key))}")
+            return 0
+        if action == "reset":
+            if getattr(args, "reset_all", False):
+                state = reset_all_settings()
+                print(f"reset {len(SETTINGS)} settings to defaults")
+                return 0
+            if not getattr(args, "key", None):
+                raise ValueError("settings reset requires KEY or --all")
+            key = resolve_setting_key(args.key)
+            state = reset_setting(key)
+            print(f"{key} -> {_format_setting_value(key, state.get(key))}")
+            return 0
+        if action == "explain":
+            key = resolve_setting_key(args.key)
+            spec = SETTINGS[key]
+            print(f"{key} [{spec.kind}] group={spec.group}")
+            print(spec.description)
+            print(f"current: {_format_setting_value(key, get_state().get(key, spec.default))}")
+            print(f"default: {_format_setting_value(key, spec.default)}")
+            if spec.choices:
+                print(f"choices: {', '.join(spec.choices)}")
+            if spec.minimum is not None or spec.maximum is not None:
+                print(f"range: {spec.minimum}..{spec.maximum}")
+            if spec.aliases:
+                print(f"aliases: {', '.join(spec.aliases)}")
+            print(f"security-impact: {spec.security_impact}")
+            print(f"restart-required: {str(spec.restart_required).lower()}")
+            return 0
+        if action == "schema":
+            schema = settings_schema()
+            if getattr(args, "json_out", False):
+                print(json.dumps(schema, indent=2, ensure_ascii=False, sort_keys=True))
+            else:
+                print(f"settings schema v{schema['schema_version']}")
+                for row in schema["settings"]:
+                    print(f"{row['key']:<20} {row['type']:<8} group={row['group']:<10} security={row['security_impact']}")
+            return 0
+        if action == "doctor":
+            report = settings_doctor()
+            if getattr(args, "json_out", False):
+                print(json.dumps(report, indent=2, ensure_ascii=False, sort_keys=True))
+            else:
+                for key, value in report.items():
+                    print(f"{key:<24} {value}")
+            return 0 if report["permissions_ok"] and report["schema_version"] <= report["expected_schema_version"] else 1
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+    return 2
+
+
+def _plugin_registry():
+    from .plugins import discover_plugins
+    state = get_state()
+    return discover_plugins(active_workspace(state.get("workspace_root")))
+
+
+def cmd_plugin(args: argparse.Namespace) -> int:
+    from .plugins import plugin_paths, set_plugin_enabled
+
+    action = getattr(args, "plugin_action", None) or "list"
+    registry = _plugin_registry()
+    if action == "list":
+        for record in registry.list():
+            state = "enabled" if record.enabled else "disabled"
+            executable = "provider" if record.executable else "declarative"
+            conflict = " conflict" if record.conflicts else ""
+            print(f"{record.plugin_id:<24} {record.scope:<9} {state:<8} {executable}{conflict}")
+        if registry.errors:
+            for error in registry.errors:
+                print(f"warning: {error}", file=sys.stderr)
+        return 1 if registry.errors else 0
+    if action == "info":
+        record = registry.get(args.plugin_id)
+        if record is None:
+            print(f"Error: plugin not found: {args.plugin_id}", file=sys.stderr)
+            return 2
+        payload = {
+            "id": record.plugin_id,
+            "name": record.manifest.name,
+            "version": record.manifest.version,
+            "api_version": record.manifest.api_version,
+            "description": record.manifest.description,
+            "scope": record.scope,
+            "path": str(record.path) if record.path else "<builtin>",
+            "enabled": record.enabled,
+            "executable": record.executable,
+            "trusted_builtin": record.manifest.trusted_builtin,
+            "capabilities": list(record.manifest.capability_groups),
+            "contributions": {
+                "tool_provider": record.manifest.tool_provider,
+                "skills_dir": record.manifest.skills_dir,
+                "agents_dir": record.manifest.agents_dir,
+                "commands_dir": record.manifest.commands_dir,
+                "hooks": list(record.manifest.hooks),
+                "settings_schema": record.manifest.settings_schema,
+                "mcp_servers": list(record.manifest.mcp_servers),
+            },
+            "conflicts": record.conflicts,
+            "diagnostics": record.diagnostics,
+        }
+        print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+        return 0
+    if action in {"enable", "disable"}:
+        if registry.get(args.plugin_id) is None:
+            print(f"Error: plugin not found: {args.plugin_id}", file=sys.stderr)
+            return 2
+        set_plugin_enabled(args.plugin_id, action == "enable")
+        print(f"{args.plugin_id} -> {action}d")
+        return 0
+    if action == "doctor":
+        report = registry.doctor(getattr(args, "plugin_id", None))
+        print(json.dumps(report, indent=2, ensure_ascii=False, sort_keys=True))
+        return 0 if report.get("ok") else 1
+    if action == "paths":
+        state = get_state()
+        workspace = active_workspace(state.get("workspace_root"))
+        for scope, path in plugin_paths(workspace):
+            print(f"{scope:<10} {str(path) if path is not None else '<builtin>'}")
+        return 0
+    return 2
+
+
 def cmd_skills(args: argparse.Namespace) -> int:
     from .skills import discover_skills, read_skill
 
@@ -351,28 +538,22 @@ def cmd_plan(args: argparse.Namespace) -> int:
 
 def cmd_status(_: argparse.Namespace) -> int:
     state = get_state()
-    ctx = context_summary(str(active_workspace(state.get("workspace_root"))))
-
-    model = state.get("selected_model") or "(not set)"
-    fallback = state.get("fallback_model") or "(not set)"
-    swarm = state.get("swarm_mode", "off")
     workspace = str(active_workspace(state.get("workspace_root")))
+    ctx = context_summary(workspace)
 
-    print("── ai-coder status ──────────────────────────────")
-    print(f"  model    : {model}")
-    print(f"  fallback : {fallback}")
-    print(f"  swarm    : {swarm}")
-    print(f"  runtime  : {state.get('runtime_mode', DEFAULT_RUNTIME_MODE)}")
-    print(f"  workspace: {workspace}")
-    print(f"  docs     : {ctx['doc_files_found']} file(s) found")
-    if ctx.get("agents_md_present"):
-        print("  AGENTS.md: ✓ present")
-    else:
-        print("  AGENTS.md: ✗ missing  ← create it for best results")
+    print("-- ai-coder status --------------------------------")
+    print("  effective settings")
+    for row in list_settings():
+        value = row["value"]
+        if row["key"] == "workspace_root":
+            value = workspace
+        print(f"    {row['key']:<18}: {_format_setting_value(row['key'], value)}")
+    print(f"  docs               : {ctx['doc_files_found']} file(s) found")
+    print(f"  AGENTS.md          : {'present' if ctx.get('agents_md_present') else 'missing'}")
     if ctx["docs"]:
         for rel in ctx["docs"]:
-            print(f"    · {rel}")
-    print("─────────────────────────────────────────────────")
+            print(f"    doc: {rel}")
+    print("----------------------------------------------------")
     return 0
 
 
@@ -900,6 +1081,58 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("runtime", help=f"Agent runtime ({', '.join(sorted(RUNTIME_MODES))})")
     p.add_argument("value", nargs="?")
     p.set_defaults(func=cmd_runtime)
+
+    p = sub.add_parser(
+        "settings", help="Read and change the shared CLI/GUI settings",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=_settings_help_epilog(),
+    )
+    settings_sub = p.add_subparsers(dest="settings_action")
+    p.set_defaults(func=cmd_settings, settings_action="list", json_out=False)
+    sp = settings_sub.add_parser("list", help="List all settings")
+    sp.add_argument("--json", dest="json_out", action="store_true")
+    sp.set_defaults(func=cmd_settings)
+    sp = settings_sub.add_parser("get", help="Read one setting")
+    sp.add_argument("key")
+    sp.add_argument("--json", dest="json_out", action="store_true")
+    sp.set_defaults(func=cmd_settings)
+    sp = settings_sub.add_parser("set", help="Set one setting")
+    sp.add_argument("key")
+    sp.add_argument("value")
+    sp.set_defaults(func=cmd_settings)
+    sp = settings_sub.add_parser("reset", help="Reset one setting or all settings to defaults")
+    sp.add_argument("key", nargs="?")
+    sp.add_argument("--all", dest="reset_all", action="store_true")
+    sp.set_defaults(func=cmd_settings)
+    sp = settings_sub.add_parser("explain", help="Explain one setting and valid values")
+    sp.add_argument("key")
+    sp.set_defaults(func=cmd_settings)
+    sp = settings_sub.add_parser("schema", help="Show the canonical settings schema")
+    sp.add_argument("--json", dest="json_out", action="store_true")
+    sp.set_defaults(func=cmd_settings)
+    sp = settings_sub.add_parser("doctor", help="Validate settings persistence and metadata")
+    sp.add_argument("--json", dest="json_out", action="store_true")
+    sp.set_defaults(func=cmd_settings)
+
+    p = sub.add_parser("plugin", help="Inspect and control AICoder plugins")
+    plugin_sub = p.add_subparsers(dest="plugin_action")
+    p.set_defaults(func=cmd_plugin, plugin_action="list")
+    sp = plugin_sub.add_parser("list", help="List discovered plugins")
+    sp.set_defaults(func=cmd_plugin)
+    sp = plugin_sub.add_parser("info", help="Show one plugin manifest and status")
+    sp.add_argument("plugin_id")
+    sp.set_defaults(func=cmd_plugin)
+    sp = plugin_sub.add_parser("enable", help="Enable a discovered plugin")
+    sp.add_argument("plugin_id")
+    sp.set_defaults(func=cmd_plugin)
+    sp = plugin_sub.add_parser("disable", help="Disable a discovered plugin")
+    sp.add_argument("plugin_id")
+    sp.set_defaults(func=cmd_plugin)
+    sp = plugin_sub.add_parser("doctor", help="Validate plugin discovery and manifests")
+    sp.add_argument("plugin_id", nargs="?")
+    sp.set_defaults(func=cmd_plugin)
+    sp = plugin_sub.add_parser("paths", help="Show plugin discovery paths")
+    sp.set_defaults(func=cmd_plugin)
 
     p = sub.add_parser("skills", help="List or read native AICoder workflow skills")
     p.add_argument("name", nargs="?", help="Skill name to read")

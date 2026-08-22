@@ -40,7 +40,7 @@ _MUTATING_TOOL_NAMES = {
     "shell", "task_runner", "custom_exec", "binary_exec", "local_exec",
     "git_ops", "lint", "test", "devops",
     "config_set", "prompt_set", "vault_add",
-    "memory_store", "memory_clear", "clipboard_write",
+    "memory_store", "memory_clear", "clipboard_write", "settings_apply_patch", "settings_reset",
     "crawl", "crawl_url",
     "service_control", "container_control", "remote_task", "mesh_task",
     "agent_start", "agent_stop", "agent_broadcast", "restart",
@@ -60,6 +60,7 @@ class ExecutionRisk:
     deletion: bool
     protected_path: bool
     destructive: bool
+    security_boundary: bool
     reasons: tuple[str, ...]
     command: str
     cwd: str
@@ -88,8 +89,9 @@ def assess_execution(tool_name: str, args: dict[str, Any], *, destructive: bool 
     canonical_tool = re.split(r"[./:]", normalized_tool)[-1]
     metadata_mutating = args.get("_mutating")
     metadata_destructive = args.get("_destructive")
+    security_boundary = args.get("_security_boundary") is True
     sudo_requested = bool(args.get("sudo")) or bool(SUDO_PREFIX_RE.match(command))
-    explicit_elevation = sudo_requested or bool(_ELEVATION_PREFIX_RE.match(command))
+    explicit_elevation = sudo_requested or args.get("_requires_elevation") is True or bool(_ELEVATION_PREFIX_RE.match(command))
     deletion = (
         bool(_DELETE_RE.search(command))
         or bool(re.search(r"(?:^|\s)find\b[^\n]*(?:\s-delete\b|\s-exec(?:dir)?\b|\s-ok(?:dir)?\b)", command, re.IGNORECASE))
@@ -119,15 +121,18 @@ def assess_execution(tool_name: str, args: dict[str, Any], *, destructive: bool 
         reasons.append("geschützter Systempfad betroffen")
     if destructive:
         reasons.append("potenziell destruktives Befehlsmuster")
+    if security_boundary:
+        reasons.append("Sicherheitsgrenze wird erweitert")
 
     return ExecutionRisk(
-        needs_approval=bool(explicit_elevation or mutation or destructive),
+        needs_approval=bool(explicit_elevation or mutation or destructive or security_boundary),
         elevation=explicit_elevation,
         sudo=sudo_requested,
         mutation=mutation,
         deletion=deletion,
         protected_path=protected_path,
         destructive=destructive,
+        security_boundary=security_boundary,
         reasons=tuple(dict.fromkeys(reasons)),
         command=command,
         cwd=cwd,
@@ -137,7 +142,7 @@ def assess_execution(tool_name: str, args: dict[str, Any], *, destructive: bool 
 
 def format_request(risk: ExecutionRisk) -> str:
     """Human-readable approval card used by terminal and GUI."""
-    title = "PRIVILEGIEN" if risk.elevation else ("LÖSCHEN" if risk.deletion else "SCHREIBZUGRIFF")
+    title = "PRIVILEGIEN" if risk.elevation else ("SICHERHEIT" if risk.security_boundary else ("LÖSCHEN" if risk.deletion else "SCHREIBZUGRIFF"))
     details = [f"  Anfrage : {title}"]
     if risk.user_reason:
         details.append(f"  Grund   : {risk.user_reason}")
@@ -159,7 +164,7 @@ def approval_is_automatic(mode: str, risk: ExecutionRisk) -> bool:
     mode = str(mode or "ask").strip().lower()
     if not risk.needs_approval:
         return True
-    if risk.elevation:
+    if risk.elevation or risk.security_boundary:
         return False
     if mode == "all":
         return bool(risk.mutation and not risk.deletion and not risk.destructive)

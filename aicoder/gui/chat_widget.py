@@ -5,6 +5,7 @@ import json
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 
 try:
     import markdown as _md
@@ -14,10 +15,10 @@ except ImportError:
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
-    QTextEdit, QPlainTextEdit, QPushButton, QLabel, QMessageBox, QComboBox,
-    QMenu, QInputDialog,
+    QTextEdit, QPlainTextEdit, QPushButton, QLabel, QMessageBox,
+    QMenu, QInputDialog, QFileDialog,
 )
-from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, QMetaObject, Q_ARG, QMimeData, QUrl
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, QMetaObject, Q_ARG, QMimeData, QUrl, QBuffer, QIODevice
 from PyQt6.QtGui import (
     QTextCursor, QDragEnterEvent, QDropEvent, QKeyEvent, QKeySequence, QShortcut,
 )
@@ -29,6 +30,10 @@ from ..privileges import (
 from ..session_state import DEFAULT_RUNTIME_MODE, get_state
 from ..workspace import active_workspace
 from ..client import TriForceClient
+from ..attachments import (
+    Attachment, MAX_ATTACHMENTS, MAX_TOTAL_ATTACHMENT_BYTES, MAX_TOTAL_TEXT_CHARS, SUPPORTED_SUFFIXES,
+    image_attachment, load_path, multimodal_content,
+)
 from .. import chat_history
 from ..executor import (
     build_system_prompt, is_destructive, is_simple_chat_message, should_load_tools,
@@ -134,6 +139,71 @@ class _AgentWorker(QThread):
             except Exception:
                 pass
 
+    @staticmethod
+    def _content_text(content, *, limit: int = 60_000) -> str:
+        """Produce bounded text context while dropping binary image payloads."""
+        if isinstance(content, str):
+            return content[:limit]
+        if isinstance(content, list):
+            chunks = []
+            image_count = 0
+            remaining = max(0, int(limit))
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") in {"text", "input_text"}:
+                    text = str(part.get("text") or "")
+                    if remaining > 0:
+                        chunks.append(text[:remaining])
+                        remaining -= len(chunks[-1])
+                elif part.get("type") in {"image_url", "input_image", "image"}:
+                    image_count += 1
+            if image_count:
+                chunks.append(f"[{image_count} image attachment(s); binary payload omitted from history]")
+            return "\n".join(chunk for chunk in chunks if chunk)
+        return str(content or "")[:limit]
+
+    @staticmethod
+    def _intent_text(content) -> str:
+        """Keep planning/routing focused on the user's request, not the full document body."""
+        if isinstance(content, str):
+            return content[:8_000]
+        if isinstance(content, list):
+            prompt = ""
+            images = 0
+            documents = 0
+            for index, part in enumerate(content):
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") in {"image_url", "input_image", "image"}:
+                    images += 1
+                elif part.get("type") in {"text", "input_text"}:
+                    text = str(part.get("text") or "")
+                    if index == 0:
+                        prompt = text[:8_000]
+                    elif text.startswith("--- ATTACHMENT:"):
+                        documents += 1
+            suffix = []
+            if documents:
+                suffix.append(f"{documents} document attachment(s)")
+            if images:
+                suffix.append(f"{images} image attachment(s)")
+            return prompt + (("\n[" + ", ".join(suffix) + "]") if suffix else "")
+        return str(content or "")[:8_000]
+
+    @classmethod
+    def _compact_messages(cls, messages: list[dict]) -> list[dict]:
+        """Drop binary image payloads after a turn so history/context stays bounded."""
+        compact = []
+        for raw in messages:
+            if not isinstance(raw, dict):
+                continue
+            item = dict(raw)
+            if isinstance(item.get("content"), list):
+                item["content"] = cls._content_text(item.get("content"))
+            compact.append(item)
+        return compact
+
     def _run_shared_runtime_impl(self, *, persistent_plan: bool):
         from ..agent_runtime import NativeLightRuntime
 
@@ -147,7 +217,8 @@ class _AgentWorker(QThread):
         if latest_user_index is None:
             self.error.emit(f"{runtime_label} runtime: no user message to execute")
             return
-        initial_prompt = str(messages[latest_user_index].get("content") or "")
+        initial_user_content = messages[latest_user_index].get("content")
+        initial_prompt = self._intent_text(initial_user_content)
         prior = [
             dict(message) for message in messages[1:latest_user_index]
             if message.get("role") != "system"
@@ -198,6 +269,7 @@ class _AgentWorker(QThread):
         runtime = NativeLightRuntime(
             client=self.client,
             initial_prompt=initial_prompt,
+            initial_user_content=initial_user_content,
             model=self.model or None,
             fallback_model=self.fallback or None,
             workspace_root=str(active_workspace(state.get("workspace_root"))),
@@ -217,8 +289,8 @@ class _AgentWorker(QThread):
         result = runtime.run()
         self.tools = result.tools
         self.system = result.system_prompt
-        self.messages = result.messages
-        self.messages_updated.emit(result.messages)
+        self.messages = self._compact_messages(result.messages)
+        self.messages_updated.emit(self.messages)
         if result.status == "failed":
             self.error.emit(result.error or f"{runtime_label} runtime failed")
             return
@@ -237,9 +309,16 @@ def _select_chat_route(model: str, fallback: str, quick_chat: bool):
 
 
 class PromptEdit(QPlainTextEdit):
-    """Compact multiline prompt: Enter sends, Alt/Shift+Enter adds a line."""
+    """Compact multiline prompt with direct clipboard-image paste support."""
 
     submitted = pyqtSignal()
+    image_pasted = pyqtSignal(object)
+
+    def insertFromMimeData(self, source):
+        if source is not None and source.hasImage():
+            self.image_pasted.emit(source.imageData())
+            return
+        super().insertFromMimeData(source)
 
     def keyPressEvent(self, event: QKeyEvent):
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
@@ -263,7 +342,8 @@ class ChatWidget(QWidget):
         self._messages = []
         self._syncing = False
         self._session_id = None
-        self._dropped_files = []
+        self._attachments: list[Attachment] = []
+        self._inflight_attachments: list[Attachment] = []
         self._activity_started = 0.0
         self._activity_label = ""
         self._activity_frame = 0
@@ -272,50 +352,20 @@ class ChatWidget(QWidget):
         self._activity_timer.timeout.connect(self._tick_activity)
         self._build_ui()
         self.setAcceptDrops(True)
-        # Connect to settings model list + selection changes
-        if self.settings_ref:
-            if hasattr(self.settings_ref, "models_loaded"):
-                self.settings_ref.models_loaded.connect(self._on_models_updated)
-            if hasattr(self.settings_ref, "selection_changed"):
-                self.settings_ref.selection_changed.connect(self._on_settings_selection_changed)
-            if hasattr(self.settings_ref, "tools_changed"):
-                self.settings_ref.tools_changed.connect(self._on_tools_changed)
-            # Editable combos can show the persisted route before the async
-            # model catalogue arrives, avoiding blank selectors on startup.
-            self.model_combo.setCurrentText(self.settings_ref.get_current_model())
-            self.fallback_combo.setCurrentText(self.settings_ref.get_current_fallback())
+        # Runtime configuration lives exclusively in the Settings tab/state store.
+        # Chat reads persisted settings for every send, so Apply takes effect without restart.
+        if self.settings_ref and hasattr(self.settings_ref, "tools_changed"):
+            self.settings_ref.tools_changed.connect(self._on_tools_changed)
 
     def _on_tools_changed(self, _mode: str, _names):
-        """Invalidate the filtered cache after a settings change."""
+        """Invalidate the filtered cache after a saved settings change."""
         self._tools = None
         self._system = None
 
-    def _on_models_updated(self, models: list):
-        """Update model dropdowns with list from backend."""
-        self._syncing = True
-        self.model_combo.clear()
-        self.fallback_combo.clear()
-        self.model_combo.addItem("")    # Backend-Default
-        self.fallback_combo.addItem("")  # kein Fallback
-        for m in models:
-            self.model_combo.addItem(m)
-            self.fallback_combo.addItem(m)
-        # Sync selection from settings (if user hasn't overridden)
-        if self.settings_ref:
-            self.model_combo.setCurrentText(self.settings_ref.get_current_model())
-            self.fallback_combo.setCurrentText(self.settings_ref.get_current_fallback())
-        self._syncing = False
-
-    def _on_settings_selection_changed(self, model: str, fallback: str):
-        """Settings tab selection changed — sync chat tab."""
-        self._syncing = True
-        self.model_combo.setCurrentText(model)
-        self.fallback_combo.setCurrentText(fallback)
-        self._syncing = False
-
     # ── Drag & Drop ──────────────────────────────────────────────
     def dragEnterEvent(self, event: QDragEnterEvent):
-        if event.mimeData().hasUrls() or event.mimeData().hasText():
+        mime = event.mimeData()
+        if mime.hasUrls() or mime.hasImage() or mime.hasText():
             event.acceptProposedAction()
 
     def dropEvent(self, event: QDropEvent):
@@ -325,27 +375,74 @@ class ChatWidget(QWidget):
                 path = url.toLocalFile()
                 if path:
                     self._handle_dropped_file(path)
+        elif mime.hasImage():
+            self._handle_clipboard_image(mime.imageData())
         elif mime.hasText():
             text = mime.text().strip()
             if text:
                 self.input.setPlainText(text)
         event.acceptProposedAction()
 
+    def _update_attachment_ui(self):
+        if not self._attachments:
+            self.attachment_label.setText("No attachments · drag files here or paste a screenshot with Ctrl+V")
+            self.clear_attachments_btn.setEnabled(False)
+            return
+        labels = []
+        for item in self._attachments:
+            suffix = "image" if item.kind == "image" else "document"
+            labels.append(f"{item.name} ({suffix}, {item.size // 1024} KB)")
+        self.attachment_label.setText(" · ".join(labels))
+        self.clear_attachments_btn.setEnabled(True)
+
+    def _add_attachment(self, item: Attachment):
+        if len(self._attachments) >= MAX_ATTACHMENTS:
+            raise ValueError(f"too many attachments (max {MAX_ATTACHMENTS})")
+        total = sum(existing.size for existing in self._attachments) + item.size
+        if total > MAX_TOTAL_ATTACHMENT_BYTES:
+            raise ValueError(
+                f"attachments exceed {MAX_TOTAL_ATTACHMENT_BYTES // (1024 * 1024)} MB total"
+            )
+        text_total = sum(len(existing.text) for existing in self._attachments) + len(item.text)
+        if text_total > MAX_TOTAL_TEXT_CHARS:
+            raise ValueError(f"document text exceeds {MAX_TOTAL_TEXT_CHARS:,} characters total")
+        self._attachments.append(item)
+        self._update_attachment_ui()
+        note = f" · {item.note}" if item.note else ""
+        self._append_msg("system", f"Attached: {item.name}", f"{item.kind}{note}")
+
     def _handle_dropped_file(self, path: str):
-        """Load dropped file as context for next message."""
-        import os
-        name = os.path.basename(path)
         try:
-            size = os.path.getsize(path)
-            if size > 500_000:
-                self._append_msg("system", f"File too large: {name} ({size//1024}KB, max 500KB)")
-                return
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read(100_000)
-            self._dropped_files.append({"name": name, "path": path, "content": content})
-            self._append_msg("system", f"📎 {name} ({size//1024}KB) — wird als Context mitgesendet")
-        except Exception as e:
-            self._append_msg("error", f"Konnte {name} nicht laden: {e}")
+            self._add_attachment(load_path(path))
+        except Exception as exc:
+            self._append_msg("error", f"Attachment rejected: {Path(path).name}: {exc}")
+
+    def _handle_clipboard_image(self, image):
+        try:
+            if image is None or getattr(image, "isNull", lambda: True)():
+                raise ValueError("clipboard does not contain a usable image")
+            buffer = QBuffer()
+            buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+            if not image.save(buffer, "PNG"):
+                raise ValueError("could not encode clipboard image")
+            raw = bytes(buffer.data())
+            buffer.close()
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            self._add_attachment(image_attachment(f"clipboard-{stamp}.png", raw, "image/png"))
+        except Exception as exc:
+            self._append_msg("error", f"Clipboard image rejected: {exc}")
+
+    def _choose_attachments(self):
+        patterns = " ".join(f"*{suffix}" for suffix in sorted(SUPPORTED_SUFFIXES))
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Attach files", "", f"Supported files ({patterns});;All files (*)"
+        )
+        for path in paths:
+            self._handle_dropped_file(path)
+
+    def _clear_attachments(self):
+        self._attachments.clear()
+        self._update_attachment_ui()
 
     # ── History ──────────────────────────────────────────────────
     def _show_history_menu(self):
@@ -399,51 +496,41 @@ class ChatWidget(QWidget):
         self.log = QTextEdit()
         self.log.setObjectName("ChatLog")
         self.log.setReadOnly(True)
+        # Let the parent ChatWidget own file/image drag-and-drop everywhere.
+        self.log.setAcceptDrops(False)
         layout.addWidget(self.log, stretch=1)
-
-        # Model-Selector Row
-        model_row = QHBoxLayout()
-        model_row.setSpacing(6)
-
-        model_label = QLabel("Model:")
-        model_label.setObjectName("Caption")
-        model_label.setFixedWidth(45)
-        model_row.addWidget(model_label)
-
-        self.model_combo = QComboBox()
-        self.model_combo.setEditable(True)
-        self.model_combo.setMinimumWidth(250)
-        self.model_combo.addItem("")  # Backend-Default (liste wird dynamisch geladen)
-        self.model_combo.setCurrentText("")
-        self.model_combo.setToolTip("Select model (empty = backend default)")
-        model_row.addWidget(self.model_combo, stretch=1)
-
-        fb_label = QLabel("Fallback:")
-        fb_label.setObjectName("Caption")
-        fb_label.setFixedWidth(55)
-        model_row.addWidget(fb_label)
-
-        self.fallback_combo = QComboBox()
-        self.fallback_combo.setEditable(True)
-        self.fallback_combo.setMinimumWidth(250)
-        self.fallback_combo.addItem("")  # (liste wird dynamisch geladen)
-        self.fallback_combo.setCurrentText("")
-        self.fallback_combo.setToolTip("Fallback model (optional)")
-        model_row.addWidget(self.fallback_combo, stretch=1)
-
-        layout.addLayout(model_row)
 
         # Status-Zeile (erweitert: User, Tier, Workspace, Tools)
         self.status = QLabel("Ready.")
         self.status.setObjectName("Caption")
         layout.addWidget(self.status)
 
+        # Attachments: documents, source files and screenshots.
+        attachment_row = QHBoxLayout()
+        self.attach_btn = QPushButton("Attach")
+        self.attach_btn.setToolTip("Attach documents/source/images")
+        self.attach_btn.clicked.connect(self._choose_attachments)
+        attachment_row.addWidget(self.attach_btn)
+        self.attachment_label = QLabel("")
+        self.attachment_label.setObjectName("Caption")
+        self.attachment_label.setWordWrap(True)
+        attachment_row.addWidget(self.attachment_label, stretch=1)
+        self.clear_attachments_btn = QPushButton("Clear")
+        self.clear_attachments_btn.clicked.connect(self._clear_attachments)
+        attachment_row.addWidget(self.clear_attachments_btn)
+        layout.addLayout(attachment_row)
+        self._update_attachment_ui()
+
         # Input-Zeile
         input_row = QHBoxLayout()
         self.input = PromptEdit()
-        self.input.setPlaceholderText("Ask ai-coder…  Enter sends · Shift/Alt+Enter adds a line")
+        # Disabling drag/drop here does not affect clipboard paste; it lets file drops
+        # over the editor bubble to ChatWidget while Ctrl+V still hits insertFromMimeData.
+        self.input.setAcceptDrops(False)
+        self.input.setPlaceholderText("Ask ai-coder…  Ctrl+V pastes screenshots · Enter sends")
         self.input.setFixedHeight(68)
         self.input.submitted.connect(self._send)
+        self.input.image_pasted.connect(self._handle_clipboard_image)
         input_row.addWidget(self.input, stretch=1)
 
         self.send_btn = QPushButton("Send")
@@ -577,6 +664,9 @@ class ChatWidget(QWidget):
         self._tools = None
         self._system = None
         self._messages = []
+        self._attachments.clear()
+        self._inflight_attachments.clear()
+        self._update_attachment_ui()
         self._update_status_idle("Reset")
         self._append_msg("system", "Chat and context reset.", "")
 
@@ -656,16 +746,29 @@ class ChatWidget(QWidget):
                 self._append_msg("system", f"Tool rejected: {tool_name}", preview[:160])
                 return
 
+        strategy = ""
+        if risk.elevation:
+            available, why = PrivilegeBroker.gui_elevation_available()
+            if not available:
+                if self._worker:
+                    self._worker.set_approval(False)
+                self._append_msg("system", f"Elevation blocked: {tool_name}", why)
+                return
+            strategy = "pkexec"
+
         if automatic:
             self._append_msg("system", f"Auto-approved: {tool_name}", f"mode={mode}")
         if self._worker:
-            self._worker.set_approval(True)
+            self._worker.set_approval(True, strategy)
 
     def _send(self):
         text = self.input.toPlainText().strip()
-        if not text:
+        if not text and not self._attachments:
             return
-        self._append_msg("user", text)
+        if not text:
+            text = "Analyze the attached file(s) and explain the relevant findings."
+        attachment_names = ", ".join(item.name for item in self._attachments)
+        self._append_msg("user", text, attachment_names)
         self.input.clear()
         self.send_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
@@ -674,8 +777,6 @@ class ChatWidget(QWidget):
             session = load_session()
             state = get_state()
             timeout = int(state.get("request_timeout", 30))
-            if self.settings_ref and hasattr(self.settings_ref, "get_request_timeout"):
-                timeout = self.settings_ref.get_request_timeout()
             client = TriForceClient(session.base_url, token=session.token, timeout=timeout)
         except Exception as e:
             self._append_msg("error", f"Keine Session: {e}")
@@ -684,18 +785,10 @@ class ChatWidget(QWidget):
             self._stop_activity()
             return
 
-        # Priority: combo box > settings tab > state file
-        model = self.model_combo.currentText().strip()
-        fallback = self.fallback_combo.currentText().strip()
+        # Model routing is configured in Settings and read fresh for every send.
         state = get_state()
-        if not model and self.settings_ref:
-            model = self.settings_ref.get_current_model()
-        if not fallback and self.settings_ref:
-            fallback = self.settings_ref.get_current_fallback()
-        if not model:
-            model = state.get("selected_model", "")
-        if not fallback:
-            fallback = state.get("fallback_model", "")
+        model = str(state.get("selected_model") or "")
+        fallback = str(state.get("fallback_model") or "")
 
         resume_requested = (
             state.get("runtime_mode", DEFAULT_RUNTIME_MODE) == "native-light"
@@ -710,9 +803,6 @@ class ChatWidget(QWidget):
             self._append_msg("system", f"Fast chat model · {model}", "")
         tool_mode = state.get("tool_mode", "on_demand")
         enabled_tool_names = state.get("enabled_tools")
-        if self.settings_ref and hasattr(self.settings_ref, "get_tool_mode"):
-            tool_mode = self.settings_ref.get_tool_mode()
-            enabled_tool_names = self.settings_ref.get_enabled_tool_names()
         should_load_tools_now = should_load_tools(
             tool_mode, text, resume=resume_requested
         ) and enabled_tool_names != []
@@ -731,15 +821,13 @@ class ChatWidget(QWidget):
         if not self._messages:
             self._messages = [{"role": "system", "content": run_system}]
 
-        # Attach dropped files as context
-        user_content = text
-        if self._dropped_files:
-            file_ctx = []
-            for f in self._dropped_files:
-                file_ctx.append(f"--- FILE: {f['name']} ---\n{f['content'][:50000]}\n--- END ---")
-            user_content = "\n\n".join(file_ctx) + "\n\nUser message: " + text
-            self._dropped_files.clear()
-
+        # Attachments are one-shot for the current user turn. Text documents become
+        # bounded text blocks; images stay binary until this request reaches a vision model.
+        turn_attachments = list(self._attachments)
+        self._inflight_attachments = turn_attachments
+        user_content = multimodal_content(text, turn_attachments)
+        self._attachments.clear()
+        self._update_attachment_ui()
         self._messages.append({"role": "user", "content": user_content})
 
         # Save to history
@@ -766,6 +854,7 @@ class ChatWidget(QWidget):
 
     def _on_response(self, text: str, model_used: str):
         self._stop_activity()
+        self._inflight_attachments.clear()
         # Cache tools loaded by worker for next message
         if self._worker and self._worker.load_tools_on_start and self._worker.tools is not None:
             self._tools = self._worker.tools
@@ -782,6 +871,14 @@ class ChatWidget(QWidget):
 
     def _on_error(self, err: str):
         self._stop_activity()
+        if self._inflight_attachments:
+            current_names = {item.name for item in self._attachments}
+            for item in self._inflight_attachments:
+                if item.name not in current_names:
+                    self._attachments.append(item)
+            self._inflight_attachments.clear()
+            self._update_attachment_ui()
+            self._append_msg("system", "Attachments restored after failed request.", "retry available")
         self._append_msg("error", err)
         self.send_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
