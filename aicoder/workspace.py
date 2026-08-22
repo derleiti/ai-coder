@@ -24,7 +24,7 @@ def activate_workspace(path: str | Path | None = None) -> Path:
 
 
 def path_within_workspace(value: str | Path, root: str | Path | None = None) -> tuple[Path, bool]:
-    workspace = active_workspace(str(root) if root is not None else None)
+    workspace = (Path(root).expanduser().resolve(strict=False) if root is not None else active_workspace())
     raw = Path(str(value or ".")).expanduser()
     candidate = raw if raw.is_absolute() else workspace / raw
     resolved = candidate.resolve(strict=False)

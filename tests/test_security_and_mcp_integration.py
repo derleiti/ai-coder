@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import contextlib
 import io
 import tempfile
@@ -149,6 +150,15 @@ class ToolPolicyIntegrationTests(unittest.TestCase):
 
 
 class LocalCapabilityTests(unittest.TestCase):
+    def setUp(self):
+        self._saved_active_workspace = os.environ.pop("AICODER_ACTIVE_WORKSPACE", None)
+
+    def tearDown(self):
+        if self._saved_active_workspace is not None:
+            os.environ["AICODER_ACTIVE_WORKSPACE"] = self._saved_active_workspace
+        else:
+            os.environ.pop("AICODER_ACTIVE_WORKSPACE", None)
+
     def test_known_mutation_bypasses_are_classified(self):
         for tool, command in (
             ("local_exec", "find . -type f -delete"),

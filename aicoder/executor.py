@@ -228,6 +228,21 @@ class AgentLoopGuard:
     def __init__(self, window: int = 12):
         self.window = max(STALL_FALLBACK_REPEATS, window)
         self._recent: list[str] = []
+        self._last_call_batch = ""
+        self._consecutive_call_batches = 0
+
+    def observe_calls(self, calls: list[dict]) -> int:
+        """Count consecutive semantically identical call batches before execution."""
+        fingerprint = json.dumps(
+            [tool_call_identity(call) for call in calls],
+            sort_keys=True, ensure_ascii=False, default=str,
+        )
+        if fingerprint == self._last_call_batch:
+            self._consecutive_call_batches += 1
+        else:
+            self._last_call_batch = fingerprint
+            self._consecutive_call_batches = 1
+        return self._consecutive_call_batches
 
     def observe(self, calls: list[dict], results: list[str]) -> int:
         payload = {
@@ -248,6 +263,8 @@ class AgentLoopGuard:
 
     def reset(self) -> None:
         self._recent.clear()
+        self._last_call_batch = ""
+        self._consecutive_call_batches = 0
 
 
 def agent_checkpoint(step: int) -> str:

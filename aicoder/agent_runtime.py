@@ -676,6 +676,52 @@ class NativeLightRuntime:
                     fallback_used=fallback_used, plan_id=plan.id if plan else "",
                 )
 
+            consecutive_call_batches = loop_guard.observe_calls(calls)
+            if consecutive_call_batches >= 2:
+                messages.append({"role": "assistant", "content": response})
+                if consecutive_call_batches == 2:
+                    current_input = (
+                        "Duplicate tool call blocked before execution: this exact tool operation "
+                        "was already executed on the previous turn. Use the existing result, "
+                        "inspect different evidence, change the arguments, or finish with a clear "
+                        "answer/blocker. Do not repeat the same call unchanged."
+                    )
+                    self._emit(
+                        "loop_prevented", iteration=i + 1, repeats=consecutive_call_batches,
+                        action="nudge",
+                    )
+                    self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
+                    continue
+                if active_fallback and active_fallback != model_used:
+                    previous_model = model_used
+                    active_model = active_fallback
+                    active_fallback = None
+                    fallback_used = True
+                    loop_guard.reset()
+                    current_input = (
+                        "Repeated duplicate tool call blocked. Continue with a different approach "
+                        "using the prior tool result; do not repeat the blocked call unchanged."
+                    )
+                    self._emit(
+                        "model_switch", previous=previous_model, model=active_model,
+                        reason="duplicate tool call prevented before execution",
+                    )
+                    self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
+                    continue
+                reason = (
+                    "Agent paused because it kept requesting the same tool operation after that "
+                    "duplicate had already been blocked. The previous tool result remains available; "
+                    "resume after changing the approach."
+                )
+                self._pause_plan(plan, reason, response)
+                self._save_journal(plan, messages, pending_input=reason, tool_batches=journal_batches)
+                self._emit("paused", reason=reason)
+                return AgentRunResult(
+                    "paused", reason, model_used, messages, tools, system,
+                    iterations=i + 1, latency_ms=total_latency,
+                    fallback_used=fallback_used, plan_id=plan.id if plan else "",
+                )
+
             tool_was_called = True
             tool_results: list[str] = []
             batch_records: list[dict[str, Any]] = []

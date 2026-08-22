@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -29,6 +30,15 @@ def _write_skill(root: Path, name: str, description: str, body: str) -> Path:
 
 
 class SkillDiscoveryTests(unittest.TestCase):
+    def setUp(self):
+        self._saved_active_workspace = os.environ.pop("AICODER_ACTIVE_WORKSPACE", None)
+
+    def tearDown(self):
+        if self._saved_active_workspace is not None:
+            os.environ["AICODER_ACTIVE_WORKSPACE"] = self._saved_active_workspace
+        else:
+            os.environ.pop("AICODER_ACTIVE_WORKSPACE", None)
+
     def test_workspace_native_skill_overrides_agents_and_global(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

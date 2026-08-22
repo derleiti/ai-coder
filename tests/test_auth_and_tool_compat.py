@@ -532,7 +532,8 @@ class ReplRegressionTests(unittest.TestCase):
             "response": '<tool_call>{"name":"health","arguments":{}}</tool_call>',
             "model": "operator",
         }
-        client.chat.side_effect = [repeated.copy() for _ in range(6)] + [
+        client.chat.side_effect = [
+            repeated.copy(), repeated.copy(), repeated.copy(),
             {"response": "DONE: recovered", "model": "fallback"},
         ]
         worker = _AgentWorker(
@@ -543,9 +544,9 @@ class ReplRegressionTests(unittest.TestCase):
         )
         with patch("aicoder.agent_runtime.run_tool", return_value=("same result", False)):
             worker.run()
-        self.assertEqual(client.chat.call_count, 7)
-        self.assertEqual(client.chat.call_args_list[6].kwargs["model"], "fallback")
-        self.assertIsNone(client.chat.call_args_list[6].kwargs["fallback_model"])
+        self.assertEqual(client.chat.call_count, 4)
+        self.assertEqual(client.chat.call_args_list[3].kwargs["model"], "fallback")
+        self.assertIsNone(client.chat.call_args_list[3].kwargs["fallback_model"])
 
 
 class PrivilegeBrokerTests(unittest.TestCase):

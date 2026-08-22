@@ -203,6 +203,61 @@ class NativeLightPlanTests(unittest.TestCase):
                 "in_progress",
             )
 
+    def test_duplicate_tool_call_is_blocked_before_second_execution(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp)
+            client = MagicMock()
+            client.timeout = 30
+            repeated = {
+                "response": '<tool_call>{"name":"file_read","arguments":{"path":"README.md"}}</tool_call>',
+                "model": "test/model",
+            }
+            client.chat.side_effect = [
+                repeated,
+                repeated,
+                {"response": "DONE: used the existing result", "model": "test/model"},
+            ]
+            runtime = NativeLightRuntime(
+                client=client, initial_prompt="Inspect README", model="test/model",
+                fallback_model=None, workspace_root=str(workspace),
+                tools=[LOCAL_FILE_READ_SCHEMA], load_tools_on_start=True,
+                persistent_plan=False, base_timeout=30,
+            )
+            events = []
+            runtime.event_fn = lambda name, payload: events.append((name, payload))
+            with patch("aicoder.agent_runtime.run_tool", return_value=("README contents", False)) as run_tool:
+                result = runtime.run()
+
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(result.response, "DONE: used the existing result")
+            self.assertEqual(run_tool.call_count, 1)
+            self.assertEqual(client.chat.call_count, 3)
+            self.assertTrue(any(name == "loop_prevented" for name, _ in events))
+
+    def test_repeated_blocked_duplicate_pauses_with_visible_reason(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp)
+            client = MagicMock()
+            client.timeout = 30
+            repeated = {
+                "response": '<tool_call>{"name":"file_read","arguments":{"path":"README.md"}}</tool_call>',
+                "model": "test/model",
+            }
+            client.chat.side_effect = [repeated, repeated, repeated]
+            runtime = NativeLightRuntime(
+                client=client, initial_prompt="Inspect README", model="test/model",
+                fallback_model=None, workspace_root=str(workspace),
+                tools=[LOCAL_FILE_READ_SCHEMA], load_tools_on_start=True,
+                persistent_plan=False, base_timeout=30,
+            )
+            with patch("aicoder.agent_runtime.run_tool", return_value=("README contents", False)) as run_tool:
+                result = runtime.run()
+
+            self.assertEqual(result.status, "paused")
+            self.assertIn("same tool operation", result.response)
+            self.assertEqual(run_tool.call_count, 1)
+            self.assertEqual(client.chat.call_count, 3)
+
     def test_resume_reuses_paused_plan_id(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

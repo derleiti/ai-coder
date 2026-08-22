@@ -46,6 +46,20 @@ class ActiveWorkspaceTests(unittest.TestCase):
 
 
 class WorkspaceEscapeTests(unittest.TestCase):
+    def test_explicit_scope_root_is_not_overridden_by_process_workspace(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            process_root = base / "process"
+            explicit_root = base / "explicit"
+            process_root.mkdir(); explicit_root.mkdir()
+            target = explicit_root / "inside.txt"
+            target.write_text("inside", encoding="utf-8")
+            with patch.dict(os.environ, {ACTIVE_WORKSPACE_ENV: str(process_root)}):
+                from aicoder.workspace import path_within_workspace
+                resolved, inside = path_within_workspace("inside.txt", explicit_root)
+            self.assertTrue(inside)
+            self.assertEqual(resolved, target.resolve())
+
     def test_inside_workspace_read_needs_no_scope_approval(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

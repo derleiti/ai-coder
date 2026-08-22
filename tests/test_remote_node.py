@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import json
 import tempfile
 import unittest
@@ -29,6 +30,15 @@ class _FakeWebSocket:
 
 
 class RemoteNodeTests(unittest.TestCase):
+    def setUp(self):
+        self._saved_active_workspace = os.environ.pop("AICODER_ACTIVE_WORKSPACE", None)
+
+    def tearDown(self):
+        if self._saved_active_workspace is not None:
+            os.environ["AICODER_ACTIVE_WORKSPACE"] = self._saved_active_workspace
+        else:
+            os.environ.pop("AICODER_ACTIVE_WORKSPACE", None)
+
     def _session(self) -> Session:
         return Session(
             base_url="https://api.ailinux.me",
