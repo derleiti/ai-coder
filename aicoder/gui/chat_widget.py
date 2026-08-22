@@ -170,11 +170,11 @@ class _AgentWorker(QThread):
                     runtime_label,
                 )
             elif kind == "model_without_tool_support":
-                _alt = str(payload.get("alternative") or "")
-                _msg = (f"{payload.get('model') or '?'} kann keine Tool-Calls — "
-                        f"{payload.get('tool_count') or 0} Tools werden nicht gesendet.")
-                if _alt:
-                    _msg += f" Tool-fähige Variante: {_alt}"
+                _msg = (
+                    f"{payload.get('model') or '?'} meldet kein natives Function Calling — "
+                    "AICoder verwendet weiterhin textbasiertes Tool-Calling; "
+                    "native Provider-Toolschemas werden nicht gesendet."
+                )
                 self.msg.emit("system", _msg, runtime_label)
             elif kind == "plan":
                 plan = payload.get("plan")

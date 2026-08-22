@@ -76,28 +76,6 @@ class CapabilityDetectionTests(unittest.TestCase):
         self.assertEqual(self.client.calls, 1, "agent loop must not refetch per request")
 
 
-class AlternativeSuggestionTests(unittest.TestCase):
-    def setUp(self):
-        mc.reset_cache()
-        self.client = _FakeClient(CATALOGUE)
-
-    def tearDown(self):
-        mc.reset_cache()
-
-    def test_suggests_a_tool_capable_route_of_the_same_model(self):
-        alt = mc.tool_capable_alternative(
-            self.client, "nvidia/nvidia/nemotron-3-ultra-550b-a55b"
-        )
-        self.assertEqual(alt, "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free")
-
-    def test_no_alternative_for_an_unrelated_model(self):
-        self.assertIsNone(mc.tool_capable_alternative(self.client, "acme/unique-model"))
-
-    def test_never_suggests_the_model_itself(self):
-        model = "mistral/mistral-code-agent-latest"
-        self.assertNotEqual(mc.tool_capable_alternative(self.client, model), model)
-
-
 class RuntimeGateTests(unittest.TestCase):
     """The runtime must drop tools rather than send them into a dead end."""
 
@@ -124,10 +102,7 @@ class RuntimeGateTests(unittest.TestCase):
         tools = [{"name": "file_edit"}, {"name": "file_read"}]
         self.assertIsNone(runtime._tools_for_request(tools, runtime.model))
         self.assertEqual([kind for kind, _ in events], ["model_without_tool_support"])
-        self.assertEqual(
-            events[0][1]["alternative"],
-            "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
-        )
+        self.assertNotIn("alternative", events[0][1])
 
     def test_warning_is_emitted_only_once_per_run(self):
         runtime = self._runtime("nvidia/nvidia/nemotron-3-ultra-550b-a55b")

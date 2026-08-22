@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .agent_journal import ContinuationJournalStore
-from .model_capabilities import supports_tools, tool_capable_alternative
+from .model_capabilities import supports_tools
 from .agent_plan import AgentPlan, PlanStore, plan_prompt_context, resume_prompt_context
 from .client import ClientError, TriForceClient
 from .capabilities import (
@@ -160,8 +160,7 @@ class NativeLightRuntime:
 
         Several providers answer a tool-carrying request from a chat-only model
         with an empty completion, which surfaces as an agent that silently does
-        nothing. Drop the tools instead and say so once, naming a route of the
-        same model that does support tool calling when one exists.
+        nothing. Suppress only the provider-native schema payload; AICoder text-based tool calling remains available.
         """
         if not tools or not self.load_tools_on_start:
             return None
@@ -174,7 +173,6 @@ class NativeLightRuntime:
             self._emit(
                 "model_without_tool_support",
                 model=model or "?",
-                alternative=tool_capable_alternative(self.client, model) or "",
                 tool_count=len(tools),
             )
         return None

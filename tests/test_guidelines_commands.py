@@ -52,6 +52,22 @@ class GuidelineTests(unittest.TestCase):
                 self.skipTest("symlinks unavailable")
             self.assertEqual(load_guidelines(workspace), [])
 
+    def test_system_prompt_keeps_full_enabled_tool_catalog(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp)
+            tools = [
+                {
+                    "name": f"tool_{index:02d}",
+                    "description": "x" * 100,
+                    "inputSchema": {"type": "object", "properties": {}},
+                }
+                for index in range(55)
+            ]
+            prompt = build_system_prompt(tools, str(workspace))
+            self.assertIn("tool_00()", prompt)
+            self.assertIn("tool_54()", prompt)
+            self.assertGreater(len(prompt.split("## Tools", 1)[1]), 4000)
+
     def test_system_prompt_includes_guidelines_and_agents_with_agents_later(self):
         with tempfile.TemporaryDirectory() as temp:
             workspace = Path(temp)

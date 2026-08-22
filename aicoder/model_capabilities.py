@@ -131,30 +131,3 @@ def supports_tools(client: Any, model: str | None) -> bool:
     if caps is None or not caps:
         return True
     return bool(caps & _TOOL_CAPABILITIES)
-
-
-def tool_capable_alternative(client: Any, model: str | None) -> Optional[str]:
-    """Find a sibling of the same base model that does support tool calling.
-
-    Backends expose the same weights under several routes — 'nvidia/<model>'
-    and 'openrouter/nvidia/<model>:free' can differ only in whether tool calling
-    is available.  Suggesting the working route is far more useful than telling
-    the user their model is unsuitable.
-    """
-    if not model:
-        return None
-    catalogue = load_catalogue(client)
-    base = str(model).split("/")[-1].split(":")[0]
-    if not base:
-        return None
-    candidates = [
-        model_id for model_id, caps in catalogue.items()
-        if model_id != model
-        and base in model_id
-        and (caps & _TOOL_CAPABILITIES)
-    ]
-    if not candidates:
-        return None
-    # Prefer a free route, then the shortest id — the least surprising variant.
-    candidates.sort(key=lambda mid: (0 if mid.endswith(":free") else 1, len(mid)))
-    return candidates[0]

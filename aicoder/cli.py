@@ -85,35 +85,19 @@ def cmd_handshake(_: argparse.Namespace) -> int:
 
 
 def cmd_tools(_: argparse.Namespace) -> int:
-    from .executor import AGENT_TOOLS
+    """Show the same effective tool catalogue used by the agent runtime."""
+    from .executor import load_tools
+
     _, client = session_client()
-    data = client.handshake()
-    tools = data.get("tools") or []
-    allowed = data.get("allowed_tools") or []
+    tools = load_tools(client, force_refresh=True)
+    enabled = get_state().get("enabled_tools")
+    if enabled is not None:
+        selected = {str(name) for name in enabled}
+        tools = [tool for tool in tools if str(tool.get("name") or "") in selected]
 
-    # Admin/enterprise handshakes commonly grant the wildcard instead of
-    # embedding the full tool catalog. Resolve it through MCP tools/list so
-    # this command reports the same effective tools as the GUI/agent.
-    if not tools and "*" in allowed:
-        payload = {"jsonrpc": "2.0", "method": "tools/list", "params": {}, "id": 1}
-        listed = client._request(
-            "POST", "/v1/mcp", payload, require_auth=True, _label="tools/list"
-        )
-        tools = listed.get("result", {}).get("tools", [])
-    elif not tools:
-        tools = allowed
-
-    if tools and isinstance(tools[0], dict):
-        tools = filter_tool_catalog(tools, AGENT_TOOLS)
-    else:
-        tools = [name for name in tools if name in AGENT_TOOLS and require_allowed_tool(name, AGENT_TOOLS)[0]]
-
-    print(f"{len(tools)} tools allowed")
+    print(f"{len(tools)} tools enabled")
     for tool in tools:
-        if isinstance(tool, dict):
-            print(tool.get("name", ""))
-        else:
-            print(tool)
+        print(tool.get("name", ""))
     return 0
 
 

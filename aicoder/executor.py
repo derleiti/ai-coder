@@ -842,7 +842,10 @@ def build_system_prompt(tools: list[dict], workspace_root: Optional[str] = None)
     # repository file.
     agents_short = agents_md[:12000] if agents_md else ""
 
-    tool_str = build_tool_desc(tools)[:4000]
+    # The effective tool catalogue is already bounded by discovery/policy. Do not
+    # truncate it by character count: that can cut a schema description mid-line
+    # and silently hide later user-enabled tools from text-tool-capable models.
+    tool_str = build_tool_desc(tools)
     return SYSTEM_TEMPLATE.format(
         guidelines=(guideline_text + "\n") if guideline_text else "",
         agents_md=("## AGENTS.md\n" + agents_short) if agents_short else "",

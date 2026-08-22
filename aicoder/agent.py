@@ -150,18 +150,13 @@ def _run_native_light_agent(
                 print(f"  {C.DIM}plan {plan_id} · persistent native-light runtime{C.RESET}")
             header_printed = True
         elif kind == "model_without_tool_support":
-            # Silently dropping the tools would look exactly like the bug this
-            # guard replaces, so always say which model cannot use them.
             model_name = payload.get("model") or "?"
-            alt = str(payload.get("alternative") or "")
             print(
-                f"\n{C.BYELLOW}◆ {model_name} kann keine Tool-Calls{C.RESET} — "
-                f"{payload.get('tool_count') or 0} Tools werden nicht mitgesendet.",
+                f"\n{C.BYELLOW}◆ {model_name} meldet kein natives Function Calling{C.RESET} — "
+                "AICoder verwendet weiterhin sein textbasiertes Tool-Calling; "
+                "native Provider-Toolschemas werden nicht mitgesendet.",
                 file=sys.stderr,
             )
-            if alt:
-                print(f"  Tool-fähige Variante: {C.BOLD}{alt}{C.RESET}", file=sys.stderr)
-                print(f"  Wechseln mit: aicoder model {alt}", file=sys.stderr)
         elif kind == "thought":
             print_thought(str(payload.get("text") or ""))
         elif kind == "tool_call":
