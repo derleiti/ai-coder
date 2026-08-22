@@ -674,6 +674,28 @@ class NativeLightGuiTests(unittest.TestCase):
             current_plans = list((Path(temp) / "config" / "plans").rglob("current.json"))
             self.assertEqual(len(current_plans), 1)
 
+    def test_review_text_mentioning_tool_call_is_a_normal_final_response(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp)
+            client = MagicMock()
+            client.timeout = 30
+            review = (
+                "P0: Tool-call normalization should keep parse_tool_calls() strict.\n"
+                "P1: END_TOOL_CALL is only a protocol marker when emitted as a tool call.\n"
+                "Fazit: no code changes are required for this review."
+            )
+            client.chat.return_value = {"response": review, "model": "test/model"}
+            runtime = NativeLightRuntime(
+                client=client, initial_prompt="Review the code only", model="test/model",
+                fallback_model=None, workspace_root=str(workspace),
+                tools=[], load_tools_on_start=False, persistent_plan=False, base_timeout=30,
+            )
+            result = runtime.run()
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(result.response, review)
+            self.assertEqual(client.chat.call_count, 1)
+
+
 
 if __name__ == "__main__":
     unittest.main()

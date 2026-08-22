@@ -105,15 +105,26 @@ def _recover_unclosed_tool_calls(text: str) -> list[dict]:
 
 
 def _has_incomplete_tool_markup(text: str) -> bool:
+    """Return True only when the response actually starts a tool protocol and truncates it.
+
+    Mentions such as ``tool_call`` or ``parse_tool_calls`` inside a normal review are
+    ordinary prose and must never trigger final-response repair.
+    """
     raw = str(text or "")
-    lowered = raw.lower()
-    legacy_opens = lowered.count("<tool_call>")
-    legacy_closes = lowered.count("</tool_call>")
-    if legacy_opens != legacy_closes:
-        return True
-    if "tool_call" in lowered or "end_tool_call" in lowered:
+    stripped = raw.lstrip()
+    lowered = stripped.lower()
+
+    # Legacy protocol: only treat it as protocol markup when the response itself
+    # starts with a legacy tool-call envelope.
+    if lowered.startswith("<tool_call>"):
+        return "</tool_call>" not in lowered
+
+    # Protocol v2: only a leading TOOL_CALL marker enters protocol mode. A normal
+    # final answer may legitimately discuss TOOL_CALL/END_TOOL_CALL as code terms.
+    if lowered.startswith("tool_call ") or lowered == "tool_call":
         from .executor import TEXT_TOOL_V2_RE
         return TEXT_TOOL_V2_RE.fullmatch(raw) is None
+
     return False
 
 
