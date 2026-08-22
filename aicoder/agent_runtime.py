@@ -829,6 +829,13 @@ class NativeLightRuntime:
                     "tool_result", name=name, result=tool_result,
                     is_error=is_error, elapsed=elapsed,
                 )
+                hook_event = "PostToolUseFailure" if is_error else "PostToolUse"
+                post_hook = self.hooks.emit(hook_event, {
+                    "name": name, "arguments": dict(args), "workspace": workspace,
+                    "iteration": i + 1, "result": str(tool_result)[:4000],
+                })
+                for diagnostic in post_hook.diagnostics:
+                    self._emit("hook_diagnostic", event=hook_event, message=diagnostic, tool=name)
                 tool_results.append(f"Tool {name} result:\n{tool_result}")
                 if not is_error and name == "file_read" and evidence_store is not None:
                     try:
