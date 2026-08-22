@@ -47,6 +47,7 @@ class _AgentWorker(QThread):
         self, client, messages_array, model, fallback, tools, system_prompt,
         load_tools_on_start=True, enabled_tool_names=None, quick_chat=False,
         tools_unavailable_reason="", progressive_tool_disclosure=True,
+        session_id="", evidence_context="",
     ):
         super().__init__()
         self.client = client
@@ -60,6 +61,8 @@ class _AgentWorker(QThread):
         self.quick_chat = quick_chat
         self.tools_unavailable_reason = str(tools_unavailable_reason or "")
         self.progressive_tool_disclosure = bool(progressive_tool_disclosure)
+        self.session_id = str(session_id or "")
+        self.evidence_context = str(evidence_context or "")
         # Approval mechanism: threading.Event + result flag
         self._approval_event = threading.Event()
         self._approval_result = False
@@ -160,9 +163,13 @@ class _AgentWorker(QThread):
             dict(message) for message in messages[1:latest_user_index]
             if message.get("role") != "system"
         ]
+        if self.evidence_context:
+            prior.append({"role": "assistant", "content": self.evidence_context})
         base_timeout = int(state.get("request_timeout", getattr(self.client, "timeout", 300)))
+        active_plan_id = ""
 
         def on_event(kind: str, payload: dict):
+            nonlocal active_plan_id
             if kind == "tools_ready":
                 self.msg.emit(
                     "system",
@@ -181,6 +188,7 @@ class _AgentWorker(QThread):
                 plan_id = getattr(plan, "id", "")
                 action = str(payload.get("action") or "plan")
                 if plan_id:
+                    active_plan_id = str(plan_id)
                     self.msg.emit("system", f"Persistent plan {action}: {plan_id}", runtime_label)
             elif kind == "model_response":
                 requested = str(payload.get("requested") or "default")
@@ -198,7 +206,18 @@ class _AgentWorker(QThread):
             elif kind == "tool_result":
                 name = str(payload.get("name") or "?")
                 result = str(payload.get("result") or "")
-                status = f"{'ERROR' if payload.get('is_error') else 'OK'} ({float(payload.get('elapsed') or 0.0):.1f}s)"
+                is_error = bool(payload.get("is_error"))
+                evidence_status = "blocked" if is_error and "blocked" in result.lower() else ("error" if is_error else "ok")
+                if self.session_id:
+                    try:
+                        chat_history.save_tool_event(
+                            self.session_id, name, evidence_status,
+                            iteration=int(payload.get("iteration") or 0),
+                            plan_id=active_plan_id,
+                        )
+                    except Exception:
+                        pass
+                status = f"{'ERROR' if is_error else 'OK'} ({float(payload.get('elapsed') or 0.0):.1f}s)"
                 self.msg.emit("tool_result", result[:2000], f"{name} {status}")
             elif kind == "model_switch":
                 self.msg.emit(
@@ -759,6 +778,12 @@ class ChatWidget(QWidget):
 
         if not self._messages:
             self._messages = [{"role": "system", "content": run_system}]
+        elif self._messages[0].get("role") != "system":
+            # History rows intentionally persist only visible chat messages. Runtime
+            # conversation handling expects slot 0 to be the current system prompt.
+            self._messages.insert(0, {"role": "system", "content": run_system})
+        else:
+            self._messages[0] = {"role": "system", "content": run_system}
 
         # Attach dropped files as context
         user_content = text
@@ -776,6 +801,7 @@ class ChatWidget(QWidget):
             title = text[:50].strip() or "New Chat"
             self._session_id = chat_history.create_session(title=title)
         chat_history.save_message(self._session_id, "user", text)
+        evidence_context = chat_history.render_tool_evidence(self._session_id, limit=40)
 
         self._worker = _AgentWorker(
             client, self._messages, model, fallback, run_tools, run_system,
@@ -784,6 +810,7 @@ class ChatWidget(QWidget):
             quick_chat=quick_chat,
             tools_unavailable_reason=tools_unavailable_reason,
             progressive_tool_disclosure=(tool_mode == "on_demand"),
+            session_id=self._session_id, evidence_context=evidence_context,
         )
         self._worker.msg.connect(self._on_agent_msg)
         self._worker.finished.connect(self._on_response)

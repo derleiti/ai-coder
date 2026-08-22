@@ -125,6 +125,15 @@ def _has_incomplete_tool_markup(text: str) -> bool:
         from .executor import TEXT_TOOL_V2_RE
         return TEXT_TOOL_V2_RE.fullmatch(raw) is None
 
+    # A provider may return only the tail of a legacy envelope (observed as
+    # ``}}\n</tool_call>``). Treat punctuation-only content before an orphan closing
+    # tag as protocol debris, while normal prose that merely mentions the tag
+    # remains a valid final answer.
+    if lowered.endswith("</tool_call>"):
+        prefix = stripped[:-len("</tool_call>")].strip()
+        if not any(ch.isalnum() for ch in prefix):
+            return True
+
     return False
 
 
@@ -922,7 +931,7 @@ class NativeLightRuntime:
                         system = messages[0]["content"]
                     self._emit(
                         "tool_result", name=name, result=tool_result,
-                        is_error=is_error, elapsed=elapsed,
+                        is_error=is_error, elapsed=elapsed, iteration=i + 1,
                     )
                     tool_results.append(f"Tool {name} result:\n{tool_result}")
                     batch_records.append({
@@ -1040,7 +1049,7 @@ class NativeLightRuntime:
                     fresh_inspection_after_resume = True
                 self._emit(
                     "tool_result", name=name, result=tool_result,
-                    is_error=is_error, elapsed=elapsed,
+                    is_error=is_error, elapsed=elapsed, iteration=i + 1,
                 )
                 hook_event = "PostToolUseFailure" if is_error else "PostToolUse"
                 post_hook = self.hooks.emit(hook_event, {
