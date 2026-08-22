@@ -202,18 +202,14 @@ class ToolCallCompatibilityTests(unittest.TestCase):
             [{"name": "code_search", "arguments": {"query": "oauth"}}],
         )
 
-    def test_tool_call_repairs_missing_outer_brace(self):
-        # Observed from mistral-code-agent: complete XML envelope, but the JSON
-        # closes arguments and omits only the final outer object brace.
+    def test_tool_call_does_not_repair_missing_outer_brace(self):
+        # Malformed JSON must never be guessed into an executable call.
         text = (
             "<tool_call>\n"
             "{\"name\":\"file_edit\",\"arguments\":{\"command\":\"cat > ~/x << 'EOF'\\nhello\\nEOF\"}\n"
             "</tool_call>"
         )
-        self.assertEqual(
-            parse_tool_calls(text),
-            [{"name": "file_edit", "arguments": {"command": "cat > ~/x << 'EOF'\nhello\nEOF"}}],
-        )
+        self.assertEqual(parse_tool_calls(text), [])
 
     def test_truncated_unclosed_tool_call_is_not_guessed(self):
         text = "<tool_call>\n{\"name\":\"file_edit\",\"arguments\":{\"command\":\"cat > ~/x << 'EOF'\\nhello"

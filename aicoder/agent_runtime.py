@@ -75,10 +75,12 @@ _VERIFICATION_REQUIRED_PROMPT = (
 )
 
 _FINAL_RESPONSE_REPAIR_PROMPT = (
-    "Your previous response was empty or contained an incomplete tool-call envelope. "
-    "Continue from the existing tool results. If another tool is required, emit exactly "
-    "one complete valid tool call. Otherwise finish the user's task with a normal textual "
-    "answer. Do not return an empty response and do not stop after a tool call."
+    "Your previous response was empty or contained an invalid/incomplete tool call. "
+    "Discard that malformed output completely; do not continue or complete its fragment. "
+    "If another tool is required, generate one NEW tool call from the beginning using exactly:\n"
+    "TOOL_CALL tool_name\n{\"argument\": \"value\"}\nEND_TOOL_CALL\n"
+    "Use the exact tool name and only its argument JSON object. No prose before or after it. "
+    "Otherwise finish the user's task with a normal textual answer. Do not return an empty response."
 )
 
 
@@ -103,13 +105,16 @@ def _recover_unclosed_tool_calls(text: str) -> list[dict]:
 
 
 def _has_incomplete_tool_markup(text: str) -> bool:
-    lowered = str(text or "").lower()
-    opens = lowered.count("<tool_call>")
-    closes = lowered.count("</tool_call>")
-    if opens != closes:
+    raw = str(text or "")
+    lowered = raw.lower()
+    legacy_opens = lowered.count("<tool_call>")
+    legacy_closes = lowered.count("</tool_call>")
+    if legacy_opens != legacy_closes:
         return True
-    start = lowered.rfind("<tool_call>")
-    return start >= 0 and "</tool_call>" not in lowered[start:]
+    if "tool_call" in lowered or "end_tool_call" in lowered:
+        from .executor import TEXT_TOOL_V2_RE
+        return TEXT_TOOL_V2_RE.fullmatch(raw) is None
+    return False
 
 
 @dataclass
@@ -205,9 +210,18 @@ class NativeLightRuntime:
             return system
         text_block = (
             "## Tool Call Format (one per response):\n"
-            "<tool_call>\n"
-            '{"name": "tool_name", "arguments": {...}}\n'
-            "</tool_call>"
+            "When you need a tool, output exactly this and nothing else:\n"
+            "TOOL_CALL tool_name\n"
+            '{"argument": "value"}\n'
+            "END_TOOL_CALL\n\n"
+            "Rules:\n"
+            "- Use the exact tool name from the tool list.\n"
+            "- The JSON object contains only that tool's arguments; do not wrap it in name/arguments.\n"
+            "- Use {} when the tool takes no arguments.\n"
+            "- Emit exactly one complete tool call per response.\n"
+            "- Do not add prose before or after a tool call.\n"
+            "- Never continue a broken prior tool call; always start a new call from TOOL_CALL.\n"
+            "- Never invent fields or omit required fields."
         )
         native_block = (
             "## Tool Calling\n"
@@ -719,9 +733,7 @@ class NativeLightRuntime:
             else:
                 native_calls = []
                 text_calls = parse_tool_calls(response)
-                recovered_calls = [] if text_calls else _recover_unclosed_tool_calls(response)
-                if recovered_calls:
-                    self._emit("tool_call_recovered", iteration=i + 1, count=len(recovered_calls))
+                recovered_calls = []
             calls = merge_tool_calls(native_calls, text_calls, recovered_calls)
             if native_calls and not response:
                 response = "\n".join(

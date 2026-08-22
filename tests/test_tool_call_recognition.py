@@ -108,6 +108,20 @@ class BareJsonToolCallTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(parse_tool_calls(text), [])
 
+    def test_protocol_v2_parses_flat_argument_json(self):
+        text = 'TOOL_CALL file_read\n{"path":"README.md"}\nEND_TOOL_CALL'
+        self.assertEqual(parse_tool_calls(text), [{"name":"file_read","arguments":{"path":"README.md"}}])
+
+    def test_protocol_v2_rejects_malformed_json_without_repair(self):
+        text = 'TOOL_CALL file_read\n{"path":"README.md"\nEND_TOOL_CALL'
+        self.assertEqual(parse_tool_calls(text), [])
+
+    def test_retry_and_resume_are_short_confirmations(self):
+        from aicoder.executor import is_short_confirmation
+        for value in ("retry", "resume", "go on", "continue", "weiter"):
+            with self.subTest(value=value):
+                self.assertTrue(is_short_confirmation(value))
+
 
 if __name__ == "__main__":
     unittest.main()

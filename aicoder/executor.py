@@ -57,6 +57,11 @@ OS_NAME = "Android/Termux" if IS_TERMUX else platform.system()
 
 
 TOOL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL | re.IGNORECASE)
+TEXT_TOOL_V2_RE = re.compile(
+    r"^\s*TOOL_CALL\s+(?P<name>[A-Za-z0-9_.:-]+)\s*\n"
+    r"(?P<args>.*?)\nEND_TOOL_CALL\s*$",
+    re.DOTALL | re.IGNORECASE,
+)
 FUNCTION_RE = re.compile(
     r"<function[=:](?P<name>[\w.-]+)>\s*(?P<args>.*?)\s*</function>",
     re.DOTALL | re.IGNORECASE,
@@ -97,7 +102,7 @@ _ACTION_REQUEST_RE = re.compile(
 
 _SHORT_CONFIRMATION_RE = re.compile(
     r"^(?:ja|ja\s+klar|klar|ok(?:ay)?|mach(?:e)?(?:\s+es)?|weiter|"
-    r"fortfahren|yes|sure|go\s+ahead|continue)[\s.!?]*$",
+    r"fortfahren|yes|sure|go\s+ahead|go\s+on|continue|retry|resume)[\s.!?]*$",
     re.IGNORECASE,
 )
 
@@ -722,9 +727,19 @@ You are ai-coder — an autonomous coding agent on AILinux/TriForce (api.ailinux
 {os_instructions}
 
 ## Tool Call Format (one per response):
-<tool_call>
-{{"name": "tool_name", "arguments": {{...}}}}
-</tool_call>
+When you need a tool, output exactly this and nothing else:
+TOOL_CALL tool_name
+{{"argument": "value"}}
+END_TOOL_CALL
+
+Rules:
+- Use the exact tool name from the tool list.
+- The JSON object contains only that tool's arguments; do not wrap it in name/arguments.
+- Use {{}} when the tool takes no arguments.
+- Emit exactly one complete tool call per response.
+- Do not add prose before or after a tool call.
+- Never continue a broken prior tool call; always start a new call from TOOL_CALL.
+- Never invent fields or omit required fields.
 
 ## Tools
 {tools}
@@ -970,7 +985,7 @@ def _normalize_tool_call(value: Any) -> Optional[dict]:
         try:
             args = json.loads(args)
         except json.JSONDecodeError:
-            args = {"input": args}
+            return None
     if args is None:
         args = {}
     if not isinstance(args, dict):
@@ -1015,29 +1030,16 @@ def merge_tool_calls(*groups: list[dict]) -> list[dict]:
 
 
 def _append_json_calls(calls: list[dict], raw: str) -> bool:
-    """Parse one JSON object/list and append any valid tool calls.
+    """Strictly parse one JSON object/list and append valid tool calls.
 
-    Some OpenAI-compatible providers occasionally omit one or two trailing
-    object braces inside an otherwise complete <tool_call> envelope. Repair
-    only that narrow case: add missing closing braces at the end and accept
-    the repair only when the result becomes valid JSON. Never guess missing
-    strings, commas, arrays, or truncated tool-call bodies.
+    This function never repairs malformed JSON. Protocol errors must be retried
+    by the model from a fresh tool-call envelope instead of being guessed locally.
     """
     text = raw.strip()
     try:
         value = json.loads(text)
     except (json.JSONDecodeError, TypeError):
-        value = None
-        if isinstance(text, str) and text.startswith("{"):
-            opens = text.count("{") - text.count("}")
-            if 0 < opens <= 2:
-                repaired = text + ("}" * opens)
-                try:
-                    value = json.loads(repaired)
-                except (json.JSONDecodeError, TypeError):
-                    value = None
-        if value is None:
-            return False
+        return False
     values = value if isinstance(value, list) else [value]
     added = False
     for item in values:
@@ -1060,8 +1062,23 @@ def normalize_tool_calls(value: Any) -> list[dict]:
 
 
 def parse_tool_calls(text: str) -> list[dict]:
-    """Extract tool calls from common OpenAI, Mistral, Hermes and XML forms."""
+    """Extract strict AICoder text-tool calls plus read-only legacy formats."""
     calls: list[dict] = []
+
+    # Preferred protocol v2: the entire response is one tool call. Tool name is
+    # outside JSON so the model only has to generate one flat argument object.
+    v2 = TEXT_TOOL_V2_RE.fullmatch(str(text or ""))
+    if v2:
+        raw_args = v2.group("args").strip()
+        try:
+            args = json.loads(raw_args) if raw_args else {}
+        except json.JSONDecodeError:
+            return []
+        call = _normalize_tool_call({"name": v2.group("name"), "arguments": args})
+        return [call] if call else []
+
+    # Legacy readers remain for compatibility with older models/sessions, but
+    # the system prompt no longer teaches these formats.
     for m in TOOL_RE.finditer(text):
         raw = m.group(1).strip()
         if _append_json_calls(calls, raw):
@@ -1087,7 +1104,7 @@ def parse_tool_calls(text: str) -> list[dict]:
         try:
             args = json.loads(raw_args) if raw_args else {}
         except json.JSONDecodeError:
-            args = {"input": raw_args}
+            continue
         call = _normalize_tool_call({"name": m.group("name"), "arguments": args})
         if call:
             calls.append(call)
@@ -1124,8 +1141,11 @@ def parse_tool_calls(text: str) -> list[dict]:
 
 
 def strip_tool_calls(text: str) -> str:
-    """Remove tool call blocks from text."""
-    return TOOL_RE.sub("", text).strip()
+    """Remove complete tool-call blocks from text."""
+    raw = str(text or "")
+    if TEXT_TOOL_V2_RE.fullmatch(raw):
+        return ""
+    return TOOL_RE.sub("", raw).strip()
 
 
 def trim_messages(msgs: list[dict]) -> list[dict]:

@@ -84,6 +84,38 @@ class RuntimeResilienceTests(unittest.TestCase):
                 client._request("GET", "/x", _retries=1)
         self.assertEqual(request.call_count, 1)
 
+    def test_retry_resumes_existing_paused_plan_instead_of_creating_new_task(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import MagicMock
+        from aicoder.agent_plan import PlanStore
+        from aicoder.agent_runtime import NativeLightRuntime
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            store = PlanStore(root / "plans")
+            plan = store.create("Review the real project", str(workspace), "test/model")
+            plan.status = "paused"
+            plan.pause_reason = "transient failure"
+            store.save(plan)
+
+            client = MagicMock()
+            client.timeout = 30
+            client.chat.return_value = {"response": "DONE: resumed", "model": "test/model"}
+            runtime = NativeLightRuntime(
+                client=client, initial_prompt="retry", model="test/model", fallback_model=None,
+                workspace_root=str(workspace), tools=[], load_tools_on_start=False,
+                plan_store=store, resume=True, base_timeout=30,
+            )
+            result = runtime.run()
+            resumed = store.load(str(workspace), plan.id)
+            self.assertEqual(result.plan_id, plan.id)
+            self.assertEqual(resumed.task, "Review the real project")
+            self.assertEqual(resumed.resume_count, 1)
+            self.assertEqual(resumed.status, "completed")
+
 
 if __name__ == "__main__":
     unittest.main()

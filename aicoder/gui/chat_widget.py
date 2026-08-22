@@ -31,7 +31,7 @@ from ..workspace import active_workspace
 from ..client import TriForceClient
 from .. import chat_history
 from ..executor import (
-    build_system_prompt, is_destructive, is_simple_chat_message, should_load_tools,
+    build_system_prompt, is_destructive, is_short_confirmation, is_simple_chat_message, should_load_tools,
 )
 
 
@@ -206,10 +206,7 @@ class _AgentWorker(QThread):
                     f"{payload.get('previous', '?')} → {payload.get('model', '?')}",
                 )
 
-        resume_requested = persistent_plan and initial_prompt.strip().lower() in {
-            "ja", "ja klar", "klar", "ok", "okay", "mach", "mache",
-            "mach es", "weiter", "fortfahren", "yes", "sure", "go ahead", "continue",
-        }
+        resume_requested = persistent_plan and is_short_confirmation(initial_prompt)
         runtime = NativeLightRuntime(
             client=self.client,
             initial_prompt=initial_prompt,
@@ -721,10 +718,7 @@ class ChatWidget(QWidget):
 
         resume_requested = (
             state.get("runtime_mode", DEFAULT_RUNTIME_MODE) == "native-light"
-            and text.strip().lower() in {
-                "ja", "ja klar", "klar", "ok", "okay", "mach", "mache",
-                "mach es", "weiter", "fortfahren", "yes", "sure", "go ahead", "continue",
-            }
+            and is_short_confirmation(text)
         )
         quick_chat = is_simple_chat_message(text) and not resume_requested
         model, fallback, fast_fallback = _select_chat_route(model, fallback, quick_chat)

@@ -203,14 +203,15 @@ class NativeLightPlanTests(unittest.TestCase):
                 "in_progress",
             )
 
-    def test_complete_json_in_unclosed_tool_tag_is_recovered_and_executed(self):
+    def test_complete_json_in_unclosed_tool_tag_is_not_executed(self):
         with tempfile.TemporaryDirectory() as temp:
             workspace = Path(temp)
             client = MagicMock()
             client.timeout = 30
             client.chat.side_effect = [
                 {"response": '<tool_call>{"name":"file_read","arguments":{"path":"README.md"}}', "model": "test/model"},
-                {"response": "DONE: recovered tool call and finished", "model": "test/model"},
+                {"response": 'TOOL_CALL file_read\n{"path":"README.md"}\nEND_TOOL_CALL', "model": "test/model"},
+                {"response": "DONE: fresh tool call finished", "model": "test/model"},
             ]
             runtime = NativeLightRuntime(
                 client=client, initial_prompt="Inspect README", model="test/model",
@@ -223,9 +224,9 @@ class NativeLightPlanTests(unittest.TestCase):
             with patch("aicoder.agent_runtime.run_tool", return_value=("README contents", False)) as execute:
                 result = runtime.run()
             self.assertEqual(result.status, "completed")
-            self.assertEqual(result.response, "DONE: recovered tool call and finished")
+            self.assertEqual(result.response, "DONE: fresh tool call finished")
             self.assertEqual(execute.call_count, 1)
-            self.assertTrue(any(name == "tool_call_recovered" for name, _ in events))
+            self.assertFalse(any(name == "tool_call_recovered" for name, _ in events))
 
     def test_truncated_tool_call_gets_one_repair_turn_then_finishes(self):
         with tempfile.TemporaryDirectory() as temp:
