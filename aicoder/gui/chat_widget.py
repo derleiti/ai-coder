@@ -194,8 +194,16 @@ class _AgentWorker(QThread):
                 requested = str(payload.get("requested") or "default")
                 used = str(payload.get("model") or requested)
                 route = used if used == requested else f"{requested} → {used}"
+                telemetry = payload.get("transport_telemetry") if isinstance(payload.get("transport_telemetry"), dict) else {}
+                meta = route
+                if telemetry:
+                    meta += (
+                        f" · transport {float(telemetry.get('elapsed_s') or 0.0):.1f}s"
+                        f" · {int(telemetry.get('chunks') or 0)} chunks"
+                        f" · max gap {float(telemetry.get('max_rx_gap_s') or 0.0):.1f}s"
+                    )
                 self.msg.emit(
-                    "system", f"Model response in {float(payload.get('elapsed_ms') or 0) / 1000.0:.1f}s", route
+                    "system", f"Model response in {float(payload.get('elapsed_ms') or 0) / 1000.0:.1f}s", meta
                 )
             elif kind == "thought":
                 self.msg.emit("thought", str(payload.get("text") or ""), f"step {payload.get('iteration', '?')}")
@@ -644,7 +652,12 @@ class ChatWidget(QWidget):
         return rendered if len(rendered) <= limit else rendered[:limit] + "…"
 
     def _on_approval_needed(self, tool_name: str, arguments: object):
-        """Apply the persisted approval policy and authenticate sudo locally."""
+        """Apply policy and reply to the worker that actually requested approval."""
+        try:
+            sender = self.sender()
+        except RuntimeError:
+            sender = None
+        approval_worker = sender if isinstance(sender, _AgentWorker) else self._worker
         args = dict(arguments) if isinstance(arguments, dict) else {}
         command = str(args.get("command", "") or "")
         risk = assess_execution(tool_name, args, destructive=is_destructive(command))
@@ -679,8 +692,8 @@ class ChatWidget(QWidget):
                 QMessageBox.StandardButton.No,
             )
             if reply != QMessageBox.StandardButton.Yes:
-                if self._worker:
-                    self._worker.set_approval(False)
+                if approval_worker:
+                    approval_worker.set_approval(False)
                 self._append_msg("system", f"Tool rejected: {tool_name}", preview[:160])
                 return
 
@@ -688,18 +701,21 @@ class ChatWidget(QWidget):
         if risk.elevation:
             available, why = PrivilegeBroker.gui_elevation_available()
             if not available:
-                if self._worker:
-                    self._worker.set_approval(False)
+                if approval_worker:
+                    approval_worker.set_approval(False)
                 self._append_msg("system", f"Elevation blocked: {tool_name}", why)
                 return
             strategy = "pkexec"
 
         if automatic:
             self._append_msg("system", f"Auto-approved: {tool_name}", f"mode={mode}")
-        if self._worker:
-            self._worker.set_approval(True, strategy)
+        if approval_worker:
+            approval_worker.set_approval(True, strategy)
 
     def _send(self):
+        if self._worker and self._worker.isRunning():
+            self._append_msg("system", "Agent already running; duplicate send ignored.", "")
+            return
         text = self.input.toPlainText().strip()
         if not text:
             return
@@ -816,7 +832,9 @@ class ChatWidget(QWidget):
         self._worker.finished.connect(self._on_response)
         self._worker.messages_updated.connect(self._on_messages_updated)
         self._worker.error.connect(self._on_error)
-        self._worker.approval_needed.connect(self._on_approval_needed)
+        self._worker.approval_needed.connect(
+            self._on_approval_needed, Qt.ConnectionType.QueuedConnection
+        )
         self._worker.start()
 
     def _on_agent_msg(self, role: str, text: str, meta: str):

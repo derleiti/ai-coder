@@ -746,9 +746,11 @@ class NativeLightRuntime:
             total_latency += latency
             if result.get("fallback_used"):
                 fallback_used = True
+            transport_telemetry = result.get("_transport_telemetry") if isinstance(result, dict) else None
             self._emit(
                 "model_response", iteration=i + 1, elapsed_ms=elapsed_ms,
                 model=model_used, requested=active_model or "backend-default",
+                transport_telemetry=(transport_telemetry if isinstance(transport_telemetry, dict) else {}),
             )
 
             native_mode = self._native_tool_calling_enabled(active_model)
@@ -1049,6 +1051,7 @@ class NativeLightRuntime:
                             model=model_used,
                             iteration=i,
                             allowed_tools=allowed_tool_names,
+                            workspace_root=self.workspace_root,
                         )
                     elapsed = time.monotonic() - started_tool
                 if not is_error and name in _INSPECTION_TOOLS:

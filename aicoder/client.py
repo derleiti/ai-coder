@@ -321,12 +321,15 @@ class TriForceClient:
         pool = _get_pool()
         if pool is not None:
             try:
+                keepalive_stream = str(headers.get("X-AICoder-Keepalive", "")).lower() in {"1", "true", "json"}
                 resp = pool.request(
                     method.upper(), url, headers=headers, body=data,
                     timeout=self.timeout, redirect=False,
+                    preload_content=not keepalive_stream,
                 )
                 if resp.status >= 400:
-                    body = resp.data.decode("utf-8", errors="replace")
+                    raw_error = resp.read() if keepalive_stream else resp.data
+                    body = raw_error.decode("utf-8", errors="replace")
                     try:
                         parsed = json.loads(body) if body else {}
                     except Exception:
@@ -343,6 +346,38 @@ class TriForceClient:
                         f"HTTP {resp.status}{label} bei {url}: {parsed}",
                         status_code=status, retryable=retryable, retry_after=retry_after, payload=parsed,
                     )
+                if keepalive_stream:
+                    started = time.monotonic()
+                    last_rx = started
+                    max_gap = 0.0
+                    chunks = 0
+                    byte_count = 0
+                    parts: list[bytes] = []
+                    try:
+                        while True:
+                            chunk = resp.read(2048)
+                            if not chunk:
+                                break
+                            now = time.monotonic()
+                            max_gap = max(max_gap, now - last_rx)
+                            last_rx = now
+                            chunks += 1
+                            byte_count += len(chunk)
+                            parts.append(chunk)
+                    finally:
+                        resp.release_conn()
+                    raw = b"".join(parts).decode("utf-8")
+                    result = json.loads(raw) if raw else {}
+                    if isinstance(result, dict):
+                        result = dict(result)
+                        result["_transport_telemetry"] = {
+                            "elapsed_s": round(time.monotonic() - started, 3),
+                            "chunks": chunks,
+                            "bytes": byte_count,
+                            "max_rx_gap_s": round(max_gap, 3),
+                            "last_rx_age_s": round(max(0.0, time.monotonic() - last_rx), 3),
+                        }
+                    return result
                 raw = resp.data.decode("utf-8")
                 return json.loads(raw) if raw else {}
             except (TokenExpiredError, ClientError):

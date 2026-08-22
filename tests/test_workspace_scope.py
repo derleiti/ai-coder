@@ -367,5 +367,26 @@ class LocalCodeToolRoutingTests(unittest.TestCase):
             self.assertEqual(approvals[0][1]["_workspace_escape"], str((project / "app.py").resolve()))
 
 
+class RuntimeWorkspaceOverrideTests(unittest.TestCase):
+    def test_run_tool_uses_explicit_runtime_workspace_for_relative_write(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            process_root = base / "process"
+            runtime_root = base / "runtime"
+            process_root.mkdir(); runtime_root.mkdir()
+            with patch.dict(os.environ, {ACTIVE_WORKSPACE_ENV: str(process_root)}):
+                result, is_error = run_tool(
+                    MagicMock(), "file_edit",
+                    {"path": "probe.txt", "operation": "create", "content": "ok"},
+                    approval_fn=lambda *_: True,
+                    allowed_tools={"file_edit"},
+                    workspace_root=runtime_root,
+                )
+            self.assertFalse(is_error, result)
+            self.assertEqual((runtime_root / "probe.txt").read_text(encoding="utf-8"), "ok")
+            self.assertFalse((process_root / "probe.txt").exists())
+
+
+
 if __name__ == "__main__":
     unittest.main()

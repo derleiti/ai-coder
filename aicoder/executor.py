@@ -6,6 +6,8 @@ Eliminates code duplication for: tool parsing, tool execution,
 message management, destructive-command guards, audit logging.
 """
 from __future__ import annotations
+
+from contextvars import ContextVar
 import copy
 import fnmatch
 import hashlib
@@ -1167,7 +1169,15 @@ def format_untrusted_tool_results(results: list[str]) -> str:
     )
 
 
+_RUNTIME_WORKSPACE_ROOT: ContextVar[str | None] = ContextVar(
+    "aicoder_runtime_workspace_root", default=None
+)
+
+
 def _workspace_root() -> Path:
+    override = _RUNTIME_WORKSPACE_ROOT.get()
+    if override:
+        return Path(override).expanduser().resolve(strict=False)
     return active_workspace(get_state().get("workspace_root"))
 
 
@@ -1808,6 +1818,28 @@ def _prepare_change_restore(tool_name: str, args: dict):
 
 
 def run_tool(
+    client: TriForceClient,
+    name: str,
+    args: dict,
+    approval_fn: Optional[Callable[[str, dict], bool]] = None,
+    model: str = "",
+    iteration: int = 0,
+    allowed_tools: Optional[set[str]] = None,
+    workspace_root: str | Path | None = None,
+) -> Tuple[str, bool]:
+    token = _RUNTIME_WORKSPACE_ROOT.set(
+        str(Path(workspace_root).expanduser().resolve(strict=False)) if workspace_root is not None else None
+    )
+    try:
+        return _run_tool_impl(
+            client, name, args, approval_fn=approval_fn, model=model, iteration=iteration,
+            allowed_tools=allowed_tools,
+        )
+    finally:
+        _RUNTIME_WORKSPACE_ROOT.reset(token)
+
+
+def _run_tool_impl(
     client: TriForceClient,
     name: str,
     args: dict,
