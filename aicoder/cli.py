@@ -131,6 +131,18 @@ def cmd_workspace(args: argparse.Namespace) -> int:
 
 
 def cmd_mcp(args: argparse.Namespace) -> int:
+    if getattr(args, "tool", None) == "serve":
+        transport = str(getattr(args, "transport", "stdio") or "stdio")
+        if transport != "stdio":
+            print("Error: v1.2 Local OS MCP currently supports only stdio; Streamable HTTP comes with the MCP registry phase.", file=sys.stderr)
+            return 2
+        from .mcp_server import serve_plugin_stdio
+        workspace = active_workspace(get_state().get("workspace_root"))
+        return serve_plugin_stdio(str(getattr(args, "plugin", None) or "local-os"), str(workspace))
+
+    if not getattr(args, "tool", None):
+        print("Error: specify an MCP tool or use 'aicoder mcp serve --plugin local-os --transport stdio'.", file=sys.stderr)
+        return 2
     from .agent import _cli_approval
     from .executor import AGENT_TOOLS, load_tools, run_tool
 
@@ -262,6 +274,32 @@ def cmd_plugin(args: argparse.Namespace) -> int:
     print(json.dumps(payload[0] if plugin_id else payload, indent=2, ensure_ascii=False, sort_keys=True))
     return 1 if action == "doctor" and any(item["diagnostics"] for item in payload) else 0
 
+
+
+
+def cmd_optimize(args: argparse.Namespace) -> int:
+    from .optimizer import build_plan, inspect_system
+    action=getattr(args,"optimize_action",None) or "inspect"
+    if action == "inspect":
+        print(json.dumps(inspect_system(),indent=2,ensure_ascii=False,sort_keys=True))
+        return 0
+    goal=" ".join(getattr(args,"goal",[]) or []).strip()
+    if not goal:
+        print("Error: optimize plan requires a goal",file=sys.stderr); return 2
+    print(json.dumps(build_plan(goal).to_dict(),indent=2,ensure_ascii=False,sort_keys=True))
+    return 0
+
+
+def cmd_changes(args: argparse.Namespace) -> int:
+    from .change_journal import ChangeJournal
+    journal=ChangeJournal(); action=getattr(args,"changes_action",None) or "list"
+    if action == "list":
+        rows=journal.list(getattr(args,"limit",50))
+        print(json.dumps(rows,indent=2,ensure_ascii=False,sort_keys=True)); return 0
+    row=journal.get(str(getattr(args,"change_id","") or ""))
+    if row is None:
+        print("Error: change not found",file=sys.stderr); return 2
+    print(json.dumps(row,indent=2,ensure_ascii=False,sort_keys=True)); return 0
 
 def cmd_runtime(args: argparse.Namespace) -> int:
     value = getattr(args, "value", None)
@@ -1079,10 +1117,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_workspace)
 
     # mcp
-    p = sub.add_parser("mcp", help="MCP-Tool-Call → /v1/mcp")
-    p.add_argument("tool")
+    p = sub.add_parser("mcp", help="Call backend MCP tools or serve an approved local provider over MCP")
+    p.add_argument("tool", nargs="?", help="Backend tool name, or 'serve' for local MCP stdio")
     p.add_argument("arg", nargs="*")
     p.add_argument("--mode", default=None, help="Spinner-Modus (work/swarm/hive)")
+    p.add_argument("--plugin", default="local-os", help="Local provider for 'mcp serve' (default: local-os)")
+    p.add_argument("--transport", choices=["stdio", "streamable-http"], default="stdio", help="Transport for 'mcp serve'")
     p.set_defaults(func=cmd_mcp)
 
     # session state
@@ -1168,6 +1208,26 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_plugin)
     sp = plugin_sub.add_parser("paths", help="Show plugin discovery roots")
     sp.set_defaults(func=cmd_plugin)
+
+
+    p = sub.add_parser("optimize", help="Evidence-first local system inspection and optimization planning")
+    opt_sub = p.add_subparsers(dest="optimize_action")
+    p.set_defaults(func=cmd_optimize, optimize_action="inspect")
+    sp = opt_sub.add_parser("inspect", help="Collect typed read-only local system evidence")
+    sp.set_defaults(func=cmd_optimize)
+    sp = opt_sub.add_parser("plan", help="Build an evidence-based, non-mutating optimization plan")
+    sp.add_argument("goal", nargs="+")
+    sp.set_defaults(func=cmd_optimize)
+
+    p = sub.add_parser("changes", help="Inspect the private structured change journal")
+    changes_sub = p.add_subparsers(dest="changes_action")
+    p.set_defaults(func=cmd_changes, changes_action="list", limit=50)
+    sp = changes_sub.add_parser("list", help="List recent state-changing tool actions")
+    sp.add_argument("--limit", type=int, default=50)
+    sp.set_defaults(func=cmd_changes)
+    sp = changes_sub.add_parser("show", help="Show one change journal record")
+    sp.add_argument("change_id")
+    sp.set_defaults(func=cmd_changes)
 
     p = sub.add_parser("skills", help="List or read native AICoder workflow skills")
     p.add_argument("name", nargs="?", help="Skill name to read")

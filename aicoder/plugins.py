@@ -201,7 +201,19 @@ class PluginRegistry:
     def providers(self) -> list[ToolProvider]:
         return [r.provider for r in self.all() if r.enabled and r.executable and r.provider is not None]
     def tool_schemas(self) -> list[dict[str, Any]]:
-        return [dict(t.schema) for p in self.providers() for t in p.tools()]
+        result: list[dict[str, Any]] = []
+        for provider in self.providers():
+            for tool in provider.tools():
+                schema = dict(tool.schema)
+                schema["capabilities"] = list(tool.capabilities)
+                annotations = dict(schema.get("annotations") or {}) if isinstance(schema.get("annotations"), dict) else {}
+                annotations.update({
+                    "readOnlyHint": bool(tool.security.read_only),
+                    "destructiveHint": bool(tool.security.destructive),
+                })
+                schema["annotations"] = annotations
+                result.append(schema)
+        return result
     def provider_for_tool(self, name: str) -> ToolProvider | None:
         for provider in self.providers():
             if any(tool.name == name for tool in provider.tools()): return provider
@@ -235,7 +247,15 @@ def discover_plugins(workspace_root: str | Path, *, config_dir: Path | None = No
         "Built-in typed AICoder settings provider", "builtin", None, ("settings",),
         "builtin:settings", True)
     builtin = PluginRecord(builtin_manifest, provider=SettingsToolProvider(), executable=True)
-    candidates = [builtin]
+    from .local_os import LocalOSToolProvider
+    local_os_manifest = PluginManifest(
+        "local-os", "Local OS", "1.0.0", PLUGIN_API_VERSION,
+        "Built-in typed local operating-system provider", "builtin", None,
+        ("system_diagnostics", "packages", "services", "containers", "network", "storage"),
+        "builtin:local-os", True,
+    )
+    local_os = PluginRecord(local_os_manifest, provider=LocalOSToolProvider(), executable=True)
+    candidates = [builtin, local_os]
     candidates += _external_records(config / "plugins", "user")
     candidates += _external_records(workspace / ".aicoder" / "plugins", "workspace")
     winners: dict[str, PluginRecord] = {}; shadowed: list[PluginRecord] = []

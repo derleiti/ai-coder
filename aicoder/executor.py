@@ -383,12 +383,12 @@ LOCAL_TASK_RUNNER_SCHEMA = {
 
 LOCAL_SUBAGENT_SCHEMA = {
     "name": "subagent_run",
-    "description": "Delegate bounded analysis/review/planning or tool-capable debug/task work to a focused subagent.",
+    "description": "Delegate bounded work to an isolated subagent profile with capability-scoped tools.",
     "inputSchema": {
         "type": "object",
         "properties": {
             "task": {"type": "string", "description": "Specific delegated task"},
-            "role": {"type": "string", "enum": ["analyze", "review", "debug", "plan", "task"]},
+            "role": {"type": "string", "enum": ["analyze", "review", "debug", "plan", "task", "explore", "research", "debugger", "security-reviewer", "test-runner", "system-diagnostician", "optimizer-planner"]},
             "context": {"type": "string", "description": "Optional bounded context already gathered by the parent"},
         },
         "required": ["task"]
@@ -1682,5 +1682,22 @@ def run_tool(
         model=model,
         iteration=iteration,
     )
+    if risk.mutation or risk.destructive:
+        try:
+            from .change_journal import ChangeJournal
+            backup_match = re.search(r"(?:^|\n)backup=([^\n]+)", str(result or ""))
+            restore = {"backup_path": backup_match.group(1).strip()} if backup_match else None
+            ChangeJournal().record(
+                tool=name,
+                arguments=execution_args,
+                risk="; ".join(risk.reasons),
+                approved=True,
+                result=result,
+                is_error=is_error,
+                reason=risk.user_reason,
+                reversible=restore,
+            )
+        except Exception:
+            pass
 
     return result, is_error

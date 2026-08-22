@@ -24,6 +24,7 @@ from .capabilities import (
 )
 from .evidence_memory import ProjectEvidenceStore
 from .failure_tracking import FailureTracker
+from .hooks import HookBus
 from .executor import (
     AGENT_CHECKPOINT_INTERVAL,
     MAX_CONTEXT_MESSAGES,
@@ -118,6 +119,7 @@ class NativeLightRuntime:
     progressive_tool_disclosure: bool = True
     tool_budget: int = DEFAULT_TOOL_BUDGET
     max_expansion_rounds: int = MAX_EXPANSION_ROUNDS
+    hooks: HookBus = field(default_factory=HookBus)
     _tool_capability_warned: bool = False
     _tool_catalog: list[dict] = field(default_factory=list, init=False, repr=False)
     _expansion_rounds: int = field(default=0, init=False, repr=False)
@@ -422,6 +424,16 @@ class NativeLightRuntime:
         workspace = str(Path(self.workspace_root or ".").resolve())
         self.workspace_root = workspace
         tools = self._prepare_tools()
+        session_hook = self.hooks.emit("SessionStart", {
+            "workspace": workspace, "prompt": self.initial_prompt,
+            "model": self.model or "", "tool_count": len(tools),
+        })
+        for diagnostic in session_hook.diagnostics:
+            self._emit("hook_diagnostic", event="SessionStart", message=diagnostic)
+        if session_hook.context:
+            self.system_prompt = (self.system_prompt or build_system_prompt(tools, workspace)).rstrip() + (
+                "\n\n## Session hook context\n" + "\n".join(session_hook.context)
+            )
         if self.tools_unavailable_reason:
             reason = self.tools_unavailable_reason
             self._emit("error", message=reason)
@@ -712,8 +724,18 @@ class NativeLightRuntime:
                 risk = assess_execution(
                     name, args, destructive=is_destructive(str(args.get("command", "")))
                 )
+                pre_hook = self.hooks.emit("PreToolUse", {
+                    "name": name, "arguments": dict(args), "workspace": workspace,
+                    "iteration": i + 1, "risk": tuple(risk.reasons),
+                })
+                for diagnostic in pre_hook.diagnostics:
+                    self._emit("hook_diagnostic", event="PreToolUse", message=diagnostic, tool=name)
                 if not allowed:
                     tool_result, is_error = f"{name}: blocked — {reason}", True
+                    elapsed = 0.0
+                elif pre_hook.blocked:
+                    tool_result = f"{name}: blocked by hook — {pre_hook.reason or 'policy hook denied operation'}"
+                    is_error = True
                     elapsed = 0.0
                 elif (
                     resumed
@@ -766,6 +788,11 @@ class NativeLightRuntime:
                                 continue
                     if name == "subagent_run":
                         from .subagents import run_subagent
+                        self.hooks.emit("SubagentStart", {
+                            "role": str(args.get("role") or "analyze"),
+                            "task": str(args.get("task") or "")[:2000],
+                            "workspace": workspace,
+                        })
                         tool_result, is_error = run_subagent(
                             model_client,
                             task=str(args.get("task") or ""),
@@ -780,6 +807,11 @@ class NativeLightRuntime:
                             fallback_model=active_fallback,
                             stop_requested=self.stop_requested,
                         )
+                        self.hooks.emit("SubagentStop", {
+                            "role": str(args.get("role") or "analyze"),
+                            "workspace": workspace, "is_error": bool(is_error),
+                            "result": str(tool_result)[:2000],
+                        })
                     else:
                         tool_result, is_error = run_tool(
                             self.client,
