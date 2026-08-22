@@ -10,8 +10,9 @@ Description: ai-coder — coding agent for AILinux and TriForce
  Terminalbasierter Coding-Agent mit optionaler PyQt6-Oberfläche.
  Modellwahl, Fallback und beratender Swarm-Modus werden unterstützt.
  .
- Der Coding-only MCP-Vertrag stellt lokale Workspace-Werkzeuge und sichere
- Backend-Werkzeuge bereit; Admin-, Infrastruktur-, Service- und Shell-Zugriffe
- sind ausgeschlossen.
+ Backend-MCP bleibt auf den kanonischen AICoder-Toolvertrag begrenzt.
+ Lokale Workspace-, Local-OS- und Ausführungswerkzeuge laufen clientseitig;
+ Mutationen, Scope-Escapes und erhöhte Rechte werden durch Tool-Policy,
+ Audit und PrivilegeBroker abgesichert.
  .
  Backend: TriForce / api.ailinux.me
