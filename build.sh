@@ -17,7 +17,16 @@ if [ ! -d ".venv" ]; then
     python3 -m venv .venv
 fi
 .venv/bin/python -m pip install -q pyinstaller setuptools wheel
+# Editable setuptools installs can leave an ignored root-level egg-info behind.
+# Remove it before reinstalling so PyInstaller copy_metadata() cannot bundle a
+# stale project version from a previous build.
+rm -rf aicoder.egg-info
 .venv/bin/python -m pip install -q --no-build-isolation -e .
+METADATA_VERSION=$(.venv/bin/python -c "import importlib.metadata as m; print(m.version('aicoder'))")
+if [ "$METADATA_VERSION" != "$VERSION" ]; then
+    echo "ERROR: installed metadata version $METADATA_VERSION != project version $VERSION" >&2
+    exit 1
+fi
 .venv/bin/python -m PyInstaller aicoder.spec \
     --distpath dist/ --workpath build/ --noconfirm --clean
 
