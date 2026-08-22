@@ -205,7 +205,7 @@ def spec_for(name: str) -> SettingSpec:
 # Legacy migration
 # --------------------------------------------------------------------------
 
-# Before the coding-only policy was centralized, the Settings UI persisted
+# Before the operator tool policy was centralized, the Settings UI persisted
 # "Select all" as a concrete snapshot. That snapshot now contains removed
 # admin/ops tools and omits newly introduced safe tools, so filtering it against
 # the current catalogue produces the misleading 27/40 state. Migrate only this

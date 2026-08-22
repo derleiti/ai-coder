@@ -1,16 +1,34 @@
 # Sicherheit — ai-coder
 
-## Grundregeln
+## Sicherheitsmodell
 
-- Backend-MCP bleibt auf den kanonischen AICoder-Scope begrenzt; ein Admin-Login erweitert diesen Modell-Scope nicht
-- Lokale Systemdiagnostik ist über typisierte, read-only Local-OS-Tools erlaubt
-- Lokale Mutationen und erhöhte Rechte laufen ausschließlich durch Tool-Policy + PrivilegeBroker
-- Read-first: Dateien lesen vor Schreiben
-- Keine destruktiven Ops ohne explizite Bestätigung
-- Modell-Tools werden durch eine zentrale Allowlist technisch erzwungen
-- Lokale Dateiwerkzeuge sind auf `workspace_root` begrenzt; ein Scope-Escape braucht explizite Freigabe
-- `shell`/`binary_exec` sind lokale Runtime-Tools, keine frei an den Backend-MCP weitergereichten Admin-Werkzeuge
-- Root-/Security-Änderungen werden niemals automatisch freigegeben
+AICoder verwendet keine künstliche Coding-only-Grenze als Sicherheitsmechanismus. Der Operator darf die für den Auftrag verfügbaren lokalen und vom TriForce-Backend angebotenen Fähigkeiten verwenden. Sicherheit wird dort erzwungen, wo tatsächlich Risiko entsteht: Workspace-Grenzen, Mutationen, Elevation, destruktive Aktionen, Security-Änderungen und sensible Daten.
+
+- Read-first: Ist-Zustand prüfen, bevor geschrieben wird.
+- Lokale und MCP-gestützte Mutationen laufen durch dieselbe Risiko-/Approval-Policy.
+- Workspace-Escapes benötigen eine sichtbare Freigabe.
+- sudo/root/elevation benötigt immer lokale interaktive Authentifizierung; kein Auto-/Autopilot-Modus darf diese umgehen.
+- Destruktive oder sicherheitsreduzierende Änderungen benötigen explizite Einmal-Freigabe.
+- Passwörter und Tokens dürfen nicht vom Modell angefordert, gelesen, geloggt oder übertragen werden.
+- Tool-Ergebnisse gelten als untrusted data und dürfen keine Benutzer-/Policy-Anweisungen überschreiben.
+
+## Operator-Fähigkeiten
+
+Coding, Builds, Tests, Paketmanagement, Services, Container, Deployment, Netzwerkdiagnostik, Systemadministration, DevOps und Infrastruktur sind legitime Operator-Aufgaben. Ein Tool wird nicht allein wegen seines Namens oder einer Kategorie wie `admin`, `service`, `remote` oder `devops` blockiert.
+
+Backend-advertisierte Fähigkeiten bleiben weiterhin an serverseitige Authentisierung/RBAC gebunden. AICoder erweitert niemals die Rechte des angemeldeten Kontos; es entfernt lediglich den früheren zusätzlichen Coding-only-Filter im Client.
+
+Besonders sensible Aktionen wie Secrets/Vault, Mailversand, Notifications oder Account-/Identity-Änderungen sollen nur für einen konkreten Benutzerauftrag verwendet werden und müssen entsprechend ihrer Wirkung als Mutation/Security-Änderung klassifiziert werden.
+
+## PrivilegeBroker
+
+Der PrivilegeBroker ist die zentrale lokale Sicherheitsgrenze für Mutationen und Elevation:
+
+1. Aktion und Grund werden angezeigt.
+2. Risiko wird klassifiziert.
+3. Schreiboperationen folgen dem gewählten Approval-Modus.
+4. Elevation sowie Security-/destruktive Änderungen bleiben interaktiv.
+5. sudo/pkexec-Authentifizierung findet lokal statt und wird nicht an das Modell oder Backend weitergereicht.
 
 ## Gespeicherte Credentials
 
@@ -19,25 +37,8 @@
 ~/.config/ai-coder/state.json     chmod 600
 ```
 
-Token wird nie geloggt. Bei `profile`-Command: maskiert.
+Tokens werden nicht im Klartext geloggt und in Statusausgaben maskiert.
 
-## Backend-MCP-Scope
+## Backend-MCP
 
-Direkte Backend-MCP-Aufrufe bleiben fail-closed auf der kanonischen Allowlist.
-Nicht freigegebene Admin-, Vault-, Mail-, Notification-, Restart-, Remote- oder
-sonstige Infrastruktur-Werkzeuge werden vor dem Netzwerk blockiert.
-
-Lokale Runtime-Tools sind davon getrennt: typisierte Workspace-Tools, read-only
-Local-OS-Diagnostik und ausdrücklich aktivierte lokale Ausführung werden auf dem
-Client geroutet und durch Workspace-Grenzen, Security-Metadaten, Audit und
-PrivilegeBroker abgesichert.
-
-## Backend-Scope (TODO)
-
-Aktuell ergibt Login einen vollen Client-Token mit Zugriff auf alle Tools.  
-Ziel: ai-coder soll als eigener `client_profile = ai_coder` laufen.  
-Details: `docs/backend_scope.md`
-
-Der Client erzwingt seinen Coding-Scope zusätzlich lokal. Das ersetzt keine
-serverseitige Autorisierung, verhindert aber, dass ein Modell, ein Text-Parser
-oder ein direkter CLI-Aufruf verbotene Toolnamen an `/v1/mcp` weiterleitet.
+`X-Client-Profile: ai-coder` identifiziert den Client, soll aber keine zweite künstliche Coding-Allowlist darstellen. Die wirksamen Backend-Rechte kommen aus Authentisierung/RBAC und dem vom Backend tatsächlich angebotenen Tool-Katalog. Lokale Runtime-Tools wie `shell`, `binary_exec` und `task_runner` werden weiterhin lokal ausgeführt und niemals versehentlich als Remote-MCP-Shell umgeleitet.

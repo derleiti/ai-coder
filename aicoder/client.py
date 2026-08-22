@@ -10,8 +10,8 @@ from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
 from . import __version__
-from .tool_policy import CODING_MCP_TOOLS, LOCAL_ONLY_TOOLS, canonical_tool_name, require_allowed_tool
-USER_AGENT = f"ai-coder/{__version__} (AILinux Coding Client)"
+from .tool_policy import LOCAL_ONLY_TOOLS, OPERATOR_MCP_TOOLS, canonical_tool_name, require_allowed_tool
+USER_AGENT = f"ai-coder/{__version__} (AILinux Operator Client)"
 CLIENT_PROFILE = "ai-coder"
 
 # ── Connection pool (keep-alive) ──────────────────────────────
@@ -456,7 +456,7 @@ class TriForceClient:
                 f"tool '{tool_name}' is local-only in ai-coder and cannot be dispatched over MCP"
             )
         allowed, reason = require_allowed_tool(
-            tool_name, CODING_MCP_TOOLS, allow_internal=allow_internal,
+            tool_name, OPERATOR_MCP_TOOLS, allow_internal=allow_internal,
         )
         if not allowed:
             raise ClientError(reason)

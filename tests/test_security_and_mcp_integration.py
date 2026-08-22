@@ -18,7 +18,7 @@ from aicoder.privileges import assess_execution
 from aicoder.swarm_runner import run_swarm_ask
 from aicoder.session_state import migrate_enabled_tools
 from aicoder.tool_policy import (
-    CODING_MCP_TOOLS,
+    OPERATOR_MCP_TOOLS,
     INTERNAL_MCP_TOOLS,
     filter_tool_catalog,
     require_allowed_tool,
@@ -40,17 +40,15 @@ class ToolPolicyIntegrationTests(unittest.TestCase):
         self.assertIsNone(migrate_enabled_tools(legacy))
         self.assertEqual(migrate_enabled_tools(["file_read", "test"]), ["file_read", "test"])
 
-    def test_forbidden_scopes_and_aliases_are_denied(self):
+    def test_operator_scopes_are_not_denied_by_name(self):
         for name in (
             "admin_users", "vault_keys", "mail_send", "notify_send",
             "restart_backend", "service_control", "remote_task",
-            "local_exec", "devops", "memory_clear",
-            "remote.search", "admin:health", "mcp/vault.keys",
+            "devops", "memory_clear", "remote.search", "admin:health",
         ):
             with self.subTest(name=name):
                 allowed, reason = require_allowed_tool(name, None)
-                self.assertFalse(allowed)
-                self.assertTrue(reason)
+                self.assertTrue(allowed, reason)
 
     def test_local_execution_names_are_allowed_for_runtime_but_not_mcp_catalog(self):
         for name in ("shell", "binary_exec", "task_runner"):
@@ -61,9 +59,9 @@ class ToolPolicyIntegrationTests(unittest.TestCase):
             {"name": "binary_exec", "inputSchema": {}},
             {"name": "task_runner", "inputSchema": {}},
         ]
-        self.assertEqual(filter_tool_catalog(catalog, CODING_MCP_TOOLS), [])
+        self.assertEqual(filter_tool_catalog(catalog, OPERATOR_MCP_TOOLS), [])
 
-    def test_catalog_filter_is_fail_closed_for_malformed_and_forbidden_tools(self):
+    def test_catalog_filter_rejects_malformed_but_not_operator_names(self):
         catalog = [
             {"name": "code_read", "inputSchema": {}},
             {"name": "vault_keys", "inputSchema": {}},
@@ -72,7 +70,10 @@ class ToolPolicyIntegrationTests(unittest.TestCase):
         ]
         self.assertEqual(
             filter_tool_catalog(catalog, {"code_read", "vault_keys"}),
-            [{"name": "code_read", "inputSchema": {}}],
+            [
+                {"name": "code_read", "inputSchema": {}},
+                {"name": "vault_keys", "inputSchema": {}},
+            ],
         )
 
     def test_only_canonical_search_is_allowed(self):
@@ -81,7 +82,7 @@ class ToolPolicyIntegrationTests(unittest.TestCase):
             {"name": "web_search", "description": "Legacy search", "inputSchema": {}},
         ]
         self.assertEqual(
-            [tool["name"] for tool in filter_tool_catalog(catalog, CODING_MCP_TOOLS)],
+            [tool["name"] for tool in filter_tool_catalog(catalog, OPERATOR_MCP_TOOLS)],
             ["search"],
         )
 
@@ -251,24 +252,22 @@ class McpProtocolTests(unittest.TestCase):
         headers = request.call_args.args[2]
         self.assertEqual(headers["X-Client-Profile"], CLIENT_PROFILE)
 
-    def test_frontend_mcp_contract_matches_backend_canonical_profile(self):
-        expected = {
-            "code_read", "code_search", "code_tree",
-            "dev_analyze", "dev_debug", "dev_lint", "dev_links",
-            "dev_refactor", "dev_summarize",
-            "doc_read", "doc_search",
-            "health", "search", "crawl",
-            "memory_search", "memory_store",
-            "models", "specialist", "prompts", "swarm_broadcast",
-        }
-        self.assertEqual(set(CODING_MCP_TOOLS) | set(INTERNAL_MCP_TOOLS), expected)
+    def test_operator_mcp_scope_uses_authenticated_backend_catalog(self):
+        self.assertIsNone(OPERATOR_MCP_TOOLS)
+        self.assertEqual(INTERNAL_MCP_TOOLS, {"swarm_broadcast"})
 
-    def test_client_blocks_forbidden_tool_before_network(self):
+    def test_client_blocks_local_only_tool_before_network(self):
         client = TriForceClient("https://example.invalid", token="opaque")
         with patch.object(client, "_request") as request:
             with self.assertRaises(ClientError):
                 client.mcp_call("shell", {"command": "id"})
         request.assert_not_called()
+
+    def test_client_allows_backend_advertised_operator_tool_name(self):
+        client = TriForceClient("https://example.invalid", token="opaque")
+        with patch.object(client, "_request", return_value={"result": {}}) as request:
+            client.mcp_call("service_control", {"action": "status"})
+        request.assert_called_once()
 
     def test_mcp_call_has_no_automatic_http_retry(self):
         client = TriForceClient("https://example.invalid", token="opaque")

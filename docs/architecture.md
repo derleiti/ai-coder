@@ -25,7 +25,7 @@
 User prompt
   → /v1/client/chat (Systemregeln + aktivierte Tool-Schemas)
   → native oder kompatibel normalisierte Tool-Calls
-  → zentrale lokale Tool-Policy (deny forbidden + per-run allowlist)
+  → zentrale lokale Risiko-/Tool-Policy (Backend-RBAC + per-run capability subset)
   → lokale typisierte Workspace-Capability ODER JSON-RPC /v1/mcp
   → als untrusted markiertes Tool-Ergebnis
   → nächster Operator-Turn
@@ -33,10 +33,8 @@ User prompt
 
 GUI, CLI-Agent und direkte `aicoder mcp`-Aufrufe verwenden dieselbe Policy.
 Lokale typisierte Workspace-Tools, progressive Capability-Discovery und der
-read-only Local-OS-Provider laufen clientseitig. Backend-Tools außerhalb der
-kanonischen AICoder-Allowlist werden weiterhin vor dem Netzwerk blockiert.
-Lokale Mutationen, Workspace-Escapes und Elevation werden transportunabhängig
-vom PrivilegeBroker klassifiziert und freigegeben oder fail-closed blockiert.
+Local-OS-Provider und lokale Runtime-Tools laufen clientseitig. Backend-Tools werden aus dem authentisierten TriForce-Katalog übernommen statt durch eine zusätzliche Coding-only-Allowlist beschnitten.
+Lokale und MCP-gestützte Mutationen, Workspace-Escapes, Elevation, destruktive Aktionen und Security-Änderungen werden transportunabhängig vom PrivilegeBroker bzw. der zentralen Approval-Policy klassifiziert.
 
 ## Lokale Dateien
 
@@ -58,7 +56,7 @@ vom PrivilegeBroker klassifiziert und freigegeben oder fail-closed blockiert.
 | `workspace.py` | Aktiver Workspace und Scope-Grenzen |
 | `capabilities.py` | Progressive Capability-Auswahl und Dynamic Expansion |
 | `plugins.py` | Plugin-/ToolProvider-Registry |
-| `local_os.py` | Typisierte read-only Local-OS-Diagnostik |
+| `local_os.py` | Typisierte Local-OS-Diagnostik und System-Capabilities |
 | `privileges.py` | Zentrale Risiko- und Freigabe-Policy |
 | `mcp_server.py` | Lokales MCP-Serving für freigegebene Provider |
 | `optimizer.py` | Evidenzbasierte Optimierungsplanung |
@@ -74,11 +72,7 @@ vom PrivilegeBroker klassifiziert und freigegeben oder fail-closed blockiert.
 | Handshake | GET | /v1/auth/client/handshake |
 | MCP-Call | POST | /v1/mcp |
 
-Der Client sendet bei allen Requests `X-Client-Profile: ai-coder`. Das Backend
-verwendet dieses Profil ausschließlich zur Einschränkung: `tools/list` und
-`tools/call` werden auf denselben kanonischen Coding-Tool-Vertrag begrenzt, den
-der Client lokal nochmals durchsetzt. Das Profil gewährt keine zusätzlichen
-Rechte.
+Der Client sendet bei allen Requests `X-Client-Profile: ai-coder`. Das Profil identifiziert den Operator-Client, gewährt aber selbst keine zusätzlichen Rechte. Autorisierung kommt aus dem angemeldeten Backend-Konto/RBAC; der Client übernimmt den angebotenen Tool-Katalog und erzwingt lokal Workspace-, Risiko-, Approval- und Privilege-Grenzen.
 
 ## MCP-Call Format (JSON-RPC 2.0)
 

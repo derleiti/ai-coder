@@ -1,7 +1,7 @@
 """Risk classification for local and MCP-backed agent operations.
 
-The coding-only client never grants elevation. Mutation approval controls
-ordinary workspace changes; elevated requests always require explicit interactive approval.
+The operator may perform coding, DevOps, system and infrastructure work. Mutation approval controls
+state changes; elevated requests always require explicit interactive approval and local authentication.
 """
 from __future__ import annotations
 

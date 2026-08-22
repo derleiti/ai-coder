@@ -1,7 +1,9 @@
 """Central capability policy for local and remote ai-coder tools.
 
-The backend is not a security boundary for the desktop client: every execution
-entry point must apply this policy before a model supplied name is dispatched.
+The backend account/RBAC and the advertised MCP catalogue define which remote
+capabilities exist. The desktop client does not impose a second task-category
+namespace filter. Local risk, workspace and privilege policy is enforced at the
+execution boundary instead.
 """
 from __future__ import annotations
 
@@ -9,52 +11,20 @@ import re
 from collections.abc import Iterable
 
 
-FORBIDDEN_PREFIXES = (
-    "admin_",
-    "vault_",
-    "mail_",
-    "notify_",
-    "restart_",
-    "service_",
-    "remote_",
-)
-
-# Equivalent aliases are included even when AGENTS.md names only the historical
-# MCP tool.  Renaming a remote shell must not bypass the coding-client scope.
-FORBIDDEN_EXACT = {
-    "custom_exec",
-    "local_exec",
-    "devops",
-    "service_control",
-    "container_control",
-    "remote_task",
-    "mesh_task",
-    "restart",
-    "memory_clear",
-}
-
-_FORBIDDEN_NAMESPACES = {prefix.rstrip("_") for prefix in FORBIDDEN_PREFIXES}
-
-# Explicit client features which are safe to call directly but are never
-# advertised to an operator model as executable project tools.
+# Explicit client workflows which are not ordinary operator-facing tools.
 INTERNAL_MCP_TOOLS = {"swarm_broadcast"}
 
-# These names are exposed by the AICoder runtime as LOCAL capabilities.
-# They must never be dispatched to the remote TriForce MCP transport.
+# These names are implemented by the AICoder runtime itself. They must never be
+# dispatched to the remote TriForce MCP transport, even if a backend happens to
+# advertise an identically named tool.
 LOCAL_ONLY_TOOLS = frozenset({"shell", "binary_exec", "task_runner"})
 
-# Single source of truth for MCP capabilities which an operator model or direct
-# coding-client command may invoke. Local capabilities live in executor.py.
-CODING_MCP_TOOLS = frozenset({
-    "code_read",
-    "code_search", "code_tree", "dev_analyze",
-    "dev_debug", "dev_lint", "dev_links",
-    "dev_refactor", "dev_summarize",
-    "doc_read", "doc_search",
-    "health", "search", "crawl",
-    "memory_search", "memory_store",
-    "models", "specialist", "prompts",
-})
+# None means: trust the authenticated backend catalogue instead of maintaining
+# a stale duplicate allowlist in the client. Kept under the historical name for
+# import compatibility while callers migrate to OPERATOR_MCP_TOOLS.
+OPERATOR_MCP_TOOLS: frozenset[str] | None = None
+CODING_MCP_TOOLS = OPERATOR_MCP_TOOLS
+
 
 def canonical_tool_name(name: str) -> str:
     """Return the non-namespaced leaf used for policy classification."""
@@ -63,19 +33,12 @@ def canonical_tool_name(name: str) -> str:
 
 
 def forbidden_reason(name: str) -> str | None:
-    """Explain why *name* is outside the coding-client capability scope."""
-    normalized = str(name or "").strip().lower()
-    parts = [part for part in re.split(r"[./:]", normalized) if part]
-    canonical = parts[-1] if parts else ""
-    if canonical in FORBIDDEN_EXACT:
-        return f"tool '{name}' is disabled by the ai-coder coding-only policy"
-    if any(
-        part in _FORBIDDEN_NAMESPACES
-        or any(part.startswith(prefix) for prefix in FORBIDDEN_PREFIXES)
-        or any(part.startswith(prefix.replace("_", "-")) for prefix in FORBIDDEN_PREFIXES)
-        for part in parts
-    ):
-        return f"tool '{name}' belongs to a forbidden admin/ops scope"
+    """Legacy compatibility hook.
+
+    Tool categories such as admin/devops/service/remote are no longer denied by
+    name. Authorization comes from backend RBAC/catalogue and execution risk is
+    handled by the local approval/PrivilegeBroker layer.
+    """
     return None
 
 
@@ -85,12 +48,11 @@ def require_allowed_tool(
     *,
     allow_internal: bool = False,
 ) -> tuple[bool, str]:
-    """Validate a tool against the global policy and a per-run capability set."""
-    reason = forbidden_reason(name)
-    if reason:
-        return False, reason
-
+    """Validate a tool against transport invariants and an optional run subset."""
     canonical = canonical_tool_name(name)
+    if not canonical:
+        return False, "tool name is empty"
+
     if canonical in INTERNAL_MCP_TOOLS:
         if allow_internal:
             return True, ""
@@ -106,12 +68,27 @@ def require_allowed_tool(
     return True, ""
 
 
-def filter_tool_catalog(tools: Iterable[dict], allowed_names: Iterable[str]) -> list[dict]:
-    """Return well-formed, policy-compliant schemas from an MCP catalogue."""
-    allowed = set(allowed_names)
-    allowed_canonical = {canonical_tool_name(item) for item in allowed}
+def filter_tool_catalog(
+    tools: Iterable[dict],
+    allowed_names: Iterable[str] | None = None,
+) -> list[dict]:
+    """Return well-formed schemas from the authenticated backend catalogue.
+
+    If *allowed_names* is supplied it is a per-run capability subset, not a
+    global admin/ops denylist. Local-only runtime names are never accepted from
+    MCP because their execution boundary is intentionally local.
+    """
+    allowed_canonical = (
+        {canonical_tool_name(item) for item in allowed_names}
+        if allowed_names is not None else None
+    )
+    raw_tools = list(tools)
+    advertised_canonical = {
+        canonical_tool_name(t.get("name"))
+        for t in raw_tools if isinstance(t, dict) and isinstance(t.get("name"), str)
+    }
     result: list[dict] = []
-    for tool in tools:
+    for tool in raw_tools:
         if not isinstance(tool, dict):
             continue
         normalized = dict(tool)
@@ -129,9 +106,19 @@ def filter_tool_catalog(tools: Iterable[dict], allowed_names: Iterable[str]) -> 
                 "type": "object", "properties": {},
             }
         name = normalized.get("name")
-        if not isinstance(name, str) or canonical_tool_name(name) not in allowed_canonical:
+        if not isinstance(name, str) or not canonical_tool_name(name):
             continue
-        ok, _ = require_allowed_tool(name, allowed)
+        canonical = canonical_tool_name(name)
+        if canonical in LOCAL_ONLY_TOOLS:
+            continue
+        # Keep the canonical unified search surface when a backend also
+        # advertises a legacy alias. This is schema hygiene, not a permission
+        # restriction; the operator still receives the full capability.
+        if canonical == "web_search" and "search" in advertised_canonical:
+            continue
+        if allowed_canonical is not None and canonical not in allowed_canonical:
+            continue
+        ok, _ = require_allowed_tool(name, allowed_names)
         if ok:
             result.append(normalized)
     return result

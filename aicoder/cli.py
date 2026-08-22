@@ -1134,9 +1134,9 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
 
 
 def cmd_shell(args: argparse.Namespace) -> int:
-    """Retained as a compatibility stub; shell execution is out of scope."""
+    """Legacy direct-CLI stub; operator shell execution is available through the agent runtime."""
     print(
-        "Error: remote shell/binary execution is disabled by the ai-coder coding-only policy.",
+        "Error: this legacy direct-CLI shell command is not wired to the local approval runtime; use the agent/runtime shell capability.",
         file=sys.stderr,
     )
     return 2
@@ -1193,8 +1193,8 @@ def cmd_sysinfo(args: argparse.Namespace) -> int:
 
 
 def cmd_service(args: argparse.Namespace) -> int:
-    """Retained as a compatibility stub; service management is out of scope."""
-    print("Error: service management is disabled by the ai-coder coding-only policy.", file=sys.stderr)
+    """Legacy direct-CLI stub; service operations are available to the operator through the agent runtime when advertised/approved."""
+    print("Error: this legacy direct-CLI service command is not wired to the local approval runtime; use the agent/runtime service capability.", file=sys.stderr)
     return 2
 
 
@@ -1521,7 +1521,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-tokens", dest="max_tokens", type=int, default=200)
     p.set_defaults(func=cmd_broadcast)
 
-    p = sub.add_parser("shell", help="Disabled compatibility stub (coding-only policy)")
+    p = sub.add_parser("shell", help="Legacy direct-CLI compatibility stub; use agent/runtime capability")
     p.add_argument("cmd", nargs="*")
     p.add_argument("--raw", "-r", action="store_true", help="Shell tool instead of binary_exec (pipes etc.)")
     p.add_argument("--elevated", "-e", action="store_true")
@@ -1538,7 +1538,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--local", "-l", action="store_true", help="Local stats (this machine, no MCP)")
     p.set_defaults(func=cmd_sysinfo)
 
-    p = sub.add_parser("service", help="Disabled compatibility stub (coding-only policy)")
+    p = sub.add_parser("service", help="Legacy direct-CLI compatibility stub; use agent/runtime capability")
     p.add_argument("action", choices=["status","start","stop","restart","logs","list"])
     p.add_argument("service", nargs="?", default=None)
     p.add_argument("--lines", type=int, default=50)
