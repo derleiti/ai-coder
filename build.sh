@@ -26,7 +26,12 @@ echo "Binary: $(ls -lh dist/aicoder | awk '{print $5, $9}')"
 # CLI-Einstiegspunkte aus dem kompilierten Binary prüfen.
 ./dist/aicoder --help >/dev/null
 ./dist/aicoder agent --help >/dev/null
-echo "Binary: OK"
+BINARY_VERSION=$(./dist/aicoder --version | awk '{print $2}')
+if [ "$BINARY_VERSION" != "$VERSION" ]; then
+    echo "ERROR: binary version $BINARY_VERSION != project version $VERSION" >&2
+    exit 1
+fi
+echo "Binary: OK (version ${BINARY_VERSION})"
 
 # Debian package (nur auf Debian/Ubuntu)
 if command -v dpkg-deb &>/dev/null; then

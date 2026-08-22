@@ -3,6 +3,7 @@ import argparse, json, os, sys, textwrap, time
 from getpass import getpass
 from pathlib import Path
 from typing import Any, Dict
+from . import __version__
 from .client import ClientError, TriForceClient, model_identifier
 from .config import DEFAULT_BASE_URL, Session, delete_session, load_session, save_session
 from .docs_context import context_summary, read_agents_md
@@ -276,6 +277,42 @@ def cmd_plugin(args: argparse.Namespace) -> int:
 
 
 
+
+
+
+def _print_provider_rows(rows: list[dict], *, json_output: bool = False) -> None:
+    if json_output:
+        print(json.dumps(rows, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    for row in rows:
+        env_names=", ".join(row.get("environment_variables_present") or []) or "-"
+        legacy=", ".join(row.get("legacy_variables_present") or []) or "-"
+        print(
+            f"{row.get('provider','?'):<14} backend_models={int(row.get('backend_model_count') or 0):<4} "
+            f"source={row.get('credential_source','?'):<13} env={env_names} legacy={legacy}"
+        )
+        for warning in row.get("warnings") or []:
+            print(f"  WARN: {warning}")
+
+
+def cmd_providers(args: argparse.Namespace) -> int:
+    from .providers import provider_status
+    action=getattr(args,"providers_action",None) or "list"
+    client=None
+    try:
+        _, client=session_client()
+    except Exception:
+        client=None
+    rows=provider_status(client)
+    _print_provider_rows(rows,json_output=bool(getattr(args,"json",False)))
+    return 0
+
+
+def cmd_credentials(args: argparse.Namespace) -> int:
+    from .providers import credential_status
+    rows=credential_status()
+    _print_provider_rows(rows,json_output=bool(getattr(args,"json",False)))
+    return 0
 
 def cmd_optimize(args: argparse.Namespace) -> int:
     from .optimizer import build_plan, inspect_system
@@ -1088,6 +1125,7 @@ def build_parser() -> argparse.ArgumentParser:
           aicoder hist
         """),
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     # auth
@@ -1209,6 +1247,22 @@ def build_parser() -> argparse.ArgumentParser:
     sp = plugin_sub.add_parser("paths", help="Show plugin discovery roots")
     sp.set_defaults(func=cmd_plugin)
 
+
+
+    p = sub.add_parser("providers", help="Inspect provider/model availability and credential-source hygiene")
+    providers_sub = p.add_subparsers(dest="providers_action")
+    p.set_defaults(func=cmd_providers, providers_action="list")
+    for provider_action in ("list", "doctor"):
+        sp = providers_sub.add_parser(provider_action, help=f"{provider_action.title()} provider availability without exposing secrets")
+        sp.add_argument("--json", action="store_true")
+        sp.set_defaults(func=cmd_providers)
+
+    p = sub.add_parser("credentials", help="Inspect local credential variable presence without showing values")
+    credentials_sub = p.add_subparsers(dest="credentials_action")
+    p.set_defaults(func=cmd_credentials, credentials_action="status")
+    sp = credentials_sub.add_parser("status", help="Show credential variable names/presence only")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_credentials)
 
     p = sub.add_parser("optimize", help="Evidence-first local system inspection and optimization planning")
     opt_sub = p.add_subparsers(dest="optimize_action")

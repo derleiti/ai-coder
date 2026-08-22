@@ -15,6 +15,7 @@ every model the backend has not annotated yet.
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
 from .client import model_identifier
@@ -42,6 +43,54 @@ def _capabilities_of(entry: Any) -> frozenset[str]:
             caps.add("function_calling")
     return frozenset(caps)
 
+
+
+
+@dataclass(frozen=True)
+class ModelInfo:
+    id: str
+    provider: str
+    capabilities: frozenset[str]
+    context_window: int | None = None
+    available: bool = True
+    raw: dict[str, Any] | None = None
+
+
+def normalize_model_info(entry: Any) -> ModelInfo | None:
+    model_id = model_identifier(entry)
+    if not model_id:
+        return None
+    data = entry if isinstance(entry, dict) else {}
+    provider = str(data.get("provider") or data.get("provider_id") or "").strip().lower()
+    if not provider and "/" in model_id:
+        provider = model_id.split("/", 1)[0].lower()
+    raw_window = data.get("context_window") or data.get("context_length") or data.get("max_context_tokens")
+    try:
+        context_window = int(raw_window) if raw_window is not None else None
+    except (TypeError, ValueError):
+        context_window = None
+    available_raw = data.get("available", data.get("enabled", True))
+    return ModelInfo(
+        id=model_id,
+        provider=provider or "unknown",
+        capabilities=_capabilities_of(data),
+        context_window=context_window if context_window and context_window > 0 else None,
+        available=bool(available_raw),
+        raw=dict(data) if isinstance(data, dict) else None,
+    )
+
+
+def load_model_info(client: Any) -> dict[str, ModelInfo]:
+    result: dict[str, ModelInfo] = {}
+    try:
+        entries = client.list_models() or []
+    except Exception:
+        return result
+    for entry in entries:
+        info = normalize_model_info(entry)
+        if info is not None:
+            result[info.id] = info
+    return result
 
 def load_catalogue(client: Any, *, force: bool = False) -> dict[str, frozenset[str]]:
     """Model id -> capability set, cached briefly to keep the agent loop cheap."""

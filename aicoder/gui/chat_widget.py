@@ -24,7 +24,7 @@ from PyQt6.QtGui import (
 
 from ..config import load_session
 from ..privileges import (
-    approval_is_automatic, assess_execution, format_request,
+    PrivilegeBroker, assess_execution, format_request,
 )
 from ..session_state import DEFAULT_RUNTIME_MODE, get_state
 from ..workspace import active_workspace

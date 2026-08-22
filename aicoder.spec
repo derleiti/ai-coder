@@ -1,11 +1,13 @@
 # -*- mode: python ; coding: utf-8 -*-
+from PyInstaller.utils.hooks import copy_metadata
+
 block_cipher = None
 
 a = Analysis(
     ['aicoder_main.py'],
     pathex=['.'],
     binaries=[],
-    datas=[],
+    datas=copy_metadata('aicoder'),
     hiddenimports=[
         'aicoder.cli',
         'aicoder.client',
@@ -21,6 +23,18 @@ a = Analysis(
         'aicoder.agent_runtime',
         'aicoder.agent_plan',
         'aicoder.agent_journal',
+        'aicoder.capabilities',
+        'aicoder.change_journal',
+        'aicoder.hooks',
+        'aicoder.local_os',
+        'aicoder.mcp_server',
+        'aicoder.model_capabilities',
+        'aicoder.model_transport',
+        'aicoder.optimizer',
+        'aicoder.plugins',
+        'aicoder.providers',
+        'aicoder.settings',
+        'aicoder.settings_tools',
         'aicoder.skills',
         'aicoder.guidelines',
         'aicoder.commands',
