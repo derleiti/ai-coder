@@ -379,16 +379,32 @@ def cmd_credentials(args: argparse.Namespace) -> int:
     return 0
 
 def cmd_optimize(args: argparse.Namespace) -> int:
-    from .optimizer import build_plan, inspect_system
+    from .optimizer import (
+        OptimizationPlanStore, apply_plan, build_plan, inspect_system, rollback_plan, verify_plan,
+    )
     action=getattr(args,"optimize_action",None) or "inspect"
     if action == "inspect":
-        print(json.dumps(inspect_system(),indent=2,ensure_ascii=False,sort_keys=True))
-        return 0
-    goal=" ".join(getattr(args,"goal",[]) or []).strip()
-    if not goal:
-        print("Error: optimize plan requires a goal",file=sys.stderr); return 2
-    print(json.dumps(build_plan(goal).to_dict(),indent=2,ensure_ascii=False,sort_keys=True))
-    return 0
+        print(json.dumps(inspect_system(),indent=2,ensure_ascii=False,sort_keys=True)); return 0
+    store=OptimizationPlanStore()
+    if action == "plan":
+        goal=" ".join(getattr(args,"goal",[]) or []).strip()
+        if not goal:
+            print("Error: optimize plan requires a goal",file=sys.stderr); return 2
+        plan=store.save(build_plan(goal))
+        print(json.dumps(plan.to_dict(),indent=2,ensure_ascii=False,sort_keys=True)); return 0
+    plan_id=str(getattr(args,"plan_id","") or "")
+    try:
+        if action == "apply": plan=apply_plan(plan_id,store=store)
+        elif action == "verify": plan=verify_plan(plan_id,store=store)
+        elif action == "rollback": plan=rollback_plan(plan_id,store=store)
+        elif action == "show":
+            plan=store.load(plan_id)
+            if plan is None: raise ValueError("optimization plan not found")
+        else:
+            raise ValueError(f"unknown optimize action: {action}")
+    except ValueError as exc:
+        print(f"Error: {exc}",file=sys.stderr); return 2
+    print(json.dumps(plan.to_dict(),indent=2,ensure_ascii=False,sort_keys=True)); return 0
 
 
 def cmd_changes(args: argparse.Namespace) -> int:
@@ -1387,6 +1403,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp = opt_sub.add_parser("plan", help="Build an evidence-based, non-mutating optimization plan")
     sp.add_argument("goal", nargs="+")
     sp.set_defaults(func=cmd_optimize)
+    for opt_action, opt_help in (
+        ("show", "Show one persisted optimization plan"),
+        ("apply", "Apply a persisted plan; unsupported mutations fail closed"),
+        ("verify", "Re-run verification for an applied plan"),
+        ("rollback", "Rollback an applied plan; read-only plans are a verified no-op"),
+    ):
+        sp = opt_sub.add_parser(opt_action, help=opt_help)
+        sp.add_argument("plan_id")
+        sp.set_defaults(func=cmd_optimize)
 
     p = sub.add_parser("changes", help="Inspect the private structured change journal")
     changes_sub = p.add_subparsers(dest="changes_action")
