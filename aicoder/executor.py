@@ -64,6 +64,11 @@ TEXT_TOOL_V2_RE = re.compile(
     r"(?P<args>.*?)\nEND_TOOL_CALL\s*$",
     re.DOTALL | re.IGNORECASE,
 )
+TEXT_TOOL_V2_BLOCK_RE = re.compile(
+    r"TOOL_CALL\s+(?P<name>[A-Za-z0-9_.:-]+)\s*\n"
+    r"(?P<args>.*?)\nEND_TOOL_CALL",
+    re.DOTALL | re.IGNORECASE,
+)
 FUNCTION_RE = re.compile(
     r"<function[=:](?P<name>[\w.-]+)>\s*(?P<args>.*?)\s*</function>",
     re.DOTALL | re.IGNORECASE,
@@ -189,13 +194,16 @@ def adaptive_request_timeout(
     iteration: int = 0,
     quick_chat: bool = False,
     model: str | None = None,
+    *,
+    continuation: bool = False,
 ) -> int:
-    """Return a per-model-attempt timeout without slowing unrelated tools.
+    """Return a timeout for one model turn, not for the whole agent task.
 
-    The persisted timeout is the user's latency preference for ordinary requests.
-    Agent work gets a larger floor because tool planning/code generation can take
-    materially longer. Heavy tasks and long-running loops get progressively more
-    room, capped at five minutes.
+    The first/planning turn may need a generous budget for a large coding task.
+    Turns that immediately follow tool output are different: they normally only
+    need to interpret bounded evidence and choose the next action.  Do not make
+    every continuation inherit a five-minute timeout merely because the original
+    task was long or because the run has accumulated many iterations.
     """
     try:
         base = int(base_timeout)
@@ -203,20 +211,23 @@ def adaptive_request_timeout(
         base = 30
     base = max(10, min(300, base))
     if quick_chat:
-        return base
+        return min(base, 60)
+
+    model_key = (model or "").lower()
+    slow_model = any(hint in model_key for hint in _SLOW_AGENT_MODEL_HINTS)
+
+    if continuation:
+        # A continuation is deliberately capped even when the persisted request
+        # timeout is 300s.  Slow/reasoning models get a little more room, while
+        # normal tool-followup turns fail fast enough to recover or use fallback.
+        return min(base, 120 if slow_model else 90)
 
     effective = max(base, 60)
-    model_key = (model or "").lower()
-    if any(hint in model_key for hint in _SLOW_AGENT_MODEL_HINTS):
+    if slow_model:
         effective = max(effective, 120)
-
     text = prompt or ""
     if len(text) >= 1500 or _HEAVY_TASK_RE.search(text):
         effective = max(effective, 180)
-    if iteration >= 3:
-        effective = max(effective, 180)
-    if iteration >= 10:
-        effective = max(effective, 240)
     return min(300, effective)
 
 
@@ -722,14 +733,14 @@ You are ai-coder — an autonomous coding agent on AILinux/TriForce (api.ailinux
   write tool and let the local client request the required approval.
 - After a tool error, use its result to correct the command or path. Do not
   abandon the task or repeat the same failing command unchanged.
-- After a change, verify the exact local result with lint, test, file_read, or file_tree.
+- After a change, verify the result. A successful typed write result that explicitly says it was deterministically verified already satisfies exact write verification; use an additional read/check only when the task requests independent verification or when behavior still needs checking.
 - When done: start reply with DONE:
 
 ## OS: {os_name}
 {os_instructions}
 
-## Tool Call Format (one per response):
-When you need a tool, output exactly this and nothing else:
+## Tool Call Format:
+When you need a tool, output one or more complete blocks and nothing else:
 TOOL_CALL tool_name
 {{"argument": "value"}}
 END_TOOL_CALL
@@ -738,8 +749,9 @@ Rules:
 - Use the exact tool name from the tool list.
 - The JSON object contains only that tool's arguments; do not wrap it in name/arguments.
 - Use {{}} when the tool takes no arguments.
-- Emit exactly one complete tool call per response.
-- Do not add prose before or after a tool call.
+- Multiple blocks in one response are allowed only for independent calls whose arguments do not depend on another call's result.
+- If a later action depends on an earlier result, emit only the first call and wait for its result.
+- Do not add prose before, between, or after tool-call blocks.
 - Never continue a broken prior tool call; always start a new call from TOOL_CALL.
 - Never invent fields or omit required fields.
 
@@ -1063,21 +1075,41 @@ def normalize_tool_calls(value: Any) -> list[dict]:
     return calls
 
 
-def parse_tool_calls(text: str) -> list[dict]:
-    """Extract strict AICoder text-tool calls plus read-only legacy formats."""
+def _parse_text_tool_v2_sequence(text: str) -> list[dict]:
+    """Parse one or more complete v2 blocks when they are the whole response."""
+    raw = str(text or "")
+    matches = list(TEXT_TOOL_V2_BLOCK_RE.finditer(raw))
+    if not matches:
+        return []
     calls: list[dict] = []
-
-    # Preferred protocol v2: the entire response is one tool call. Tool name is
-    # outside JSON so the model only has to generate one flat argument object.
-    v2 = TEXT_TOOL_V2_RE.fullmatch(str(text or ""))
-    if v2:
-        raw_args = v2.group("args").strip()
+    cursor = 0
+    for match in matches:
+        if raw[cursor:match.start()].strip():
+            return []
+        raw_args = match.group("args").strip()
         try:
             args = json.loads(raw_args) if raw_args else {}
         except json.JSONDecodeError:
             return []
-        call = _normalize_tool_call({"name": v2.group("name"), "arguments": args})
-        return [call] if call else []
+        call = _normalize_tool_call({"name": match.group("name"), "arguments": args})
+        if call is None:
+            return []
+        calls.append(call)
+        cursor = match.end()
+    if raw[cursor:].strip():
+        return []
+    return calls
+
+
+def parse_tool_calls(text: str) -> list[dict]:
+    """Extract strict AICoder text-tool calls plus read-only legacy formats."""
+    calls: list[dict] = []
+
+    # Preferred protocol v2. Several independent calls may share one model turn,
+    # but every block must be complete and the response may contain no prose.
+    v2_calls = _parse_text_tool_v2_sequence(str(text or ""))
+    if v2_calls:
+        return v2_calls
 
     # Legacy readers remain for compatibility with older models/sessions, but
     # the system prompt no longer teaches these formats.
@@ -1145,7 +1177,7 @@ def parse_tool_calls(text: str) -> list[dict]:
 def strip_tool_calls(text: str) -> str:
     """Remove complete tool-call blocks from text."""
     raw = str(text or "")
-    if TEXT_TOOL_V2_RE.fullmatch(raw):
+    if _parse_text_tool_v2_sequence(raw):
         return ""
     return TOOL_RE.sub("", raw).strip()
 
@@ -1395,7 +1427,14 @@ def run_file_edit(args: dict) -> Tuple[str, bool]:
                 True,
             )
         atomic_write_text(path, pending)
-        return f"updated {_display_workspace_path(path)}", False
+        actual = path.read_text(encoding="utf-8", errors="strict")
+        if actual != pending:
+            if previous is None:
+                path.unlink(missing_ok=True)
+            else:
+                atomic_write_text(path, previous)
+            return f"file_edit error: read-back verification mismatch for {_display_workspace_path(path)}; previous state restored", True
+        return f"updated {_display_workspace_path(path)}; verified exact content ({len(actual)} chars)", False
     except Exception as exc:
         return f"file_edit error: {exc}", True
 
@@ -1414,7 +1453,7 @@ def run_directory_create(args: dict) -> Tuple[str, bool]:
                 return f"directory already exists: {_display_workspace_path(path)}", False
             return f"directory_create error: path exists and is not a directory: {path}", True
         path.mkdir(parents=True, exist_ok=False)
-        return f"created directory {_display_workspace_path(path)}", False
+        return f"created directory {_display_workspace_path(path)}; verified directory exists", False
     except Exception as exc:
         return f"directory_create error: {exc}", True
 

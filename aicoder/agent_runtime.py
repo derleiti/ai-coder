@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import queue
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -74,6 +75,20 @@ _VERIFICATION_REQUIRED_PROMPT = (
     "a read/check/lint/test tool now. Do not report DONE until verification succeeds."
 )
 
+_STRUCTURED_REQUIREMENT_RE = re.compile(r"(?m)^\s*(?:[-*+]\s+|\d+[.)]\s+)")
+
+def _needs_completion_audit(prompt: str) -> bool:
+    text = str(prompt or "")
+    return len(_STRUCTURED_REQUIREMENT_RE.findall(text)) >= 3
+
+def _completion_audit_prompt(prompt: str) -> str:
+    task = str(prompt or "")[:5000]
+    return (
+        "Completion audit: compare every explicit requirement in the original task against the tool evidence already present. "
+        "If anything remains unfinished, continue with the required tool. If all requirements are complete, return the final answer beginning with DONE:. "
+        "Do not repeat already verified work.\n\nOriginal task:\n" + task
+    )
+
 _FINAL_RESPONSE_REPAIR_PROMPT = (
     "Your previous response was empty or contained an invalid/incomplete tool call. "
     "Discard that malformed output completely; do not continue or complete its fragment. "
@@ -122,8 +137,7 @@ def _has_incomplete_tool_markup(text: str) -> bool:
     # Protocol v2: only a leading TOOL_CALL marker enters protocol mode. A normal
     # final answer may legitimately discuss TOOL_CALL/END_TOOL_CALL as code terms.
     if lowered.startswith("tool_call ") or lowered == "tool_call":
-        from .executor import TEXT_TOOL_V2_RE
-        return TEXT_TOOL_V2_RE.fullmatch(raw) is None
+        return not bool(parse_tool_calls(raw))
 
     # A provider may return only the tail of a legacy envelope (observed as
     # ``}}\n</tool_call>``). Treat punctuation-only content before an orphan closing
@@ -229,8 +243,8 @@ class NativeLightRuntime:
         if not native:
             return system
         text_block = (
-            "## Tool Call Format (one per response):\n"
-            "When you need a tool, output exactly this and nothing else:\n"
+            "## Tool Call Format:\n"
+            "When you need a tool, output one or more complete blocks and nothing else:\n"
             "TOOL_CALL tool_name\n"
             '{"argument": "value"}\n'
             "END_TOOL_CALL\n\n"
@@ -238,8 +252,9 @@ class NativeLightRuntime:
             "- Use the exact tool name from the tool list.\n"
             "- The JSON object contains only that tool's arguments; do not wrap it in name/arguments.\n"
             "- Use {} when the tool takes no arguments.\n"
-            "- Emit exactly one complete tool call per response.\n"
-            "- Do not add prose before or after a tool call.\n"
+            "- Multiple blocks in one response are allowed only for independent calls whose arguments do not depend on another call's result.\n"
+            "- If a later action depends on an earlier result, emit only the first call and wait for its result.\n"
+            "- Do not add prose before, between, or after tool-call blocks.\n"
             "- Never continue a broken prior tool call; always start a new call from TOOL_CALL.\n"
             "- Never invent fields or omit required fields."
         )
@@ -479,7 +494,23 @@ class NativeLightRuntime:
             mutation_seen = True
             plan.set_step("inspect", "completed", "Relevant state inspected before mutation")
             plan.set_step("implement", "completed", f"Successful mutation via {name}")
-            plan.set_step("verify", "in_progress", "Waiting for post-change verification")
+            deterministic_verified = False
+            if "verified" in str(result).lower():
+                if name == "directory_create":
+                    deterministic_verified = True
+                elif name == "file_edit":
+                    # Exact read-back proves the bytes landed, but source/config
+                    # changes still need a behavioral/syntax check. Only plain
+                    # document/data artifacts may finish verification here.
+                    suffix = Path(str(args.get("path") or "")).suffix.lower()
+                    deterministic_verified = suffix in {
+                        ".txt", ".md", ".rst", ".csv", ".log",
+                    }
+            if deterministic_verified:
+                plan.set_step("verify", "completed", f"Deterministically verified by {name}")
+                verification_seen = True
+            else:
+                plan.set_step("verify", "in_progress", "Waiting for post-change verification")
         else:
             inspect = next((step for step in plan.steps if step.id == "inspect"), None)
             if inspect is not None and inspect.status == "in_progress":
@@ -648,6 +679,7 @@ class NativeLightRuntime:
 
         iteration_limit = max(1, min(MAX_ITERATIONS, int(self.max_iterations or MAX_ITERATIONS)))
         final_response_repair_sent = False
+        completion_audit_sent = False
         for i in range(iteration_limit):
             if self._stopped():
                 reason = "Agent stopped by user"
@@ -672,14 +704,19 @@ class NativeLightRuntime:
 
             messages.append({"role": "user", "content": current_input})
             messages = trim_messages(messages)
+            continuation_turn = i > 0 and current_input != self.initial_prompt
             timeout = adaptive_request_timeout(
                 self.base_timeout,
-                prompt=self.initial_prompt,
+                prompt=current_input,
                 iteration=i,
                 quick_chat=self.quick_chat,
                 model=active_model,
+                continuation=continuation_turn,
             )
-            self._emit("model_start", iteration=i + 1, timeout=timeout, model=active_model or "")
+            self._emit(
+                "model_start", iteration=i + 1, timeout=timeout, model=active_model or "",
+                phase="continuation" if continuation_turn else "planning",
+            )
             started = time.monotonic()
             try:
                 request_tools = self._tools_for_request(tools, active_model)
@@ -836,6 +873,13 @@ class NativeLightRuntime:
                         "for generic confirmation. If execution is impossible, name the exact blocker."
                     )
                     tool_nudge_sent = True
+                    self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
+                    continue
+                if tool_was_called and not completion_audit_sent and _needs_completion_audit(self.initial_prompt):
+                    messages.append({"role": "assistant", "content": response})
+                    current_input = _completion_audit_prompt(self.initial_prompt)
+                    completion_audit_sent = True
+                    self._emit("completion_audit", iteration=i + 1)
                     self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
                     continue
                 messages.append({"role": "assistant", "content": response})

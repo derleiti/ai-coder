@@ -38,6 +38,7 @@ from ..executor import (
 class _AgentWorker(QThread):
     """Background thread: agent loop with approval support and stop."""
     msg = pyqtSignal(str, str, str)          # (role, text, meta)
+    activity = pyqtSignal(str)
     finished = pyqtSignal(str, str)           # (final_text, model)
     error = pyqtSignal(str)
     messages_updated = pyqtSignal(list)
@@ -190,6 +191,10 @@ class _AgentWorker(QThread):
                 if plan_id:
                     active_plan_id = str(plan_id)
                     self.msg.emit("system", f"Persistent plan {action}: {plan_id}", runtime_label)
+            elif kind == "model_start":
+                phase = str(payload.get("phase") or "planning")
+                model_name = str(payload.get("model") or self.model or "backend")
+                self.activity.emit(f"Waiting for model · {model_name} · {phase} · timeout {int(payload.get('timeout') or 0)}s")
             elif kind == "model_response":
                 requested = str(payload.get("requested") or "default")
                 used = str(payload.get("model") or requested)
@@ -209,6 +214,7 @@ class _AgentWorker(QThread):
                 self.msg.emit("thought", str(payload.get("text") or ""), f"step {payload.get('iteration', '?')}")
             elif kind == "tool_call":
                 name = str(payload.get("name") or "?")
+                self.activity.emit(f"Running tool · {name}")
                 args = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
                 self.msg.emit("tool", f">> {name}({json.dumps(args, ensure_ascii=False)[:200]})", "")
             elif kind == "tool_result":
@@ -604,6 +610,11 @@ class ChatWidget(QWidget):
         self._activity_timer.start()
         self._tick_activity()
 
+    def _on_worker_activity(self, label: str):
+        self._activity_label = str(label or "working")
+        if self._activity_timer.isActive():
+            self._tick_activity()
+
     def _tick_activity(self):
         frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
         elapsed = max(0.0, time.monotonic() - self._activity_started)
@@ -779,15 +790,14 @@ class ChatWidget(QWidget):
         elif not should_load_tools_now:
             self._append_msg("system", "On demand · tools skipped for this prompt", "")
 
-        if should_load_tools_now and tool_mode == "on_demand":
-            # Re-resolve from the cached full catalogue inside load_tools(). Caching
-            # only the previous working set would make later capability expansion
-            # impossible after the topic changes.
+        if should_load_tools_now:
+            # Rebuild the effective tool working set/system prompt for every run.
+            # load_tools() already has a per-account TTL cache, so this is cheap,
+            # while avoiding stale AGENTS.md, stale tool descriptions, or a system
+            # prompt inherited from a previous task. on_demand will additionally
+            # resolve a small capability working set inside NativeLightRuntime.
             run_tools = None
             run_system = None
-        elif should_load_tools_now:
-            run_tools = self._tools
-            run_system = self._system
         else:
             run_tools = []
             run_system = build_system_prompt([], str(active_workspace(state.get("workspace_root"))))
@@ -830,6 +840,7 @@ class ChatWidget(QWidget):
         )
         self._worker.msg.connect(self._on_agent_msg)
         self._worker.finished.connect(self._on_response)
+        self._worker.activity.connect(self._on_worker_activity)
         self._worker.messages_updated.connect(self._on_messages_updated)
         self._worker.error.connect(self._on_error)
         self._worker.approval_needed.connect(
