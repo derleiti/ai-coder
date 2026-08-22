@@ -49,11 +49,16 @@ class CapabilityDetectionTests(unittest.TestCase):
     def test_chat_only_model_is_rejected(self):
         self.assertFalse(mc.supports_tools(self.client, "nvidia/nvidia/nemotron-3-ultra-550b-a55b"))
 
-    def test_function_calling_model_is_accepted(self):
-        for model in ("openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
-                      "mistral/mistral-code-agent-latest"):
+    def test_openrouter_is_pinned_to_text_tool_protocol(self):
+        for model in (
+            "openrouter/nvidia/nemotron-3-ultra-550b-a55b",
+            "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+        ):
             with self.subTest(model=model):
-                self.assertTrue(mc.supports_tools(self.client, model))
+                self.assertFalse(mc.supports_tools(self.client, model))
+
+    def test_other_function_calling_provider_is_accepted(self):
+        self.assertTrue(mc.supports_tools(self.client, "mistral/mistral-code-agent-latest"))
 
     def test_boolean_flag_variant_is_understood(self):
         # Not every backend uses the capabilities list.
@@ -112,6 +117,11 @@ class RuntimeGateTests(unittest.TestCase):
         for _ in range(4):
             runtime._tools_for_request(tools, runtime.model)
         self.assertEqual(events.count("model_without_tool_support"), 1)
+
+    def test_openrouter_runtime_never_sends_native_tool_schemas(self):
+        runtime = self._runtime("openrouter/nvidia/nemotron-3-ultra-550b-a55b")
+        tools = [{"name": "file_edit"}, {"name": "file_read"}]
+        self.assertIsNone(runtime._tools_for_request(tools, runtime.model))
 
     def test_tools_pass_through_for_a_capable_model(self):
         runtime = self._runtime("mistral/mistral-code-agent-latest")

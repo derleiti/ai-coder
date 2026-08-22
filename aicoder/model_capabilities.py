@@ -126,7 +126,16 @@ def capabilities(client: Any, model: str | None) -> Optional[frozenset[str]]:
 
 
 def supports_tools(client: Any, model: str | None) -> bool:
-    """True unless the catalogue positively states the model cannot call tools."""
+    """Whether AICoder should send provider-native tool schemas for this model.
+
+    OpenRouter is intentionally pinned to AICoder's text-based tool protocol.
+    Its models may advertise native function calling, but AICoder keeps one
+    provider-independent conversation loop there and does not send native
+    ``tools`` / ``tool_choice`` payloads through OpenRouter.
+    """
+    model_id = str(model or "")
+    if model_id.startswith("openrouter/"):
+        return False
     caps = capabilities(client, model)
     if caps is None or not caps:
         return True
