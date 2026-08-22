@@ -104,6 +104,10 @@ def _recover_unclosed_tool_calls(text: str) -> list[dict]:
 
 def _has_incomplete_tool_markup(text: str) -> bool:
     lowered = str(text or "").lower()
+    opens = lowered.count("<tool_call>")
+    closes = lowered.count("</tool_call>")
+    if opens != closes:
+        return True
     start = lowered.rfind("<tool_call>")
     return start >= 0 and "</tool_call>" not in lowered[start:]
 

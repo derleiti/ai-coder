@@ -253,6 +253,28 @@ class NativeLightPlanTests(unittest.TestCase):
             self.assertEqual(client.chat.call_count, 3)
             self.assertTrue(any(name == "final_response_repair" for name, _ in events))
 
+    def test_orphan_closing_tool_tag_is_repaired_not_completed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp)
+            client = MagicMock()
+            client.timeout = 30
+            client.chat.side_effect = [
+                {"response": "}}\n</tool_call>", "model": "test/model"},
+                {"response": "DONE: valid textual summary", "model": "test/model"},
+            ]
+            runtime = NativeLightRuntime(
+                client=client, initial_prompt="Summarize the current state", model="test/model",
+                fallback_model=None, workspace_root=str(workspace),
+                tools=[], load_tools_on_start=False, persistent_plan=False, base_timeout=30,
+            )
+            events = []
+            runtime.event_fn = lambda name, payload: events.append((name, payload))
+            result = runtime.run()
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(result.response, "DONE: valid textual summary")
+            self.assertEqual(client.chat.call_count, 2)
+            self.assertTrue(any(name == "final_response_repair" for name, _ in events))
+
     def test_empty_response_after_tool_never_completes_and_pauses_after_repair(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
