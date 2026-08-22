@@ -9,6 +9,146 @@ This task is a substantial architectural hardening and capability upgrade. Work 
 
 ---
 
+
+# 0A. VERIFIED IMPLEMENTATION STATUS — 2026-08-22
+
+This section overrides stale status assumptions elsewhere in this document. The remainder of the file is still the architectural target/specification unless explicitly marked otherwise.
+
+Verified repository:
+- source of truth: `/home/zombie/ai-coder`
+- verified HEAD during this review: `6b48ecc`
+- working tree was clean before this roadmap-only update
+- `pyproject.toml` version: `0.9.9`
+- full test suite: **379/379 passing** (`python -m unittest discover tests`)
+- do **not** call the product `1.2.0` yet
+
+## Status legend
+
+- ✅ **implemented and exercised** — real code exists and focused/full tests cover the critical path
+- 🟡 **foundation implemented / incomplete product surface** — usable core exists, but important edge cases, integration, UX, trust, packaging, or real-world validation remain
+- 🔴 **not release-ready / still required**
+- ⚪ **deliberately deferred / only implement if evidence justifies it**
+
+## What is genuinely working now
+
+### ✅ Native agent runtime and reliability core
+- `NativeLightRuntime` is the first-class native agent state machine.
+- Persistent plans, pause/resume, continuation journals, model fallback, stall/duplicate-call guards, fresh-read-before-mutation after resume, mutation/verification tracking, and long-run safety pauses exist.
+- HTTP 408/429 and transient backend/model failure handling are covered; 524-style upstream/proxy timeouts remain an infrastructure reality and cannot be fixed solely by increasing local client timeouts.
+- Short continuation commands such as `retry`, `resume`, `continue`, `weiter`, and `fortfahren` reuse the persistent plan instead of silently creating a new task.
+
+### ✅ Text-first tool protocol with optional native OpenRouter mode
+- Provider-independent text Protocol v2 is the default:
+  `TOOL_CALL <name>` + strict JSON arguments + `END_TOOL_CALL`.
+- Semantic JSON repair is intentionally disabled. Malformed calls are not guessed into executable operations.
+- Legacy valid tool-call formats remain readable for compatibility.
+- Provider-native OpenRouter function calling exists only behind `native_openrouter_tool_calling=false/true`; default remains text-based.
+- Final-response recovery no longer treats normal review prose containing `tool_call`, `TOOL_CALL`, `END_TOOL_CALL`, or parser function names as malformed protocol.
+- Orphan protocol tails such as `}}\n</tool_call>` are still treated as protocol debris and repaired rather than shown as a valid final answer.
+
+### ✅ Progressive `on_demand` capability selection
+- Capability taxonomy, deterministic resolver, bounded initial working set, stable meta-tools, `toolbox_search`, `capability_request`, and bounded dynamic expansion exist.
+- Resume capability selection is anchored to the original persistent `plan.task`, not merely the short continuation word.
+- A resumed plan blocks new mutations until a fresh successful inspection/check has occurred.
+- This is a working progressive system, but routing quality still needs real-world evals across more model families and task classes.
+
+### ✅ Unified settings foundation
+- Canonical settings registry and `SettingsStore` exist with validation/persistence.
+- CLI supports `settings list/get/set/reset/explain/schema/doctor`.
+- GUI settings are schema-backed for the implemented settings and share the same session/settings state.
+- Typed LLM settings tools exist. Security-boundary reductions require host-side approval/policy rather than model self-authorization.
+- `native_openrouter_tool_calling` is exposed in both GUI and CLI/settings state.
+
+### ✅ Plugin/ToolProvider foundation
+- Built-in ToolProvider abstraction, manifest parser, discovery scopes, deterministic override handling, enable/disable state, `plugin list/info/enable/disable/doctor/paths`, and security metadata exist.
+- Built-in `settings` and `local-os` providers are executable.
+- **External Python providers are deliberately not executed yet.** Their manifests may be discovered, but executable loading remains blocked until a real trust/install broker exists. This is a security feature, not a missing accidental import.
+
+### ✅ Privilege/security broker foundation
+- `PrivilegeBroker`, execution risk assessment, GUI/terminal/headless policy paths, destructive-command checks, protected-path checks, workspace escape approval, and typed tool security metadata exist.
+- Host-side policy remains authoritative. Models cannot grant themselves privilege.
+- Coding-only restrictions currently remain intentionally stricter than the broad long-term system-assistant vision.
+
+### ✅ Subagents / skills / hooks foundation
+- Bounded subagent profiles and `subagent_run` exist. Recursive subagent spawning is blocked by removing `subagent_run` from delegated tool sets.
+- Native skills, guidelines, commands, and lifecycle hooks exist and have focused tests.
+- Treat subagents primarily as context/capability isolation, not as an excuse to multiply models indiscriminately.
+
+### ✅ Local OS + MCP read-only foundation
+- Typed local OS diagnostics exist through `LocalOSToolProvider`.
+- AICoder can expose an approved local provider through MCP stdio; `local-os` is the current default local provider.
+- MCP client registry/management and verification tests exist.
+- This does **not** mean arbitrary root/system administration over MCP is release-ready. Mutating OS capability must remain privilege-brokered and narrowly typed.
+
+### ✅ Optimizer and change journal foundation
+- Evidence-first optimizer inspect/plan flows exist.
+- Structured change journal and rollback support exist for reversible supported actions.
+- The safe target remains inspect → plan → explicitly approved apply → verify → rollback where possible.
+
+### ✅ Provider/model hygiene foundation
+- Model capability normalization, model transport helpers, provider/credential inspection commands, secret-presence reporting without printing values, and secret redaction tests exist.
+- TriForce remains the default gateway. Do not duplicate backend secrets into the client.
+
+### ✅ Chat continuity and minimal tool evidence
+- SQLite chat history persists user/assistant sessions. GUI currently displays the 15 most recent sessions, but the DB retains older sessions unless explicitly deleted.
+- Reopened chats now preserve the first historical user message correctly in model context.
+- Per-session tool evidence stores only: timestamp, tool name, `ok/error/blocked`, iteration, and plan id.
+- Tool arguments, paths, raw outputs, source snippets, credentials, and arbitrary tool content are **not** persisted as chat evidence.
+- Up to the last 40 tool events are rendered as compact metadata context so a model can notice prior activity while still re-inspecting the live workspace for exact evidence.
+
+## Known remaining weaknesses / realistic limits
+
+### 🔴 First-turn / startup reliability still needs targeted reproduction
+The GUI can occasionally appear to start an agent run but require a manual `retry` before useful tool execution begins. This is a real user-observed issue and should be reproduced with event/state logging before speculative fixes. Do not mask it with automatic infinite retries.
+
+### 🔴 Real-world model compatibility is broader than unit tests
+Qwen and Nemotron have completed real text-tool smoke/review runs, including normal final answers. More models/providers must be tested for:
+- strict Protocol v2 compliance;
+- malformed-call recovery;
+- long context/tool loops;
+- finalization after many tool calls;
+- fallback transitions;
+- short `retry`/resume behavior.
+
+### 🔴 External plugin trust/install lifecycle is incomplete
+Discovery is not the same as safe execution. Before external executable plugins are allowed, implement and test:
+- explicit install/trust flow;
+- immutable/identified plugin source or digest where practical;
+- environment-variable allowlisting/sanitization;
+- permission/capability declaration review;
+- update/remove lifecycle;
+- clear user approval for executable code.
+Do not simply `import` user/workspace Python from discovered manifests.
+
+### 🟡 GUI/CLI parity is strong at the settings core, not perfect everywhere
+Do not claim every operational command has a GUI equivalent. v1.2 acceptance should require parity for canonical runtime/settings controls and critical agent behavior, not a GUI clone of every CLI subcommand.
+
+### 🟡 Local OS/system-assistant vision must stay narrower than the marketing vision until hardened
+The current repository guidance remains coding-oriented and blocks broad raw shell/admin behavior. That is acceptable for safety. Expand system operations only through typed capabilities, privilege policy, verification, and tests. Avoid turning v1.2 into unrestricted remote root automation.
+
+### 🟡 Context durability must remain compact
+Do not persist raw tool outputs merely to make resume “remember everything.” Conversation history is semantic context; plan/journal is crash state; live workspace is source of truth; compact tool metadata is evidence. Re-read files/state when exact details matter.
+
+### 🟡 Agent/runtime modules are becoming large
+`agent_runtime.py`, `executor.py`, and GUI widgets are sizeable. Refactor only when tests and responsibility boundaries justify it. Do not perform a cosmetic rewrite before release. Prefer extracting stable subsystems when a concrete maintenance/testability problem appears.
+
+### ⚪ 600-second model timeouts are not a default solution
+The client currently caps adaptive model attempts at 300 seconds, while upstream gateways/proxies may fail sooner (for example observed 524 behavior). Increasing a local cap cannot overcome an upstream timeout. Fix/request-streaming/infrastructure behavior at the correct layer instead of blindly raising constants.
+
+## Immediate pre-1.2 priority order
+
+1. Reproduce and fix the intermittent first-turn/manual-`retry` startup issue.
+2. Run repeated end-to-end agent tasks across Qwen, Nemotron, and additional representative provider/model families.
+3. Harden chat/session continuation and evidence behavior with GUI-level regression tests, including reopen → continue → tool use → final answer.
+4. Finish external plugin trust/install lifecycle **or explicitly keep external executable providers out of v1.2**.
+5. Validate privilege behavior on actual supported Linux desktop/headless paths without weakening the coding-only safety baseline.
+6. Validate MCP local provider serving/client management end-to-end and document the read-only vs mutating boundary.
+7. Complete packaging/install smoke tests (PyInstaller/Debian/installed binary) on clean systems, including version and dependency behavior.
+8. Unify final version metadata only when release acceptance passes; then bump from `0.9.9` to `1.2.0`.
+9. Update README/CHANGELOG/security/plugin/MCP/migration documentation to match what actually ships.
+10. Avoid new large features unless they close a release criterion or a reproduced reliability/security gap.
+
+---
 # 0. ABSOLUTE OPERATING RULES
 
 Follow these rules throughout the task.
@@ -63,39 +203,31 @@ Follow these rules throughout the task.
 
 # 1. CURRENT REPOSITORY / WORKTREE FACTS — VERIFY THEM FIRST
 
-Repository:
+Repository / source of truth:
 `/home/zombie/ai-coder`
 
-At the start of this work, inspect and preserve the existing working tree.
+The self-test target may be copied to:
+`/home/zombie/workspace/ai-coder`
 
-Known current state from the previous session:
+Never patch a stale server copy and never treat the workspace copy as the source of truth. When testing AICoder against itself, first synchronize/copy the current source intentionally, then point AICoder at the workspace copy.
 
-- `aicoder/__init__.py` is modified and currently changes `__version__` from `0.9.5` to `0.9.7`.
-- `aicoder/client.py` is modified to prefer backend `model_details` when available.
-- `packaging/aur/aicoder` already has unrelated modifications.
-- `.claude/` is untracked.
-- `.backups/` is untracked.
-- Do NOT overwrite or delete any of these blindly.
-- Inspect their diffs first and preserve them.
+Verified on 2026-08-22:
+- reviewed HEAD before this roadmap update: `6b48ecc`;
+- full test suite: 379/379 passing;
+- canonical package metadata currently reports `0.9.9` in `pyproject.toml`;
+- `aicoder.__version__` resolves from source/distribution metadata rather than maintaining a second hard-coded release number;
+- current `AGENTS.md` is AICoder-specific (the earlier stale TriForce backend layout problem has been corrected);
+- current GUI history menu displays 15 recent sessions, while SQLite may retain more sessions;
+- current default model gateway remains TriForce `/v1/client/chat`;
+- OpenRouter native function calling is opt-in, not default.
 
-Version metadata is currently inconsistent:
-- `pyproject.toml` still says `0.9.5`.
-- `aicoder/__init__.py` working tree currently says `0.9.7`.
-- Existing generated Debian packages include multiple 0.9.x versions.
-- `build.sh` derives the package version from `pyproject.toml`.
-- Do not bump to `1.2.0` until the release acceptance tests pass.
-- As part of v1.2, make one authoritative version source and remove manual drift.
-
-Important repository hygiene issue:
-- The current `/home/zombie/ai-coder/AGENTS.md` appears stale/mismatched and contains TriForce-backend project structure instructions (`app/`, FastAPI, MCP handlers, etc.) that do not describe this repository.
-- Do not blindly follow those stale repository-specific sections.
-- Preserve any intentional model policy block, inspect history/context, then replace the repository-specific guidance with accurate AICoder instructions as part of the work.
-
-Current AICoder model transport:
-- `TriForceClient.chat()` currently calls `/v1/client/chat`.
-- AICoder therefore primarily uses TriForce as its model gateway.
-- Do NOT copy backend provider secrets into the AICoder client just because they exist on the development server.
-- Keep backend-managed credentials on the backend/vault unless an explicit BYOK/local provider mode is introduced.
+Operating hygiene:
+- Always inspect `git status` and diffs before editing.
+- Preserve unrelated work and create targeted backups before risky changes.
+- Do not overwrite `/home/zombie/ai-coder` from `/home/zombie/workspace/ai-coder`.
+- Do not bump to `1.2.0` until release acceptance tests, packaging smoke tests, and documentation are complete.
+- Keep backend-managed provider secrets on the backend/vault unless a deliberately scoped BYOK/local-provider feature is implemented.
+- A clean unit test suite is necessary but not sufficient; real GUI/model/provider runs are part of acceptance.
 
 ---
 
@@ -1389,90 +1521,56 @@ Compare:
 
 ---
 
-# 26. V1.2 IMPLEMENTATION PHASES
+# 26. V1.2 IMPLEMENTATION PHASES — VERIFIED STATUS
 
-Do not implement all of this in one uncontrolled patch.
+Do not re-implement completed foundations. Inspect the code and extend the smallest missing layer.
 
-## Phase 0 — Baseline
-- inspect git status/diffs;
-- create backup;
-- run current tests;
-- build current binary if feasible;
-- record current `aicoder --help`;
-- inspect current GUI settings behavior;
-- verify current packaged version metadata;
-- correct your mental model before editing.
+## Phase 0 — Baseline — ✅ completed / repeat before release
+- repository inspection, backups, test baseline, runtime/GUI inspection, and version checks are established;
+- repeat clean-system/package smoke checks immediately before release.
 
-## Phase 1 — Settings foundation
-- canonical registry;
-- robust SettingsStore;
-- migrations;
-- CLI settings commands;
-- status;
-- GUI/REPL parity;
-- LLM settings tools;
-- tests.
+## Phase 1 — Settings foundation — ✅ core completed, 🟡 polish remains
+Implemented: canonical registry/store, validation, CLI settings commands, schema/doctor, GUI integration, LLM settings tools, fallback invariant, security-change gating tests.
+Remaining: audit every newly added runtime setting for GUI/CLI discoverability and eliminate any one-off setting path that bypasses the registry.
 
-## Phase 2 — Plugin / ToolProvider foundation
-- manifest;
-- registry;
-- discovery scopes;
-- security metadata;
-- plugin CLI;
-- built-in settings provider;
-- tests.
+## Phase 2 — Plugin / ToolProvider foundation — 🟡 foundation completed
+Implemented: manifest, scopes, registry, deterministic override behavior, built-in providers, security metadata, enable/disable/doctor/paths, tests.
+Remaining: executable **external** plugin trust/install/update/remove lifecycle. Do not load arbitrary discovered Python before this exists. This may be deferred beyond 1.2 if external executable plugins are explicitly documented as unsupported.
 
-## Phase 3 — Capability resolver / on-demand tools
-- capability taxonomy;
-- deterministic intent hints;
-- URL detection;
-- tool budget;
-- dynamic expansion;
-- tool catalog caching;
-- terminal + GUI same behavior;
-- evals.
+## Phase 3 — Capability resolver / on-demand tools — ✅ functional, 🟡 eval/hardening remains
+Implemented: capability taxonomy, deterministic hints, bounded working set, stable meta layer, dynamic expansion, resume anchoring, URL/tool policy tests.
+Remaining: model/task eval matrix, routing quality metrics, first-turn reliability investigation, cache/latency measurement.
 
-## Phase 4 — Privilege broker
-- centralize current terminal/GUI/headless flows;
-- preserve existing behavior;
-- add missing tests;
-- no real sudo prompt until mocks pass.
+## Phase 4 — Privilege broker — ✅ foundation completed, 🟡 real-environment validation remains
+Implemented: central risk assessment, terminal/GUI/headless policy, workspace-boundary handling, destructive/security metadata tests.
+Remaining: clean-machine GUI/Polkit/headless smoke tests and documentation of supported elevation strategies.
 
-## Phase 5 — Local OS plugin/provider + MCP exposure
-- read-only diagnostics first;
-- typed mutations second;
-- privilege integration;
-- `aicoder mcp serve`;
-- optimizer inspect/plan foundation;
-- rollback journal.
+## Phase 5 — Local OS provider + MCP exposure — 🟡 read-only foundation completed
+Implemented: typed Local OS provider, read-only diagnostics, MCP stdio serving, MCP registry/client management, optimizer inspect/plan, change journal/rollback foundations.
+Remaining: narrowly typed mutating OS actions only where justified, privilege-broker integration per action, verification/rollback coverage, MCP boundary documentation. Do not add unrestricted shell/root MCP.
 
-## Phase 6 — Subagents / skills / hooks
-- focused read-only Explore/Research/System diagnostics first;
-- plugin contributions;
-- capability isolation;
-- tests.
+## Phase 6 — Subagents / skills / hooks — ✅ foundation completed, 🟡 behavior eval remains
+Implemented: bounded profiles, recursion prevention, skills/guidelines/commands, hooks, tests.
+Remaining: measure whether delegation improves context/reliability; add worktree isolation only for real concurrent mutation workflows.
 
-## Phase 7 — Provider/model capability + credentials doctor
-- normalized model details;
-- provider health/status;
-- aliases/legacy env names;
-- secret redaction;
-- tool-call ID preservation;
-- direct BYOK only if cleanly scoped.
+## Phase 7 — Provider/model capability + credentials doctor — ✅ foundation completed, 🟡 compatibility matrix remains
+Implemented: normalized model capability layer, text-first Protocol v2, optional native OpenRouter calling, provider/credential status, redaction, tool-call normalization/ID handling tests.
+Remaining: real provider/model compatibility runs and backend timeout/streaming behavior validation.
 
-## Phase 8 — Packaging / docs / release
-- accurate AICoder `AGENTS.md`;
-- CLI docs;
-- security docs;
-- plugin authoring docs;
-- OS MCP docs;
-- migration notes;
-- version source unification;
-- CHANGELOG;
-- PyInstaller;
-- Debian package;
-- installed binary test;
-- only then bump/release 1.2.0.
+## Phase 7.5 — Chat continuity / evidence — ✅ newly implemented, 🟡 GUI E2E remains
+Implemented: persistent SQLite sessions, reopened-chat context fix, compact per-session tool metadata timeline without arguments/outputs, resume safety.
+Remaining: GUI reopen/continue end-to-end tests and retention UX decision. Do not silently delete old sessions merely because the menu displays only 15.
+
+## Phase 8 — Packaging / docs / release — 🔴 not complete
+Required before `1.2.0`:
+- clean README/CHANGELOG/security/migration/plugin/MCP docs;
+- reconcile broad system-assistant vision with actual coding-only safety boundaries;
+- PyInstaller build and installed-binary smoke test;
+- Debian package build/install/upgrade smoke test on clean supported Linux environments;
+- verify no secrets/local config/backups enter packages;
+- final version source/reporting check;
+- repeated GUI agent smoke runs;
+- only then bump/release `1.2.0`.
 
 ---
 
@@ -1568,37 +1666,43 @@ Add focused tests rather than one huge slow suite.
 
 ---
 
-# 28. RELEASE ACCEPTANCE CRITERIA FOR 1.2.0
+# 28. RELEASE ACCEPTANCE CRITERIA FOR 1.2.0 — CURRENT STATUS
 
-Do NOT call it v1.2 until all critical items pass.
+Do NOT call it v1.2 until all **critical** items are green. A foundation existing in code is not the same as release validation.
 
-Required:
+1. ✅ CLI exposes native agent/settings/plugin/provider/optimizer/change/MCP capabilities clearly.
+2. ✅ Canonical runtime settings are discoverable/settable through settings CLI; re-audit before release.
+3. ✅ GUI uses the same canonical settings/session state for implemented settings.
+4. ✅ Typed LLM settings inspection/change tools exist.
+5. ✅ Security-boundary changes require host-side policy/approval.
+6. ✅ `on_demand` uses progressive capability selection rather than all tools for every task.
+7. ✅ Bare URL/tool relevance behavior has targeted policy coverage.
+8. ✅ Tools can expand during a task without restarting the session.
+9. ✅ Disabled tools/provider policy is reapplied host-side.
+10. ✅ Tool-call normalization/identity handling has targeted tests; 🟡 continue real-provider validation.
+11. ✅ Typed Local OS diagnostics work.
+12. ✅ Mutating/destructive actions route through central security assessment; 🔴 broaden OS mutations only when individually hardened.
+13. 🟡 Terminal/GUI privilege paths have tests; clean desktop/Polkit validation still required.
+14. ✅ Headless privilege denial is designed to fail clearly rather than hang; 🟡 clean-host smoke test still required.
+15. ✅ Plugin discovery and enable/disable work.
+16. ✅ Built-in Local OS provider can be exposed via MCP stdio.
+17. ✅ Optimizer can inspect and produce evidence-based plans.
+18. ✅ Change journal/rollback foundation exists for supported reversible actions; 🟡 expand only with verified actions.
+19. ✅ Provider/credential doctor reports presence/status without exposing secret values.
+20. ✅ Secret redaction/hygiene tests exist; 🔴 package-content audit still required before release.
+21. ✅ Current workflow preserves unrelated source-of-truth changes when discipline is followed.
+22. ✅ Current full suite: 379/379 passing at the 2026-08-22 review point.
+23. 🔴 PyInstaller/installed binary must pass final clean-system smoke tests.
+24. 🔴 Version must report `1.2.0` only after acceptance; current project version remains `0.9.9`.
+25. 🔴 CHANGELOG and migration/security/plugin/MCP docs must be updated to the shipping behavior.
+26. ✅ Reopened GUI chats restore semantic conversation context correctly.
+27. ✅ Tool evidence persists metadata only, never raw outputs/arguments; 🟡 GUI E2E continuation test still required.
+28. 🔴 Intermittent first-turn/manual-`retry` issue must be reproduced, understood, or explicitly bounded before release.
+29. 🔴 Run a representative real-model matrix (at minimum Qwen + Nemotron + additional provider/model families) through read → tool → multi-step → finalization and pause/resume scenarios.
+30. 🔴 Decide external executable plugin scope for 1.2: either finish trust/install lifecycle or explicitly ship manifest/discovery-only external plugins.
 
-1. `aicoder --help` exposes the new configuration/agent capabilities clearly.
-2. Every runtime setting is discoverable and settable from CLI.
-3. GUI uses the same settings schema/store.
-4. An LLM can inspect and change authorized AICoder settings using typed tools.
-5. Security-reducing settings cannot be silently changed by the model.
-6. `on_demand` no longer means “all tools for every non-greeting”.
-7. A bare URL activates a small web capability set.
-8. Tools can expand during a task without restarting the session.
-9. Disabled tools/plugins cannot be reactivated by the model.
-10. Tool-call IDs survive the loop where providers require them.
-11. Local OS diagnostics work through typed tools.
-12. Mutating/root OS actions pass through the central privilege broker.
-13. Terminal elevation and GUI Polkit paths have passing tests.
-14. Headless privilege failure is clear and non-hanging.
-15. Plugin discovery and enable/disable work.
-16. At least the Local OS provider can be exposed through MCP.
-17. System optimizer can inspect and produce an evidence-based plan.
-18. Applied optimization actions are journaled and, where possible, rollback-capable.
-19. Provider credentials doctor reports presence/health without revealing values.
-20. No secrets are added to git, logs, test output, or packaged binary.
-21. Current unrelated working-tree changes remain preserved.
-22. Full targeted test suite passes.
-23. PyInstaller binary passes smoke tests.
-24. Version metadata is unified and reports `1.2.0`.
-25. CHANGELOG and migration/security docs are updated.
+Release rule:
+> AICoder 1.2 should ship a smaller set of capabilities that are demonstrably reliable and safe rather than claim every ambitious roadmap item as complete.
 
 ---
 
