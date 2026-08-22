@@ -273,5 +273,79 @@ class WorkspaceEscapeTests(unittest.TestCase):
                     os.environ[ACTIVE_WORKSPACE_ENV] = previous
 
 
+class LocalCodeToolRoutingTests(unittest.TestCase):
+    def test_code_tools_execute_locally_and_never_call_mcp(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            nested = root / "pkg"
+            nested.mkdir()
+            (root / "main.py").write_text("from pkg.mod import VALUE\n", encoding="utf-8")
+            (nested / "mod.py").write_text("VALUE = 42\nneedle = 'local-code-search'\n", encoding="utf-8")
+            client = MagicMock()
+            with patch.dict(os.environ, {ACTIVE_WORKSPACE_ENV: str(root)}):
+                read, read_error = run_tool(
+                    client, "code_read", {"path": "pkg/mod.py", "start_line": 1, "end_line": 1},
+                    approval_fn=lambda *_: True, allowed_tools={"code_read"},
+                )
+                tree, tree_error = run_tool(
+                    client, "code_tree", {"path": ".", "depth": 3},
+                    approval_fn=lambda *_: True, allowed_tools={"code_tree"},
+                )
+                search, search_error = run_tool(
+                    client, "code_search", {"query": "local-code-search", "path": ".", "file_pattern": "*.py"},
+                    approval_fn=lambda *_: True, allowed_tools={"code_search"},
+                )
+            self.assertFalse(read_error, read)
+            self.assertIn("1: VALUE = 42", read)
+            self.assertFalse(tree_error, tree)
+            self.assertIn("mod.py", tree)
+            self.assertFalse(search_error, search)
+            self.assertIn("pkg/mod.py:2", search)
+            client.mcp_call.assert_not_called()
+
+    def test_code_tools_support_explicit_project_root(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project = root / "project"
+            project.mkdir()
+            (project / "app.py").write_text("print('root-ok')\n", encoding="utf-8")
+            with patch.dict(os.environ, {ACTIVE_WORKSPACE_ENV: str(root)}):
+                result, is_error = run_tool(
+                    MagicMock(), "code_read", {"root": str(project), "path": "app.py"},
+                    approval_fn=lambda *_: True, allowed_tools={"code_read"},
+                )
+            self.assertFalse(is_error, result)
+            self.assertIn("root-ok", result)
+
+    def test_code_tool_invalid_target_is_reported_without_runtime_crash(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with patch.dict(os.environ, {ACTIVE_WORKSPACE_ENV: str(root)}):
+                result, is_error = run_tool(
+                    MagicMock(), "code_search", {"query": "needle", "target": "mars"},
+                    approval_fn=lambda *_: True, allowed_tools={"code_search"},
+                )
+            self.assertTrue(is_error)
+            self.assertIn("target must be one of", result)
+
+    def test_code_tool_project_outside_workspace_needs_scope_approval(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            workspace = base / "workspace"
+            project = base / "project"
+            workspace.mkdir(); project.mkdir()
+            (project / "app.py").write_text("outside = True\n", encoding="utf-8")
+            approvals = []
+            with patch.dict(os.environ, {ACTIVE_WORKSPACE_ENV: str(workspace)}):
+                result, is_error = run_tool(
+                    MagicMock(), "code_read", {"root": str(project), "path": "app.py"},
+                    approval_fn=lambda name, args: approvals.append((name, dict(args))) or True,
+                    allowed_tools={"code_read"},
+                )
+            self.assertFalse(is_error, result)
+            self.assertEqual(len(approvals), 1)
+            self.assertEqual(approvals[0][1]["_workspace_escape"], str((project / "app.py").resolve()))
+
+
 if __name__ == "__main__":
     unittest.main()

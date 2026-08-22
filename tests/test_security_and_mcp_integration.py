@@ -107,7 +107,8 @@ class ToolPolicyIntegrationTests(unittest.TestCase):
             patch.object(executor, "_tool_security_hints", {}),
         ):
             names = [tool["name"] for tool in executor.load_tools(client)]
-        self.assertEqual([name for name in names if "search" in name], ["search"])
+        self.assertEqual([name for name in names if name in {"search", "web_search", "web_search_local"}], ["search"])
+        self.assertEqual(names.count("code_search"), 1)
 
     def test_cli_agent_cannot_execute_a_tool_when_tool_mode_is_off(self):
         client = MagicMock()

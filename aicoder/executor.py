@@ -7,6 +7,7 @@ message management, destructive-command guards, audit logging.
 """
 from __future__ import annotations
 import copy
+import fnmatch
 import hashlib
 import json
 import os
@@ -489,7 +490,58 @@ LOCAL_FILE_TREE_SCHEMA = {
     }
 }
 
+LOCAL_CODE_READ_SCHEMA = {
+    "name": "code_read",
+    "description": "Read code/text locally or via TriForce. target=auto/local uses the AICoder host; target=remote uses the TriForce host.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "File path, absolute or relative to root"},
+            "root": {"type": "string", "description": "Optional project root on the selected target"},
+            "target": {"type": "string", "enum": ["auto", "local", "remote"], "description": "Execution target; auto defaults to local"},
+            "start_line": {"type": "integer", "minimum": 1},
+            "end_line": {"type": "integer", "minimum": 1},
+        },
+        "required": ["path"],
+    },
+}
+
+LOCAL_CODE_TREE_SCHEMA = {
+    "name": "code_tree",
+    "description": "Recursively inspect a project locally or via TriForce. target=auto/local uses AICoder; target=remote uses TriForce.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Directory path, absolute or relative to root"},
+            "root": {"type": "string", "description": "Optional project root on the selected target"},
+            "target": {"type": "string", "enum": ["auto", "local", "remote"], "description": "Execution target; auto defaults to local"},
+            "depth": {"type": "integer", "minimum": 1, "maximum": 8},
+            "ignore": {"type": "array", "items": {"type": "string"}},
+            "max_entries": {"type": "integer", "minimum": 1, "maximum": 1000},
+        },
+    },
+}
+
 LOCAL_CODE_SEARCH_SCHEMA = {
+    "name": "code_search",
+    "description": "Recursively search project files locally or via TriForce. target=auto/local uses AICoder; target=remote uses TriForce.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"},
+            "path": {"type": "string", "description": "Search scope, absolute or relative to root"},
+            "root": {"type": "string", "description": "Optional project root on the selected target"},
+            "target": {"type": "string", "enum": ["auto", "local", "remote"], "description": "Execution target; auto defaults to local"},
+            "file_pattern": {"type": "string", "description": "Glob such as *.py; defaults to *"},
+            "case_sensitive": {"type": "boolean"},
+            "regex": {"type": "boolean", "description": "Treat query as regular expression"},
+            "max_results": {"type": "integer", "minimum": 1, "maximum": 500},
+        },
+        "required": ["query"],
+    },
+}
+
+LOCAL_CODE_GREP_SCHEMA = {
     "name": "code_grep",
     "description": "Regex-search LOCAL text files. Outside-workspace paths require explicit one-time local scope approval.",
     "inputSchema": {
@@ -588,7 +640,10 @@ LOCAL_TOOL_SCHEMAS = [
     LOCAL_FILE_EDIT_SCHEMA,
     LOCAL_DIRECTORY_CREATE_SCHEMA,
     LOCAL_FILE_TREE_SCHEMA,
+    LOCAL_CODE_READ_SCHEMA,
+    LOCAL_CODE_TREE_SCHEMA,
     LOCAL_CODE_SEARCH_SCHEMA,
+    LOCAL_CODE_GREP_SCHEMA,
     LOCAL_GIT_SCHEMA,
     LOCAL_LINT_SCHEMA,
     LOCAL_TEST_SCHEMA,
@@ -620,8 +675,8 @@ You are ai-coder — an autonomous coding agent on AILinux/TriForce (api.ailinux
 - MCP tools run on the remote TriForce backend and remain coding-scoped.
 
 ## When to use which:
-- LOCAL READ/ANALYZE: file_read, file_tree, code_grep on the user's machine.
-- REMOTE READ/ANALYZE: code_read, code_search, code_tree on the TriForce backend.
+- LOCAL READ/ANALYZE: file_read, file_tree, code_grep, code_read, code_search, code_tree on the AICoder machine. code_* accepts an optional project root plus target=auto|local|remote; auto defaults to the local AICoder host, while remote explicitly executes through TriForce.
+- MCP schema origin does not imply remote execution. AICoder dispatches workspace/code tools locally; backend-only tools remain remote.
 - CREATE DIRECTORIES: use directory_create. Never use file_edit on a directory path.
 - WRITE/MODIFY FILES: use file_edit with path + operation + typed content fields.
 - BACKEND CONNECTIVITY: health (READ-ONLY)
@@ -1088,11 +1143,39 @@ def _workspace_path(
     return resolved
 
 
+def _code_execution_target(args: dict) -> str:
+    target = str(args.get("target") or "auto").strip().lower()
+    if target not in {"auto", "local", "remote"}:
+        raise ValueError("target must be one of: auto, local, remote")
+    return "local" if target == "auto" else target
+
+
+def _code_project_path(args: dict, default_path: str = ".") -> Path:
+    """Resolve a TriForce-compatible code tool path on the local AICoder host."""
+    workspace = _workspace_root()
+    root_value = args.get("root")
+    if root_value:
+        root = Path(str(root_value)).expanduser()
+        if not root.is_absolute():
+            root = workspace / root
+        root = root.resolve(strict=False)
+    else:
+        root = workspace
+    raw = Path(str(args.get("path") or default_path)).expanduser()
+    return (raw if raw.is_absolute() else root / raw).resolve(strict=False)
+
+
 def _workspace_escape_target(tool_name: str, args: dict) -> Path | None:
     if tool_name in {"git", "lint", "test", "shell", "task_runner"}:
         field = "cwd"
     elif tool_name == "binary_exec":
         field = "work_dir"
+    elif tool_name in {"code_read", "code_tree", "code_search"}:
+        if _code_execution_target(args) == "remote":
+            return None
+        resolved = _code_project_path(args)
+        _, inside = path_within_workspace(str(resolved), _workspace_root())
+        return None if inside else resolved
     elif tool_name in {"file_read", "file_edit", "directory_create", "file_tree", "code_grep"}:
         field = "path"
     else:
@@ -1312,6 +1395,99 @@ def run_file_tree(args: dict) -> Tuple[str, bool]:
         return "\n".join(rows) or "(empty directory)", False
     except Exception as exc:
         return f"file_tree error: {exc}", True
+
+
+def run_local_code_read(args: dict) -> Tuple[str, bool]:
+    try:
+        if not isinstance(args.get("path"), str) or not args.get("path"):
+            return "code_read error: path is required", True
+        target = _code_project_path(args)
+        path = _workspace_path(str(target), allow_outside=bool(args.get("_workspace_escape_approved")))
+        if not path.is_file():
+            return f"code_read error: not a file: {path}", True
+        sample = path.read_bytes()[:4096]
+        if b"\x00" in sample:
+            return f"code_read error: binary file; textual read not supported: {path}", True
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        start = max(1, int(args.get("start_line") or 1))
+        end = min(len(lines), int(args.get("end_line") or len(lines)))
+        if end < start:
+            return "code_read error: end_line must be >= start_line", True
+        output = "\n".join(f"{number}: {lines[number - 1]}" for number in range(start, end + 1))
+        return output[:12000] + ("…" if len(output) > 12000 else ""), False
+    except Exception as exc:
+        return f"code_read error: {exc}", True
+
+
+def run_local_code_tree(args: dict) -> Tuple[str, bool]:
+    try:
+        target = _code_project_path(args)
+        root = _workspace_path(str(target), allow_outside=bool(args.get("_workspace_escape_approved")))
+        if not root.is_dir():
+            return f"code_tree error: not a directory: {root}", True
+        depth_limit = max(1, min(8, int(args.get("depth") or 3)))
+        entry_limit = max(1, min(1000, int(args.get("max_entries") or 300)))
+        ignored = {".git", ".venv", "node_modules", "__pycache__", ".pytest_cache"}
+        patterns = [str(item) for item in (args.get("ignore") or []) if str(item)]
+        rows: list[str] = []
+        base_depth = len(root.parts)
+        for current, dirs, files in os.walk(root):
+            current_path = Path(current)
+            level = len(current_path.parts) - base_depth
+            def skip(name: str) -> bool:
+                return name in ignored or any(fnmatch.fnmatch(name, pattern) for pattern in patterns)
+            dirs[:] = sorted(name for name in dirs if not skip(name))
+            if level >= depth_limit:
+                dirs[:] = []
+            rel = current_path.relative_to(root)
+            if rel != Path("."):
+                rows.append("  " * level + rel.name + "/")
+            for name in sorted(files):
+                if not skip(name):
+                    rows.append("  " * (level + 1) + name)
+            if len(rows) >= entry_limit:
+                rows = rows[:entry_limit] + ["… entry limit reached"]
+                break
+        return "\n".join(rows) or "(empty directory)", False
+    except Exception as exc:
+        return f"code_tree error: {exc}", True
+
+
+def run_local_code_search(args: dict) -> Tuple[str, bool]:
+    try:
+        query = str(args.get("query") or "")
+        if not query:
+            return "code_search error: query is required", True
+        target = _code_project_path(args)
+        root = _workspace_path(str(target), allow_outside=bool(args.get("_workspace_escape_approved")))
+        if not root.exists():
+            return f"code_search error: path does not exist: {root}", True
+        case_sensitive = bool(args.get("case_sensitive"))
+        use_regex = bool(args.get("regex"))
+        flags = 0 if case_sensitive else re.IGNORECASE
+        pattern = re.compile(query if use_regex else re.escape(query), flags)
+        file_pattern = str(args.get("file_pattern") or "*")
+        limit = max(1, min(500, int(args.get("max_results") or 50)))
+        paths = [root] if root.is_file() else root.rglob(file_pattern)
+        matches: list[str] = []
+        for path in paths:
+            if not path.is_file() or any(part in {".git", ".venv", "node_modules", "__pycache__"} for part in path.parts):
+                continue
+            try:
+                if path.stat().st_size > 2_000_000:
+                    continue
+                for number, line in enumerate(path.read_text(encoding="utf-8", errors="strict").splitlines(), 1):
+                    if pattern.search(line):
+                        matches.append(f"{_display_workspace_path(path)}:{number}:{line[:500]}")
+                        if len(matches) >= limit:
+                            return "\n".join(matches) + "\n… result limit reached", False
+            except (OSError, UnicodeError):
+                continue
+        return "\n".join(matches) if matches else "(no matches)", False
+    except re.error as exc:
+        return f"code_search error: invalid regex: {exc}", True
+    except Exception as exc:
+        return f"code_search error: {exc}", True
 
 
 def run_code_grep(args: dict) -> Tuple[str, bool]:
@@ -1573,6 +1749,17 @@ def run_tool(
         )
         return result, True
 
+    if name in {"code_read", "code_tree", "code_search"}:
+        try:
+            _code_execution_target(args)
+        except ValueError as exc:
+            result = f"{name} error: {exc}"
+            audit.log_tool(
+                tool_name=name, arguments=args, result=result, duration_s=0,
+                is_error=True, model=model, iteration=iteration,
+            )
+            return result, True
+
     # Approval is transport-independent. A mutating MCP tool is just as
     # consequential as a local subprocess and must pass through the same local
     # broker. This keeps GUI and REPL behaviour identical.
@@ -1665,6 +1852,22 @@ def run_tool(
         result, is_error = run_directory_create(execution_args)
     elif name == "file_tree":
         result, is_error = run_file_tree(execution_args)
+    elif name in {"code_read", "code_tree", "code_search"}:
+        try:
+            code_target = _code_execution_target(execution_args)
+        except ValueError as exc:
+            result, is_error = f"{name} error: {exc}", True
+        else:
+            if code_target == "remote":
+                remote_args = dict(args)
+                remote_args.pop("target", None)
+                result, is_error = run_mcp_tool(client, name, remote_args, mutating=False)
+            elif name == "code_read":
+                result, is_error = run_local_code_read(execution_args)
+            elif name == "code_tree":
+                result, is_error = run_local_code_tree(execution_args)
+            else:
+                result, is_error = run_local_code_search(execution_args)
     elif name == "code_grep":
         result, is_error = run_code_grep(execution_args)
     elif name == "git":
