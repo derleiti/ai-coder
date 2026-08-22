@@ -773,6 +773,15 @@ _tool_security_hints: dict[str, tuple[bool | None, bool | None]] = {}
 _TOOL_CACHE_TTL = 300  # 5 minutes
 
 
+def invalidate_tool_cache() -> None:
+    """Drop cached schemas after local plugin/MCP registry changes."""
+    global _tool_cache, _tool_cache_ts, _tool_cache_key, _tool_security_hints
+    _tool_cache = None
+    _tool_cache_ts = 0
+    _tool_cache_key = None
+    _tool_security_hints = {}
+
+
 def _client_tool_cache_key(client: TriForceClient) -> tuple[str, str]:
     """Keep tool catalogs isolated per endpoint and authenticated account."""
     base_url = str(getattr(client, "base_url", "") or "").rstrip("/")
@@ -839,9 +848,19 @@ def load_tools(client: TriForceClient, force_refresh: bool = False) -> list[dict
     # providers remain declarative until the later trust/privilege phase.
     registry = discover_plugins(_workspace_root())
     provider_tools = registry.tool_schemas()
-    local_names = LOCAL_TOOL_NAMES | {str(tool.get("name") or "") for tool in provider_tools}
-    mcp_tools = [tool for tool in mcp_tools if tool.get("name") not in local_names]
-    result = LOCAL_TOOL_SCHEMAS + provider_tools + mcp_tools
+    try:
+        from .mcp_registry import external_tool_schemas
+        external_tools = external_tool_schemas()
+    except Exception:
+        # A broken optional external server must not take down the built-in agent.
+        external_tools = []
+    reserved_names = (
+        LOCAL_TOOL_NAMES
+        | {str(tool.get("name") or "") for tool in provider_tools}
+        | {str(tool.get("name") or "") for tool in external_tools}
+    )
+    mcp_tools = [tool for tool in mcp_tools if tool.get("name") not in reserved_names]
+    result = LOCAL_TOOL_SCHEMAS + provider_tools + external_tools + mcp_tools
     _tool_security_hints = {
         str(tool.get("name", "")): _tool_security_metadata(tool)
         for tool in result
@@ -1724,6 +1743,50 @@ def run_mcp_tool(
     return f"TOOL FAILED (after retry): {last_err}", True
 
 
+def _prepare_settings_restore(tool_name: str, args: dict) -> dict | None:
+    if tool_name not in {"settings_apply_patch", "settings_reset"}:
+        return None
+    from . import settings
+    from .settings_tools import _normalized_patch
+
+    current = settings.STORE.load()
+    proposed = dict(current)
+    if tool_name == "settings_apply_patch":
+        proposed.update(_normalized_patch(args.get("patch")))
+    else:
+        key = settings.resolve_key(str(args.get("key") or ""))
+        proposed[key] = settings.REGISTRY[key].default
+    settings.apply_invariants(proposed)
+    changed = [key for key in settings.REGISTRY if current.get(key, settings.REGISTRY[key].default) != proposed.get(key, settings.REGISTRY[key].default)]
+    if not changed or any(settings.REGISTRY[key].sensitive for key in changed):
+        return None
+    return {
+        "kind": "settings_patch",
+        "previous": {key: current.get(key, settings.REGISTRY[key].default) for key in changed},
+        "post": {key: proposed.get(key, settings.REGISTRY[key].default) for key in changed},
+    }
+
+
+def _prepare_change_restore(tool_name: str, args: dict):
+    from .change_journal import ChangeJournal
+    journal = ChangeJournal()
+    if tool_name == "file_edit":
+        target = _workspace_path(
+            args.get("path"), must_exist=False,
+            allow_outside=bool(args.get("_workspace_escape_approved")),
+        )
+        return journal, journal.prepare_file_change(target)
+    if tool_name == "directory_create":
+        target = _workspace_path(
+            args.get("path"), must_exist=False,
+            allow_outside=bool(args.get("_workspace_escape_approved")),
+        )
+        return journal, journal.prepare_directory_create(target)
+    if tool_name in {"settings_apply_patch", "settings_reset"}:
+        return journal, _prepare_settings_restore(tool_name, args)
+    return journal, None
+
+
 def run_tool(
     client: TriForceClient,
     name: str,
@@ -1820,6 +1883,22 @@ def run_tool(
     if needs_scope_approval:
         execution_args["_workspace_escape_approved"] = True
 
+    change_journal = None
+    restore_metadata = None
+    if risk.mutation or risk.destructive:
+        try:
+            change_journal, restore_metadata = _prepare_change_restore(name, execution_args)
+        except Exception as exc:
+            # A file edit must never proceed when its required pre-write snapshot failed.
+            if name == "file_edit":
+                result = f"{name}: blocked — pre-change rollback snapshot failed: {type(exc).__name__}: {exc}"
+                audit.log_tool(
+                    tool_name=name, arguments=args, result=result, duration_s=0,
+                    is_error=True, model=model, iteration=iteration,
+                )
+                return result, True
+            restore_metadata = None
+
     # Route local tools (all execute via subprocess on client machine)
     _provider = discover_plugins(_workspace_root()).provider_for_tool(name)
     _is_local = name in LOCAL_TOOL_NAMES or _provider is not None
@@ -1885,6 +1964,9 @@ def run_tool(
         result, is_error = web_fetch(args.get("url", ""))
     elif (provider := discover_plugins(_workspace_root()).provider_for_tool(name)) is not None:
         result, is_error = provider.execute(name, execution_args)
+    elif name.startswith("mcp."):
+        from .mcp_registry import call_external_tool
+        result, is_error = call_external_tool(name, execution_args)
     elif _is_local:
         result, is_error = f"{name}: no safe local handler is registered", True
     else:
@@ -1908,17 +1990,26 @@ def run_tool(
     if risk.mutation or risk.destructive:
         try:
             from .change_journal import ChangeJournal
-            backup_match = re.search(r"(?:^|\n)backup=([^\n]+)", str(result or ""))
-            restore = {"backup_path": backup_match.group(1).strip()} if backup_match else None
-            ChangeJournal().record(
+            journal = change_journal or ChangeJournal()
+            if is_error:
+                journal.discard_restore_metadata(restore_metadata)
+                restore_metadata = None
+            else:
+                restore_metadata = journal.finalize_restore_metadata(restore_metadata)
+            try:
+                session_id = str(load_session().client_id or "")
+            except Exception:
+                session_id = ""
+            journal.record(
                 tool=name,
-                arguments=execution_args,
+                arguments=args,
                 risk="; ".join(risk.reasons),
                 approved=True,
                 result=result,
                 is_error=is_error,
                 reason=risk.user_reason,
-                reversible=restore,
+                reversible=restore_metadata,
+                session_id=session_id,
             )
         except Exception:
             pass

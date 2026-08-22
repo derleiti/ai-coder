@@ -28,6 +28,7 @@ a = Analysis(
         'aicoder.hooks',
         'aicoder.local_os',
         'aicoder.mcp_server',
+        'aicoder.mcp_registry',
         'aicoder.model_capabilities',
         'aicoder.model_transport',
         'aicoder.optimizer',

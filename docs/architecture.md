@@ -32,8 +32,11 @@ User prompt
 ```
 
 GUI, CLI-Agent und direkte `aicoder mcp`-Aufrufe verwenden dieselbe Policy.
-Lokale Lese-/Editierwerkzeuge akzeptieren keine Shell-Kommandos. Admin-, Ops-,
-Remote-, Vault-, Service- und Shell-Werkzeuge werden vor dem Netzwerk blockiert.
+Lokale typisierte Workspace-Tools, progressive Capability-Discovery und der
+read-only Local-OS-Provider laufen clientseitig. Backend-Tools außerhalb der
+kanonischen AICoder-Allowlist werden weiterhin vor dem Netzwerk blockiert.
+Lokale Mutationen, Workspace-Escapes und Elevation werden transportunabhängig
+vom PrivilegeBroker klassifiziert und freigegeben oder fail-closed blockiert.
 
 ## Lokale Dateien
 
@@ -52,7 +55,14 @@ Remote-, Vault-, Service- und Shell-Werkzeuge werden vor dem Netzwerk blockiert.
 | `config.py` | Session-Persistenz |
 | `session_state.py` | Modell/Swarm-State-Persistenz |
 | `docs_context.py` | Projekt-Doku-Discovery (AGENTS.md, README, ...) |
-| `workspace.py` | Git-Repo-Snapshot |
+| `workspace.py` | Aktiver Workspace und Scope-Grenzen |
+| `capabilities.py` | Progressive Capability-Auswahl und Dynamic Expansion |
+| `plugins.py` | Plugin-/ToolProvider-Registry |
+| `local_os.py` | Typisierte read-only Local-OS-Diagnostik |
+| `privileges.py` | Zentrale Risiko- und Freigabe-Policy |
+| `mcp_server.py` | Lokales MCP-Serving für freigegebene Provider |
+| `optimizer.py` | Evidenzbasierte Optimierungsplanung |
+| `change_journal.py` | Privates strukturiertes Änderungsjournal |
 | `status.py` | Terminal-Spinner, Phase-Labels |
 
 ## API-Endpunkte

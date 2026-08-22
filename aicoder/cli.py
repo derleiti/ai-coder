@@ -116,38 +116,118 @@ def cmd_workspace(args: argparse.Namespace) -> int:
 
 
 def cmd_mcp(args: argparse.Namespace) -> int:
-    if getattr(args, "tool", None) == "serve":
+    action = str(getattr(args, "tool", None) or "").strip()
+    management = {"list", "add", "remove", "enable", "disable", "tools", "doctor"}
+    if action in management:
+        from .executor import invalidate_tool_cache
+        from .mcp_registry import (
+            MCPRegistry, MCPRegistryError, MCPServerConfig, doctor_server, list_server_tools, parse_header_env,
+        )
+        registry = MCPRegistry()
+        values = list(getattr(args, "arg", None) or [])
+        try:
+            if action == "list":
+                for row in registry.list():
+                    target = "builtin" if row.get("builtin") else (row.get("command") or row.get("url") or "")
+                    print(f"{row.get('name',''):<20} {str(row.get('transport','')):<16} {'enabled' if row.get('enabled') else 'disabled':<9} {row.get('trust',''):<10} {target}")
+                return 0
+
+            if not values:
+                print(f"Error: 'aicoder mcp {action}' requires a server NAME", file=sys.stderr)
+                return 2
+            name = values[0]
+
+            if action == "add":
+                config = MCPServerConfig(
+                    name=name,
+                    enabled=True,
+                    transport=str(getattr(args, "transport", "stdio") or "stdio"),
+                    command=str(getattr(args, "command", "") or ""),
+                    url=str(getattr(args, "url", "") or ""),
+                    args=list(getattr(args, "server_arg", None) or []),
+                    env_names=list(getattr(args, "env_name", None) or []),
+                    allow_tools=list(getattr(args, "allow_tool", None) or []),
+                    deny_tools=list(getattr(args, "deny_tool", None) or []),
+                    trust=str(getattr(args, "trust", "untrusted") or "untrusted"),
+                    timeout=int(getattr(args, "server_timeout", 30) or 30),
+                    capability_tags=list(getattr(args, "capability", None) or []),
+                    header_env=parse_header_env(list(getattr(args, "header_env", None) or [])),
+                )
+                check = doctor_server(config)
+                if not check.get("ok"):
+                    print(json.dumps(check, indent=2, ensure_ascii=False, sort_keys=True), file=sys.stderr)
+                    return 1
+                registry.put(config)
+                invalidate_tool_cache()
+                print(json.dumps(check, indent=2, ensure_ascii=False, sort_keys=True))
+                return 0
+
+            if name == "triforce":
+                if action in {"remove", "enable", "disable"}:
+                    print("Error: built-in TriForce profile cannot be changed by the external MCP registry", file=sys.stderr)
+                    return 2
+                _, client = session_client()
+                payload = {"jsonrpc": "2.0", "method": "tools/list", "params": {}, "id": 1}
+                data = client._request("POST", "/v1/mcp", payload, require_auth=True, _label="tools/list")
+                tools = filter_tool_catalog(data.get("result", {}).get("tools", []), __import__('aicoder.executor', fromlist=['AGENT_TOOLS']).AGENT_TOOLS)
+                if action == "doctor":
+                    print(json.dumps({"name":"triforce","ok":True,"transport":"builtin","tool_count":len(tools)}, indent=2, sort_keys=True))
+                else:
+                    for tool in tools:
+                        print(f"{tool.get('name',''):<36} {(tool.get('description','') or '')[:72]}")
+                return 0
+
+            if action == "remove":
+                if not registry.remove(name):
+                    print(f"Error: unknown MCP server: {name}", file=sys.stderr); return 2
+                invalidate_tool_cache(); print(f"{name} → removed"); return 0
+            if action in {"enable", "disable"}:
+                registry.set_enabled(name, action == "enable")
+                invalidate_tool_cache(); print(f"{name} → {action}d"); return 0
+
+            config = registry.get(name)
+            if config is None:
+                print(f"Error: unknown MCP server: {name}", file=sys.stderr); return 2
+            if action == "doctor":
+                check = doctor_server(config)
+                print(json.dumps(check, indent=2, ensure_ascii=False, sort_keys=True))
+                return 0 if check.get("ok") else 1
+            for tool in list_server_tools(config):
+                print(f"{tool.get('name',''):<36} {(tool.get('description','') or '')[:72]}")
+            return 0
+        except (MCPRegistryError, OSError, ValueError, RuntimeError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
+
+    if action == "serve":
         transport = str(getattr(args, "transport", "stdio") or "stdio")
         if transport != "stdio":
-            print("Error: v1.2 Local OS MCP currently supports only stdio; Streamable HTTP comes with the MCP registry phase.", file=sys.stderr)
+            print("Error: local provider serving currently supports stdio; Streamable HTTP is supported for registered MCP clients.", file=sys.stderr)
             return 2
         from .mcp_server import serve_plugin_stdio
         workspace = active_workspace(get_state().get("workspace_root"))
         return serve_plugin_stdio(str(getattr(args, "plugin", None) or "local-os"), str(workspace))
 
-    if not getattr(args, "tool", None):
-        print("Error: specify an MCP tool or use 'aicoder mcp serve --plugin local-os --transport stdio'.", file=sys.stderr)
+    if not action:
+        print("Error: use 'aicoder mcp list', 'aicoder mcp add ...', a backend tool name, or 'aicoder mcp serve'.", file=sys.stderr)
         return 2
     from .agent import _cli_approval
     from .executor import AGENT_TOOLS, load_tools, run_tool
 
     _, client = session_client()
     arguments = parse_kv_pairs(args.arg or [])
-    allowed, reason = require_allowed_tool(args.tool, AGENT_TOOLS)
+    allowed, reason = require_allowed_tool(action, AGENT_TOOLS)
     if not allowed:
         print(f"Error: {reason}", file=sys.stderr)
         return 2
-    # Populate backend mutation annotations before routing through the same
-    # approval/audit path as GUI and agent calls.
     load_tools(client)
     state = get_state()
-    # Show active context before running
     swarm = state.get('swarm_mode', 'off')
     _print_header(state)
     label = phase_label(args.mode or swarm)
     with Spinner(label):
         output, is_error = run_tool(
-            client, args.tool, arguments,
+            client, action, arguments,
             approval_fn=_cli_approval,
             model="user/direct-mcp",
             allowed_tools=set(AGENT_TOOLS),
@@ -1139,12 +1219,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_workspace)
 
     # mcp
-    p = sub.add_parser("mcp", help="Call backend MCP tools or serve an approved local provider over MCP")
-    p.add_argument("tool", nargs="?", help="Backend tool name, or 'serve' for local MCP stdio")
-    p.add_argument("arg", nargs="*")
+    p = sub.add_parser("mcp", help="Manage MCP servers, call TriForce tools, or serve an approved local provider")
+    p.add_argument("tool", nargs="?", help="list/add/remove/enable/disable/tools/doctor/serve, or a TriForce backend tool")
+    p.add_argument("arg", nargs="*", help="Server name for registry actions, or key=value for a direct TriForce tool")
     p.add_argument("--mode", default=None, help="Spinner-Modus (work/swarm/hive)")
     p.add_argument("--plugin", default="local-os", help="Local provider for 'mcp serve' (default: local-os)")
-    p.add_argument("--transport", choices=["stdio", "streamable-http"], default="stdio", help="Transport for 'mcp serve'")
+    p.add_argument("--transport", choices=["stdio", "streamable-http"], default="stdio", help="Transport for mcp add/serve")
+    p.add_argument("--command", default="", help="stdio MCP executable for 'mcp add'")
+    p.add_argument("--url", default="", help="Streamable HTTP endpoint for 'mcp add' (no embedded secrets)")
+    p.add_argument("--server-arg", action="append", default=[], help="Argument passed to a stdio MCP server; repeatable")
+    p.add_argument("--env", dest="env_name", action="append", default=[], help="Environment variable NAME allowed for the server; repeatable")
+    p.add_argument("--header-env", action="append", default=[], metavar="HEADER=ENV_NAME", help="HTTP header sourced from an environment variable; stores names only")
+    p.add_argument("--allow-tool", action="append", default=[], help="Allow only this remote tool name; repeatable")
+    p.add_argument("--deny-tool", action="append", default=[], help="Deny this remote tool name; repeatable")
+    p.add_argument("--trust", choices=["untrusted", "trusted"], default="untrusted")
+    p.add_argument("--server-timeout", type=int, default=30)
+    p.add_argument("--capability", action="append", default=[], help="Capability tag added to this server's tools; repeatable")
     p.set_defaults(func=cmd_mcp)
 
     # session state

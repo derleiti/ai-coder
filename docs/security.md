@@ -2,12 +2,15 @@
 
 ## Grundregeln
 
-- ai-coder ist ein Coding-Client, kein Admin-Client
-- Auch bei Admin-Login: Scope bleibt Coding
+- Backend-MCP bleibt auf den kanonischen AICoder-Scope begrenzt; ein Admin-Login erweitert diesen Modell-Scope nicht
+- Lokale Systemdiagnostik ist über typisierte, read-only Local-OS-Tools erlaubt
+- Lokale Mutationen und erhöhte Rechte laufen ausschließlich durch Tool-Policy + PrivilegeBroker
 - Read-first: Dateien lesen vor Schreiben
 - Keine destruktiven Ops ohne explizite Bestätigung
 - Modell-Tools werden durch eine zentrale Allowlist technisch erzwungen
-- Lokale Dateiwerkzeuge sind auf `workspace_root` begrenzt und shell-frei
+- Lokale Dateiwerkzeuge sind auf `workspace_root` begrenzt; ein Scope-Escape braucht explizite Freigabe
+- `shell`/`binary_exec` sind lokale Runtime-Tools, keine frei an den Backend-MCP weitergereichten Admin-Werkzeuge
+- Root-/Security-Änderungen werden niemals automatisch freigegeben
 
 ## Gespeicherte Credentials
 
@@ -18,16 +21,16 @@
 
 Token wird nie geloggt. Bei `profile`-Command: maskiert.
 
-## Verbotene Tool-Scopes
+## Backend-MCP-Scope
 
-ai-coder darf folgende Backend-Tools NICHT aufrufen:
-- `admin_*` — Admin-Ops
-- `vault_*` — Secrets/Keys
-- `mail_*` — E-Mail
-- `notify_*` — Notifications
-- `restart_*` / `service_*` — Service-Management
-- `remote_*` — Remote-Execution
-- `shell` / `task_runner` — Shell-Zugriff
+Direkte Backend-MCP-Aufrufe bleiben fail-closed auf der kanonischen Allowlist.
+Nicht freigegebene Admin-, Vault-, Mail-, Notification-, Restart-, Remote- oder
+sonstige Infrastruktur-Werkzeuge werden vor dem Netzwerk blockiert.
+
+Lokale Runtime-Tools sind davon getrennt: typisierte Workspace-Tools, read-only
+Local-OS-Diagnostik und ausdrücklich aktivierte lokale Ausführung werden auf dem
+Client geroutet und durch Workspace-Grenzen, Security-Metadaten, Audit und
+PrivilegeBroker abgesichert.
 
 ## Backend-Scope (TODO)
 
