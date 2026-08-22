@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 from aicoder.change_journal import ChangeJournal
 import aicoder.executor as executor
 import aicoder.settings as settings
-from aicoder.optimizer import build_plan, inspect_system
+from aicoder.optimizer import (OptimizationPlanStore, apply_plan, build_plan, inspect_system, rollback_plan, verify_plan)
 
 class FakeProvider:
     def execute(self,name,args):
@@ -13,6 +13,7 @@ class FakeProvider:
             'os_system_overview': {'hostname':'test','release':'9.9','memory':{'MemAvailable':'8 GiB'}},
             'os_kernel_info': {'uname':{'release':'9.9'}},
             'os_storage_overview': {'filesystems':{'stdout':'ok'}},
+            'os_container_list': {'stdout':'CONTAINER ID   IMAGE'},
         }[name]
         return json.dumps(data),False
 
@@ -141,5 +142,33 @@ class OptimizerTests(unittest.TestCase):
         self.assertEqual(plan['priorities']['development'],'high')
         self.assertTrue(plan['proposed_actions'])
         self.assertTrue(all(action['mutation'] is False for action in plan['proposed_actions']))
+
+    def test_persistent_plan_lifecycle_apply_verify_and_noop_rollback(self):
+        with tempfile.TemporaryDirectory() as t:
+            store=OptimizationPlanStore(Path(t)/'plans'); plan=store.save(build_plan('Python Docker stability',FakeProvider()))
+            path=(Path(t)/'plans'/f"{plan.id}.json")
+            self.assertTrue(path.is_file()); self.assertEqual(path.stat().st_mode & 0o777,0o600)
+            applied=apply_plan(plan.id,provider=FakeProvider(),store=store)
+            self.assertEqual(applied.status,'applied'); self.assertTrue(applied.applied_actions); self.assertTrue(all(x['ok'] for x in applied.applied_actions))
+            verified=verify_plan(plan.id,provider=FakeProvider(),store=store)
+            self.assertEqual(verified.status,'verified'); self.assertTrue(all(x['ok'] for x in verified.verification_results))
+            rolled=rollback_plan(plan.id,store=store)
+            self.assertEqual(rolled.status,'rolled_back'); self.assertIn('No state-changing',rolled.lifecycle_note)
+
+    def test_optimizer_refuses_unregistered_mutation_action(self):
+        with tempfile.TemporaryDirectory() as t:
+            store=OptimizationPlanStore(Path(t)/'plans'); plan=build_plan('stability',FakeProvider())
+            plan.proposed_actions=[{'kind':'unsafe_future_action','mutation':True,'tool':'os_service_action','arguments':{'service':'demo','action':'restart'}}]
+            store.save(plan)
+            applied=apply_plan(plan.id,provider=FakeProvider(),store=store)
+            self.assertEqual(applied.status,'failed')
+            self.assertIn('mutation refused',applied.lifecycle_note)
+
+    def test_optimizer_parser_exposes_full_lifecycle(self):
+        from aicoder.cli import build_parser
+        for action in ('show','apply','verify','rollback'):
+            args=build_parser().parse_args(['optimize',action,'opt-20260822T000000Z-abcdef12'])
+            self.assertEqual(args.optimize_action,action)
+            self.assertEqual(args.plan_id,'opt-20260822T000000Z-abcdef12')
 
 if __name__=='__main__': unittest.main()
