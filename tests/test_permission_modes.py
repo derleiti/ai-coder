@@ -63,10 +63,11 @@ class GuiSudoApprovalTests(unittest.TestCase):
         with (
             patch("aicoder.gui.chat_widget.get_state", return_value={"approval_mode": "all"}),
             patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes) as question,
+            patch("aicoder.gui.chat_widget.PrivilegeBroker.gui_elevation_available", return_value=(True, "ok")),
         ):
             ChatWidget._on_approval_needed(widget, "shell", args)
         question.assert_called_once()
-        widget._worker.set_approval.assert_called_once_with(True)
+        widget._worker.set_approval.assert_called_once_with(True, "pkexec")
 
     def test_gui_root_request_can_be_rejected(self):
         widget = ChatWidget.__new__(ChatWidget)

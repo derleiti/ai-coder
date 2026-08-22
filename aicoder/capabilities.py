@@ -8,15 +8,50 @@ DEFAULT_TOOL_BUDGET = 12
 MAX_ACTIVE_TOOLS = 20
 MAX_EXPANSION_ROUNDS = 3
 
-# A rich primitive kit keeps normal coding work possible without a second trip
-# to the catalogue. shell is intentionally always present; execution policy,
-# not catalogue visibility, remains the security boundary.
-BASE_TOOL_NAMES = (
-    "shell", "binary_exec", "file_read", "file_tree", "code_grep",
-    "file_edit", "directory_create", "git", "test", "lint",
-    "skill_read", "subagent_run",
-)
+# Progressive disclosure deliberately avoids an unconditional primitive bundle.
+# A URL prompt should not receive shell/file mutation schemas merely because they
+# exist. Stable host-side meta tools remain available so the model can discover
+# and request additional capabilities without seeing the full catalogue.
+BASE_TOOL_NAMES: tuple[str, ...] = ()
 META_TOOL_NAMES = ("toolbox_search", "capability_request", "toolbox_improvise")
+META_TOOL_SCHEMAS = (
+    {
+        "name": "toolbox_search",
+        "description": "Search inactive AICoder tools/capabilities without exposing the full tool schemas.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 12}},
+            "required": ["query"],
+        },
+        "capabilities": ["research"],
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "capability_request",
+        "description": "Request additional named tools or capability groups for this task. The host reapplies enable/deny policy and active-tool limits.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "capabilities": {"type": "array", "items": {"type": "string"}},
+                "tools": {"type": "array", "items": {"type": "string"}},
+                "reason": {"type": "string"},
+            },
+        },
+        "capabilities": ["research"],
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "toolbox_improvise",
+        "description": "Explain the safe next step when no existing tool matches a capability gap; never installs or enables executable code.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
+        "capabilities": ["research"],
+        "annotations": {"readOnlyHint": True},
+    },
+)
 
 CAPABILITIES = frozenset({
     "web", "local_code_read", "local_code_write", "remote_code", "debug",
@@ -100,20 +135,32 @@ def select_tools(tools: Iterable[dict], resolution: CapabilityResolution, *, bud
 
 
 def build_working_set(tools: Iterable[dict], resolution: CapabilityResolution, *, budget: int = DEFAULT_TOOL_BUDGET) -> list[dict]:
-    """Build a useful initial toolbox: primitives first, task-specific tools second."""
+    """Build the initial task-specific set plus stable host meta tools.
+
+    ``budget`` is the total model-facing schema budget, including meta tools.
+    Unknown tools are never selected implicitly.
+    """
     catalogue = [tool for tool in tools if isinstance(tool, dict) and tool.get("name")]
     by_name = {str(tool["name"]): tool for tool in catalogue}
+    limit = max(0, min(MAX_ACTIVE_TOOLS, int(budget)))
     chosen: list[dict] = []
     seen: set[str] = set()
+    for schema in META_TOOL_SCHEMAS:
+        if len(chosen) >= limit:
+            break
+        name = str(schema["name"])
+        chosen.append(dict(schema)); seen.add(name)
     for name in BASE_TOOL_NAMES:
+        if len(chosen) >= limit:
+            break
         tool = by_name.get(name)
         if tool is not None and name not in seen:
             chosen.append(tool); seen.add(name)
-    for tool in select_tools(catalogue, resolution, budget=MAX_ACTIVE_TOOLS):
+    remaining = max(0, limit - len(chosen))
+    for tool in select_tools(catalogue, resolution, budget=remaining):
         name = str(tool.get("name") or "")
         if name and name not in seen:
             chosen.append(tool); seen.add(name)
-    limit = max(len([n for n in BASE_TOOL_NAMES if n in by_name]), min(MAX_ACTIVE_TOOLS, int(budget)))
     return chosen[:limit]
 
 

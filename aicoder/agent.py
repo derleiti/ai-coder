@@ -15,7 +15,7 @@ from .executor import (
 )
 from .history import record as history_record
 from .privileges import (
-    approval_is_automatic, assess_execution, format_request,
+    PrivilegeBroker, assess_execution, format_request,
 )
 from .session_state import DEFAULT_RUNTIME_MODE, get_state
 from .workspace import active_workspace
@@ -37,7 +37,8 @@ def _cli_approval(tool_name: str, args: dict) -> bool:
         return True
 
     mode = get_state().get("approval_mode", "ask")
-    automatic = approval_is_automatic(mode, risk) and not scope_target
+    decision = PrivilegeBroker.evaluate(mode, risk, workspace_escape=bool(scope_target), headless=False)
+    automatic = decision.automatic
     if automatic:
         print(f"\n{C.BGREEN}✓ Automatisch freigegeben ({mode}){C.RESET}", file=sys.stderr)
     else:
@@ -56,6 +57,13 @@ def _cli_approval(tool_name: str, args: dict) -> bool:
             print("  Abgelehnt.", file=sys.stderr)
             return False
 
+    if risk.elevation:
+        ok, message = PrivilegeBroker.authenticate_terminal()
+        if not ok:
+            print(f"  Elevation blocked: {message}", file=sys.stderr)
+            return False
+        args["_elevation_strategy"] = "sudo"
+
     return True
 
 
@@ -71,14 +79,11 @@ def _headless_approval(tool_name: str, args: dict) -> bool:
     risk = assess_execution(
         tool_name, args, destructive=is_destructive(str(args.get("command", "")))
     )
-    if args.get("_workspace_escape"):
-        return False
-    if not risk.needs_approval:
-        return True
-    if risk.elevation:
-        return False
     mode = get_state().get("approval_mode", "ask")
-    return approval_is_automatic(mode, risk)
+    decision = PrivilegeBroker.evaluate(
+        mode, risk, workspace_escape=bool(args.get("_workspace_escape")), headless=True
+    )
+    return decision.automatic and not decision.denied
 
 
 def _native_exit_code(status: str) -> int:
@@ -208,6 +213,7 @@ def _run_native_light_agent(
         base_timeout=request_timeout,
         max_output_tokens=int(state.get("max_output_tokens", 16384)),
         tools_unavailable_reason=tools_unavailable_reason,
+        progressive_tool_disclosure=(tool_mode == "on_demand"),
     )
     result = runtime.run()
     if not header_printed and not (json_output or json_events):

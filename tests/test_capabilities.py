@@ -1,5 +1,5 @@
 import unittest
-from aicoder.capabilities import MAX_ACTIVE_TOOLS, resolve_capabilities, select_tools
+from aicoder.capabilities import MAX_ACTIVE_TOOLS, META_TOOL_NAMES, build_working_set, resolve_capabilities, select_tools
 
 class CapabilityTests(unittest.TestCase):
     def test_url_starts_web_only_family(self):
@@ -23,5 +23,27 @@ class CapabilityTests(unittest.TestCase):
         self.assertLessEqual(len(select_tools(tools,resolve_capabilities('error app.py'),budget=999)),MAX_ACTIVE_TOOLS)
     def test_unknown_tool_not_auto_selected(self):
         self.assertEqual(select_tools([{'name':'mystery_root_tool'}],resolve_capabilities('fix error')),[])
+
+    def test_url_working_set_is_small_and_has_no_shell(self):
+        tools=[
+            {"name":"shell","capabilities":["local_code_write"]},
+            {"name":"file_read","capabilities":["local_code_read"]},
+            {"name":"search","capabilities":["web","research"]},
+            {"name":"crawl","capabilities":["web","research"]},
+        ]
+        active=build_working_set(tools,resolve_capabilities("https://example.com/docs"),budget=6)
+        names={tool["name"] for tool in active}
+        self.assertTrue(set(META_TOOL_NAMES).issubset(names))
+        self.assertIn("search",names)
+        self.assertIn("crawl",names)
+        self.assertNotIn("shell",names)
+        self.assertNotIn("file_read",names)
+        self.assertLessEqual(len(active),6)
+
+    def test_working_set_budget_includes_meta_tools(self):
+        tools=[{"name":"search","capabilities":["web"]}]
+        active=build_working_set(tools,resolve_capabilities("https://example.com"),budget=4)
+        self.assertEqual(len(active),4)
+        self.assertEqual([tool["name"] for tool in active[:3]],list(META_TOOL_NAMES))
 
 if __name__ == '__main__': unittest.main()

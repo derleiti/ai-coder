@@ -618,11 +618,14 @@ class PrivilegeBrokerTests(unittest.TestCase):
         }
         with (
             patch("builtins.input", return_value="y") as prompt,
+            patch("aicoder.agent.PrivilegeBroker.authenticate_terminal", return_value=(True, "ok")) as auth,
             contextlib.redirect_stdout(io.StringIO()),
             contextlib.redirect_stderr(io.StringIO()),
         ):
             self.assertTrue(cli_agent._cli_approval("file_edit", args))
         prompt.assert_called_once()
+        auth.assert_called_once()
+        self.assertEqual(args.get("_elevation_strategy"), "sudo")
 
     def test_cli_elevation_request_can_be_rejected(self):
         with (

@@ -13,6 +13,7 @@ import os
 import ast
 import platform
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -1413,10 +1414,21 @@ def _format_process_result(completed: subprocess.CompletedProcess[str]) -> str:
     return text[:12000] + ("…" if len(text) > 12000 else "")
 
 
+def _elevated_shell_command(command: str, strategy: str) -> str:
+    stripped = re.sub(r"^\s*(?:sudo|doas|pkexec)(?:\s+--)?\s+", "", command, count=1, flags=re.IGNORECASE).strip()
+    if strategy == "sudo":
+        return f"sudo -n -- /bin/bash -lc {shlex.quote(stripped)}"
+    if strategy == "pkexec":
+        return f"pkexec /bin/bash -lc {shlex.quote(stripped)}"
+    return command
+
 def run_local_shell(args: dict, *, task_runner: bool = False) -> Tuple[str, bool]:
     command = str(args.get("command") or "").strip()
     if not command:
         return "shell error: command is required", True
+    strategy = str(args.get("_elevation_strategy") or "")
+    if strategy:
+        command = _elevated_shell_command(command, strategy)
     try:
         cwd = _workspace_path(
             args.get("cwd") or ".",
@@ -1597,7 +1609,7 @@ def run_tool(
             )
             return result, True
 
-    execution_args = dict(args)
+    execution_args = dict(approval_args)
     if needs_scope_approval:
         execution_args["_workspace_escape_approved"] = True
 

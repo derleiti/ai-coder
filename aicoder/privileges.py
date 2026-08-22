@@ -173,3 +173,60 @@ def approval_is_automatic(mode: str, risk: ExecutionRisk) -> bool:
     if mode == "autopilot":
         return bool(risk.mutation and not risk.elevation and not risk.deletion and not risk.destructive)
     return False
+
+
+@dataclass(frozen=True)
+class ApprovalDecision:
+    automatic: bool
+    requires_confirmation: bool
+    denied: bool
+    reason: str
+
+
+class PrivilegeBroker:
+    """Central host policy for CLI, GUI and headless approval decisions."""
+
+    @staticmethod
+    def authenticate_terminal() -> tuple[bool, str]:
+        import shutil, subprocess, sys
+        if not getattr(sys.stdin, "isatty", lambda: False)():
+            return False, "no interactive TTY available for elevation"
+        if shutil.which("sudo") is None:
+            return False, "sudo is not installed"
+        try:
+            completed = subprocess.run(["sudo", "-v"], timeout=120, check=False)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return False, f"sudo authentication failed: {exc}"
+        if completed.returncode != 0:
+            return False, f"sudo authentication failed with exit code {completed.returncode}"
+        return True, "sudo credentials validated"
+
+    @staticmethod
+    def gui_elevation_available() -> tuple[bool, str]:
+        import os, shutil
+        if shutil.which("pkexec") is None:
+            return False, "pkexec is not installed"
+        if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+            return False, "no graphical session is available for Polkit authentication"
+        return True, "pkexec available"
+
+    @staticmethod
+    def evaluate(mode: str, risk: ExecutionRisk, *, workspace_escape: bool = False, headless: bool = False) -> ApprovalDecision:
+        if not risk.needs_approval and not workspace_escape:
+            return ApprovalDecision(True, False, False, "read-only/safe operation")
+        automatic = approval_is_automatic(mode, risk) and not workspace_escape
+        if automatic:
+            return ApprovalDecision(True, False, False, f"allowed by approval mode {mode}")
+        if workspace_escape:
+            reason = "workspace boundary crossing requires explicit approval"
+        elif risk.elevation:
+            reason = "elevation always requires explicit interactive approval/authentication"
+        elif risk.security_change:
+            reason = "security-boundary changes always require explicit approval"
+        elif risk.deletion or risk.destructive:
+            reason = "destructive operations always require explicit approval"
+        else:
+            reason = "state-changing operation requires explicit approval"
+        if headless:
+            return ApprovalDecision(False, False, True, reason + "; headless mode fails closed")
+        return ApprovalDecision(False, True, False, reason)

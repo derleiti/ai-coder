@@ -46,7 +46,7 @@ class _AgentWorker(QThread):
     def __init__(
         self, client, messages_array, model, fallback, tools, system_prompt,
         load_tools_on_start=True, enabled_tool_names=None, quick_chat=False,
-        tools_unavailable_reason="",
+        tools_unavailable_reason="", progressive_tool_disclosure=True,
     ):
         super().__init__()
         self.client = client
@@ -59,18 +59,21 @@ class _AgentWorker(QThread):
         self.enabled_tool_names = enabled_tool_names
         self.quick_chat = quick_chat
         self.tools_unavailable_reason = str(tools_unavailable_reason or "")
+        self.progressive_tool_disclosure = bool(progressive_tool_disclosure)
         # Approval mechanism: threading.Event + result flag
         self._approval_event = threading.Event()
         self._approval_result = False
+        self._approval_strategy = ""
         self._stopped = False
 
     def stop(self):
         """Request stop from main thread."""
         self._stopped = True
 
-    def set_approval(self, approved: bool):
+    def set_approval(self, approved: bool, strategy: str = ""):
         """Called from main thread after user decision."""
         self._approval_result = approved
+        self._approval_strategy = str(strategy or "")
         self._approval_event.set()
 
     def _gui_approval(self, tool_name: str, args: dict) -> bool:
@@ -81,6 +84,7 @@ class _AgentWorker(QThread):
         # GUI dialog misclassify or hide the requested operation.
         self._approval_event.clear()
         self._approval_result = False
+        self._approval_strategy = ""
         self.approval_needed.emit(tool_name, approval_args)
         # Poll every 2s so stop() is respected during pending approval
         for _ in range(60):  # max 120s total
@@ -88,6 +92,8 @@ class _AgentWorker(QThread):
                 break
             if self._stopped:
                 return False  # Agent stopped — reject command
+        if self._approval_result and self._approval_strategy:
+            args["_elevation_strategy"] = self._approval_strategy
         return self._approval_result
 
     def _emit_advisor_review(self, original_request: str, response: str, operator_model: str) -> None:
@@ -224,6 +230,7 @@ class _AgentWorker(QThread):
             base_timeout=base_timeout,
             max_output_tokens=int(state.get("max_output_tokens", 16384)),
             tools_unavailable_reason=self.tools_unavailable_reason,
+            progressive_tool_disclosure=self.progressive_tool_disclosure,
         )
         result = runtime.run()
         self.tools = result.tools
@@ -628,9 +635,10 @@ class ChatWidget(QWidget):
         mode = get_state().get("approval_mode", "ask")
         scope_target = str(args.get("_workspace_escape") or "")
         scope_root = str(args.get("_workspace_root") or "")
-        automatic = approval_is_automatic(mode, risk) and not scope_target
+        decision = PrivilegeBroker.evaluate(mode, risk, workspace_escape=bool(scope_target), headless=False)
+        automatic = decision.automatic
 
-        if not automatic:
+        if decision.requires_confirmation:
             if scope_target:
                 title = "Leave active workspace — allow once?"
             elif risk.deletion or risk.destructive:
@@ -659,10 +667,20 @@ class ChatWidget(QWidget):
                 self._append_msg("system", f"Tool rejected: {tool_name}", preview[:160])
                 return
 
+        strategy = ""
+        if risk.elevation:
+            available, why = PrivilegeBroker.gui_elevation_available()
+            if not available:
+                if self._worker:
+                    self._worker.set_approval(False)
+                self._append_msg("system", f"Elevation blocked: {tool_name}", why)
+                return
+            strategy = "pkexec"
+
         if automatic:
             self._append_msg("system", f"Auto-approved: {tool_name}", f"mode={mode}")
         if self._worker:
-            self._worker.set_approval(True)
+            self._worker.set_approval(True, strategy)
 
     def _send(self):
         text = self.input.toPlainText().strip()
@@ -731,10 +749,18 @@ class ChatWidget(QWidget):
         elif not should_load_tools_now:
             self._append_msg("system", "On demand · tools skipped for this prompt", "")
 
-        run_tools = self._tools if should_load_tools_now else []
-        run_system = self._system if should_load_tools_now and self._system else build_system_prompt(
-            [], str(active_workspace(state.get("workspace_root")))
-        )
+        if should_load_tools_now and tool_mode == "on_demand":
+            # Re-resolve from the cached full catalogue inside load_tools(). Caching
+            # only the previous working set would make later capability expansion
+            # impossible after the topic changes.
+            run_tools = None
+            run_system = None
+        elif should_load_tools_now:
+            run_tools = self._tools
+            run_system = self._system
+        else:
+            run_tools = []
+            run_system = build_system_prompt([], str(active_workspace(state.get("workspace_root"))))
 
         if not self._messages:
             self._messages = [{"role": "system", "content": run_system}]
@@ -762,6 +788,7 @@ class ChatWidget(QWidget):
             enabled_tool_names=enabled_tool_names,
             quick_chat=quick_chat,
             tools_unavailable_reason=tools_unavailable_reason,
+            progressive_tool_disclosure=(tool_mode == "on_demand"),
         )
         self._worker.msg.connect(self._on_agent_msg)
         self._worker.finished.connect(self._on_response)
@@ -776,7 +803,11 @@ class ChatWidget(QWidget):
     def _on_response(self, text: str, model_used: str):
         self._stop_activity()
         # Cache tools loaded by worker for next message
-        if self._worker and self._worker.load_tools_on_start and self._worker.tools is not None:
+        if (
+            self._worker and self._worker.load_tools_on_start
+            and not self._worker.progressive_tool_disclosure
+            and self._worker.tools is not None
+        ):
             self._tools = self._worker.tools
             self._system = self._worker.system
         self._append_msg("assistant", text, model_used)

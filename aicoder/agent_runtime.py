@@ -17,6 +17,11 @@ from .agent_journal import ContinuationJournalStore
 from .model_capabilities import supports_tools, tool_capable_alternative
 from .agent_plan import AgentPlan, PlanStore, plan_prompt_context, resume_prompt_context
 from .client import ClientError, TriForceClient
+from .capabilities import (
+    DEFAULT_TOOL_BUDGET, MAX_ACTIVE_TOOLS, MAX_EXPANSION_ROUNDS,
+    META_TOOL_NAMES, build_working_set, expansion_tools, improvisation_advice,
+    resolve_capabilities, search_toolbox,
+)
 from .evidence_memory import ProjectEvidenceStore
 from .failure_tracking import FailureTracker
 from .executor import (
@@ -110,7 +115,12 @@ class NativeLightRuntime:
     max_output_tokens: int = 16384
     tools_unavailable_reason: str = ""
     max_iterations: int = MAX_ITERATIONS
+    progressive_tool_disclosure: bool = True
+    tool_budget: int = DEFAULT_TOOL_BUDGET
+    max_expansion_rounds: int = MAX_EXPANSION_ROUNDS
     _tool_capability_warned: bool = False
+    _tool_catalog: list[dict] = field(default_factory=list, init=False, repr=False)
+    _expansion_rounds: int = field(default=0, init=False, repr=False)
 
     def _emit(self, kind: str, **payload: Any) -> None:
         if self.event_fn is not None:
@@ -154,7 +164,9 @@ class NativeLightRuntime:
         if not tools or not self.load_tools_on_start:
             return None
         if supports_tools(self.client, model):
-            return tools
+            # Freeze the active schema set for this model turn. Dynamic expansion
+            # mutates the runtime working set only for subsequent turns.
+            return list(tools)
         if not self._tool_capability_warned:
             self._tool_capability_warned = True
             self._emit(
@@ -168,15 +180,70 @@ class NativeLightRuntime:
     def _prepare_tools(self) -> list[dict]:
         if self.tools is None and self.load_tools_on_start:
             started = time.monotonic()
-            tools = load_tools(self.client)
+            catalogue = load_tools(self.client)
             if self.enabled_tool_names is not None:
                 enabled = set(self.enabled_tool_names)
-                tools = [tool for tool in tools if tool.get("name") in enabled]
+                catalogue = [tool for tool in catalogue if tool.get("name") in enabled]
+            self._tool_catalog = list(catalogue)
+            if self.progressive_tool_disclosure:
+                resolution = resolve_capabilities(self.initial_prompt, resume=self.resume)
+                tools = build_working_set(catalogue, resolution, budget=self.tool_budget)
+                self._emit(
+                    "capabilities_ready", capabilities=list(resolution.capabilities),
+                    signals=list(resolution.signals), confidence=resolution.confidence,
+                    active_tools=[str(tool.get("name") or "") for tool in tools],
+                )
+            else:
+                tools = list(catalogue)
             self.tools = tools
-            self._emit("tools_ready", count=len(tools), elapsed=time.monotonic() - started)
+            self._emit(
+                "tools_ready", count=len(tools), catalogue_count=len(catalogue),
+                elapsed=time.monotonic() - started,
+            )
         elif self.tools is None:
             self.tools = []
+        else:
+            self._tool_catalog = list(self.tools)
         return self.tools
+
+    def _run_meta_tool(self, name: str, args: dict, tools: list[dict]) -> tuple[str, bool, bool]:
+        """Execute stable capability-discovery tools inside the host runtime."""
+        active_names = {str(tool.get("name") or "") for tool in tools}
+        if name == "toolbox_search":
+            matches = search_toolbox(
+                self._tool_catalog, str(args.get("query") or ""),
+                active_names=active_names, limit=int(args.get("limit") or 8),
+            )
+            return json.dumps({"matches": matches}, ensure_ascii=False), False, False
+        if name == "toolbox_improvise":
+            query = str(args.get("query") or "")
+            matches = search_toolbox(self._tool_catalog, query, active_names=active_names)
+            return json.dumps(improvisation_advice(query, matches), ensure_ascii=False), False, False
+        if name == "capability_request":
+            if self._expansion_rounds >= max(0, int(self.max_expansion_rounds)):
+                return "capability_request: expansion limit reached", True, False
+            requested: list[str] = []
+            for key in ("capabilities", "tools"):
+                value = args.get(key)
+                if isinstance(value, list):
+                    requested.extend(str(item).strip() for item in value if str(item).strip())
+            if not requested:
+                return "capability_request: provide at least one capability or tool name", True, False
+            slots = max(0, MAX_ACTIVE_TOOLS - len(active_names))
+            additions = expansion_tools(
+                self._tool_catalog, requested, active_names=active_names, slots=slots,
+            )
+            if not additions:
+                return "capability_request: no enabled inactive tools matched the request", True, False
+            tools.extend(additions)
+            self._expansion_rounds += 1
+            added_names = [str(tool.get("name") or "") for tool in additions]
+            self._emit(
+                "tools_expanded", added=added_names, active_count=len(tools),
+                round=self._expansion_rounds, reason=str(args.get("reason") or ""),
+            )
+            return json.dumps({"added": added_names, "active_count": len(tools)}, ensure_ascii=False), False, True
+        return f"{name}: unknown runtime meta tool", True, False
 
     def _prepare_plan(self) -> tuple[AgentPlan | None, bool]:
         if not self.persistent_plan:
@@ -617,6 +684,30 @@ class NativeLightRuntime:
                 name = str(call.get("name") or "?")
                 args = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
                 self._emit("tool_call", name=name, arguments=args, iteration=i + 1)
+                if name in META_TOOL_NAMES:
+                    started_tool = time.monotonic()
+                    tool_result, is_error, tools_changed = self._run_meta_tool(name, args, tools)
+                    elapsed = time.monotonic() - started_tool
+                    if tools_changed:
+                        allowed_tool_names = {
+                            str(tool.get("name")) for tool in tools if tool.get("name")
+                        }
+                        base_system = self.system_prompt or build_system_prompt(tools, workspace)
+                        messages[0]["content"] = self._with_plan_context(base_system, plan)
+                        system = messages[0]["content"]
+                    self._emit(
+                        "tool_result", name=name, result=tool_result,
+                        is_error=is_error, elapsed=elapsed,
+                    )
+                    tool_results.append(f"Tool {name} result:\n{tool_result}")
+                    batch_records.append({
+                        "id": str(call.get("id") or ""), "name": name,
+                        "provider": str(call.get("provider") or ""),
+                        "raw_type": str(call.get("raw_type") or ""),
+                        "metadata": call.get("metadata") if isinstance(call.get("metadata"), dict) else {},
+                        "arguments": args, "is_error": bool(is_error),
+                    })
+                    continue
                 allowed, reason = require_allowed_tool(name, allowed_tool_names)
                 risk = assess_execution(
                     name, args, destructive=is_destructive(str(args.get("command", "")))
