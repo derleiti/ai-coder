@@ -10,6 +10,12 @@ export PYINSTALLER_CONFIG_DIR="$ROOT_DIR/build/pyinstaller-cache"
 
 VERSION=$(python3 -c "import tomllib; d=tomllib.load(open('pyproject.toml','rb')); print(d['project']['version'])")
 ARCH=$(uname -m)
+DEB_TEMPLATE_VERSION=$(awk '/^Version:/ {print $2; exit}' packaging/debian/aicoder/DEBIAN/control)
+AUR_TEMPLATE_VERSION=$(sed -n 's/^pkgver=//p' packaging/aur/PKGBUILD | head -n1)
+if [ "$DEB_TEMPLATE_VERSION" != "$VERSION" ] || [ "$AUR_TEMPLATE_VERSION" != "$VERSION" ]; then
+    echo "ERROR: package template version mismatch (project=$VERSION deb=$DEB_TEMPLATE_VERSION aur=$AUR_TEMPLATE_VERSION)" >&2
+    exit 1
+fi
 echo "Building aicoder v${VERSION} (${ARCH})..."
 
 # Build-Umgebung reproduzierbar aus den aktuellen Projekt-Metadaten befüllen.

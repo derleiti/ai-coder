@@ -1,5 +1,5 @@
 Package: aicoder
-Version: 0.9.8b1
+Version: 0.9.9
 Section: utils
 Priority: optional
 Architecture: amd64

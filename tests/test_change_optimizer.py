@@ -29,6 +29,15 @@ class ChangeJournalTests(unittest.TestCase):
             self.assertNotIn('"abc"',text)
             self.assertEqual(path.stat().st_mode & 0o777,0o600)
             self.assertEqual(journal.get(row['id'])['verification'],'pending')
+
+    def test_non_secret_setting_names_containing_tokens_remain_rollbackable(self):
+        with tempfile.TemporaryDirectory() as t:
+            journal=ChangeJournal(Path(t))
+            metadata={'kind':'settings_patch','previous':{'max_output_tokens':16384},'post':{'max_output_tokens':20000}}
+            row=journal.record(tool='settings_apply_patch',arguments={},risk='write',approved=True,result='ok',is_error=False,reversible=metadata)
+            saved=journal.get(row['id'])
+            self.assertEqual(saved['restore_metadata']['previous']['max_output_tokens'],16384)
+
     def test_list_and_mark_verified(self):
         with tempfile.TemporaryDirectory() as t:
             journal=ChangeJournal(Path(t)); row=journal.record(tool='demo',arguments={},risk='test',approved=True,result='ok',is_error=False)

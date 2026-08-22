@@ -14,7 +14,7 @@ from typing import Any
 
 from .config import CONFIG_DIR, atomic_write_private
 
-_SECRET = re.compile(r"password|token|secret|api[_-]?key|authorization|cookie", re.I)
+_SECRET = re.compile(r"(?:^|[_-])(?:password|passwd|token|secret|api[_-]?key|authorization|cookie)(?:$|[_-])", re.I)
 _ID = re.compile(r"^[A-Za-z0-9_.-]+$")
 _INLINE = re.compile(r"(?i)\b(password|passwd|token|bearer|secret|api[_-]?key|authorization)\b(\s*[:=]\s*|\s+)([^\s,;]+)")
 _ROLLBACK_KINDS = {"restore_file", "remove_created_file", "remove_created_dir", "settings_patch"}
