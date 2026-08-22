@@ -75,11 +75,19 @@ _VERIFICATION_REQUIRED_PROMPT = (
     "a read/check/lint/test tool now. Do not report DONE until verification succeeds."
 )
 
-_STRUCTURED_REQUIREMENT_RE = re.compile(r"(?m)^\s*(?:[-*+]\s+|\d+[.)]\s+)")
+_STRUCTURED_REQUIREMENT_RE = re.compile(r"(?m)^\s*(?:\\?[-*+]\s+|\d+\\?[.)]\s+)")
 
 def _needs_completion_audit(prompt: str) -> bool:
     text = str(prompt or "")
     return len(_STRUCTURED_REQUIREMENT_RE.findall(text)) >= 3
+
+def _has_embedded_text_tool_protocol(text: str) -> bool:
+    """Detect a likely v2 tool attempt surrounded by prose without executing it."""
+    raw = str(text or "")
+    return bool(
+        re.search(r"(?m)^\s*TOOL_CALL\s+[A-Za-z0-9_.:-]+\s*$", raw)
+        and re.search(r"(?m)^\s*END_TOOL_CALL\s*$", raw)
+    )
 
 def _completion_audit_prompt(prompt: str) -> str:
     task = str(prompt or "")[:5000]
@@ -811,7 +819,11 @@ class NativeLightRuntime:
                 self._emit("thought", text=visible, iteration=i + 1)
 
             if not calls:
-                unusable_final = (not response) or _has_incomplete_tool_markup(response)
+                unusable_final = (
+                    (not response)
+                    or _has_incomplete_tool_markup(response)
+                    or _has_embedded_text_tool_protocol(response)
+                )
                 if unusable_final:
                     if response:
                         messages.append({"role": "assistant", "content": response})
@@ -820,7 +832,11 @@ class NativeLightRuntime:
                         final_response_repair_sent = True
                         self._emit(
                             "final_response_repair", iteration=i + 1,
-                            reason="empty_response" if not response else "incomplete_tool_call",
+                            reason=(
+                                "empty_response" if not response
+                                else "mixed_tool_protocol" if _has_embedded_text_tool_protocol(response)
+                                else "incomplete_tool_call"
+                            ),
                         )
                         self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
                         continue

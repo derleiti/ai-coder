@@ -233,6 +233,13 @@ class _AgentWorker(QThread):
                         pass
                 status = f"{'ERROR' if is_error else 'OK'} ({float(payload.get('elapsed') or 0.0):.1f}s)"
                 self.msg.emit("tool_result", result[:2000], f"{name} {status}")
+            elif kind == "loop_prevented":
+                self.activity.emit("Duplicate tool call blocked · waiting for corrected model action")
+                self.msg.emit(
+                    "system",
+                    "Duplicate tool call blocked before execution; asking the model to continue from the existing result.",
+                    f"repeat {int(payload.get('repeats') or 0)}",
+                )
             elif kind == "model_switch":
                 self.msg.emit(
                     "system", "Repeated tool loop detected; switching fallback model.",

@@ -138,5 +138,77 @@ class PlanVerificationSemanticsTests(unittest.TestCase):
             self.assertEqual(next(x.status for x in plan.steps if x.id == "verify"), "in_progress")
 
 
+class DuplicateRecoveryRegressionTests(unittest.TestCase):
+    def test_escaped_markdown_requirements_are_structured(self):
+        escaped = "1\\. inspect\n2\\. mutate\n3\\. verify\n\\* cleanup\n"
+        self.assertTrue(_needs_completion_audit(escaped))
+
+    def test_duplicate_then_mixed_tool_protocol_repairs_and_continues(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            client = MagicMock()
+            client.timeout = 300
+            first = 'TOOL_CALL file_tree\n{"path":"."}\nEND_TOOL_CALL'
+            mixed = (
+                "The directory is empty; continuing now.\n\n"
+                'TOOL_CALL directory_create\n{"path":"sub"}\nEND_TOOL_CALL\n'
+                'TOOL_CALL file_edit\n{"path":"alpha.txt","operation":"create","content":"alpha"}\nEND_TOOL_CALL'
+            )
+            clean = (
+                'TOOL_CALL directory_create\n{"path":"sub"}\nEND_TOOL_CALL\n'
+                'TOOL_CALL file_edit\n{"path":"alpha.txt","operation":"create","content":"alpha"}\nEND_TOOL_CALL'
+            )
+            client.chat.side_effect = [
+                {"response": first, "model": "openrouter/qwen/qwen3.8-27b"},
+                {"response": first, "model": "openrouter/qwen/qwen3.8-27b"},
+                {"response": mixed, "model": "openrouter/qwen/qwen3.8-27b"},
+                {"response": clean, "model": "openrouter/qwen/qwen3.8-27b"},
+                {"response": "DONE: work complete", "model": "openrouter/qwen/qwen3.8-27b"},
+                {"response": "DONE: audited", "model": "openrouter/qwen/qwen3.8-27b"},
+            ]
+            events: list[tuple[str, dict]] = []
+            tools = [
+                {"name": "file_tree", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}}},
+                {"name": "directory_create", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
+                {"name": "file_edit", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "operation": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "operation"]}},
+            ]
+            runtime = NativeLightRuntime(
+                client=client,
+                initial_prompt="1\\. inspect\n2\\. create directory\n3\\. create file\n\\* verify\n",
+                model="openrouter/qwen/qwen3.8-27b",
+                fallback_model=None,
+                workspace_root=str(root),
+                tools=tools,
+                load_tools_on_start=False,
+                persistent_plan=False,
+                base_timeout=300,
+                event_fn=lambda kind, payload: events.append((kind, payload)),
+            )
+            executed: list[str] = []
+            def fake_run(_client, name, args, **kwargs):
+                executed.append(name)
+                if name == "file_tree":
+                    return "(empty directory)", False
+                if name == "directory_create":
+                    return "created directory sub; verified directory exists", False
+                if name == "file_edit":
+                    return "updated alpha.txt; verified exact content (5 chars)", False
+                return "ok", False
+
+            with patch("aicoder.agent_runtime.run_tool", side_effect=fake_run):
+                result = runtime.run()
+
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(result.response, "DONE: audited")
+            self.assertEqual(executed.count("file_tree"), 1, "duplicate read must be blocked before execution")
+            self.assertEqual(executed.count("directory_create"), 1)
+            self.assertEqual(executed.count("file_edit"), 1)
+            self.assertEqual(sum(kind == "loop_prevented" for kind, _ in events), 1)
+            repairs = [payload for kind, payload in events if kind == "final_response_repair"]
+            self.assertEqual(len(repairs), 1)
+            self.assertEqual(repairs[0].get("reason"), "mixed_tool_protocol")
+            self.assertEqual(sum(kind == "completion_audit" for kind, _ in events), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
