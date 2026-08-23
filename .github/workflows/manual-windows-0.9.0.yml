@@ -1,0 +1,76 @@
+name: Windows Build 1.0.0
+
+
+on:
+  push:
+    branches:
+      - ci/windows-aicoder-1.0.0
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: '3.12'
+  VERSION: '1.0.0'
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Verify project version
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROJECT_VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          test "$PROJECT_VERSION" = "$VERSION"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip setuptools wheel pyinstaller
+          python -m pip install -e .
+
+      - name: Build EXE
+        shell: pwsh
+        run: |
+          python -m PyInstaller --onefile --name aicoder --console --noconfirm --clean --collect-submodules=aicoder --hidden-import=PyQt6.QtWidgets --hidden-import=PyQt6.QtGui --hidden-import=PyQt6.QtCore --hidden-import=aicoder.gui --hidden-import=aicoder.gui.app --hidden-import=aicoder.gui.main_window --hidden-import=aicoder.gui.chat_widget --hidden-import=aicoder.gui.settings_widget --hidden-import=aicoder.gui.autostart --hidden-import=certifi aicoder_main.py
+          if (-not (Test-Path 'dist\aicoder.exe')) { throw 'aicoder.exe was not created' }
+
+      - name: Build NSIS installer
+        shell: pwsh
+        run: |
+          choco install nsis nsis-envar -y --no-progress
+          $parts = $env:VERSION.Split('.'); while ($parts.Count -lt 4) { $parts += '0' }
+          $nsisVer = ($parts[0..3] -join '.')
+          $makensis = 'C:\Program Files (x86)\NSIS\makensis.exe'
+          & $makensis /V2 /DVERSION="$env:VERSION" /DVERSIONINFO="$nsisVer" /DEXE_PATH="dist\aicoder.exe" packaging\windows\installer.nsi
+          if (-not (Test-Path "aicoder-$env:VERSION-setup.exe")) { throw 'NSIS installer was not created' }
+
+      - name: Prepare artifacts and checksums
+        shell: pwsh
+        run: |
+          Copy-Item dist\aicoder.exe "aicoder-$env:VERSION-windows-x64.exe"
+          $files = @("aicoder-$env:VERSION-windows-x64.exe", "aicoder-$env:VERSION-setup.exe")
+          foreach ($file in $files) {
+            $hash = (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
+            "$hash  $file" | Add-Content "SHA256SUMS-$env:VERSION.txt"
+          }
+          Get-ChildItem aicoder-*.exe, SHA256SUMS-*.txt | Select-Object Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aicoder-windows-0.9.0
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            aicoder-0.9.0-windows-x64.exe
+            aicoder-0.9.0-setup.exe
+            SHA256SUMS-0.9.0.txt
