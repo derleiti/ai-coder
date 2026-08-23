@@ -1,3 +1,8 @@
 {
-    "nvidia-nim.showReasoning": false
+    "nvidia-nim.showReasoning": false,
+    "python.testing.pytestArgs": [
+        "."
+    ],
+    "python.testing.unittestEnabled": false,
+    "python.testing.pytestEnabled": true
 }
