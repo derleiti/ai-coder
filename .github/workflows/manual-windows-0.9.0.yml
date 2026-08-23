@@ -1,17 +1,17 @@
-name: Windows Build 0.9.0
+name: Windows Build 1.0.0
 
 on:
   push:
     branches:
-      - ci/windows-aicoder-0.9.0
+      - ci/windows-aicoder-1.0.0
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   PYTHON_VERSION: '3.12'
-  VERSION: '0.9.0'
+  VERSION: '1.0.0'
 
 jobs:
   build-windows:
@@ -40,8 +40,22 @@ jobs:
       - name: Build EXE
         shell: pwsh
         run: |
-          python -m PyInstaller --onefile --name aicoder --console --noconfirm --clean --collect-submodules=aicoder --hidden-import=PyQt6.QtWidgets --hidden-import=PyQt6.QtGui --hidden-import=PyQt6.QtCore --hidden-import=aicoder.gui --hidden-import=aicoder.gui.app --hidden-import=aicoder.gui.main_window --hidden-import=aicoder.gui.chat_widget --hidden-import=aicoder.gui.settings_widget --hidden-import=aicoder.gui.autostart --hidden-import=certifi aicoder_main.py
+          python -m PyInstaller `
+            --onefile `
+            --name aicoder `
+            --console `
+            --noconfirm `
+            --clean `
+            --collect-submodules=aicoder `
+            --hidden-import=PyQt6.QtWidgets `
+            --hidden-import=PyQt6.QtGui `
+            --hidden-import=PyQt6.QtCore `
+            --hidden-import=PyQt6.QtNetwork `
+            --add-data "src/aicoder/assets:aicoder/assets" `
+            src/aicoder/cli.py
           if (-not (Test-Path 'dist\aicoder.exe')) { throw 'aicoder.exe was not created' }
+          $size = (Get-Item dist\aicoder.exe).Length / 1MB
+          Write-Host "aicoder.exe: $([math]::Round($size,1)) MB"
 
       - name: Build NSIS installer
         shell: pwsh
@@ -66,10 +80,10 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: aicoder-windows-0.9.0
+          name: aicoder-windows-1.0.0
           if-no-files-found: error
           retention-days: 30
           path: |
-            aicoder-0.9.0-windows-x64.exe
-            aicoder-0.9.0-setup.exe
-            SHA256SUMS-0.9.0.txt
+            aicoder-1.0.0-windows-x64.exe
+            aicoder-1.0.0-setup.exe
+            SHA256SUMS-1.0.0.txt
