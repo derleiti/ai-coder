@@ -45,17 +45,17 @@ path_added:
   ; Start Menu shortcuts
   CreateDirectory "$SMPROGRAMS\ai-coder"
   CreateShortcut "$SMPROGRAMS\ai-coder\ai-coder Terminal.lnk" \
-    "$INSTDIR\${APP_EXE}" "" "$INSTDIR\${APP_EXE}" 0 SW_SHOW
+    "$INSTDIR\${APP_EXE}" "" "$INSTDIR\${APP_EXE}" 0 SW_SHOWNORMAL
   CreateShortcut "$SMPROGRAMS\ai-coder\ai-coder GUI.lnk" \
-    "$INSTDIR\${APP_EXE}" "gui" "$INSTDIR\${APP_EXE}" 0 SW_HIDE
+    "$INSTDIR\${APP_EXE}" "gui" "$INSTDIR\${APP_EXE}" 0 SW_SHOWNORMAL
   CreateShortcut "$SMPROGRAMS\ai-coder\Uninstall.lnk" \
     "$INSTDIR\uninstall.exe" "" "" 0
 
   ; Desktop shortcuts
   CreateShortcut "$DESKTOP\ai-coder GUI.lnk" \
-    "$INSTDIR\${APP_EXE}" "gui" "$INSTDIR\${APP_EXE}" 0 SW_HIDE
+    "$INSTDIR\${APP_EXE}" "gui" "$INSTDIR\${APP_EXE}" 0 SW_SHOWNORMAL
   CreateShortcut "$DESKTOP\ai-coder Terminal.lnk" \
-    "$INSTDIR\${APP_EXE}" "" "$INSTDIR\${APP_EXE}" 0 SW_SHOW
+    "$INSTDIR\${APP_EXE}" "" "$INSTDIR\${APP_EXE}" 0 SW_SHOWNORMAL
 
   ; Registry
   WriteRegStr HKLM "Software\ai-coder" "Install_Dir" "$INSTDIR"
