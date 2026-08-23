@@ -3,6 +3,7 @@ import base64
 import json
 import ssl
 import sys
+import threading
 import time
 from typing import Any, Dict, Optional
 from urllib.error import HTTPError, URLError
@@ -10,17 +11,12 @@ from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
 from . import __version__
-USER_AGENT = f"ai-coder/{__version__} (AILinux Coding Client)"
-
-# ── Force IPv4 (IPv6 broken on Hetzner/CF, causes 30-60s hangs) ──
-import socket
-_orig_getaddrinfo = socket.getaddrinfo
-def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
-    """Force IPv4 to avoid IPv6 timeout on broken AAAA records."""
-    if family == 0:
-        family = socket.AF_INET
-    return _orig_getaddrinfo(host, port, family, type, proto, flags)
-socket.getaddrinfo = _ipv4_getaddrinfo
+from .tool_policy import (
+    LOCAL_ONLY_TOOLS, OPERATOR_MCP_TOOLS, canonical_tool_name, require_allowed_tool,
+    triforce_host_forbidden_reason,
+)
+USER_AGENT = f"ai-coder/{__version__} (AILinux Operator Client)"
+CLIENT_PROFILE = "ai-coder"
 
 # ── Connection pool (keep-alive) ──────────────────────────────
 _POOL = None
@@ -69,7 +65,35 @@ def _decode_jwt_exp(token: str) -> Optional[int]:
 
 
 class ClientError(RuntimeError):
-    pass
+    def __init__(
+        self, message: str, *, status_code: int | None = None,
+        retryable: bool | None = None, retry_after: int | None = None,
+        payload: Any = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retryable = retryable
+        self.retry_after = retry_after
+        self.payload = payload
+
+
+def _error_metadata(payload: Any, status_code: int | None = None) -> tuple[int | None, bool | None, int | None]:
+    data = payload if isinstance(payload, dict) else {}
+    error = data.get("error") if isinstance(data.get("error"), dict) else data
+    status = error.get("status", error.get("status_code", status_code))
+    try:
+        status = int(status) if status is not None else status_code
+    except (TypeError, ValueError):
+        status = status_code
+    retryable = error.get("retryable")
+    if retryable is None and status is not None:
+        retryable = status in {408, 429, 500, 502, 503, 504, 524}
+    retry_after = error.get("retry_after")
+    try:
+        retry_after = int(retry_after) if retry_after is not None else None
+    except (TypeError, ValueError):
+        retry_after = None
+    return status, bool(retryable) if retryable is not None else None, retry_after
 
 
 class TokenExpiredError(ClientError):
@@ -77,11 +101,167 @@ class TokenExpiredError(ClientError):
     pass
 
 
+def _content_text(value: Any) -> str:
+    """Extract visible text without destroying structured provider blocks."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") in {"text", "output_text"} and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        return "\n".join(parts)
+    return ""
+
+
+def _normalize_chat_response(data: Any) -> Dict[str, Any]:
+    """Normalize common provider envelopes while preserving raw tool-call identity."""
+    if not isinstance(data, dict):
+        raise ClientError(f"Chat backend returned {type(data).__name__}, expected object")
+    if data.get("error") is not None and not data.get("response"):
+        status, retryable, retry_after = _error_metadata(data)
+        detail = data.get("error")
+        raise ClientError(
+            f"Chat backend error: {json.dumps(detail, ensure_ascii=False, default=str)}",
+            status_code=status, retryable=retryable, retry_after=retry_after, payload=data,
+        )
+    if "response" in data:
+        return data
+
+    # OpenAI Chat Completions and compatible APIs (Mistral, Groq, etc.).
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        message = choices[0].get("message", {})
+        if isinstance(message, dict):
+            normalized = dict(data)
+            normalized["response"] = _content_text(message.get("content"))
+            if isinstance(message.get("tool_calls"), list):
+                normalized["tool_calls"] = message["tool_calls"]
+            return normalized
+
+    # OpenAI Responses API: text and function calls are sibling output items.
+    output = data.get("output")
+    if isinstance(output, list):
+        texts: list[str] = []
+        calls: list[dict] = []
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "message":
+                text = _content_text(item.get("content"))
+                if text:
+                    texts.append(text)
+            elif item.get("type") in {"function_call", "tool_call"}:
+                calls.append(dict(item))
+        normalized = dict(data)
+        normalized["response"] = "\n".join(texts)
+        if calls:
+            normalized["tool_calls"] = calls
+        return normalized
+
+    # Anthropic Messages API. Keep tool_use blocks intact so their IDs survive.
+    content = data.get("content")
+    if isinstance(content, list):
+        texts: list[str] = []
+        calls: list[dict] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text" and isinstance(block.get("text"), str):
+                texts.append(block["text"])
+            elif block.get("type") in {"tool_use", "tool_call"}:
+                calls.append(dict(block))
+        normalized = dict(data)
+        normalized["response"] = "\n".join(texts)
+        if calls:
+            normalized["tool_calls"] = calls
+        return normalized
+
+    # Gemini generateContent. Preserve the complete functionCall payload and
+    # any thought signature attached to its containing part.
+    candidates = data.get("candidates")
+    if isinstance(candidates, list) and candidates and isinstance(candidates[0], dict):
+        parts = ((candidates[0].get("content") or {}).get("parts") or [])
+        texts: list[str] = []
+        calls: list[dict] = []
+        for part in parts if isinstance(parts, list) else []:
+            if not isinstance(part, dict):
+                continue
+            if isinstance(part.get("text"), str):
+                texts.append(part["text"])
+            function_call = part.get("functionCall")
+            if isinstance(function_call, dict):
+                raw_call = {"functionCall": dict(function_call)}
+                for key in ("thoughtSignature", "thought_signature"):
+                    if key in part:
+                        raw_call[key] = part[key]
+                calls.append(raw_call)
+        normalized = dict(data)
+        normalized["response"] = "\n".join(texts)
+        if calls:
+            normalized["tool_calls"] = calls
+        return normalized
+
+    # Ollama and other APIs that return a top-level message object.
+    message = data.get("message")
+    if isinstance(message, dict):
+        normalized = dict(data)
+        normalized["response"] = _content_text(message.get("content"))
+        if isinstance(message.get("tool_calls"), list):
+            normalized["tool_calls"] = message["tool_calls"]
+        return normalized
+
+    raise ClientError("Chat backend response contains no recognized response envelope")
+
+
+def model_identifier(value: Any) -> str:
+    """Return a stable model id from string or catalogue-object variants."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("id", "model", "name", "model_id"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate:
+                return candidate
+    return ""
+
+
 class TriForceClient:
-    def __init__(self, base_url: str, token: Optional[str] = None, timeout: int = 60):
+    def __init__(self, base_url: str, token: Optional[str] = None, timeout: int = 300):
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.timeout = timeout
+        self._active_response_lock = threading.Lock()
+        self._active_response = None
+
+    def _set_active_response(self, response: Any) -> None:
+        with self._active_response_lock:
+            self._active_response = response
+
+    def _clear_active_response(self, response: Any) -> None:
+        with self._active_response_lock:
+            if self._active_response is response:
+                self._active_response = None
+
+    def cancel_current_request(self) -> bool:
+        """Best-effort cancellation by closing the active HTTP response handle."""
+        with self._active_response_lock:
+            response = self._active_response
+            self._active_response = None
+        if response is None:
+            return False
+        closed = False
+        for method_name in ("close", "release_conn"):
+            method = getattr(response, method_name, None)
+            if callable(method):
+                try:
+                    method()
+                    closed = True
+                except Exception:
+                    pass
+        return closed
 
     def token_expires_in(self) -> Optional[float]:
         """Seconds until token expires. None if unknown, negative if expired."""
@@ -122,6 +302,7 @@ class TriForceClient:
         require_auth: bool = False,
         _label: str = "",
         _retries: int = 1,
+        _extra_headers: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         url = urljoin(self.base_url + "/", path.lstrip("/"))
         data = None
@@ -129,7 +310,10 @@ class TriForceClient:
             "Accept": "application/json",
             "Content-Type": "application/json",
             "User-Agent": USER_AGENT,
+            "X-Client-Profile": CLIENT_PROFILE,
         }
+        if _extra_headers:
+            headers.update({str(k): str(v) for k, v in _extra_headers.items()})
         if require_auth:
             if not self.token:
                 raise ClientError("Kein Token vorhanden. Erst einloggen.")
@@ -151,10 +335,13 @@ class TriForceClient:
             except ClientError as e:
                 last_err = e
                 err_str = str(e)
-                # Don't retry auth errors or 4xx
-                if "HTTP 4" in err_str or "Token expired" in err_str:
+                # Do not retry permanent 4xx/auth errors. 408 and 429 are transient.
+                if (
+                    ("HTTP 4" in err_str and "HTTP 408" not in err_str and "HTTP 429" not in err_str)
+                    or "Token expired" in err_str
+                ):
                     raise
-                # Retry on 5xx, timeout, connection errors
+                # Retry on 5xx, 408/429, timeout, and connection errors.
                 if attempt < _retries:
                     continue
                 raise
@@ -167,12 +354,16 @@ class TriForceClient:
         pool = _get_pool()
         if pool is not None:
             try:
+                keepalive_stream = str(headers.get("X-AICoder-Keepalive", "")).lower() in {"1", "true", "json"}
                 resp = pool.request(
                     method.upper(), url, headers=headers, body=data,
                     timeout=self.timeout, redirect=False,
+                    preload_content=not keepalive_stream,
                 )
+                self._set_active_response(resp)
                 if resp.status >= 400:
-                    body = resp.data.decode("utf-8", errors="replace")
+                    raw_error = resp.read() if keepalive_stream else resp.data
+                    body = raw_error.decode("utf-8", errors="replace")
                     try:
                         parsed = json.loads(body) if body else {}
                     except Exception:
@@ -184,9 +375,68 @@ class TriForceClient:
                             raise TokenExpiredError(
                                 f"Token expired (HTTP {resp.status}). Please re-login: aicoder setup"
                             )
-                    raise ClientError(f"HTTP {resp.status}{label} bei {url}: {parsed}")
-                raw = resp.data.decode("utf-8")
-                return json.loads(raw) if raw else {}
+                    status, retryable, retry_after = _error_metadata(parsed, resp.status)
+                    self._clear_active_response(resp)
+                    raise ClientError(
+                        f"HTTP {resp.status}{label} bei {url}: {parsed}",
+                        status_code=status, retryable=retryable, retry_after=retry_after, payload=parsed,
+                    )
+                if keepalive_stream:
+                    started = time.monotonic()
+                    last_rx = started
+                    max_gap = 0.0
+                    chunks = 0
+                    byte_count = 0
+                    keepalive_chunks = 0
+                    payload_chunks = 0
+                    keepalive_times_s: list[float] = []
+                    parts: list[bytes] = []
+                    try:
+                        while True:
+                            # self.timeout is an inactivity timeout, not a maximum
+                            # model-thinking duration. The backend emits keepalive bytes
+                            # while provider inference is still alive so proxies do not
+                            # mistake long reasoning for an idle origin connection.
+                            chunk = resp.read(2048)
+                            if not chunk:
+                                break
+                            now = time.monotonic()
+                            max_gap = max(max_gap, now - last_rx)
+                            last_rx = now
+                            chunks += 1
+                            byte_count += len(chunk)
+                            if not chunk.strip():
+                                keepalive_chunks += 1
+                                keepalive_times_s.append(round(now - started, 3))
+                            else:
+                                payload_chunks += 1
+                            parts.append(chunk)
+                    finally:
+                        self._clear_active_response(resp)
+                        try:
+                            resp.release_conn()
+                        except Exception:
+                            pass
+                    raw = b"".join(parts).decode("utf-8")
+                    result = json.loads(raw) if raw else {}
+                    if isinstance(result, dict):
+                        result = dict(result)
+                        result["_transport_telemetry"] = {
+                            "elapsed_s": round(time.monotonic() - started, 3),
+                            "chunks": chunks,
+                            "bytes": byte_count,
+                            "keepalive_chunks": keepalive_chunks,
+                            "payload_chunks": payload_chunks,
+                            "keepalive_times_s": keepalive_times_s[-32:],
+                            "max_rx_gap_s": round(max_gap, 3),
+                            "last_rx_age_s": round(max(0.0, time.monotonic() - last_rx), 3),
+                        }
+                    return result
+                try:
+                    raw = resp.data.decode("utf-8")
+                    return json.loads(raw) if raw else {}
+                finally:
+                    self._clear_active_response(resp)
             except (TokenExpiredError, ClientError):
                 raise
             except Exception as e:
@@ -201,9 +451,17 @@ class TriForceClient:
         # Fallback: plain urlopen (no pool)
         req = Request(url=url, data=data, headers=headers, method=method.upper())
         try:
-            with urlopen(req, timeout=self.timeout, context=_ssl_context()) as resp:
+            resp = urlopen(req, timeout=self.timeout, context=_ssl_context())
+            self._set_active_response(resp)
+            try:
                 raw = resp.read().decode("utf-8")
                 return json.loads(raw) if raw else {}
+            finally:
+                self._clear_active_response(resp)
+                try:
+                    resp.close()
+                except Exception:
+                    pass
         except HTTPError as e:
             body = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else ""
             try:
@@ -217,7 +475,11 @@ class TriForceClient:
                     raise TokenExpiredError(
                         f"Token expired (HTTP {e.code}). Please re-login: aicoder setup"
                     ) from e
-            raise ClientError(f"HTTP {e.code}{label} bei {url}: {parsed}") from e
+            status, retryable, retry_after = _error_metadata(parsed, e.code)
+            raise ClientError(
+                f"HTTP {e.code}{label} bei {url}: {parsed}",
+                status_code=status, retryable=retryable, retry_after=retry_after, payload=parsed,
+            ) from e
         except TimeoutError:
             label = f" [{_label}]" if _label else ""
             raise ClientError(
@@ -235,6 +497,9 @@ class TriForceClient:
         token = result.get("token")
         if not token:
             raise ClientError(f"Login fehlgeschlagen: {result}")
+        # Older TriForce deployments expose only tier; current deployments also
+        # return the concrete client account role. Keep one stable client shape.
+        result.setdefault("account_role", result.get("role") or result.get("tier", "unknown"))
         self.token = token
         return result
 
@@ -244,7 +509,25 @@ class TriForceClient:
     def handshake(self) -> Dict[str, Any]:
         return self._request("GET", "/v1/auth/client/handshake", require_auth=True, _label="handshake")
 
-    def mcp_call(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    def mcp_call(
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        *,
+        allow_internal: bool = False,
+    ) -> Dict[str, Any]:
+        if canonical_tool_name(tool_name) in LOCAL_ONLY_TOOLS:
+            raise ClientError(
+                f"tool '{tool_name}' is local-only in ai-coder and cannot be dispatched over MCP"
+            )
+        host_reason = triforce_host_forbidden_reason(tool_name)
+        if host_reason:
+            raise ClientError(host_reason)
+        allowed, reason = require_allowed_tool(
+            tool_name, OPERATOR_MCP_TOOLS, allow_internal=allow_internal,
+        )
+        if not allowed:
+            raise ClientError(reason)
         payload = {
             "jsonrpc": "2.0",
             "method": "tools/call",
@@ -254,12 +537,32 @@ class TriForceClient:
             },
             "id": 1,
         }
-        return self._request("POST", "/v1/mcp", payload, require_auth=True, _label=tool_name)
+        response = self._request(
+            "POST", "/v1/mcp", payload, require_auth=True,
+            _label=tool_name, _retries=0,
+        )
+        if isinstance(response, dict) and response.get("error") is not None:
+            raise ClientError(
+                f"MCP {tool_name} failed: "
+                f"{json.dumps(response['error'], ensure_ascii=False, default=str)}"
+            )
+        if not isinstance(response, dict):
+            raise ClientError(f"MCP {tool_name} returned a non-object response")
+        # Accept the legacy gateway shape while presenting one JSON-RPC shape
+        # to the rest of the client.
+        if "result" not in response and "content" in response:
+            response = {"jsonrpc": "2.0", "id": response.get("id", 1), "result": response}
+        if "result" not in response:
+            raise ClientError(f"MCP {tool_name} response contains neither result nor error")
+        return response
 
     def list_models(self) -> list:
         """Fetch available models from /v1/client/models."""
         try:
             data = self._request("GET", "/v1/client/models", require_auth=True, _label="models")
+            details = data.get("model_details") or []
+            if isinstance(details, list) and details:
+                return [m for m in details if isinstance(m, dict)]
             models = data.get("models", [])
             result = []
             for m in models:
@@ -290,6 +593,7 @@ class TriForceClient:
         messages: Optional[list] = None,
         tools: Optional[list] = None,
         tool_choice: Any = "auto",
+        request_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Call /v1/client/chat. Supports messages array for multi-turn context."""
         payload: Dict[str, Any] = {
@@ -308,17 +612,41 @@ class TriForceClient:
             payload["tools"] = tools
             payload["tool_choice"] = tool_choice
         try:
-            return self._request(
+            primary_result = _normalize_chat_response(self._request(
                 "POST", "/v1/client/chat", payload, require_auth=True,
                 _label=f"chat/{model or 'default'}", _retries=0,
-            )
+                _extra_headers={"X-AICoder-Keepalive": "json", **({"X-AICoder-Request-ID": request_id} if request_id else {})},
+            ))
+            if isinstance(primary_result, dict) and request_id:
+                primary_result = dict(primary_result)
+                telemetry = dict(primary_result.get("_transport_telemetry") or {})
+                telemetry["request_id"] = request_id
+                primary_result["_transport_telemetry"] = telemetry
+            return primary_result
+        except TokenExpiredError:
+            raise
         except ClientError as e:
             if fallback_model and fallback_model != model:
+                # Authentication/authorization and other client-side 4xx errors
+                # cannot be repaired by selecting another model.
+                message = str(e)
+                if "HTTP 4" in message and "HTTP 408" not in message and "HTTP 429" not in message:
+                    raise
                 import sys
                 print(f"\n[FALLBACK: {model} failed → {fallback_model}]", file=sys.stderr)
                 payload["model"] = fallback_model
-                return self._request(
+                fallback_result = _normalize_chat_response(self._request(
                     "POST", "/v1/client/chat", payload, require_auth=True,
                     _label=f"chat/{fallback_model}(fallback)", _retries=0,
-                )
+                    _extra_headers={"X-AICoder-Keepalive": "json", **({"X-AICoder-Request-ID": request_id} if request_id else {})},
+                ))
+                if isinstance(fallback_result, dict):
+                    fallback_result = dict(fallback_result)
+                    fallback_result["fallback_used"] = True
+                    fallback_result.setdefault("primary_model", model)
+                    if request_id:
+                        telemetry = dict(fallback_result.get("_transport_telemetry") or {})
+                        telemetry["request_id"] = request_id
+                        fallback_result["_transport_telemetry"] = telemetry
+                return fallback_result
             raise

@@ -35,7 +35,7 @@ class MainWindow(QMainWindow):
         mark.setObjectName("BrandMark")
         brand = QLabel("ai-coder")
         brand.setObjectName("Brand")
-        caption = QLabel("AILinux coding agent")
+        caption = QLabel("AILinux operator agent")
         caption.setObjectName("Caption")
         shortcut_hint = QLabel("Ctrl+1 Chat   Ctrl+2 Settings   Ctrl+K Prompt")
         shortcut_hint.setObjectName("Caption")

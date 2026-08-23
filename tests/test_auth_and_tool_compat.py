@@ -14,10 +14,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtWidgets import QApplication
 
-from aicoder.client import ClientError, TriForceClient, _decode_jwt_exp
+from aicoder.client import ClientError, TriForceClient, _decode_jwt_exp, _normalize_chat_response
 from aicoder.config import Session
 from aicoder.executor import (
-    is_action_request, is_simple_chat_message, normalize_tool_calls, parse_tool_calls,
+    is_action_request, is_simple_chat_message, merge_tool_calls, normalize_tool_calls, parse_tool_calls,
 )
 from aicoder.gui.chat_widget import _AgentWorker, _select_chat_route
 import aicoder.gui.settings_widget as settings_widget
@@ -27,6 +27,7 @@ from aicoder.repl_input import COMMANDS, ReplInput
 from aicoder.ui import AgentSpinner
 from aicoder.privileges import assess_execution
 import aicoder.executor as executor
+import aicoder.repl_input as repl_input_module
 
 
 def _unsigned_token(exp: int) -> str:
@@ -90,21 +91,108 @@ class AuthCompatibilityTests(unittest.TestCase):
 
 
 class ToolCallCompatibilityTests(unittest.TestCase):
-    def test_structured_openai_tool_calls(self):
+    def test_structured_openai_compatible_tool_calls_preserve_id(self):
         self.assertEqual(
             normalize_tool_calls([{
                 "id": "call_1",
                 "type": "function",
                 "function": {"name": "health", "arguments": "{}"},
             }]),
+            [{"name": "health", "arguments": {}, "id": "call_1", "raw_type": "function"}],
+        )
+
+    def test_openai_responses_function_call_preserves_call_id(self):
+        normalized = _normalize_chat_response({
+            "output": [
+                {"type": "message", "content": [{"type": "output_text", "text": "Checking"}]},
+                {"type": "function_call", "call_id": "call_resp_1", "name": "health", "arguments": "{}"},
+            ]
+        })
+        self.assertEqual(normalized["response"], "Checking")
+        self.assertEqual(
+            normalize_tool_calls(normalized["tool_calls"]),
+            [{
+                "name": "health", "arguments": {}, "id": "call_resp_1",
+                "provider": "openai", "raw_type": "function_call",
+            }],
+        )
+
+    def test_anthropic_tool_use_preserves_id(self):
+        normalized = _normalize_chat_response({
+            "content": [
+                {"type": "text", "text": "Checking"},
+                {"type": "tool_use", "id": "toolu_1", "name": "health", "input": {}},
+            ]
+        })
+        self.assertEqual(normalized["response"], "Checking")
+        self.assertEqual(
+            normalize_tool_calls(normalized["tool_calls"]),
+            [{
+                "name": "health", "arguments": {}, "id": "toolu_1",
+                "provider": "anthropic", "raw_type": "tool_use",
+            }],
+        )
+
+    def test_gemini_function_call_preserves_id_and_signature(self):
+        normalized = _normalize_chat_response({
+            "candidates": [{"content": {"parts": [
+                {"text": "Checking"},
+                {
+                    "functionCall": {"id": "gem_1", "name": "health", "args": {}},
+                    "thoughtSignature": "opaque-signature",
+                },
+            ]}}]
+        })
+        self.assertEqual(normalized["response"], "Checking")
+        self.assertEqual(
+            normalize_tool_calls(normalized["tool_calls"]),
+            [{
+                "name": "health", "arguments": {}, "id": "gem_1",
+                "provider": "gemini",
+                "metadata": {"thoughtSignature": "opaque-signature"},
+            }],
+        )
+
+    def test_ollama_message_tool_calls_are_normalized(self):
+        normalized = _normalize_chat_response({
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"function": {"name": "health", "arguments": {}}}],
+            }
+        })
+        self.assertEqual(normalized["response"], "")
+        self.assertEqual(
+            normalize_tool_calls(normalized["tool_calls"]),
             [{"name": "health", "arguments": {}}],
         )
+
+    def test_native_and_text_tool_call_are_deduplicated_without_losing_id(self):
+        native = normalize_tool_calls([{
+            "id": "call_1", "type": "function",
+            "function": {"name": "health", "arguments": "{}"},
+        }])
+        textual = parse_tool_calls('<tool_call>{"name":"health","arguments":{}}</tool_call>')
+        merged = merge_tool_calls(native, textual)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["id"], "call_1")
+
+    def test_parallel_tool_calls_preserve_order_and_ids(self):
+        calls = normalize_tool_calls([
+            {"id": "call_a", "type": "function", "function": {"name": "health", "arguments": "{}"}},
+            {"id": "call_b", "type": "function", "function": {"name": "code_read", "arguments": "{\"path\":\"README.md\"}"}},
+        ])
+        self.assertEqual([call["name"] for call in calls], ["health", "code_read"])
+        self.assertEqual([call["id"] for call in calls], ["call_a", "call_b"])
 
     def test_native_openai_shape(self):
         text = '<tool_call>{"type":"function","function":{"name":"code_read","arguments":"{\\"path\\":\\"README.md\\"}"}}</tool_call>'
         self.assertEqual(
             parse_tool_calls(text),
-            [{"name": "code_read", "arguments": {"path": "README.md"}}],
+            [{
+                "name": "code_read", "arguments": {"path": "README.md"},
+                "raw_type": "function",
+            }],
         )
 
     def test_mistral_shape(self):
@@ -113,6 +201,19 @@ class ToolCallCompatibilityTests(unittest.TestCase):
             parse_tool_calls(text),
             [{"name": "code_search", "arguments": {"query": "oauth"}}],
         )
+
+    def test_tool_call_does_not_repair_missing_outer_brace(self):
+        # Malformed JSON must never be guessed into an executable call.
+        text = (
+            "<tool_call>\n"
+            "{\"name\":\"file_edit\",\"arguments\":{\"command\":\"cat > ~/x << 'EOF'\\nhello\\nEOF\"}\n"
+            "</tool_call>"
+        )
+        self.assertEqual(parse_tool_calls(text), [])
+
+    def test_truncated_unclosed_tool_call_is_not_guessed(self):
+        text = "<tool_call>\n{\"name\":\"file_edit\",\"arguments\":{\"command\":\"cat > ~/x << 'EOF'\\nhello"
+        self.assertEqual(parse_tool_calls(text), [])
 
     def test_hermes_function_shape(self):
         text = '<function=health>{}</function>'
@@ -136,14 +237,15 @@ class FastChatTests(unittest.TestCase):
         self.assertFalse(is_simple_chat_message("Hi, prüfe bitte den OAuth-Code"))
         self.assertFalse(is_simple_chat_message("Warum ist das Modell langsam?"))
 
-    def test_greeting_uses_fast_fallback_directly(self):
+    def test_greeting_preserves_primary_and_fallback(self):
+        expected = ("anthropic/slow", "ollama/llama3.2:latest", False)
         self.assertEqual(
             _select_chat_route("anthropic/slow", "ollama/llama3.2:latest", True),
-            ("ollama/llama3.2:latest", "", True),
+            expected,
         )
         self.assertEqual(
             _select_chat_route("anthropic/slow", "ollama/llama3.2:latest", False),
-            ("anthropic/slow", "ollama/llama3.2:latest", False),
+            expected,
         )
 
 
@@ -195,10 +297,20 @@ class GuiToolModeTests(unittest.TestCase):
         worker = _AgentWorker(
             client,
             [{"role": "system", "content": "simple"}, {"role": "user", "content": "check"}],
-            "test", "", [{"name": "health", "inputSchema": {}}], "simple",
+            "openrouter/nvidia/nemotron-3-ultra-550b-a55b", "",
+            [{"name": "health", "inputSchema": {}}], "simple",
             load_tools_on_start=True,
         )
-        with patch("aicoder.gui.chat_widget.run_tool", return_value=("healthy", False)) as execute:
+        state = {
+            "runtime_mode": "native-light",
+            "request_timeout": 30,
+            "workspace_root": ".",
+            "native_openrouter_tool_calling": True,
+        }
+        with (
+            patch("aicoder.gui.chat_widget.get_state", return_value=state),
+            patch("aicoder.agent_runtime.run_tool", return_value=("healthy", False)) as execute,
+        ):
             worker.run()
         execute.assert_called_once()
 
@@ -211,7 +323,7 @@ class GuiToolModeTests(unittest.TestCase):
             "test", "", [], "simple",
             load_tools_on_start=False, quick_chat=True,
         )
-        with patch("aicoder.gui.chat_widget.load_tools") as discover:
+        with patch("aicoder.agent_runtime.load_tools") as discover:
             worker.run()
         discover.assert_not_called()
         self.assertEqual(worker.tools, [])
@@ -228,7 +340,7 @@ class GuiToolModeTests(unittest.TestCase):
             "test", "", [], "simple",
             load_tools_on_start=False,
         )
-        with patch("aicoder.gui.chat_widget.run_tool") as execute:
+        with patch("aicoder.agent_runtime.run_tool") as execute:
             worker.run()
         execute.assert_not_called()
 
@@ -277,6 +389,26 @@ class ReplRegressionTests(unittest.TestCase):
         guard.reset()
         self.assertEqual(guard.observe(calls, ["new result"]), 1)
 
+    def test_loop_guard_ignores_provider_call_id_churn(self):
+        guard = executor.AgentLoopGuard()
+        first = [{"name": "health", "arguments": {}, "id": "call_1"}]
+        second = [{"name": "health", "arguments": {}, "id": "call_2"}]
+        self.assertEqual(guard.observe(first, ["same result"]), 1)
+        self.assertEqual(guard.observe(second, ["same result"]), 2)
+
+    def test_repeated_error_recovery_requires_hypothesis_change(self):
+        self.assertIn("failed twice", executor.REPEATED_ERROR_RECOVERY_PROMPT)
+        self.assertIn("Stop retrying", executor.REPEATED_ERROR_RECOVERY_PROMPT)
+        self.assertIn("corrected arguments", executor.REPEATED_ERROR_RECOVERY_PROMPT)
+
+    def test_research_recovery_tells_stalled_agent_to_use_external_evidence(self):
+        self.assertIn("Research recovery", executor.RESEARCH_RECOVERY_PROMPT)
+        self.assertIn("search", executor.RESEARCH_RECOVERY_PROMPT)
+        self.assertIn("release notes", executor.RESEARCH_RECOVERY_PROMPT)
+        self.assertIn("upstream issue", executor.RESEARCH_RECOVERY_PROMPT)
+        self.assertIn("Do not install or upgrade packages", executor.RESEARCH_RECOVERY_PROMPT)
+
+
     def test_basic_input_fallback_remains_usable(self):
         repl = ReplInput.__new__(ReplInput)
         repl._session = None
@@ -285,6 +417,11 @@ class ReplRegressionTests(unittest.TestCase):
         basic_input.assert_called_once_with("> ")
 
     def test_enhanced_input_falls_back_to_memory_when_history_is_read_only(self):
+        if repl_input_module.PromptSession is None:
+            repl = ReplInput(Path("/read-only/history"), lambda: "")
+            self.assertFalse(repl.enhanced)
+            self.assertFalse(repl.persistent_history)
+            return
         with patch.object(Path, "open", side_effect=OSError("read only")):
             repl = ReplInput(Path("/read-only/history"), lambda: "")
         self.assertTrue(repl.enhanced)
@@ -302,7 +439,7 @@ class ReplRegressionTests(unittest.TestCase):
             pass
         self.assertEqual(target.getvalue(), "")
 
-    def test_cli_greeting_skips_discovery_and_uses_fast_model(self):
+    def test_cli_greeting_skips_discovery_and_preserves_primary(self):
         client = MagicMock()
         client.chat.return_value = {
             "response": "Hello",
@@ -327,7 +464,7 @@ class ReplRegressionTests(unittest.TestCase):
             patch.object(cli_agent, "load_session", return_value=session),
             patch.object(cli_agent, "get_state", return_value=state),
             patch.object(cli_agent, "TriForceClient", return_value=client),
-            patch.object(cli_agent, "load_tools") as discover,
+            patch("aicoder.agent_runtime.load_tools") as discover,
             patch.object(cli_agent, "print_header"),
             patch.object(cli_agent, "print_task"),
             patch.object(cli_agent, "print_final"),
@@ -336,8 +473,8 @@ class ReplRegressionTests(unittest.TestCase):
             result = cli_agent.run_agent("hi", "anthropic/slow", "ollama/fast")
         self.assertEqual(result, 0)
         discover.assert_not_called()
-        self.assertEqual(client.chat.call_args.kwargs["model"], "ollama/fast")
-        self.assertIsNone(client.chat.call_args.kwargs["fallback_model"])
+        self.assertEqual(client.chat.call_args.kwargs["model"], "anthropic/slow")
+        self.assertEqual(client.chat.call_args.kwargs["fallback_model"], "ollama/fast")
         self.assertIsNone(client.chat.call_args.kwargs["tools"])
 
     def test_repl_conversation_is_reused_and_action_gets_one_tool_nudge(self):
@@ -355,6 +492,7 @@ class ReplRegressionTests(unittest.TestCase):
             "tool_mode": "always",
             "enabled_tools": None,
             "request_timeout": 30,
+            "runtime_mode": "classic",
         }
         session = Session(
             base_url="https://example.invalid",
@@ -372,8 +510,8 @@ class ReplRegressionTests(unittest.TestCase):
             patch.object(cli_agent, "load_session", return_value=session),
             patch.object(cli_agent, "get_state", return_value=state),
             patch.object(cli_agent, "TriForceClient", return_value=client),
-            patch.object(cli_agent, "load_tools", return_value=[executor.LOCAL_FILE_TREE_SCHEMA]),
-            patch.object(cli_agent, "run_tool", return_value=("documents", False)) as execute,
+            patch("aicoder.agent_runtime.load_tools", return_value=[executor.LOCAL_FILE_TREE_SCHEMA]),
+            patch("aicoder.agent_runtime.run_tool", return_value=("documents", False)) as execute,
             patch.object(cli_agent, "print_header"),
             patch.object(cli_agent, "print_task"),
             patch.object(cli_agent, "print_thought"),
@@ -400,7 +538,8 @@ class ReplRegressionTests(unittest.TestCase):
             "response": '<tool_call>{"name":"health","arguments":{}}</tool_call>',
             "model": "operator",
         }
-        client.chat.side_effect = [repeated.copy() for _ in range(6)] + [
+        client.chat.side_effect = [
+            repeated.copy(), repeated.copy(), repeated.copy(),
             {"response": "DONE: recovered", "model": "fallback"},
         ]
         worker = _AgentWorker(
@@ -409,11 +548,11 @@ class ReplRegressionTests(unittest.TestCase):
             "operator", "fallback", [{"name": "health", "inputSchema": {}}], "simple",
             load_tools_on_start=True,
         )
-        with patch("aicoder.gui.chat_widget.run_tool", return_value=("same result", False)):
+        with patch("aicoder.agent_runtime.run_tool", return_value=("same result", False)):
             worker.run()
-        self.assertEqual(client.chat.call_count, 7)
-        self.assertEqual(client.chat.call_args_list[6].kwargs["model"], "fallback")
-        self.assertIsNone(client.chat.call_args_list[6].kwargs["fallback_model"])
+        self.assertEqual(client.chat.call_count, 4)
+        self.assertEqual(client.chat.call_args_list[3].kwargs["model"], "fallback")
+        self.assertIsNone(client.chat.call_args_list[3].kwargs["fallback_model"])
 
 
 class PrivilegeBrokerTests(unittest.TestCase):
@@ -451,65 +590,112 @@ class PrivilegeBrokerTests(unittest.TestCase):
         self.assertIn("requires explicit approval", result)
         audit_log.assert_called_once()
 
-    def test_sudo_redirect_runs_inside_elevated_shell(self):
-        completed = MagicMock(returncode=0, stdout="", stderr="")
-        with patch.object(executor.subprocess, "run", return_value=completed) as run:
-            result, is_error = executor.run_local_exec({
-                "command": "printf enabled > /etc/aicoder.conf",
-                "sudo": True,
-            })
-        self.assertFalse(is_error)
-        self.assertEqual(result, "(no output)")
-        self.assertEqual(
-            run.call_args.args[0],
-            ["sudo", "--", "sh", "-c", "printf enabled > /etc/aicoder.conf"],
-        )
-        self.assertFalse(run.call_args.kwargs["shell"])
+    def test_mutating_mcp_tool_is_blocked_without_approval_callback(self):
+        client = MagicMock()
+        with patch.object(executor.audit, "log_tool") as audit_log:
+            result, is_error = executor.run_tool(
+                client, "code_patch", {"patch": "--- a/x\n+++ b/x\n"}
+            )
+        self.assertTrue(is_error)
+        self.assertIn("requires explicit approval", result)
+        client.mcp_call.assert_not_called()
+        audit_log.assert_called_once()
 
-    def test_shell_free_local_command_expands_home_paths(self):
-        completed = MagicMock(returncode=0, stdout="ok\n", stderr="")
-        with patch.object(executor.subprocess, "run", return_value=completed) as run:
-            result, is_error = executor.run_local_exec({
-                "command": "ls -la ~/Documents",
-                "cwd": "~/",
-            })
+    def test_mutating_mcp_tool_runs_after_local_approval(self):
+        client = MagicMock()
+        client.mcp_call.return_value = {
+            "result": {"content": [{"type": "text", "text": "patched"}]}
+        }
+        approval = MagicMock(return_value=True)
+        with patch.object(executor.audit, "log_tool"):
+            result, is_error = executor.run_tool(
+                client, "code_patch", {"patch": "--- a/x\n+++ b/x\n"},
+                approval_fn=approval,
+            )
         self.assertFalse(is_error)
-        self.assertEqual(result, "ok\n")
-        self.assertEqual(
-            run.call_args.args[0],
-            ["ls", "-la", os.path.expanduser("~/Documents")],
-        )
-        self.assertEqual(run.call_args.kwargs["cwd"], os.path.expanduser("~/"))
-        self.assertFalse(run.call_args.kwargs["shell"])
+        self.assertEqual(result, "patched")
+        approval.assert_called_once()
+        client.mcp_call.assert_called_once()
 
-    def test_cli_sudo_approval_validates_locally_after_consent(self):
+    def test_cli_sudo_request_requires_manual_yes(self):
         args = {
             "command": "install -m 644 app.conf /etc/app.conf",
             "sudo": True,
             "reason": "Installiere die bestätigte Konfiguration",
         }
         with (
-            patch("builtins.input", return_value="j"),
-            patch.object(cli_agent, "validate_sudo_session", return_value=(True, "ok")) as validate,
+            patch("builtins.input", return_value="y") as prompt,
+            patch("aicoder.agent.PrivilegeBroker.authenticate_terminal", return_value=(True, "ok")) as auth,
             contextlib.redirect_stdout(io.StringIO()),
             contextlib.redirect_stderr(io.StringIO()),
         ):
             self.assertTrue(cli_agent._cli_approval("file_edit", args))
-        validate.assert_called_once_with()
+        prompt.assert_called_once()
+        auth.assert_called_once()
+        self.assertEqual(args.get("_elevation_strategy"), "sudo")
 
-    def test_cli_rejects_unexplained_elevation_request(self):
+    def test_cli_elevation_request_can_be_rejected(self):
         with (
-            patch("builtins.input") as prompt,
-            patch.object(cli_agent, "validate_sudo_session") as validate,
+            patch("builtins.input", return_value="n") as prompt,
             contextlib.redirect_stderr(io.StringIO()),
         ):
             allowed = cli_agent._cli_approval(
                 "local_exec", {"command": "apt update", "sudo": True}
             )
         self.assertFalse(allowed)
-        prompt.assert_not_called()
-        validate.assert_not_called()
+        prompt.assert_called_once()
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ToolSecurityHardeningTests(unittest.TestCase):
+    def test_namespaced_mutating_tool_requires_approval(self):
+        for name in ("mcp.code_edit", "server/code_patch", "plugin:memory_clear"):
+            with self.subTest(name=name):
+                self.assertTrue(assess_execution(name, {}).needs_approval)
+
+    def test_dynamic_mutating_hint_requires_approval(self):
+        self.assertTrue(assess_execution("future_tool", {"_mutating": True}).needs_approval)
+        self.assertFalse(assess_execution("future_tool", {"_mutating": False}).needs_approval)
+
+    def test_tool_cache_is_scoped_per_authenticated_client(self):
+        class FakeClient:
+            def __init__(self, base_url, token, tool_name):
+                self.base_url = base_url
+                self.token = token
+                self.tool_name = tool_name
+                self.calls = 0
+
+            def _request(self, *args, **kwargs):
+                self.calls += 1
+                return {"result": {"tools": [{
+                    "name": self.tool_name,
+                    "description": "test",
+                    "inputSchema": {"type": "object", "properties": {}},
+                }]}}
+
+        saved = (
+            executor.AGENT_TOOLS, executor._tool_cache, executor._tool_cache_ts,
+            executor._tool_cache_key, executor._tool_security_hints,
+        )
+        try:
+            executor.AGENT_TOOLS = {"health", "status"}
+            executor._tool_cache = None
+            executor._tool_cache_ts = 0
+            executor._tool_cache_key = None
+            executor._tool_security_hints = {}
+            first = FakeClient("https://one.invalid", "token-a", "health")
+            second = FakeClient("https://one.invalid", "token-b", "status")
+            first_tools = executor.load_tools(first)
+            second_tools = executor.load_tools(second)
+            self.assertIn("health", {tool["name"] for tool in first_tools})
+            self.assertIn("status", {tool["name"] for tool in second_tools})
+            self.assertEqual(first.calls, 1)
+            self.assertEqual(second.calls, 1)
+        finally:
+            (
+                executor.AGENT_TOOLS, executor._tool_cache, executor._tool_cache_ts,
+                executor._tool_cache_key, executor._tool_security_hints,
+            ) = saved

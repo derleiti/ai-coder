@@ -5,7 +5,7 @@
 ### Auth
 
 ```bash
-aicoder login [--base-url URL] [--email EMAIL] [--password PASS]
+aicoder login [--base-url URL] [--email EMAIL]
 aicoder logout
 aicoder whoami          # Token-Payload anzeigen
 aicoder handshake       # Tools-Liste (ungefiltert)
@@ -74,9 +74,9 @@ aicoder models                    # alle verfügbaren Modelle
 aicoder models --filter groq      # gefiltert
 aicoder models --json             # als JSON
 
-aicoder mcp-list                  # alle MCP-Tools tabellarisch
+aicoder mcp-list                  # Coding-allowlisted MCP-Tools
 aicoder mcp health                # MCP health check
-aicoder mcp <tool> [key=val ...]  # beliebiger MCP-Tool-Call
+aicoder mcp <tool> [key=val ...]  # erlaubter MCP-Tool-Call + zentrale Policy
 ```
 
 ### History
@@ -104,8 +104,6 @@ hist        status-demo
 | Modus | Verhalten |
 |---|---|
 | `off` | Kein Swarm (default) |
-| `auto` | Swarm-Spinner bei MCP-Calls |
-| `on` | Swarm-Spinner immer |
-| `review` | Hive-Spinner |
-
-Echter paralleler Swarm-Call: V3 (siehe docs/swarm.md).
+| `auto` | Advisor bei als komplex erkannten Aufgaben |
+| `on` | Operator primär, separates Modell beratend |
+| `review` | Operator zuerst, anschließend echtes Output-Review |

@@ -1,52 +1,31 @@
 # Backend-Scope — ai-coder
 
-## Problem
-
-Aktuell: Login über `/v1/auth/login` ergibt ein allgemeines Token.  
-`/v1/auth/client/handshake` gibt alle Tools für die User-Rolle zurück.  
-ai-coder bekommt damit zu viele Tools — inkl. Admin/Ops-Rechte.
-
 ## Ziel
 
-ai-coder soll einen eigenen eingeschränkten Scope haben:
+AICoder ist ein allgemeiner Operator für Coding, Entwicklung, DevOps, System- und Infrastrukturaufgaben. Das Profil `ai-coder` dient der Identifikation, Telemetrie und kompatiblen Tool-Auslieferung — nicht als zusätzliche Coding-only-Berechtigungsstufe.
 
-**Erlaubt:**
-- code_read, code_search, code_tree, code_edit
-- dev_analyze, dev_debug, dev_lint, dev_refactor, dev_summarize
-- file_ops (read/list/find — kein shell-write ohne Review)
-- search, fetch, web_search
-- memory_search, memory_store (user-scoped)
-- git_ops (read: status, log, diff — kein push)
+## Autorisierung
 
-**Verboten:** alle Ops/Admin/Infra-Tools (siehe security.md)
+Die tatsächliche Berechtigung kommt vom angemeldeten TriForce-Konto und dessen serverseitigem RBAC/Tier. Der Client darf keine Rechte erfinden oder einen Backend-Deny umgehen, soll aber auch keine vom Backend legitim angebotenen Operator-Tools pauschal nach Namen herausfiltern.
 
-## Mögliche Umsetzung im Backend
+Das bedeutet:
 
-### Option A: User-Agent basiert
+- Backend-RBAC entscheidet, welche Fähigkeiten der Account grundsätzlich besitzt.
+- Der Backend-Toolkatalog beschreibt, welche Fähigkeiten in dieser Session angeboten werden.
+- AICoder wendet darauf lokale Risiko-, Workspace-, Approval- und PrivilegeBroker-Regeln an.
+- `shell`, `binary_exec` und `task_runner` bleiben lokale AICoder-Fähigkeiten und werden nicht über MCP an einen Server umgeleitet.
+- Elevation bleibt immer lokale Benutzerentscheidung und lokale Authentifizierung.
 
-TriForce erkennt `User-Agent: ai-coder/...` und wendet ein Coding-Profil an.
+## Sicherheitsgrenzen
 
-Wo: `routes/mcp.py` oder `auth/handshake`-Handler  
-Logik: wenn `user_agent.startswith("ai-coder")` → `tool_filter = CODING_SCOPE`
+Die Sicherheitsgrenze ist nicht `coding vs. admin`, sondern die Wirkung einer Aktion:
 
-### Option B: client_profile im Token
+- read-only Diagnose
+- Mutation
+- Workspace-Escape
+- Elevation
+- destruktive Aktion
+- Security-Änderung
+- sensible Daten / externe Kommunikation
 
-Login-Request mit `{"client_profile": "ai_coder"}`.  
-Backend legt beim JWT-Signing das Profil fest.  
-Handshake gibt nur Coding-Tools zurück.
-
-Wo: `routes/auth.py` login-Handler + JWT-Payload + handshake-Handler
-
-### Option C: Separates API-Key-Profil
-
-Eigenes API-Key-Tier `ai_coder` in `config/users.json` oder RBAC.
-
-### Empfehlung
-
-Option A ist schnell umsetzbar ohne Breaking Changes.  
-Option B ist sauberer für Multi-Client-Szenarien.
-
-## Status
-
-Noch nicht umgesetzt. ai-coder muss aktuell selbst darauf achten,  
-keine Admin-Tools aufzurufen (durch AGENTS.md-Regeln).
+Neue Backend-Fähigkeiten sollen anhand dieser Eigenschaften klassifiziert werden, nicht durch pauschale Namensverbote.

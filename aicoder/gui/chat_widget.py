@@ -23,30 +23,32 @@ from PyQt6.QtGui import (
 )
 
 from ..config import load_session
-from ..privileges import assess_execution, format_request
-from ..session_state import get_state
-from ..client import TriForceClient, ClientError
+from ..privileges import (
+    PrivilegeBroker, assess_execution, format_request,
+)
+from ..session_state import DEFAULT_RUNTIME_MODE, get_state
+from ..workspace import active_workspace
+from ..client import TriForceClient
 from .. import chat_history
 from ..executor import (
-    AGENT_CHECKPOINT_INTERVAL, STALL_FALLBACK_REPEATS, STALL_NUDGE_REPEATS,
-    STALL_RECOVERY_PROMPT, AgentLoopGuard, agent_checkpoint,
-    load_tools, build_system_prompt, build_tool_desc,
-    normalize_tool_calls, parse_tool_calls, strip_tool_calls, trim_messages, run_tool,
-    is_destructive, is_simple_chat_message, MAX_ITERATIONS,
+    build_system_prompt, is_destructive, is_short_confirmation, is_simple_chat_message, should_load_tools,
 )
 
 
 class _AgentWorker(QThread):
     """Background thread: agent loop with approval support and stop."""
     msg = pyqtSignal(str, str, str)          # (role, text, meta)
+    activity = pyqtSignal(str)
     finished = pyqtSignal(str, str)           # (final_text, model)
     error = pyqtSignal(str)
     messages_updated = pyqtSignal(list)
-    approval_needed = pyqtSignal(str, str, bool, str)  # tool, command, elevation, reason
+    approval_needed = pyqtSignal(str, object)  # tool, complete approval arguments
 
     def __init__(
         self, client, messages_array, model, fallback, tools, system_prompt,
         load_tools_on_start=True, enabled_tool_names=None, quick_chat=False,
+        tools_unavailable_reason="", progressive_tool_disclosure=True,
+        session_id="", evidence_context="",
     ):
         super().__init__()
         self.client = client
@@ -58,215 +60,255 @@ class _AgentWorker(QThread):
         self.load_tools_on_start = load_tools_on_start
         self.enabled_tool_names = enabled_tool_names
         self.quick_chat = quick_chat
+        self.tools_unavailable_reason = str(tools_unavailable_reason or "")
+        self.progressive_tool_disclosure = bool(progressive_tool_disclosure)
+        self.session_id = str(session_id or "")
+        self.evidence_context = str(evidence_context or "")
         # Approval mechanism: threading.Event + result flag
         self._approval_event = threading.Event()
         self._approval_result = False
+        self._approval_strategy = ""
         self._stopped = False
 
     def stop(self):
         """Request stop from main thread."""
         self._stopped = True
 
-    def set_approval(self, approved: bool):
+    def set_approval(self, approved: bool, strategy: str = ""):
         """Called from main thread after user decision."""
         self._approval_result = approved
+        self._approval_strategy = str(strategy or "")
         self._approval_event.set()
 
     def _gui_approval(self, tool_name: str, args: dict) -> bool:
-        """Approval callback for risky writes; elevation stays terminal-only."""
-        cmd = args.get("command", "")
-        risk = assess_execution(tool_name, args, destructive=is_destructive(cmd))
-        # Emit signal to main thread, then wait
+        """Approval callback for risky workspace writes."""
+        approval_args = dict(args)
+        # Preserve the complete, security-enriched argument map. Structured MCP
+        # writes often have no command string; dropping metadata here made the
+        # GUI dialog misclassify or hide the requested operation.
         self._approval_event.clear()
         self._approval_result = False
-        self.approval_needed.emit(tool_name, cmd, risk.elevation, risk.user_reason)
+        self._approval_strategy = ""
+        self.approval_needed.emit(tool_name, approval_args)
         # Poll every 2s so stop() is respected during pending approval
         for _ in range(60):  # max 120s total
             if self._approval_event.wait(timeout=2):
                 break
             if self._stopped:
                 return False  # Agent stopped — reject command
+        if self._approval_result and self._approval_strategy:
+            args["_elevation_strategy"] = self._approval_strategy
         return self._approval_result
 
+    def _emit_advisor_review(self, original_request: str, response: str, operator_model: str) -> None:
+        """Run the configured swarm as a non-executing post-response advisor."""
+        from ..session_state import get_state
+        from ..swarm_runner import should_auto_swarm
+
+        state = get_state()
+        mode = state.get("swarm_mode", "off")
+        if mode == "auto" and not should_auto_swarm(original_request):
+            return
+        if mode not in {"auto", "on", "review"}:
+            return
+        advisor = self.fallback
+        if not advisor or advisor == operator_model:
+            return
+        prompt = (
+            "Act only as an advisor. Review the operator response for bugs, security "
+            "risks, missing verification, and conflicts with the request. Do not call "
+            "tools.\n\n"
+            f"Request:\n{original_request[:4000]}\n\n"
+            f"Operator response:\n{response[:12000]}"
+        )
+        try:
+            result = self.client.chat(
+                message=prompt, model=advisor, system_prompt=self.system,
+                temperature=0.2, max_tokens=2048,
+            )
+            review = str(result.get("response", "") or "").strip()
+            if review:
+                self.msg.emit("system", review, f"Swarm review · {result.get('model', advisor)}")
+        except Exception as exc:
+            self.msg.emit("system", f"Swarm review unavailable: {exc}", "advisor")
+
     def run(self):
-        messages = self.messages
-        model_used = self.model or "default"
-        active_model = self.model
-        active_fallback = self.fallback
-        loop_guard = AgentLoopGuard()
-        MAX_CTX = 30
-
-        # None means undiscovered; [] is an intentional no-tools run.
-        if self.load_tools_on_start and self.tools is None:
+        # GUI-Resilienz: in PyQt6 killt eine unbehandelte Exception in einer
+        # QThread.run()-Reimplementation den ganzen Prozess (stiller GUI-Abbruch).
+        # Die REPL ueberlebt dieselben Fehler, weil sie im Main-Thread unter
+        # hoeheren except-Handlern laeuft. Dasselbe Sicherheitsnetz hier:
+        try:
+            self._run_impl()
+        except Exception as e:  # bewusster catch-all: Thread darf nie ungebremst sterben
+            import traceback
             try:
-                tool_started = time.monotonic()
-                self.tools = load_tools(self.client)
-                if self.enabled_tool_names is not None:
-                    enabled = set(self.enabled_tool_names)
-                    self.tools = [tool for tool in self.tools if tool.get("name") in enabled]
-                from ..session_state import get_state
-                state = get_state()
-                self.system = build_system_prompt(
-                    self.tools,
-                    state.get("workspace_root"),
+                self.error.emit(f"Agent crashed: {e}\n{traceback.format_exc()}")
+            except Exception:
+                pass
+
+    def _run_shared_runtime_impl(self, *, persistent_plan: bool):
+        from ..agent_runtime import NativeLightRuntime
+
+        state = get_state()
+        runtime_label = "native-light" if persistent_plan else "classic"
+        messages = list(self.messages)
+        latest_user_index = next(
+            (index for index in range(len(messages) - 1, -1, -1) if messages[index].get("role") == "user"),
+            None,
+        )
+        if latest_user_index is None:
+            self.error.emit(f"{runtime_label} runtime: no user message to execute")
+            return
+        initial_prompt = str(messages[latest_user_index].get("content") or "")
+        prior = [
+            dict(message) for message in messages[1:latest_user_index]
+            if message.get("role") != "system"
+        ]
+        if self.evidence_context:
+            prior.append({"role": "assistant", "content": self.evidence_context})
+        base_timeout = int(state.get("request_timeout", getattr(self.client, "timeout", 300)))
+        active_plan_id = ""
+
+        def on_event(kind: str, payload: dict):
+            nonlocal active_plan_id
+            if kind == "tools_ready":
+                self.msg.emit(
+                    "system",
+                    f"{int(payload.get('count') or 0)} tools ready in {float(payload.get('elapsed') or 0.0):.2f}s",
+                    runtime_label,
                 )
-                if messages and messages[0].get("role") == "system":
-                    messages[0]["content"] = self.system
-                elapsed = time.monotonic() - tool_started
-                self.msg.emit("system", f"{len(self.tools)} tools ready in {elapsed:.2f}s", "")
-            except Exception as e:
-                self.msg.emit("error", f"Tool-Loading: {e}", "")
-                self.tools = []
-                self.system = (
-                    "Du bist ai-coder, autonomer Coding- und DevOps-Agent auf AILinux/TriForce (api.ailinux.me). "
-                    "INIT: current_time pruefen, memory_search, dann handeln. "
-                    "Lesen vor Schreiben. Diagnose vor Patch. Kleinste Aenderung zuerst. Sprache: Deutsch."
-                )
-        elif self.tools is None:
-            self.tools = []
-
-        if not self.system:
-            from ..session_state import get_state
-            self.system = build_system_prompt(self.tools, get_state().get("workspace_root"))
-        if messages and messages[0].get("role") == "system":
-            messages[0]["content"] = self.system
-
-        for i in range(MAX_ITERATIONS):
-            if self._stopped:
-                self.finished.emit("(Agent stopped)", model_used)
-                return
-
-            messages = trim_messages(messages)
-
-            try:
-                model_started = time.monotonic()
-                result = self.client.chat(
-                    messages=messages,
-                    model=active_model or None,
-                    fallback_model=active_fallback or None,
-                    temperature=0.3,
-                    max_tokens=256 if self.quick_chat else 4096,
-                    tools=self.tools if self.load_tools_on_start else None,
-                    tool_choice="auto",
-                )
-            except (ClientError, Exception) as e:
-                self.error.emit(str(e))
-                return
-
-            response = result.get("response", "").strip()
-            model_used = result.get("model", self.model or "default")
-            model_elapsed = time.monotonic() - model_started
-            requested = active_model or "default"
-            route = model_used if model_used == requested else f"{requested} → {model_used}"
-            self.msg.emit("system", f"Model response in {model_elapsed:.1f}s", route)
-
-            native_calls = normalize_tool_calls(result.get("tool_calls") or [])
-            calls = native_calls + [
-                call for call in parse_tool_calls(response)
-                if call not in native_calls
-            ]
-            if native_calls and not response:
-                response = "\n".join(
-                    f"<tool_call>{json.dumps(call, ensure_ascii=False)}</tool_call>"
-                    for call in native_calls
-                )
-            visible = strip_tool_calls(response)
-
-            if not calls:
-                messages.append({"role": "assistant", "content": response})
-                self.messages_updated.emit(messages)
-                self.finished.emit(response, model_used)
-                return
-
-            if visible:
-                self.msg.emit("thought", visible, f"step {i+1}")
-
-            # Tool execution
-            tool_results = []
-            allowed_tools = {tool.get("name") for tool in self.tools}
-            for call in calls:
-                if self._stopped:
-                    self.messages_updated.emit(messages)
-                    self.finished.emit("(Agent stopped)", model_used)
-                    return
-
-                tname = call.get("name", "?")
-                targs = call.get("arguments", {})
-                self.msg.emit("tool", f">> {tname}({json.dumps(targs, ensure_ascii=False)[:200]})", "")
-
-                if tname not in allowed_tools:
-                    tr = f"Tool '{tname}' is disabled for this run. Enable it in Settings > Tools."
-                    self.msg.emit("tool_result", tr, f"{tname} BLOCKED")
-                    tool_results.append(f"Tool {tname} result:\n{tr}")
-                    continue
-
-                t0 = time.time()
-                tr, is_err = run_tool(
-                    self.client, tname, targs,
-                    approval_fn=self._gui_approval,
-                    model=model_used,
-                    iteration=i,
-                )
-                elapsed = time.time() - t0
-
-                status = f"{'ERROR' if is_err else 'OK'} ({elapsed:.1f}s)"
-                self.msg.emit("tool_result", tr[:2000], f"{tname} {status}")
-                tool_results.append(f"Tool {tname} result:\n{tr}")
-
-            repeats = loop_guard.observe(calls, tool_results)
-            if repeats == STALL_NUDGE_REPEATS:
-                tool_results.append(STALL_RECOVERY_PROMPT)
-
-            if repeats >= STALL_FALLBACK_REPEATS:
-                if active_fallback and active_fallback != model_used:
+            elif kind == "run_start":
+                configured = str(payload.get("configured_model") or payload.get("model") or "default")
+                effective = str(payload.get("effective_model") or payload.get("model") or configured)
+                fallback = str(payload.get("fallback") or "")
+                route = configured if configured == effective else f"{configured} → {effective}"
+                detail = f"effective={route}"
+                if fallback:
+                    detail += f" · fallback={fallback}"
+                detail += f" · transport={payload.get('transport') or 'default'}"
+                self.msg.emit("system", "Run route", detail)
+                if bool(payload.get("resumed")):
                     self.msg.emit(
                         "system",
-                        "Repeated tool loop detected; switching to fallback model.",
-                        f"{model_used} → {active_fallback}",
+                        "Resume safety",
+                        "Raw tool evidence is not restored · fresh inspection required before mutation",
                     )
-                    tool_results.append(
-                        f"Loop recovery: switch to {active_fallback} and continue with "
-                        "a different approach. Do not repeat the prior call."
+            elif kind == "model_without_tool_support":
+                _msg = (
+                    f"{payload.get('model') or '?'} meldet kein natives Function Calling — "
+                    "AICoder verwendet weiterhin textbasiertes Tool-Calling; "
+                    "native Provider-Toolschemas werden nicht gesendet."
+                )
+                self.msg.emit("system", _msg, runtime_label)
+            elif kind == "plan":
+                plan = payload.get("plan")
+                plan_id = getattr(plan, "id", "")
+                action = str(payload.get("action") or "plan")
+                if plan_id:
+                    active_plan_id = str(plan_id)
+                    self.msg.emit("system", f"Persistent plan {action}: {plan_id}", runtime_label)
+            elif kind == "model_start":
+                phase = str(payload.get("phase") or "planning")
+                model_name = str(payload.get("model") or self.model or "backend")
+                self.activity.emit(f"Waiting for model · {model_name} · {phase} · idle timeout {int(payload.get('timeout') or 0)}s")
+            elif kind == "model_response":
+                requested = str(payload.get("requested") or "default")
+                used = str(payload.get("model") or requested)
+                route = used if used == requested else f"{requested} → {used}"
+                telemetry = payload.get("transport_telemetry") if isinstance(payload.get("transport_telemetry"), dict) else {}
+                meta = route
+                request_id = str(payload.get("request_id") or telemetry.get("request_id") or "")
+                if request_id:
+                    meta += f" · req {request_id[-8:]}"
+                if telemetry:
+                    meta += (
+                        f" · transport {float(telemetry.get('elapsed_s') or 0.0):.1f}s"
+                        f" · {int(telemetry.get('chunks') or 0)} chunks"
+                        f" · max gap {float(telemetry.get('max_rx_gap_s') or 0.0):.1f}s"
                     )
-                    active_model = active_fallback
-                    active_fallback = ""
-                    loop_guard.reset()
-                else:
-                    pause = (
-                        "Agent paused because the same tool operation kept repeating "
-                        "without progress. The conversation is preserved; send "
-                        "'continue' to resume with a different approach."
-                    )
-                    messages.append({"role": "assistant", "content": response})
-                    messages.append({"role": "user", "content": "\n\n".join(tool_results)})
-                    self.messages_updated.emit(messages)
-                    self.finished.emit(pause, model_used)
-                    return
+                self.msg.emit(
+                    "system", f"Model response in {float(payload.get('elapsed_ms') or 0) / 1000.0:.1f}s", meta
+                )
+            elif kind == "thought":
+                self.msg.emit("thought", str(payload.get("text") or ""), f"step {payload.get('iteration', '?')}")
+            elif kind == "tool_call":
+                name = str(payload.get("name") or "?")
+                self.activity.emit(f"Running tool · {name}")
+                args = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
+                self.msg.emit("tool", f">> {name}({json.dumps(args, ensure_ascii=False)[:200]})", "")
+            elif kind == "tool_result":
+                name = str(payload.get("name") or "?")
+                result = str(payload.get("result") or "")
+                is_error = bool(payload.get("is_error"))
+                evidence_status = "blocked" if is_error and "blocked" in result.lower() else ("error" if is_error else "ok")
+                if self.session_id:
+                    try:
+                        chat_history.save_tool_event(
+                            self.session_id, name, evidence_status,
+                            iteration=int(payload.get("iteration") or 0),
+                            plan_id=active_plan_id,
+                        )
+                    except Exception:
+                        pass
+                status = f"{'ERROR' if is_error else 'OK'} ({float(payload.get('elapsed') or 0.0):.1f}s)"
+                self.activity.emit(f"Tool completed · {name} · {"ERROR" if is_error else "OK"}")
+                self.msg.emit("tool_result", result[:2000], f"{name} {status}")
+            elif kind == "loop_prevented":
+                self.activity.emit("Duplicate tool call blocked · waiting for corrected model action")
+                self.msg.emit(
+                    "system",
+                    "Duplicate tool call blocked before execution; asking the model to continue from the existing result.",
+                    f"repeat {int(payload.get('repeats') or 0)}",
+                )
+            elif kind == "model_switch":
+                self.msg.emit(
+                    "system", "Repeated tool loop detected; switching fallback model.",
+                    f"{payload.get('previous', '?')} → {payload.get('model', '?')}",
+                )
 
-            if (i + 1) % AGENT_CHECKPOINT_INTERVAL == 0:
-                tool_results.append(agent_checkpoint(i + 1))
-
-            messages.append({"role": "assistant", "content": response})
-            current_input = "\n\n".join(tool_results)
-            messages.append({"role": "user", "content": current_input})
-
-            if "DONE:" in response[:200].upper():
-                self.messages_updated.emit(messages)
-                self.finished.emit(visible or response, model_used)
-                return
-
-        self.messages_updated.emit(messages)
-        self.finished.emit(
-            "Agent safety pause after an unusually long run. The conversation "
-            "is preserved; send 'continue' to resume.",
-            model_used,
+        resume_requested = persistent_plan and is_short_confirmation(initial_prompt)
+        runtime = NativeLightRuntime(
+            client=self.client,
+            initial_prompt=initial_prompt,
+            model=self.model or None,
+            fallback_model=self.fallback or None,
+            workspace_root=str(active_workspace(state.get("workspace_root"))),
+            tools=self.tools,
+            system_prompt=self.system,
+            conversation=prior,
+            load_tools_on_start=self.load_tools_on_start,
+            enabled_tool_names=self.enabled_tool_names,
+            quick_chat=self.quick_chat and not resume_requested,
+            approval_fn=self._gui_approval,
+            event_fn=on_event,
+            stop_requested=lambda: self._stopped,
+            persistent_plan=persistent_plan,
+            resume=resume_requested,
+            base_timeout=base_timeout,
+            max_output_tokens=int(state.get("max_output_tokens", 16384)),
+            tools_unavailable_reason=self.tools_unavailable_reason,
+            progressive_tool_disclosure=self.progressive_tool_disclosure,
+            native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
         )
+        result = runtime.run()
+        self.tools = result.tools
+        self.system = result.system_prompt
+        self.messages = result.messages
+        self.messages_updated.emit(result.messages)
+        if result.status == "failed":
+            self.error.emit(result.error or f"{runtime_label} runtime failed")
+            return
+        if result.status == "completed":
+            self._emit_advisor_review(initial_prompt, result.response, result.model)
+        self.finished.emit(result.response, result.model)
+
+    def _run_impl(self):
+        runtime_mode = get_state().get("runtime_mode", DEFAULT_RUNTIME_MODE)
+        self._run_shared_runtime_impl(persistent_plan=(runtime_mode == "native-light"))
 
 
 def _select_chat_route(model: str, fallback: str, quick_chat: bool):
-    """Use the configured fast fallback directly for greetings."""
-    if quick_chat and fallback and fallback != model:
-        return fallback, "", True
+    """Preserve the configured primary route; fallback means fallback."""
     return model, fallback, False
 
 
@@ -296,6 +338,8 @@ class ChatWidget(QWidget):
         self._system = None
         self._messages = []
         self._syncing = False
+        self._model_override_dirty = False
+        self._fallback_override_dirty = False
         self._session_id = None
         self._dropped_files = []
         self._activity_started = 0.0
@@ -324,8 +368,18 @@ class ChatWidget(QWidget):
         self._tools = None
         self._system = None
 
+    def _mark_model_override_dirty(self, *_args):
+        if not self._syncing:
+            self._model_override_dirty = True
+
+    def _mark_fallback_override_dirty(self, *_args):
+        if not self._syncing:
+            self._fallback_override_dirty = True
+
     def _on_models_updated(self, models: list):
-        """Update model dropdowns with list from backend."""
+        """Refresh model choices without clobbering manual Chat overrides."""
+        current_model = self.model_combo.currentText()
+        current_fallback = self.fallback_combo.currentText()
         self._syncing = True
         self.model_combo.clear()
         self.fallback_combo.clear()
@@ -334,17 +388,23 @@ class ChatWidget(QWidget):
         for m in models:
             self.model_combo.addItem(m)
             self.fallback_combo.addItem(m)
-        # Sync selection from settings (if user hasn't overridden)
-        if self.settings_ref:
+        if self._model_override_dirty:
+            self.model_combo.setCurrentText(current_model)
+        elif self.settings_ref:
             self.model_combo.setCurrentText(self.settings_ref.get_current_model())
+        if self._fallback_override_dirty:
+            self.fallback_combo.setCurrentText(current_fallback)
+        elif self.settings_ref:
             self.fallback_combo.setCurrentText(self.settings_ref.get_current_fallback())
         self._syncing = False
 
     def _on_settings_selection_changed(self, model: str, fallback: str):
-        """Settings tab selection changed — sync chat tab."""
+        """Settings tab selection changed — explicitly resync Chat routing."""
         self._syncing = True
         self.model_combo.setCurrentText(model)
         self.fallback_combo.setCurrentText(fallback)
+        self._model_override_dirty = False
+        self._fallback_override_dirty = False
         self._syncing = False
 
     # ── Drag & Drop ──────────────────────────────────────────────
@@ -450,6 +510,8 @@ class ChatWidget(QWidget):
         self.model_combo.addItem("")  # Backend-Default (liste wird dynamisch geladen)
         self.model_combo.setCurrentText("")
         self.model_combo.setToolTip("Select model (empty = backend default)")
+        self.model_combo.lineEdit().textEdited.connect(self._mark_model_override_dirty)
+        self.model_combo.activated.connect(self._mark_model_override_dirty)
         model_row.addWidget(self.model_combo, stretch=1)
 
         fb_label = QLabel("Fallback:")
@@ -463,6 +525,8 @@ class ChatWidget(QWidget):
         self.fallback_combo.addItem("")  # (liste wird dynamisch geladen)
         self.fallback_combo.setCurrentText("")
         self.fallback_combo.setToolTip("Fallback model (optional)")
+        self.fallback_combo.lineEdit().textEdited.connect(self._mark_fallback_override_dirty)
+        self.fallback_combo.activated.connect(self._mark_fallback_override_dirty)
         model_row.addWidget(self.fallback_combo, stretch=1)
 
         layout.addLayout(model_row)
@@ -572,10 +636,8 @@ class ChatWidget(QWidget):
         except Exception:
             parts.append("not logged in")
         state = get_state()
-        ws = state.get("workspace_root")
-        if ws:
-            from pathlib import Path
-            parts.append(Path(ws).name)
+        ws = active_workspace(state.get("workspace_root"))
+        parts.append(ws.name or str(ws))
         if self._tools:
             parts.append(f"{len(self._tools)} Tools")
         if extra:
@@ -596,6 +658,11 @@ class ChatWidget(QWidget):
         self._activity_label = f"{route} · {'agent tools' if tools_enabled else 'chat'}"
         self._activity_timer.start()
         self._tick_activity()
+
+    def _on_worker_activity(self, label: str):
+        self._activity_label = str(label or "working")
+        if self._activity_timer.isActive():
+            self._tick_activity()
 
     def _tick_activity(self):
         frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -622,41 +689,93 @@ class ChatWidget(QWidget):
             self._activity_label = "stopping safely"
             self._append_msg("system", "Stop requested...", "")
 
-    def _on_approval_needed(self, tool_name: str, command: str, elevation: bool, reason: str):
-        """Show modal dialog for command approval (main thread)."""
-        preview = command if len(command) <= 300 else command[:300] + "…"
-        args = {"command": command}
-        if elevation:
-            args["sudo"] = True
-        if reason:
-            args["reason"] = reason
-        risk = assess_execution(tool_name, args, destructive=is_destructive(command))
-        if risk.elevation:
-            QMessageBox.warning(
-                self,
-                "Terminal authorization required",
-                format_request(risk) +
-                "\n\nErhöhte Rechte sind nur im interaktiven `aicoder agent`-REPL erlaubt. "
-                "Dadurch bleibt das sudo-Passwort vollständig im lokalen Terminal.",
-            )
-            if self._worker:
-                self._worker.set_approval(False)
-            return
+    @staticmethod
+    def _approval_preview(arguments: dict, limit: int = 1200) -> str:
+        """Render structured tool arguments without exposing common secrets."""
+        sensitive = {"token", "password", "secret", "api_key", "apikey", "authorization"}
 
-        title = "Delete local files?" if risk.deletion else "Allow local write?"
-        msg = format_request(risk) + "\n\nEinmal ausführen?"
-        reply = QMessageBox.question(
-            self, title, msg,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No if destructive else QMessageBox.StandardButton.Yes,
-        )
-        approved = reply == QMessageBox.StandardButton.Yes
-        if self._worker:
-            self._worker.set_approval(approved)
-        if not approved:
-            self._append_msg("system", f"Command rejected: {preview[:100]}", "")
+        def scrub(value):
+            if isinstance(value, dict):
+                return {
+                    str(key): ("<redacted>" if str(key).lower() in sensitive else scrub(item))
+                    for key, item in value.items()
+                    if not str(key).startswith("_")
+                }
+            if isinstance(value, list):
+                return [scrub(item) for item in value]
+            return value
+
+        try:
+            rendered = json.dumps(scrub(arguments), ensure_ascii=False, indent=2, default=str)
+        except Exception:
+            rendered = repr(arguments)
+        return rendered if len(rendered) <= limit else rendered[:limit] + "…"
+
+    def _on_approval_needed(self, tool_name: str, arguments: object):
+        """Apply policy and reply to the worker that actually requested approval."""
+        try:
+            sender = self.sender()
+        except RuntimeError:
+            sender = None
+        approval_worker = sender if isinstance(sender, _AgentWorker) else self._worker
+        args = dict(arguments) if isinstance(arguments, dict) else {}
+        command = str(args.get("command", "") or "")
+        risk = assess_execution(tool_name, args, destructive=is_destructive(command))
+        preview = self._approval_preview(args)
+        mode = get_state().get("approval_mode", "ask")
+        scope_target = str(args.get("_workspace_escape") or "")
+        scope_root = str(args.get("_workspace_root") or "")
+        decision = PrivilegeBroker.evaluate(mode, risk, workspace_escape=bool(scope_target), headless=False)
+        automatic = decision.automatic
+
+        if decision.requires_confirmation:
+            if scope_target:
+                title = "Leave active workspace — allow once?"
+            elif risk.deletion or risk.destructive:
+                title = "Destructive operation — allow once?"
+            elif risk.elevation:
+                title = "Root operation — authenticate and allow once?"
+            elif risk.security_change:
+                title = "Security setting change — allow once?"
+            elif risk.mutation:
+                title = "State-changing operation — allow once?"
+            else:
+                title = "Tool operation — allow once?"
+            scope = (
+                f"\n\nWorkspace boundary:\n  root: {scope_root}\n  target: {scope_target}"
+                if scope_target else ""
+            )
+            msg = format_request(risk) + scope + "\n\nTool arguments:\n" + preview + "\n\nEinmal ausführen?"
+            reply = QMessageBox.question(
+                self, title, msg,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                if approval_worker:
+                    approval_worker.set_approval(False)
+                self._append_msg("system", f"Tool rejected: {tool_name}", preview[:160])
+                return
+
+        strategy = ""
+        if risk.elevation:
+            available, why = PrivilegeBroker.gui_elevation_available()
+            if not available:
+                if approval_worker:
+                    approval_worker.set_approval(False)
+                self._append_msg("system", f"Elevation blocked: {tool_name}", why)
+                return
+            strategy = "pkexec"
+
+        if automatic:
+            self._append_msg("system", f"Auto-approved: {tool_name}", f"mode={mode}")
+        if approval_worker:
+            approval_worker.set_approval(True, strategy)
 
     def _send(self):
+        if self._worker and self._worker.isRunning():
+            self._append_msg("system", "Agent already running; duplicate send ignored.", "")
+            return
         text = self.input.toPlainText().strip()
         if not text:
             return
@@ -692,7 +811,11 @@ class ChatWidget(QWidget):
         if not fallback:
             fallback = state.get("fallback_model", "")
 
-        quick_chat = is_simple_chat_message(text)
+        resume_requested = (
+            state.get("runtime_mode", DEFAULT_RUNTIME_MODE) == "native-light"
+            and is_short_confirmation(text)
+        )
+        quick_chat = is_simple_chat_message(text) and not resume_requested
         model, fallback, fast_fallback = _select_chat_route(model, fallback, quick_chat)
         if fast_fallback:
             self._append_msg("system", f"Fast chat model · {model}", "")
@@ -701,24 +824,41 @@ class ChatWidget(QWidget):
         if self.settings_ref and hasattr(self.settings_ref, "get_tool_mode"):
             tool_mode = self.settings_ref.get_tool_mode()
             enabled_tool_names = self.settings_ref.get_enabled_tool_names()
-        should_load_tools = (
-            tool_mode == "always"
-            or (tool_mode == "on_demand" and not quick_chat)
-        ) and enabled_tool_names != []
-        self._start_activity(model, should_load_tools)
+        tools_requested = should_load_tools(tool_mode, text, resume=resume_requested)
+        should_load_tools_now = tools_requested and enabled_tool_names != []
+        tools_unavailable_reason = ""
+        if tools_requested and enabled_tool_names == []:
+            tools_unavailable_reason = (
+                "No tools are enabled. Open Settings, load the available tools, and select "
+                "the tools AICoder may use before running this task."
+            )
+        self._start_activity(model, should_load_tools_now)
 
-        if should_load_tools and self._tools is None:
-            self._append_msg("system", "Loading selected tools on demand...", "")
-        elif quick_chat and tool_mode != "always":
-            self._append_msg("system", "Fast chat · tools skipped", "")
+        if should_load_tools_now and self._tools is None:
+            self._append_msg("system", f"Loading selected tools · mode={tool_mode}", "")
+        elif not should_load_tools_now:
+            self._append_msg("system", "On demand · tools skipped for this prompt", "")
 
-        run_tools = self._tools if should_load_tools else []
-        run_system = self._system if should_load_tools else build_system_prompt(
-            [], state.get("workspace_root")
-        )
+        if should_load_tools_now:
+            # Rebuild the effective tool working set/system prompt for every run.
+            # load_tools() already has a per-account TTL cache, so this is cheap,
+            # while avoiding stale AGENTS.md, stale tool descriptions, or a system
+            # prompt inherited from a previous task. on_demand will additionally
+            # resolve a small capability working set inside NativeLightRuntime.
+            run_tools = None
+            run_system = None
+        else:
+            run_tools = []
+            run_system = build_system_prompt([], str(active_workspace(state.get("workspace_root"))))
 
         if not self._messages:
             self._messages = [{"role": "system", "content": run_system}]
+        elif self._messages[0].get("role") != "system":
+            # History rows intentionally persist only visible chat messages. Runtime
+            # conversation handling expects slot 0 to be the current system prompt.
+            self._messages.insert(0, {"role": "system", "content": run_system})
+        else:
+            self._messages[0] = {"role": "system", "content": run_system}
 
         # Attach dropped files as context
         user_content = text
@@ -736,18 +876,25 @@ class ChatWidget(QWidget):
             title = text[:50].strip() or "New Chat"
             self._session_id = chat_history.create_session(title=title)
         chat_history.save_message(self._session_id, "user", text)
+        evidence_context = chat_history.render_tool_evidence(self._session_id, limit=40)
 
         self._worker = _AgentWorker(
             client, self._messages, model, fallback, run_tools, run_system,
-            load_tools_on_start=should_load_tools,
+            load_tools_on_start=should_load_tools_now,
             enabled_tool_names=enabled_tool_names,
             quick_chat=quick_chat,
+            tools_unavailable_reason=tools_unavailable_reason,
+            progressive_tool_disclosure=(tool_mode == "on_demand"),
+            session_id=self._session_id, evidence_context=evidence_context,
         )
         self._worker.msg.connect(self._on_agent_msg)
         self._worker.finished.connect(self._on_response)
+        self._worker.activity.connect(self._on_worker_activity)
         self._worker.messages_updated.connect(self._on_messages_updated)
         self._worker.error.connect(self._on_error)
-        self._worker.approval_needed.connect(self._on_approval_needed)
+        self._worker.approval_needed.connect(
+            self._on_approval_needed, Qt.ConnectionType.QueuedConnection
+        )
         self._worker.start()
 
     def _on_agent_msg(self, role: str, text: str, meta: str):
@@ -756,7 +903,11 @@ class ChatWidget(QWidget):
     def _on_response(self, text: str, model_used: str):
         self._stop_activity()
         # Cache tools loaded by worker for next message
-        if self._worker and self._worker.load_tools_on_start and self._worker.tools is not None:
+        if (
+            self._worker and self._worker.load_tools_on_start
+            and not self._worker.progressive_tool_disclosure
+            and self._worker.tools is not None
+        ):
             self._tools = self._worker.tools
             self._system = self._worker.system
         self._append_msg("assistant", text, model_used)

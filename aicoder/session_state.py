@@ -1,109 +1,122 @@
+"""Backwards-compatible facade over the canonical settings registry.
+
+Every definition, default and validation rule now lives in ``aicoder.settings``.
+This module keeps the historical import surface working (13 call sites across
+CLI, GUI, REPL, executor and tests) so the migration to the registry does not
+have to happen in one commit.
+
+Prefer ``aicoder.settings`` in new code.
+"""
+
 from __future__ import annotations
-import json, os, threading
-from pathlib import Path
+
+import threading
 from typing import Any, Dict, Optional
 
-from .config import CONFIG_DIR
+from . import settings as _settings
+from .config import CONFIG_DIR, atomic_write_private  # noqa: F401 - patched by tests
+from .settings import (  # noqa: F401 - re-exported for existing importers
+    APPROVAL_MODES,
+    DEFAULT_FALLBACK_MODEL,
+    DEFAULT_RUNTIME_MODE,
+    RUNTIME_MODES,
+    SWARM_MODES,
+    TOOL_MODES,
+    migrate_enabled_tools,
+)
 
 STATE_FILE = CONFIG_DIR / "state.json"
 
-SWARM_MODES = {"off", "auto", "on", "review"}
-TOOL_MODES = {"off", "on_demand", "always"}
-DEFAULT_FALLBACK_MODEL = "ollama/llama3.2:latest"
+_DEFAULTS: Dict[str, Any] = dict(_settings.DEFAULTS)
 
-_DEFAULTS: Dict[str, Any] = {
-    "selected_model": None,
-    "fallback_model": DEFAULT_FALLBACK_MODEL,
-    "swarm_mode": "off",
-    "workspace_root": None,
-    # on_demand skips tool discovery for greetings/small talk, but keeps the
-    # full agent available for actual work.  None means "all discovered tools".
-    "tool_mode": "on_demand",
-    "enabled_tools": None,
-    "request_timeout": 30,
-}
+# Resolved lazily through the module global so ``patch.object(session_state,
+# "STATE_FILE", ...)`` keeps working: the store must never capture the path at
+# import time.
+_STORE = _settings.SettingsStore(lambda: STATE_FILE)
 
-# In-memory cache — vermeidet wiederholte Disk-Reads im Agent-Loop
+# Legacy cache mirrors. Tests set these to None to force a reload; the bridge in
+# _load_raw() turns that into a real store invalidation.
 _cache: Dict[str, Any] | None = None
-_lock = threading.Lock()  # thread-safe cache access (GUI + Worker threads)
+_cache_stamp: tuple[str, int, int] | None = None
+_lock = threading.Lock()
 
 
 def _load_raw() -> Dict[str, Any]:
-    global _cache
-    with _lock:
-        if _cache is not None:
-            return dict(_cache)
-        if not STATE_FILE.exists():
-            _cache = dict(_DEFAULTS)
-            return dict(_cache)
-        try:
-            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            # Migrate the old "unset" null value. An explicit empty string
-            # still means that the user intentionally disabled fallback.
-            if data.get("fallback_model") is None:
-                data["fallback_model"] = DEFAULT_FALLBACK_MODEL
-            _cache = {**_DEFAULTS, **data}
-            return dict(_cache)
-        except Exception:
-            _cache = dict(_DEFAULTS)
-            return dict(_cache)
+    global _cache, _cache_stamp
+    if _cache is None or _cache_stamp is None:
+        _STORE.invalidate()
+    data = _STORE.load()
+    data.pop("_schema_version", None)
+    data.pop("_recovered_from", None)
+    _cache = dict(data)
+    _cache_stamp = _STORE._stamp(_STORE.path)
+    return dict(data)
 
 
 def _save_raw(data: Dict[str, Any]) -> None:
-    global _cache
-    with _lock:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        STATE_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        os.chmod(STATE_FILE, 0o600)
-        _cache = dict(data)
+    global _cache, _cache_stamp
+    saved = _STORE.save(data)
+    saved.pop("_schema_version", None)
+    _cache = dict(saved)
+    _cache_stamp = _STORE._stamp(_STORE.path)
 
 
 def get_state() -> Dict[str, Any]:
     return _load_raw()
 
 
+def _apply(**changes: Any) -> None:
+    global _cache, _cache_stamp
+    if _cache is None or _cache_stamp is None:
+        _STORE.invalidate()
+    saved = _STORE.update(**changes)
+    saved.pop("_schema_version", None)
+    _cache = dict(saved)
+    _cache_stamp = _STORE._stamp(_STORE.path)
+
+
 def set_model(model: str) -> None:
-    d = _load_raw()
-    d["selected_model"] = model
-    _save_raw(d)
+    # Clearing an identical fallback is an invariant of the registry, not of
+    # this call site — see settings.apply_invariants().
+    _apply(selected_model=model)
 
 
 def set_fallback(model: str) -> None:
-    d = _load_raw()
-    d["fallback_model"] = model
-    _save_raw(d)
+    _apply(fallback_model=model)
 
 
 def set_tool_mode(mode: str) -> None:
-    if mode not in TOOL_MODES:
-        raise ValueError(f"Ungültiger Tool-Modus '{mode}'. Erlaubt: {', '.join(sorted(TOOL_MODES))}")
-    d = _load_raw()
-    d["tool_mode"] = mode
-    _save_raw(d)
+    _apply(tool_mode=mode)
 
 
 def set_enabled_tools(names: Optional[list[str]]) -> None:
     """Persist selected tool names. None means all discovered tools."""
-    d = _load_raw()
-    d["enabled_tools"] = None if names is None else sorted(set(names))
-    _save_raw(d)
+    _apply(enabled_tools=names)
+
+
+def set_native_openrouter_tool_calling(enabled: bool) -> None:
+    _apply(native_openrouter_tool_calling=bool(enabled))
+
+
+def set_approval_mode(mode: str) -> None:
+    _apply(approval_mode=mode)
 
 
 def set_request_timeout(seconds: int) -> None:
-    d = _load_raw()
-    d["request_timeout"] = max(10, min(180, int(seconds)))
-    _save_raw(d)
+    # Historical behaviour clamps instead of raising, because the GUI spin box
+    # and older configs rely on out-of-range values being silently corrected.
+    spec = _settings.REGISTRY["request_timeout"]
+    value = max(spec.minimum, min(spec.maximum, int(seconds)))
+    _apply(request_timeout=value)
+
+
+def set_runtime_mode(mode: str) -> None:
+    _apply(runtime_mode=mode)
 
 
 def set_swarm(mode: str) -> None:
-    if mode not in SWARM_MODES:
-        raise ValueError(f"Ungültiger Swarm-Modus '{mode}'. Erlaubt: {', '.join(sorted(SWARM_MODES))}")
-    d = _load_raw()
-    d["swarm_mode"] = mode
-    _save_raw(d)
+    _apply(swarm_mode=mode)
 
 
 def set_workspace(path: Optional[str]) -> None:
-    d = _load_raw()
-    d["workspace_root"] = path
-    _save_raw(d)
+    _apply(workspace_root=path)

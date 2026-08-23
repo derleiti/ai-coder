@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=AI-Coder (Dev, Source)
+Exec=/home/zombie/ai-coder/.venv/bin/python /home/zombie/ai-coder/aicoder_main.py gui
+Path=/home/zombie/ai-coder
+Icon=utilities-terminal
+Terminal=false
+StartupNotify=true
+Categories=Development;IDE;

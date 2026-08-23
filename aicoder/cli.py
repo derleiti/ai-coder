@@ -1,17 +1,24 @@
 from __future__ import annotations
 import argparse, json, os, sys, textwrap, time
 from getpass import getpass
+from pathlib import Path
 from typing import Any, Dict
-from .client import ClientError, TriForceClient
+from . import __version__
+from .client import ClientError, TriForceClient, model_identifier
 from .config import DEFAULT_BASE_URL, Session, delete_session, load_session, save_session
 from .docs_context import context_summary, read_agents_md
 from .history import record as history_record, get_history, clear_history
 from .session_state import (
-    SWARM_MODES, get_state,
-    set_fallback, set_model, set_swarm, set_workspace,
+    RUNTIME_MODES, DEFAULT_RUNTIME_MODE, SWARM_MODES, TOOL_MODES, get_state,
+    set_fallback, set_model, set_runtime_mode, set_swarm, set_tool_mode, set_workspace,
 )
 from .status import Spinner, phase_label
-from .workspace import workspace_snapshot
+from . import settings as settings_core
+from .workspace import activate_workspace, active_workspace, workspace_snapshot
+from .tool_policy import (
+    filter_tool_catalog,
+    require_allowed_tool,
+)
 
 
 def parse_kv_pairs(pairs: list[str]) -> Dict[str, Any]:
@@ -78,12 +85,19 @@ def cmd_handshake(_: argparse.Namespace) -> int:
 
 
 def cmd_tools(_: argparse.Namespace) -> int:
+    """Show the same effective tool catalogue used by the agent runtime."""
+    from .executor import load_tools
+
     _, client = session_client()
-    data = client.handshake()
-    tools = data.get("tools", [])
-    print(f"{len(tools)} tools allowed")
-    for t in tools:
-        print(t)
+    tools = load_tools(client, force_refresh=True)
+    enabled = get_state().get("enabled_tools")
+    if enabled is not None:
+        selected = {str(name) for name in enabled}
+        tools = [tool for tool in tools if str(tool.get("name") or "") in selected]
+
+    print(f"{len(tools)} tools enabled")
+    for tool in tools:
+        print(tool.get("name", ""))
     return 0
 
 
@@ -94,26 +108,132 @@ def cmd_profile(_: argparse.Namespace) -> int:
 
 
 def cmd_workspace(args: argparse.Namespace) -> int:
-    snap = workspace_snapshot(args.path)
-    # persist workspace root in state if it's a real git repo
-    if snap.get("git_root"):
-        set_workspace(snap["git_root"])
+    root = activate_workspace(args.path)
+    set_workspace(str(root))
+    snap = workspace_snapshot(str(root))
     print_json(snap)
     return 0
 
 
 def cmd_mcp(args: argparse.Namespace) -> int:
+    action = str(getattr(args, "tool", None) or "").strip()
+    management = {"list", "add", "remove", "enable", "disable", "tools", "doctor"}
+    if action in management:
+        from .executor import invalidate_tool_cache
+        from .mcp_registry import (
+            MCPRegistry, MCPRegistryError, MCPServerConfig, doctor_server, list_server_tools, parse_header_env,
+        )
+        registry = MCPRegistry()
+        values = list(getattr(args, "arg", None) or [])
+        try:
+            if action == "list":
+                for row in registry.list():
+                    target = "builtin" if row.get("builtin") else (row.get("command") or row.get("url") or "")
+                    print(f"{row.get('name',''):<20} {str(row.get('transport','')):<16} {'enabled' if row.get('enabled') else 'disabled':<9} {row.get('trust',''):<10} {target}")
+                return 0
+
+            if not values:
+                print(f"Error: 'aicoder mcp {action}' requires a server NAME", file=sys.stderr)
+                return 2
+            name = values[0]
+
+            if action == "add":
+                config = MCPServerConfig(
+                    name=name,
+                    enabled=True,
+                    transport=str(getattr(args, "transport", "stdio") or "stdio"),
+                    command=str(getattr(args, "command", "") or ""),
+                    url=str(getattr(args, "url", "") or ""),
+                    args=list(getattr(args, "server_arg", None) or []),
+                    env_names=list(getattr(args, "env_name", None) or []),
+                    allow_tools=list(getattr(args, "allow_tool", None) or []),
+                    deny_tools=list(getattr(args, "deny_tool", None) or []),
+                    trust=str(getattr(args, "trust", "untrusted") or "untrusted"),
+                    timeout=int(getattr(args, "server_timeout", 30) or 30),
+                    capability_tags=list(getattr(args, "capability", None) or []),
+                    header_env=parse_header_env(list(getattr(args, "header_env", None) or [])),
+                )
+                check = doctor_server(config)
+                if not check.get("ok"):
+                    print(json.dumps(check, indent=2, ensure_ascii=False, sort_keys=True), file=sys.stderr)
+                    return 1
+                registry.put(config)
+                invalidate_tool_cache()
+                print(json.dumps(check, indent=2, ensure_ascii=False, sort_keys=True))
+                return 0
+
+            if name == "triforce":
+                if action in {"remove", "enable", "disable"}:
+                    print("Error: built-in TriForce profile cannot be changed by the external MCP registry", file=sys.stderr)
+                    return 2
+                _, client = session_client()
+                payload = {"jsonrpc": "2.0", "method": "tools/list", "params": {}, "id": 1}
+                data = client._request("POST", "/v1/mcp", payload, require_auth=True, _label="tools/list")
+                tools = filter_tool_catalog(data.get("result", {}).get("tools", []), __import__('aicoder.executor', fromlist=['AGENT_TOOLS']).AGENT_TOOLS)
+                if action == "doctor":
+                    print(json.dumps({"name":"triforce","ok":True,"transport":"builtin","tool_count":len(tools)}, indent=2, sort_keys=True))
+                else:
+                    for tool in tools:
+                        print(f"{tool.get('name',''):<36} {(tool.get('description','') or '')[:72]}")
+                return 0
+
+            if action == "remove":
+                if not registry.remove(name):
+                    print(f"Error: unknown MCP server: {name}", file=sys.stderr); return 2
+                invalidate_tool_cache(); print(f"{name} → removed"); return 0
+            if action in {"enable", "disable"}:
+                registry.set_enabled(name, action == "enable")
+                invalidate_tool_cache(); print(f"{name} → {action}d"); return 0
+
+            config = registry.get(name)
+            if config is None:
+                print(f"Error: unknown MCP server: {name}", file=sys.stderr); return 2
+            if action == "doctor":
+                check = doctor_server(config)
+                print(json.dumps(check, indent=2, ensure_ascii=False, sort_keys=True))
+                return 0 if check.get("ok") else 1
+            for tool in list_server_tools(config):
+                print(f"{tool.get('name',''):<36} {(tool.get('description','') or '')[:72]}")
+            return 0
+        except (MCPRegistryError, OSError, ValueError, RuntimeError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
+
+    if action == "serve":
+        transport = str(getattr(args, "transport", "stdio") or "stdio")
+        if transport != "stdio":
+            print("Error: local provider serving currently supports stdio; Streamable HTTP is supported for registered MCP clients.", file=sys.stderr)
+            return 2
+        from .mcp_server import serve_plugin_stdio
+        workspace = active_workspace(get_state().get("workspace_root"))
+        return serve_plugin_stdio(str(getattr(args, "plugin", None) or "local-os"), str(workspace))
+
+    if not action:
+        print("Error: use 'aicoder mcp list', 'aicoder mcp add ...', a backend tool name, or 'aicoder mcp serve'.", file=sys.stderr)
+        return 2
+    from .agent import _cli_approval
+    from .executor import AGENT_TOOLS, load_tools, run_tool
+
     _, client = session_client()
     arguments = parse_kv_pairs(args.arg or [])
+    allowed, reason = require_allowed_tool(action, AGENT_TOOLS)
+    if not allowed:
+        print(f"Error: {reason}", file=sys.stderr)
+        return 2
+    load_tools(client)
     state = get_state()
-    # Show active context before running
     swarm = state.get('swarm_mode', 'off')
     _print_header(state)
     label = phase_label(args.mode or swarm)
     with Spinner(label):
-        data = client.mcp_call(args.tool, arguments)
-    print_json(data)
-    return 0
+        output, is_error = run_tool(
+            client, action, arguments,
+            approval_fn=_cli_approval,
+            model="user/direct-mcp",
+            allowed_tools=set(AGENT_TOOLS),
+        )
+    print(output)
+    return 1 if is_error else 0
 
 
 def cmd_status_demo(args: argparse.Namespace) -> int:
@@ -140,7 +260,11 @@ def cmd_model(args: argparse.Namespace) -> int:
 def cmd_fallback(args: argparse.Namespace) -> int:
     if args.value:
         set_fallback(args.value)
-        print(f"fallback → {args.value}")
+        effective = get_state().get("fallback_model") or ""
+        if effective:
+            print(f"fallback → {effective}")
+        else:
+            print("fallback → disabled (same as operator)")
     else:
         state = get_state()
         val = state.get("fallback_model") or "(not set)"
@@ -162,21 +286,485 @@ def cmd_swarm(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_tool_mode(args: argparse.Namespace) -> int:
+    value = getattr(args, "value", None)
+    if value:
+        try:
+            set_tool_mode(value)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        print(f"tool-mode → {value}")
+    else:
+        print(f"tool-mode = {get_state().get('tool_mode', 'on_demand')}")
+    return 0
+
+def cmd_plugin(args: argparse.Namespace) -> int:
+    from .plugins import discover_plugins, set_plugin_enabled
+    workspace = active_workspace(get_state().get("workspace_root"))
+    action = getattr(args, "plugin_action", None) or "list"
+    registry = discover_plugins(workspace)
+    if action == "paths":
+        config = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "aicoder"
+        print(f"builtin: internal")
+        print(f"user: {config / 'plugins'}")
+        print(f"workspace: {workspace / '.aicoder' / 'plugins'}")
+        return 0
+    plugin_id = getattr(args, "plugin_id", None)
+    if action in {"enable", "disable"}:
+        if registry.get(plugin_id) is None:
+            print(f"Error: unknown plugin: {plugin_id}", file=sys.stderr); return 2
+        set_plugin_enabled(plugin_id, action == "enable")
+        print(f"{plugin_id} → {'enabled' if action == 'enable' else 'disabled'}")
+        return 0
+    if action == "list":
+        for record in registry.all():
+            mode = "provider" if record.executable else "manifest"
+            state = "enabled" if record.enabled else "disabled"
+            print(f"{record.plugin_id:<24} {record.scope:<9} {state:<8} {mode}")
+        return 0
+    records = registry.all() if not plugin_id else [registry.get(plugin_id)]
+    records = [record for record in records if record is not None]
+    if not records:
+        print(f"Error: unknown plugin: {plugin_id}", file=sys.stderr); return 2
+    payload = []
+    for record in records:
+        m = record.manifest
+        payload.append({"id": record.plugin_id, "name": m.name, "version": m.version,
+            "api_version": m.api_version, "scope": record.scope, "enabled": record.enabled,
+            "executable": record.executable, "trusted_builtin": m.trusted_builtin,
+            "capabilities": list(m.capability_groups), "tool_provider": m.tool_provider,
+            "path": str(m.path) if m.path else None, "conflicts": record.conflicts,
+            "diagnostics": record.diagnostics})
+    print(json.dumps(payload[0] if plugin_id else payload, indent=2, ensure_ascii=False, sort_keys=True))
+    return 1 if action == "doctor" and any(item["diagnostics"] for item in payload) else 0
+
+
+
+
+
+
+def _print_provider_rows(rows: list[dict], *, json_output: bool = False) -> None:
+    if json_output:
+        print(json.dumps(rows, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    for row in rows:
+        env_names=", ".join(row.get("environment_variables_present") or []) or "-"
+        legacy=", ".join(row.get("legacy_variables_present") or []) or "-"
+        print(
+            f"{row.get('provider','?'):<14} backend_models={int(row.get('backend_model_count') or 0):<4} "
+            f"source={row.get('credential_source','?'):<13} env={env_names} legacy={legacy}"
+        )
+        for warning in row.get("warnings") or []:
+            print(f"  WARN: {warning}")
+
+
+def cmd_providers(args: argparse.Namespace) -> int:
+    from .providers import provider_status
+    action=getattr(args,"providers_action",None) or "list"
+    client=None
+    try:
+        _, client=session_client()
+    except Exception:
+        client=None
+    rows=provider_status(client)
+    _print_provider_rows(rows,json_output=bool(getattr(args,"json",False)))
+    return 0
+
+
+def cmd_credentials(args: argparse.Namespace) -> int:
+    from .providers import credential_status
+    rows=credential_status()
+    _print_provider_rows(rows,json_output=bool(getattr(args,"json",False)))
+    return 0
+
+def cmd_optimize(args: argparse.Namespace) -> int:
+    from .optimizer import (
+        OptimizationPlanStore, apply_plan, build_plan, inspect_system, rollback_plan, verify_plan,
+    )
+    action=getattr(args,"optimize_action",None) or "inspect"
+    if action == "inspect":
+        print(json.dumps(inspect_system(),indent=2,ensure_ascii=False,sort_keys=True)); return 0
+    store=OptimizationPlanStore()
+    if action == "plan":
+        goal=" ".join(getattr(args,"goal",[]) or []).strip()
+        if not goal:
+            print("Error: optimize plan requires a goal",file=sys.stderr); return 2
+        plan=store.save(build_plan(goal))
+        print(json.dumps(plan.to_dict(),indent=2,ensure_ascii=False,sort_keys=True)); return 0
+    plan_id=str(getattr(args,"plan_id","") or "")
+    try:
+        if action == "apply": plan=apply_plan(plan_id,store=store)
+        elif action == "verify": plan=verify_plan(plan_id,store=store)
+        elif action == "rollback": plan=rollback_plan(plan_id,store=store)
+        elif action == "show":
+            plan=store.load(plan_id)
+            if plan is None: raise ValueError("optimization plan not found")
+        else:
+            raise ValueError(f"unknown optimize action: {action}")
+    except ValueError as exc:
+        print(f"Error: {exc}",file=sys.stderr); return 2
+    print(json.dumps(plan.to_dict(),indent=2,ensure_ascii=False,sort_keys=True)); return 0
+
+
+def cmd_changes(args: argparse.Namespace) -> int:
+    from .change_journal import ChangeJournal
+    journal=ChangeJournal(); action=getattr(args,"changes_action",None) or "list"
+    if action == "list":
+        rows=journal.list(getattr(args,"limit",50))
+        print(json.dumps(rows,indent=2,ensure_ascii=False,sort_keys=True)); return 0
+    change_id=str(getattr(args,"change_id","") or "")
+    row=journal.get(change_id)
+    if row is None:
+        print("Error: change not found",file=sys.stderr); return 2
+    if action == "show":
+        print(json.dumps(row,indent=2,ensure_ascii=False,sort_keys=True)); return 0
+
+    metadata=row.get("restore_metadata") if isinstance(row.get("restore_metadata"),dict) else {}
+    kind=str(metadata.get("kind") or "")
+    if not row.get("reversible"):
+        print("Error: change is marked irreversible",file=sys.stderr); return 2
+    approval_args={"reason":f"Rollback change {change_id}","_mutating":True,"_security_change":True}
+    approval_tool="file_edit"
+    if kind in {"restore_file","remove_created_file","remove_created_dir"}:
+        target=str(metadata.get("target") or "")
+        if not target:
+            print("Error: rollback metadata has no target",file=sys.stderr); return 2
+        approval_args.update({"path":target,"operation":"rollback"})
+        if kind in {"remove_created_file","remove_created_dir"}:
+            approval_args["_destructive"]=True
+        if kind == "remove_created_dir":
+            approval_tool="directory_create"
+        from .workspace import path_within_workspace
+        workspace=str(active_workspace(get_state().get("workspace_root")))
+        _resolved,inside=path_within_workspace(target,workspace)
+        if not inside:
+            approval_args["_workspace_escape"]=target
+            approval_args["_workspace_root"]=workspace
+    elif kind == "settings_patch":
+        previous=metadata.get("previous")
+        if not isinstance(previous,dict) or not previous:
+            print("Error: settings rollback metadata is incomplete",file=sys.stderr); return 2
+        approval_tool="settings_apply_patch"
+        approval_args["patch"]=previous
+    else:
+        print(f"Error: unsupported rollback kind: {kind or '?'}",file=sys.stderr); return 2
+
+    from .agent import _cli_approval
+    if not _cli_approval(approval_tool,approval_args):
+        print("Rollback rejected.",file=sys.stderr); return 3
+    try:
+        result=journal.rollback(change_id,approved=True)
+    except (OSError,ValueError,PermissionError,RuntimeError) as exc:
+        print(f"Error: rollback failed: {exc}",file=sys.stderr); return 1
+    print(json.dumps(result,indent=2,ensure_ascii=False,sort_keys=True)); return 0
+
+def cmd_runtime(args: argparse.Namespace) -> int:
+    value = getattr(args, "value", None)
+    if value:
+        try:
+            set_runtime_mode(value)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        print(f"runtime → {value}")
+    else:
+        print(f"runtime = {get_state().get('runtime_mode', DEFAULT_RUNTIME_MODE)}")
+    return 0
+
+
+def _setting_value_for_output(key: str, state: dict[str, Any]) -> Any:
+    spec = settings_core.REGISTRY[key]
+    return "***" if spec.sensitive else state.get(key, spec.default)
+
+
+def _settings_help_epilog() -> str:
+    lines = ["Canonical settings:"]
+    for key in sorted(settings_core.REGISTRY, key=lambda k: (settings_core.REGISTRY[k].group, k)):
+        spec = settings_core.REGISTRY[key]
+        details = [f"type={spec.type}", f"default={spec.default!r}"]
+        choices = spec.choice_list()
+        if choices:
+            details.append("choices=" + ",".join(choices))
+        if spec.aliases:
+            details.append("aliases=" + ",".join(spec.aliases))
+        if spec.minimum is not None or spec.maximum is not None:
+            details.append(f"range={spec.minimum!r}..{spec.maximum!r}")
+        if spec.security_impact:
+            details.append("SECURITY-IMPACT")
+        lines.append(f"  {key}: {'; '.join(details)}")
+        lines.append(f"    {spec.description}")
+    return "\n".join(lines)
+
+
+def _settings_payload() -> list[dict[str, Any]]:
+    state = settings_core.STORE.load()
+    rows: list[dict[str, Any]] = []
+    for key in sorted(settings_core.REGISTRY, key=lambda k: (settings_core.REGISTRY[k].group, k)):
+        spec = settings_core.REGISTRY[key]
+        rows.append({
+            "key": key,
+            "value": _setting_value_for_output(key, state),
+            "default": spec.default,
+            "type": spec.type,
+            "group": spec.group,
+            "choices": spec.choice_list(),
+            "aliases": list(spec.aliases),
+            "description": spec.description,
+            "sensitive": spec.sensitive,
+            "mutable": spec.mutable,
+            "restart_required": spec.restart_required,
+            "security_impact": spec.security_impact,
+        })
+    return rows
+
+
+def cmd_settings(args: argparse.Namespace) -> int:
+    action = getattr(args, "settings_action", None) or "list"
+    try:
+        if action == "list":
+            rows = _settings_payload()
+            if getattr(args, "json_out", False):
+                print(json.dumps(rows, indent=2, ensure_ascii=False, sort_keys=True))
+                return 0
+            for row in rows:
+                value = row["value"]
+                choices = f" choices={','.join(row['choices'])}" if row["choices"] else ""
+                print(f"{row['key']:<22} = {value!s:<24} [{row['type']}] {row['description']}{choices}")
+            return 0
+
+        if action == "get":
+            key = settings_core.resolve_key(args.key)
+            spec = settings_core.REGISTRY[key]
+            value = "***" if spec.sensitive else settings_core.STORE.get(key)
+            if getattr(args, "json_out", False):
+                print(json.dumps({"key": key, "value": value}, ensure_ascii=False, sort_keys=True))
+            else:
+                print(f"{key} = {value}")
+            return 0
+
+        if action == "set":
+            key = settings_core.resolve_key(args.key)
+            spec = settings_core.REGISTRY[key]
+            if not spec.mutable:
+                raise settings_core.SettingsError(f"'{key}' is read-only.")
+            value = settings_core.coerce(key, args.value)
+            saved = settings_core.STORE.set(key, value)
+            shown = "***" if spec.sensitive else saved.get(key)
+            print(f"{key} → {shown}")
+            if spec.restart_required:
+                print("note: restart required for all consumers to use this value", file=sys.stderr)
+            return 0
+
+        if action == "reset":
+            if getattr(args, "all", False):
+                settings_core.STORE.reset_all()
+                print("settings → defaults")
+                return 0
+            if not getattr(args, "key", None):
+                raise settings_core.SettingsError("settings reset requires KEY or --all")
+            key = settings_core.resolve_key(args.key)
+            saved = settings_core.STORE.reset(key)
+            spec = settings_core.REGISTRY[key]
+            shown = "***" if spec.sensitive else saved.get(key)
+            print(f"{key} → {shown}")
+            return 0
+
+        if action == "explain":
+            data = settings_core.describe(args.key)
+            if getattr(args, "json_out", False):
+                print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+                return 0
+            print(f"{data['key']} [{data['type']}] · group={data['group']}")
+            print(data["description"])
+            print(f"current: {data['value']}")
+            print(f"default: {data['default']}")
+            if data["choices"]:
+                print(f"choices: {', '.join(data['choices'])}")
+            if data["aliases"]:
+                print(f"aliases: {', '.join(data['aliases'])}")
+            print(f"mutable={data['mutable']} restart_required={data['restart_required']} security_impact={data['security_impact']}")
+            return 0
+
+        if action == "schema":
+            data = settings_core.schema()
+            print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=True))
+            return 0
+
+        if action == "doctor":
+            path = settings_core.STORE.path
+            state = settings_core.STORE.load()
+            issues: list[str] = []
+            mode = None
+            if path.exists():
+                try:
+                    mode = oct(path.stat().st_mode & 0o777)
+                    if mode != "0o600":
+                        issues.append(f"permissions are {mode}, expected 0o600")
+                except OSError as exc:
+                    issues.append(f"cannot stat state file: {exc}")
+            corrupt = sorted(str(x) for x in path.parent.glob(path.name + ".corrupt-*")) if path.parent.exists() else []
+            if corrupt:
+                issues.append(f"{len(corrupt)} quarantined corrupt state file(s) present")
+            payload = {
+                "path": str(path),
+                "exists": path.exists(),
+                "permissions": mode,
+                "schema_version": state.get("_schema_version", settings_core.SCHEMA_VERSION),
+                "settings_count": len(settings_core.REGISTRY),
+                "issues": issues,
+                "ok": not issues,
+            }
+            if getattr(args, "json_out", False):
+                print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+            else:
+                print(f"state: {payload['path']}")
+                print(f"schema: {payload['schema_version']} · settings: {payload['settings_count']} · permissions: {mode or 'not created'}")
+                if issues:
+                    for issue in issues:
+                        print(f"WARN: {issue}")
+                else:
+                    print("OK")
+            return 0 if not issues else 1
+    except settings_core.SettingsError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    print(f"Error: unknown settings action {action}", file=sys.stderr)
+    return 2
+
+
+def cmd_skills(args: argparse.Namespace) -> int:
+    from .skills import discover_skills, read_skill
+
+    state = get_state()
+    workspace = str(active_workspace(state.get("workspace_root")))
+    name = getattr(args, "name", None)
+    if name:
+        text, is_error = read_skill(workspace, name)
+        stream = sys.stderr if is_error else sys.stdout
+        print(text, file=stream)
+        return 1 if is_error else 0
+    skills = discover_skills(workspace)
+    if not skills:
+        print("no skills discovered")
+        return 0
+    for skill in skills:
+        print(f"{skill.name:<24} {skill.scope:<18} {skill.description}")
+    return 0
+
+
+
+def cmd_guidelines(args: argparse.Namespace) -> int:
+    from .guidelines import load_guidelines
+
+    state = get_state()
+    workspace = str(active_workspace(state.get("workspace_root")))
+    rows = load_guidelines(workspace)
+    if not rows:
+        print("no guidelines discovered")
+        return 0
+    for scope, text in rows:
+        print(f"## {scope}\n{text}\n")
+    return 0
+
+
+def cmd_commands(args: argparse.Namespace) -> int:
+    from .commands import discover_commands, read_command
+
+    state = get_state()
+    workspace = str(active_workspace(state.get("workspace_root")))
+    name = getattr(args, "name", None)
+    if name:
+        text, is_error = read_command(workspace, name)
+        print(text, file=sys.stderr if is_error else sys.stdout)
+        return 1 if is_error else 0
+    commands = discover_commands(workspace)
+    if not commands:
+        print("no commands discovered")
+        return 0
+    for command in commands:
+        print(f"{command.name:<24} {command.scope:<18} {command.description}")
+    return 0
+
+
+def cmd_command(args: argparse.Namespace) -> int:
+    from .agent import run_agent
+    from .commands import expand_command
+
+    state = get_state()
+    workspace = str(active_workspace(state.get("workspace_root")))
+    text, is_error = expand_command(
+        workspace,
+        str(getattr(args, "name", "") or ""),
+        " ".join(getattr(args, "arguments", []) or []),
+    )
+    if is_error:
+        print(text, file=sys.stderr)
+        return 1
+    return run_agent(
+        initial_prompt=text,
+        model=getattr(args, "model", None) or state.get("selected_model"),
+        fallback_model=state.get("fallback_model"),
+        verbose=getattr(args, "verbose", False),
+        runtime_mode="native-light",
+        json_output=bool(getattr(args, "json_out", False)),
+        json_events=bool(getattr(args, "json_events", False)),
+    )
+
+def cmd_plan(args: argparse.Namespace) -> int:
+    from .agent_plan import PlanStore, format_plan
+
+    state = get_state()
+    workspace = str(active_workspace(state.get("workspace_root")))
+    store = PlanStore()
+    if getattr(args, "clear", False):
+        cleared = store.clear_current(workspace)
+        print("current plan cleared" if cleared else "no current plan")
+        return 0
+    if getattr(args, "list", False):
+        plans = store.list(workspace, limit=getattr(args, "limit", 10))
+        if not plans:
+            print("no plans")
+            return 0
+        for plan in plans:
+            print(f"{plan.id}  {plan.status:<9}  iter={plan.iteration:<3}  {plan.task[:80]}")
+        return 0
+    plan_id = getattr(args, "id", None)
+    plan = store.load(workspace, plan_id) if plan_id else store.load_current(workspace)
+    if plan is None:
+        print("no current plan")
+        return 1
+    print(format_plan(plan))
+    try:
+        from .agent_journal import ContinuationJournalStore
+        journal = ContinuationJournalStore(store.root.parent / "journals").load(workspace, plan.id)
+    except (OSError, ValueError):
+        journal = None
+    if journal is not None:
+        print(f"journal=present  messages={len(journal.messages)}  tool_batches={len(journal.tool_batches)}")
+    else:
+        print("journal=none")
+    return 0
+
+
 def cmd_status(_: argparse.Namespace) -> int:
     state = get_state()
-    ctx = context_summary(state.get("workspace_root"))
-
-    model = state.get("selected_model") or "(not set)"
-    fallback = state.get("fallback_model") or "(not set)"
-    swarm = state.get("swarm_mode", "off")
-    workspace = state.get("workspace_root") or ctx.get("project_root") or "(not set)"
+    ctx = context_summary(str(active_workspace(state.get("workspace_root"))))
+    workspace = str(active_workspace(state.get("workspace_root")))
 
     print("── ai-coder status ──────────────────────────────")
-    print(f"  model    : {model}")
-    print(f"  fallback : {fallback}")
-    print(f"  swarm    : {swarm}")
-    print(f"  workspace: {workspace}")
-    print(f"  docs     : {ctx['doc_files_found']} file(s) found")
+    for key in sorted(settings_core.REGISTRY, key=lambda k: (settings_core.REGISTRY[k].group, k)):
+        spec = settings_core.REGISTRY[key]
+        if spec.sensitive:
+            continue
+        value = state.get(key, spec.default)
+        if key == "workspace_root":
+            value = workspace
+        elif key == "enabled_tools":
+            value = "all" if value is None else ("none" if value == [] else ",".join(value))
+        print(f"  {key:<20}: {value if value is not None else '(not set)'}")
+    print(f"  docs                 : {ctx['doc_files_found']} file(s) found")
     if ctx.get("agents_md_present"):
         print("  AGENTS.md: ✓ present")
     else:
@@ -251,7 +839,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
         return 1
 
     # System prompt: AGENTS.md from workspace
-    workspace = state.get("workspace_root")
+    workspace = str(active_workspace(state.get("workspace_root")))
     system_prompt = None
     if not getattr(args, "no_agents", False):
         system_prompt = read_agents_md(workspace)
@@ -309,7 +897,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
     model = _resolve_model(state, getattr(args, "model", None))
     swarm = state.get("swarm_mode", "off")
 
-    workspace = state.get("workspace_root")
+    workspace = str(active_workspace(state.get("workspace_root")))
     system_prompt = None
     if not getattr(args, "no_agents", False):
         system_prompt = read_agents_md(workspace)
@@ -342,6 +930,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
             elif cmd == "/model" and val:
                 model = val
                 set_model(val)
+                state = get_state()
                 print(f"model → {val}")
             elif cmd == "/swarm" and val:
                 try:
@@ -353,9 +942,13 @@ def cmd_chat(args: argparse.Namespace) -> int:
             elif cmd == "/status":
                 print(f"model={model or 'backend default'}  swarm={swarm}  turns={len(history)}")
             elif cmd == "/fallback" and val:
-                state["fallback_model"] = val
                 set_fallback(val)
-                print(f"fallback → {val}")
+                effective = get_state().get("fallback_model") or ""
+                state["fallback_model"] = effective
+                if effective:
+                    print(f"fallback → {effective}")
+                else:
+                    print("fallback → disabled (same as operator)")
             elif cmd == "/help":
                 print("  /model <n>  /fallback <n>  /swarm <mode>  /status  /clear  /exit")
             elif cmd == "/clear":
@@ -413,6 +1006,17 @@ def cmd_chat(args: argparse.Namespace) -> int:
         meta += "]"
         print(meta)
         print()
+
+        if _cs in {"on", "review"}:
+            from .swarm_runner import run_swarm_review
+            run_swarm_review(
+                original_task=user_input,
+                operator_response=resp,
+                operator_model=model_used,
+                fallback_model=fallback,
+                system_prompt=system_prompt,
+                client=client,
+            )
 
         history.append({"user": user_input, "assistant": resp})
         try:
@@ -504,7 +1108,7 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
     print(f"Broadcasting (top_n={top_n}, providers={params.get('only_providers','all')})...", file=sys.stderr)
     with Spinner("swarming..."):
         try:
-            raw = client.mcp_call("swarm_broadcast", params)
+            raw = client.mcp_call("swarm_broadcast", params, allow_internal=True)
         except ClientError as e:
             print(f"Error: {e}", file=sys.stderr)
             return 1
@@ -530,76 +1134,12 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
 
 
 def cmd_shell(args: argparse.Namespace) -> int:
-    """Run shell command via MCP binary_exec/shell.
-
-    Kurzbefehle: aicoder shell uptime
-                 aicoder shell df -h
-                 aicoder shell systemctl status triforce
-                 aicoder shell --raw "ps aux | grep python"  (via shell tool)
-    """
-    _, client = session_client()
-    cmd_parts = list(args.cmd) if args.cmd else []
-    if not cmd_parts:
-        # Ohne Argumente: liste verfuegbare Programme
-        with Spinner("working..."):
-            raw = client.mcp_call("binary_exec", {"action": "list"})
-        content = raw.get("result", {}).get("content", [{}])[0].get("text", "")
-        try:
-            data = json.loads(content)
-            bins = sorted(data.get("binaries", {}).keys())
-            print(f"{len(bins)} available programs:")
-            print("  ".join(bins))
-        except Exception:
-            print(content)
-        return 0
-
-    use_raw = getattr(args, "raw", False)
-
-    if use_raw:
-        # Raw shell execution via shell tool
-        cmd_str = " ".join(cmd_parts)
-        print(f"$ {cmd_str}", file=sys.stderr)
-        with Spinner("working..."):
-            try:
-                raw = client.mcp_call("shell", {"command": cmd_str})
-            except ClientError as e:
-                print(f"Error: {e}", file=sys.stderr)
-                return 1
-    else:
-        # binary_exec: erstes Token = Programm, Rest = Argumente
-        program = cmd_parts[0]
-        arguments = cmd_parts[1:]
-        params: dict = {
-            "action": "run",
-            "program": program,
-            "arguments": arguments,
-            "elevated": getattr(args, "elevated", False),
-            "timeout": getattr(args, "timeout", 30),
-        }
-        wd = getattr(args, "cwd", None)
-        if wd:
-            params["work_dir"] = wd
-        print(f"$ {program} {' '.join(arguments)}", file=sys.stderr)
-        with Spinner("working..."):
-            try:
-                raw = client.mcp_call("binary_exec", params)
-            except ClientError as e:
-                print(f"Error: {e}", file=sys.stderr)
-                return 1
-
-    content = raw.get("result", {}).get("content", [{}])[0].get("text", "")
-    try:
-        data = json.loads(content)
-        out = data.get("stdout", "") or data.get("output", "") or data.get("result", "") or content
-        err = data.get("stderr", "")
-        rc = int(data.get("returncode", data.get("exit_code", data.get("rc", 0))) or 0)
-    except Exception:
-        out, err, rc = content, "", 0
-    if out:
-        print(out)
-    if err:
-        print(err, file=sys.stderr)
-    return rc
+    """Legacy direct-CLI stub; operator shell execution is available through the agent runtime."""
+    print(
+        "Error: this legacy direct-CLI shell command is not wired to the local approval runtime; use the agent/runtime shell capability.",
+        file=sys.stderr,
+    )
+    return 2
 
 
 
@@ -623,7 +1163,8 @@ def cmd_sysinfo(args: argparse.Namespace) -> int:
             if p in cmds:
                 cmds = {p: cmds[p]}
             else:
-                cmds = {"cmd": [p]}
+                print(f"Error: unknown read-only probe: {p}", file=sys.stderr)
+                return 2
         for label, cmd in cmds.items():
             if label == "cpu":
                 # CPU kompakt
@@ -646,73 +1187,56 @@ def cmd_sysinfo(args: argparse.Namespace) -> int:
                 print(f"  {label}: {e}")
         return 0
 
-    # Remote: safe_probe via MCP
-    _, client = session_client()
-    action = getattr(args, "action", "overview")
-    params: dict = {"action": action}
-    probe = getattr(args, "probe", None)
-    if probe:
-        params["probe"] = probe
-    service = getattr(args, "service", None)
-    if service:
-        params["service"] = service
-    print("\033[2m(Backend-Server: Hetzner/ailinux — nicht lokaler Rechner)\033[0m", file=sys.stderr)
-    with Spinner("working..."):
-        try:
-            raw = client.mcp_call("safe_probe", params)
-        except ClientError as e:
-            print(f"Error: {e}", file=sys.stderr)
-            return 1
-    content = raw.get("result", {}).get("content", [{}])[0].get("text", "")
-    try:
-        print_json(json.loads(content))
-    except Exception:
-        print(content)
-    return 0
+    # Remote infrastructure probing is outside the coding-client scope.
+    print("Error: remote system probing is disabled; use --local for local read-only stats.", file=sys.stderr)
+    return 2
 
 
 def cmd_service(args: argparse.Namespace) -> int:
-    """Manage systemd service locally (subprocess, not MCP)."""
-    import subprocess as _sp
-    action = args.action
-    service = getattr(args, "service", None)
+    """Legacy direct-CLI stub; service operations are available to the operator through the agent runtime when advertised/approved."""
+    print("Error: this legacy direct-CLI service command is not wired to the local approval runtime; use the agent/runtime service capability.", file=sys.stderr)
+    return 2
 
-    if action == "list":
-        r = _sp.run(["systemctl", "list-units", "--type=service",
-                     "--state=running", "--no-pager", "--no-legend"],
-                    capture_output=True, text=True, timeout=10)
-        print(r.stdout.rstrip() or r.stderr.rstrip())
-        return r.returncode
 
-    if not service:
-        print(f"Error: specify service. Example: aicoder service {action} triforce",
-              file=sys.stderr)
-        return 1
+def cmd_remote_node(args: argparse.Namespace) -> int:
+    """Expose the active workspace to TriForce through the read-only preview node."""
+    from .remote_node import run_remote_node
 
-    if action == "logs":
-        n = getattr(args, "lines", 50)
-        cmd = ["journalctl", "-u", service, f"-n{n}", "--no-pager"]
+    state = get_state()
+    workspace = str(active_workspace(state.get("workspace_root")))
+    allow_writes = bool(getattr(args, "allow_writes", False))
+    profile = "write-preview" if allow_writes else "read-only"
+    print(f"remote-node · {profile} · workspace={workspace}", file=sys.stderr)
+    if allow_writes:
+        print(
+            "Remote file create/exact-replace enabled; backups are mandatory. "
+            "Delete, shell and blind overwrite remain blocked.",
+            file=sys.stderr,
+        )
     else:
-        cmd = ["systemctl", action, service]
-
-    print(f"$ {' '.join(cmd)}", file=sys.stderr)
-    r = _sp.run(cmd, capture_output=True, text=True, timeout=30)
-    out = (r.stdout or r.stderr or "").rstrip()
-    if out:
-        print(out)
-    return r.returncode
+        print("Ctrl+C stops the remote node. Writes and shell execution are blocked.", file=sys.stderr)
+    try:
+        run_remote_node(allow_writes=allow_writes)
+    except KeyboardInterrupt:
+        return 0
+    except Exception as exc:
+        print(f"remote-node error: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="aicoder",
-        description="ai-coder — terminal-based coding agent for AILinux / TriForce",
+        description="ai-coder — terminal-based operator agent for AILinux / TriForce",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""        Examples:
           aicoder login --base-url http://127.0.0.1:9000
           aicoder model anthropic/claude-sonnet-4
           aicoder fallback gemini/gemini-2.0-flash
           aicoder swarm auto
+          aicoder settings list
+          aicoder settings explain approval_mode
           aicoder status
           aicoder ask "Was macht diese Funktion?"
           aicoder task "Add docstrings" -f datei.py --dry-run
@@ -722,6 +1246,7 @@ def build_parser() -> argparse.ArgumentParser:
           aicoder hist
         """),
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     # auth
@@ -751,10 +1276,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_workspace)
 
     # mcp
-    p = sub.add_parser("mcp", help="MCP-Tool-Call → /v1/mcp")
-    p.add_argument("tool")
-    p.add_argument("arg", nargs="*")
+    p = sub.add_parser("mcp", help="Manage MCP servers, call TriForce tools, or serve an approved local provider")
+    p.add_argument("tool", nargs="?", help="list/add/remove/enable/disable/tools/doctor/serve, or a TriForce backend tool")
+    p.add_argument("arg", nargs="*", help="Server name for registry actions, or key=value for a direct TriForce tool")
     p.add_argument("--mode", default=None, help="Spinner-Modus (work/swarm/hive)")
+    p.add_argument("--plugin", default="local-os", help="Local provider for 'mcp serve' (default: local-os)")
+    p.add_argument("--transport", choices=["stdio", "streamable-http"], default="stdio", help="Transport for mcp add/serve")
+    p.add_argument("--command", default="", help="stdio MCP executable for 'mcp add'")
+    p.add_argument("--url", default="", help="Streamable HTTP endpoint for 'mcp add' (no embedded secrets)")
+    p.add_argument("--server-arg", action="append", default=[], help="Argument passed to a stdio MCP server; repeatable")
+    p.add_argument("--env", dest="env_name", action="append", default=[], help="Environment variable NAME allowed for the server; repeatable")
+    p.add_argument("--header-env", action="append", default=[], metavar="HEADER=ENV_NAME", help="HTTP header sourced from an environment variable; stores names only")
+    p.add_argument("--allow-tool", action="append", default=[], help="Allow only this remote tool name; repeatable")
+    p.add_argument("--deny-tool", action="append", default=[], help="Deny this remote tool name; repeatable")
+    p.add_argument("--trust", choices=["untrusted", "trusted"], default="untrusted")
+    p.add_argument("--server-timeout", type=int, default=30)
+    p.add_argument("--capability", action="append", default=[], help="Capability tag added to this server's tools; repeatable")
     p.set_defaults(func=cmd_mcp)
 
     # session state
@@ -769,6 +1306,154 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("swarm", help=f"Swarm-Modus anzeigen oder setzen ({', '.join(sorted(SWARM_MODES))})")
     p.add_argument("value", nargs="?")
     p.set_defaults(func=cmd_swarm)
+
+
+    p = sub.add_parser("tool-mode", help=f"Tool discovery mode ({', '.join(sorted(TOOL_MODES))})")
+    p.add_argument("value", nargs="?")
+    p.set_defaults(func=cmd_tool_mode)
+
+    p = sub.add_parser("runtime", help=f"Agent runtime ({', '.join(sorted(RUNTIME_MODES))})")
+    p.add_argument("value", nargs="?")
+    p.set_defaults(func=cmd_runtime)
+
+    p = sub.add_parser(
+        "settings",
+        help="List, explain and change all AICoder runtime settings",
+        description="Schema-driven settings shared by CLI, REPL, GUI and agent tools.",
+        epilog=_settings_help_epilog(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    settings_sub = p.add_subparsers(dest="settings_action")
+    p.set_defaults(func=cmd_settings, settings_action="list", json_out=False)
+
+    sp = settings_sub.add_parser("list", help="List every setting with effective value and schema metadata")
+    sp.add_argument("--json", dest="json_out", action="store_true")
+    sp.set_defaults(func=cmd_settings)
+
+    sp = settings_sub.add_parser("get", help="Read one setting")
+    sp.add_argument("key")
+    sp.add_argument("--json", dest="json_out", action="store_true")
+    sp.set_defaults(func=cmd_settings)
+
+    sp = settings_sub.add_parser("set", help="Set one setting; enabled_tools accepts all, none, or comma-separated names")
+    sp.add_argument("key")
+    sp.add_argument("value")
+    sp.set_defaults(func=cmd_settings)
+
+    sp = settings_sub.add_parser("reset", help="Reset one setting or the full registry to defaults")
+    sp.add_argument("key", nargs="?")
+    sp.add_argument("--all", action="store_true")
+    sp.set_defaults(func=cmd_settings)
+
+    sp = settings_sub.add_parser("explain", help="Explain one setting, including defaults, choices and aliases")
+    sp.add_argument("key")
+    sp.add_argument("--json", dest="json_out", action="store_true")
+    sp.set_defaults(func=cmd_settings)
+
+    sp = settings_sub.add_parser("schema", help="Emit the complete settings schema as deterministic JSON")
+    sp.add_argument("--json", dest="json_out", action="store_true", help="Compatibility flag; schema output is always JSON")
+    sp.set_defaults(func=cmd_settings)
+
+    sp = settings_sub.add_parser("doctor", help="Validate settings storage, schema and file permissions")
+    sp.add_argument("--json", dest="json_out", action="store_true")
+    sp.set_defaults(func=cmd_settings)
+
+    p = sub.add_parser("plugin", help="Discover and manage AICoder plugins")
+    plugin_sub = p.add_subparsers(dest="plugin_action")
+    p.set_defaults(func=cmd_plugin, plugin_action="list")
+    sp = plugin_sub.add_parser("list", help="List effective plugins")
+    sp.set_defaults(func=cmd_plugin)
+    sp = plugin_sub.add_parser("info", help="Show one plugin manifest")
+    sp.add_argument("plugin_id")
+    sp.set_defaults(func=cmd_plugin)
+    sp = plugin_sub.add_parser("enable", help="Enable a plugin")
+    sp.add_argument("plugin_id")
+    sp.set_defaults(func=cmd_plugin)
+    sp = plugin_sub.add_parser("disable", help="Disable a plugin")
+    sp.add_argument("plugin_id")
+    sp.set_defaults(func=cmd_plugin)
+    sp = plugin_sub.add_parser("doctor", help="Validate one plugin or the effective registry")
+    sp.add_argument("plugin_id", nargs="?")
+    sp.set_defaults(func=cmd_plugin)
+    sp = plugin_sub.add_parser("paths", help="Show plugin discovery roots")
+    sp.set_defaults(func=cmd_plugin)
+
+
+
+    p = sub.add_parser("providers", help="Inspect provider/model availability and credential-source hygiene")
+    providers_sub = p.add_subparsers(dest="providers_action")
+    p.set_defaults(func=cmd_providers, providers_action="list")
+    for provider_action in ("list", "doctor"):
+        sp = providers_sub.add_parser(provider_action, help=f"{provider_action.title()} provider availability without exposing secrets")
+        sp.add_argument("--json", action="store_true")
+        sp.set_defaults(func=cmd_providers)
+
+    p = sub.add_parser("credentials", help="Inspect local credential variable presence without showing values")
+    credentials_sub = p.add_subparsers(dest="credentials_action")
+    p.set_defaults(func=cmd_credentials, credentials_action="status")
+    sp = credentials_sub.add_parser("status", help="Show credential variable names/presence only")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_credentials)
+
+    p = sub.add_parser("optimize", help="Evidence-first local system inspection and optimization planning")
+    opt_sub = p.add_subparsers(dest="optimize_action")
+    p.set_defaults(func=cmd_optimize, optimize_action="inspect")
+    sp = opt_sub.add_parser("inspect", help="Collect typed read-only local system evidence")
+    sp.set_defaults(func=cmd_optimize)
+    sp = opt_sub.add_parser("plan", help="Build an evidence-based, non-mutating optimization plan")
+    sp.add_argument("goal", nargs="+")
+    sp.set_defaults(func=cmd_optimize)
+    for opt_action, opt_help in (
+        ("show", "Show one persisted optimization plan"),
+        ("apply", "Apply a persisted plan; unsupported mutations fail closed"),
+        ("verify", "Re-run verification for an applied plan"),
+        ("rollback", "Rollback an applied plan; read-only plans are a verified no-op"),
+    ):
+        sp = opt_sub.add_parser(opt_action, help=opt_help)
+        sp.add_argument("plan_id")
+        sp.set_defaults(func=cmd_optimize)
+
+    p = sub.add_parser("changes", help="Inspect the private structured change journal")
+    changes_sub = p.add_subparsers(dest="changes_action")
+    p.set_defaults(func=cmd_changes, changes_action="list", limit=50)
+    sp = changes_sub.add_parser("list", help="List recent state-changing tool actions")
+    sp.add_argument("--limit", type=int, default=50)
+    sp.set_defaults(func=cmd_changes)
+    sp = changes_sub.add_parser("show", help="Show one change journal record")
+    sp.add_argument("change_id")
+    sp.set_defaults(func=cmd_changes)
+    sp = changes_sub.add_parser("rollback", help="Rollback one reversible change after explicit local approval")
+    sp.add_argument("change_id")
+    sp.set_defaults(func=cmd_changes)
+
+    p = sub.add_parser("skills", help="List or read native AICoder workflow skills")
+    p.add_argument("name", nargs="?", help="Skill name to read")
+    p.set_defaults(func=cmd_skills)
+
+
+    p = sub.add_parser("guidelines", help="Show effective native AICoder guidelines")
+    p.set_defaults(func=cmd_guidelines)
+
+    p = sub.add_parser("commands", help="List or read native AICoder prompt commands")
+    p.add_argument("name", nargs="?", help="Command name to read")
+    p.set_defaults(func=cmd_commands)
+
+    p = sub.add_parser("command", help="Run a native AICoder prompt command")
+    p.add_argument("name", help="Command name")
+    p.add_argument("arguments", nargs="*", help="Arguments passed to $ARGUMENTS/{{args}}")
+    p.add_argument("--model", default=None)
+    p.add_argument("--verbose", "-v", action="store_true")
+    headless = p.add_mutually_exclusive_group()
+    headless.add_argument("--json", dest="json_out", action="store_true", help="Headless final JSON output")
+    headless.add_argument("--json-events", action="store_true", help="Headless NDJSON runtime events")
+    p.set_defaults(func=cmd_command)
+
+    p = sub.add_parser("plan", help="Show/list the persistent native-light execution plan")
+    p.add_argument("id", nargs="?", help="Specific plan id (default: current)")
+    p.add_argument("--list", action="store_true", help="List recent plans for the workspace")
+    p.add_argument("--limit", type=int, default=10)
+    p.add_argument("--clear", action="store_true", help="Clear only the current-plan pointer")
+    p.set_defaults(func=cmd_plan)
 
     p = sub.add_parser("status", help="Show active status (model, fallback, swarm, workspace, docs)")
     p.set_defaults(func=cmd_status)
@@ -836,7 +1521,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-tokens", dest="max_tokens", type=int, default=200)
     p.set_defaults(func=cmd_broadcast)
 
-    p = sub.add_parser("shell", help="Run command via MCP binary_exec (no args: list)")
+    p = sub.add_parser("shell", help="Legacy direct-CLI compatibility stub; use agent/runtime capability")
     p.add_argument("cmd", nargs="*")
     p.add_argument("--raw", "-r", action="store_true", help="Shell tool instead of binary_exec (pipes etc.)")
     p.add_argument("--elevated", "-e", action="store_true")
@@ -845,7 +1530,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_shell)
 
 
-    p = sub.add_parser("sysinfo", help="System overview: --local = this machine, else backend server")
+    p = sub.add_parser("sysinfo", help="Read-only local system overview (--local required)")
     p.add_argument("action", nargs="?", default="overview",
                    choices=["overview","run","service_status","journal","list"])
     p.add_argument("--probe", default=None)
@@ -853,17 +1538,35 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--local", "-l", action="store_true", help="Local stats (this machine, no MCP)")
     p.set_defaults(func=cmd_sysinfo)
 
-    p = sub.add_parser("service", help="Manage systemd service")
+    p = sub.add_parser("service", help="Legacy direct-CLI compatibility stub; use agent/runtime capability")
     p.add_argument("action", choices=["status","start","stop","restart","logs","list"])
     p.add_argument("service", nargs="?", default=None)
     p.add_argument("--lines", type=int, default=50)
     p.set_defaults(func=cmd_service)
 
+    p = sub.add_parser("remote-node", help="Expose active workspace to TriForce (safe remote preview)")
+    p.add_argument(
+        "--allow-writes", action="store_true",
+        help="Opt in to remote create/exact-replace with mandatory backups",
+    )
+    p.set_defaults(func=cmd_remote_node)
+
     p = sub.add_parser("agent", help="Agent REPL / autonomous terminal agent")
     p.add_argument("prompt", nargs="*", help="Direct prompt (no REPL)")
     p.add_argument("--model", default=None)
+    p.add_argument(
+        "--resume", action="store_true",
+        help="Resume the current persistent native-light plan (implies native-light)",
+    )
+    p.add_argument(
+        "--plan-id", default=None,
+        help="Resume a specific persistent plan id (requires --resume)",
+    )
     p.add_argument("--setup", action="store_true")
     p.add_argument("--verbose", "-v", action="store_true")
+    headless = p.add_mutually_exclusive_group()
+    headless.add_argument("--json", dest="json_out", action="store_true", help="Headless final JSON output")
+    headless.add_argument("--json-events", action="store_true", help="Headless NDJSON runtime events")
     p.set_defaults(func=cmd_agent)
 
 
@@ -883,25 +1586,41 @@ def cmd_agent(args: argparse.Namespace) -> int:
         run_setup(force=True)
 
     prompt_parts = getattr(args, "prompt", []) or []
-    if prompt_parts:
-        # Direkt-Prompt: kein REPL, einmaliger Agent-Run
+    resume_requested = bool(getattr(args, "resume", False))
+    plan_id = getattr(args, "plan_id", None)
+    if plan_id and not resume_requested:
+        print("Error: --plan-id requires --resume", file=sys.stderr)
+        return 2
+    headless_requested = bool(getattr(args, "json_out", False) or getattr(args, "json_events", False))
+    if headless_requested and not (prompt_parts or resume_requested):
+        print("Error: headless agent mode requires a prompt or --resume", file=sys.stderr)
+        return 2
+    if prompt_parts or resume_requested:
+        # Direct prompt or explicit process-restart resume: no REPL.
         from .session_state import get_state
         state = get_state()
+        initial_prompt = " ".join(prompt_parts) if prompt_parts else "continue"
         return run_agent(
-            initial_prompt=" ".join(prompt_parts),
+            initial_prompt=initial_prompt,
             model=getattr(args, "model", None) or state.get("selected_model"),
             fallback_model=state.get("fallback_model"),
             verbose=getattr(args, "verbose", False),
+            runtime_mode="native-light" if resume_requested else None,
+            resume_plan_id=(plan_id or "current") if resume_requested else None,
+            json_output=bool(getattr(args, "json_out", False)),
+            json_events=bool(getattr(args, "json_events", False)),
         )
-    else:
-        return run_repl(skip_setup=getattr(args, "setup", False))
+    return run_repl(skip_setup=getattr(args, "setup", False))
 
 def cmd_models(args: argparse.Namespace) -> int:
     """List available models from backend."""
     session, client = session_client()
     with Spinner("working..."):
         data = client._request("GET", "/v1/client/models", require_auth=True, _label="models")
-    models = data.get("models", [])
+    models = [
+        model_id for item in data.get("models", [])
+        if (model_id := model_identifier(item))
+    ]
     tier = data.get("tier", "?")
     count = data.get("model_count", len(models))
 
@@ -936,11 +1655,12 @@ def cmd_models(args: argparse.Namespace) -> int:
 
 def cmd_mcp_list(_: argparse.Namespace) -> int:
     """Tabular list of all allowed MCP tools."""
+    from .executor import AGENT_TOOLS
     _, client = session_client()
     payload = {"jsonrpc": "2.0", "method": "tools/list", "params": {}, "id": 1}
     with Spinner("working..."):
         data = client._request("POST", "/v1/mcp", payload, require_auth=True, _label="tools/list")
-    tools = data.get("result", {}).get("tools", [])
+    tools = filter_tool_catalog(data.get("result", {}).get("tools", []), AGENT_TOOLS)
     print(f"{'Name':<35} {'Description'}")
     print("─" * 80)
     for t in tools:
@@ -1015,7 +1735,19 @@ def _run_gui() -> int:
         return 1
 
 
+def _activate_startup_workspace(argv: list[str] | None = None) -> Path:
+    """Choose startup workspace without letting a GUI launcher cwd override settings."""
+    args = list(sys.argv if argv is None else argv)
+    if len(args) > 1 and args[1] == "gui":
+        configured = str(get_state().get("workspace_root") or "").strip()
+        return activate_workspace(configured or os.getcwd())
+    return activate_workspace()
+
+
 def main() -> int:
+    # CLI/REPL intentionally use the launch cwd as workspace. GUI launchers often
+    # start from the source/install directory, so GUI must honor persisted settings.
+    _activate_startup_workspace()
     # Kein Argument → Setup-Wizard + Agent-REPL starten
     if len(sys.argv) == 1:
         from .setup import run_repl

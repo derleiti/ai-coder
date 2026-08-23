@@ -43,8 +43,11 @@ def clipboard_write(text: str) -> Tuple[str, bool]:
     try:
         if IS_WINDOWS:
             r = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", f"Set-Clipboard -Value '{text}'"],
-                capture_output=True, text=True, timeout=5,
+                [
+                    "powershell", "-NoProfile", "-Command",
+                    "Set-Clipboard -Value ([Console]::In.ReadToEnd())",
+                ],
+                input=text, capture_output=True, text=True, timeout=5,
             )
             return ("Copied to clipboard" if r.returncode == 0 else r.stderr), r.returncode != 0
         elif IS_MAC:

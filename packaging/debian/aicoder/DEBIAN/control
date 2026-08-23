@@ -1,15 +1,18 @@
 Package: aicoder
-Version: 0.9.0
+Version: 1.0.0
 Section: utils
 Priority: optional
 Architecture: amd64
+Depends: libc6
 Maintainer: Markus Leitermann <admin@ailinux.me>
-Homepage: https://ailinux.me
-Description: ai-coder — Terminal Coding & DevOps Agent
- Terminalbasierter autonomer Coding-Agent für AILinux / TriForce Backend.
- Modell-auswählbar, Swarm-Support, DevOps-Tools, opencode-Style UI.
+Homepage: https://ailinux.me/ai-coder/
+Description: ai-coder — coding agent for AILinux and TriForce
+ Terminalbasierter Coding-Agent mit optionaler PyQt6-Oberfläche.
+ Modellwahl, Fallback und beratender Swarm-Modus werden unterstützt.
  .
- Features: ask, chat, task, review, agent (autonomous loop), shell,
- sudo, sysinfo, service, broadcast, models, history und mehr.
+ Backend-MCP bleibt auf den kanonischen AICoder-Toolvertrag begrenzt.
+ Lokale Workspace-, Local-OS- und Ausführungswerkzeuge laufen clientseitig;
+ Mutationen, Scope-Escapes und erhöhte Rechte werden durch Tool-Policy,
+ Audit und PrivilegeBroker abgesichert.
  .
  Backend: TriForce / api.ailinux.me

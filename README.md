@@ -1,6 +1,6 @@
 # ai-coder
 
-Terminalbasierter Coding & DevOps Agent für AILinux / TriForce.
+Terminalbasierter Coding-Agent für AILinux / TriForce.
 
 **Prinzip:** Dünner lokaler CLI-Client — Intelligenz sitzt im Backend.
 
@@ -76,7 +76,7 @@ aicoder status
 | `review <file>` | Strukturiertes Code-Review |
 | `agent <prompt>` | Autonomer Agent mit Tool-Loop |
 | `models [--filter]` | Verfügbare Modelle vom Backend |
-| `mcp <tool> [args]` | MCP-Tool-Call gegen /v1/mcp |
+| `mcp <tool> [args]` | Coding-allowlisted MCP-Tool-Call gegen /v1/mcp |
 | `workspace [path]` | Lokalen Repo-Snapshot erstellen |
 | `hist [-n N]` | Call-History anzeigen |
 

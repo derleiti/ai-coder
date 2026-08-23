@@ -1,3 +1,56 @@
+## v0.9.8b1 — Directory Tool Beta (2026-08-20)
+
+- Add a typed `directory_create` local capability for creating project directories and missing parents.
+- Make `file_edit` explicitly file-only so agents no longer misuse it for folder creation.
+- Apply workspace-boundary approval and mutation classification to directory creation.
+- Preserve dynamic "all tools" selection in the GUI so newly added safe capabilities become available automatically.
+- Unify package metadata at `0.9.8b1` and make the GitHub release workflow prerelease-aware.
+
+## v0.9.6 — Unified Tool Policy and MCP Hardening (2026-08-13)
+
+- Expose only the canonical MCP `search` tool; remove the obsolete DuckDuckGo
+  local search and the synthetic `web_search` alias from model-facing tools.
+- Enforce one coding-only tool policy across CLI agent, GUI, direct MCP calls,
+  and the low-level MCP client; forbidden admin/ops/shell scopes fail closed.
+- Replace model-facing local shell commands with typed, workspace-confined file,
+  tree, search, edit, and read-only Git capabilities.
+- Normalize JSON-RPC errors, MCP `isError`, multi-block content and
+  `structuredContent`; disable transport retries for tool calls and prevent
+  mutation retries after ambiguous timeouts.
+- Mark tool output as untrusted model input, redact nested audit secrets, use
+  private atomic config writes, and protect SQLite chat-history permissions.
+- Make fallback reporting deterministic and align `on`/`review` swarm behavior
+  with the documented operator/advisor hierarchy.
+- Add end-to-end regression coverage for policy bypasses, typed local tools,
+  MCP protocol variants, retry safety, fallback, swarm, and redaction.
+- Keep client and TriForce on one tested, restrictive `ai-coder` MCP contract;
+  alias normalization, Swarm calls, and login role fields now match end to end.
+- Migrate the obsolete persisted 40-tool snapshot to the current dynamic
+  coding-only catalog so newly supported safe tools are visible after upgrade.
+
+## v0.9.5 — Agent Reliability + Long Task Timeout (2026-08-08)
+
+- Harden tool-call parsing for provider responses that omit only trailing JSON object braces inside a complete `<tool_call>` envelope.
+- Keep genuinely truncated tool calls non-executable instead of guessing missing content.
+- Guide large `file_edit` writes into smaller sequential chunks to avoid oversized heredoc generations.
+- Enforce primary/fallback separation and improve fallback/tool compatibility behavior.
+- Raise the default AICoder model request timeout to 300 seconds for long coding and agent tasks.
+- Expand the GUI timeout control to 300 seconds and keep release metadata aligned across Debian, AUR, and the Windows installer.
+
+## v0.9.2 — Primary Routing + MCP Code Handler Fix (2026-08-08)
+
+- AI Coder keeps the selected primary model for quick chat; fallback is only used after failure or explicit loop recovery.
+- Updated routing regression tests for CLI and GUI semantics.
+- TriForce MCP V4 code handlers now use the maintained `mcp_service` implementations instead of stale `tristar_mcp` imports.
+- NVIDIA free-model routing remains server-side via the unified provider router.
+
+## v0.9.1 — GUI Approval Broker + Tool Loading Hardening (2026-07-16)
+
+- Preserve complete structured MCP arguments and mutation/destruction metadata through the GUI approval signal.
+- Display redacted tool arguments in approval dialogs and default state-changing operations to deny.
+- Harden provider tool-call normalization, account-scoped tool caching, and on-demand tool loading behavior.
+- Add regression coverage for GUI approval metadata, secret redaction, provider compatibility, and tool selection.
+
 ## v0.9.0 — Reliable Agent Runtime + Privilege Broker (2026-07-15)
 
 ### Agent Runtime

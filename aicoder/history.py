@@ -3,12 +3,12 @@ from __future__ import annotations
 history.py — Persistent call history for ask/task results.
 Saves last N entries to ~/.config/ai-coder/history.json
 """
-import json, os, re
+import json, re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .config import CONFIG_DIR
+from .config import CONFIG_DIR, atomic_write_private
 
 HISTORY_FILE = CONFIG_DIR / "history.json"
 MAX_ENTRIES = 50
@@ -24,9 +24,10 @@ def _load() -> List[Dict[str, Any]]:
 
 
 def _save(entries: List[Dict[str, Any]]) -> None:
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    HISTORY_FILE.write_text(json.dumps(entries, indent=2, ensure_ascii=False), encoding="utf-8")
-    os.chmod(HISTORY_FILE, 0o600)
+    atomic_write_private(
+        HISTORY_FILE,
+        json.dumps(entries, indent=2, ensure_ascii=False),
+    )
 
 
 _SECRET_RE = re.compile(

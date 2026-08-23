@@ -17,11 +17,13 @@ from typing import Optional
 
 from .config import CONFIG_DIR, DEFAULT_BASE_URL, Session, load_session, save_session
 from .session_state import (
-    SWARM_MODES, get_state,
-    set_fallback, set_model, set_swarm, set_workspace,
+    SWARM_MODES, APPROVAL_MODES, DEFAULT_RUNTIME_MODE, get_state,
+    set_approval_mode, set_fallback, set_model, set_runtime_mode, set_swarm, set_tool_mode, set_workspace,
 )
 from .ui import C, bold, dim, cyan, green, yellow, red, magenta, white, panel, term_width, reset_live_line
+from .workspace import active_workspace
 from .repl_input import COMMANDS, PromptCancelled, ReplInput
+from . import settings as settings_core
 
 
 
@@ -330,7 +332,15 @@ def run_setup(force: bool = False) -> bool:
         fallback = _ask("Fallback-ID", "")
     if fallback and fallback != "(keins)":
         set_fallback(fallback)
-        print(f"  fallback → {_c('green', fallback)}")
+        state = get_state()
+        effective_fallback = state.get("fallback_model") or ""
+        if effective_fallback:
+            print(f"  fallback → {_c('green', effective_fallback)}")
+        else:
+            print(f"  fallback → {_c('dim', 'disabled (same as operator)')}")
+    else:
+        set_fallback("")
+        print(f"  fallback → {_c('dim', 'disabled')}")
 
     print("\n── Swarm-Modus ────────────────────────────")
     swarm_descs = {
@@ -348,7 +358,7 @@ def run_setup(force: bool = False) -> bool:
         print(f"  swarm → {_c('green', swarm)}")
 
     print("\n── Workspace ──────────────────────────────")
-    ws_default = state.get("workspace_root") or str(Path.cwd())
+    ws_default = str(active_workspace(state.get("workspace_root")))
     workspace = _ask("Projekt-Verzeichnis", ws_default)
     if workspace:
         Path(workspace).mkdir(parents=True, exist_ok=True)
@@ -409,6 +419,66 @@ def _setup_readline():
     readline.parse_and_bind("tab: complete")
 
 
+def _repl_settings_command(value: str) -> int:
+    """Handle /settings through the same canonical registry/store as CLI and GUI."""
+    parts = (value or "").split(None, 2)
+    action = parts[0].lower() if parts else "list"
+    try:
+        if action in {"list", "ls"}:
+            state = settings_core.STORE.load()
+            for key in sorted(settings_core.REGISTRY, key=lambda k: (settings_core.REGISTRY[k].group, k)):
+                spec = settings_core.REGISTRY[key]
+                if spec.sensitive:
+                    shown = "***"
+                else:
+                    shown = state.get(key, spec.default)
+                    if key == "enabled_tools":
+                        shown = "all" if shown is None else ("none" if shown == [] else ",".join(shown))
+                print(f"  {key:<22} = {shown}")
+            return 0
+        if action == "get" and len(parts) >= 2:
+            key = settings_core.resolve_key(parts[1])
+            spec = settings_core.REGISTRY[key]
+            shown = "***" if spec.sensitive else settings_core.STORE.get(key)
+            print(f"  {key} = {shown}")
+            return 0
+        if action == "set" and len(parts) >= 3:
+            key = settings_core.resolve_key(parts[1])
+            spec = settings_core.REGISTRY[key]
+            if not spec.mutable:
+                raise settings_core.SettingsError(f"'{key}' is read-only.")
+            value_to_set = settings_core.coerce(key, parts[2])
+            saved = settings_core.STORE.set(key, value_to_set)
+            shown = "***" if spec.sensitive else saved.get(key)
+            print(f"  {key} → {shown}")
+            return 0
+        if action == "reset" and len(parts) >= 2:
+            key = settings_core.resolve_key(parts[1])
+            saved = settings_core.STORE.reset(key)
+            spec = settings_core.REGISTRY[key]
+            shown = "***" if spec.sensitive else saved.get(key)
+            print(f"  {key} → {shown}")
+            return 0
+        if action in {"explain", "describe"} and len(parts) >= 2:
+            data = settings_core.describe(parts[1])
+            print(f"  {data['key']} [{data['type']}] · group={data['group']}")
+            print(f"  {data['description']}")
+            print(f"  current={data['value']} · default={data['default']}")
+            if data["choices"]:
+                print(f"  choices={','.join(data['choices'])}")
+            if data["aliases"]:
+                print(f"  aliases={','.join(data['aliases'])}")
+            if data["security_impact"]:
+                print("  security-impacting setting")
+            return 0
+    except settings_core.SettingsError as exc:
+        print(f"  Fehler: {exc}")
+        return 2
+
+    print("  usage: /settings [list|get KEY|set KEY VALUE|reset KEY|explain KEY]")
+    return 2
+
+
 def run_repl(skip_setup: bool = False) -> int:
     """
     Interaktiver Agent-REPL.
@@ -426,13 +496,15 @@ def run_repl(skip_setup: bool = False) -> int:
     model    = state.get("selected_model")
     fallback = state.get("fallback_model")
     swarm    = state.get("swarm_mode","off")
-    ws       = state.get("workspace_root") or str(Path.cwd())
+    ws       = str(active_workspace(state.get("workspace_root")))
 
     def _toolbar() -> str:
         current = get_state()
         active_model = current.get("selected_model") or "backend"
         mode = current.get("tool_mode", "on_demand")
-        return f"  {active_model} · tools:{mode} · approvals:ask · swarm:{current.get('swarm_mode', 'off')}"
+        approval = current.get("approval_mode", "ask")
+        runtime = current.get("runtime_mode", DEFAULT_RUNTIME_MODE)
+        return f"  {active_model} · runtime:{runtime} · tools:{mode} · approvals:{approval} · swarm:{current.get('swarm_mode', 'off')}"
 
     repl_input = ReplInput(CONFIG_DIR / "history", _toolbar)
     conversation: list[dict] = []
@@ -443,10 +515,10 @@ def run_repl(skip_setup: bool = False) -> int:
         model = state.get("selected_model")
         fallback = state.get("fallback_model")
         swarm = state.get("swarm_mode", "off")
-        ws = state.get("workspace_root") or str(Path.cwd())
+        ws = str(active_workspace(state.get("workspace_root")))
         tool_mode = state.get("tool_mode", "on_demand")
         enabled = state.get("enabled_tools")
-        timeout = int(state.get("request_timeout", 30))
+        timeout = int(state.get("request_timeout", 300))
         try:
             session = load_session()
             identity = f"{session.user_id} · {session.tier}"
@@ -461,15 +533,17 @@ def run_repl(skip_setup: bool = False) -> int:
         print(f"  {dim('account  ')} {cyan(identity)}")
         print(f"  {dim('operator ')} {cyan(model or '(backend default)')}")
         print(f"  {dim('fallback ')} {dim(fallback or '—')}")
-        print(f"  {dim('runtime  ')} tools={cyan(tool_mode)} · enabled={cyan('all' if enabled is None else str(len(enabled)))} · "
-              f"swarm={cyan(swarm)} · timeout={cyan(str(timeout)+'s')}")
+        approval_mode = state.get("approval_mode", "ask")
+        runtime_mode = state.get("runtime_mode", DEFAULT_RUNTIME_MODE)
+        print(f"  {dim('runtime  ')} mode={cyan(runtime_mode)} · tools={cyan(tool_mode)} · enabled={cyan('all' if enabled is None else str(len(enabled)))} · "
+              f"approvals={cyan(approval_mode)} · swarm={cyan(swarm)} · timeout={cyan(str(timeout)+'s')}")
         print(f"  {dim('workspace')} {dim(ws)}")
         print(f"  {C.DIM}{rule}{C.RESET}")
         if repl_input.enhanced:
             print(f"  {dim('Enter send · Alt+Enter newline · Ctrl+C clear/cancel · Ctrl+R history · Tab commands')}")
         else:
             print(f"  {yellow('Basic input mode')} {dim('· install prompt-toolkit for multiline editing and safe repaint')}")
-        print(f"  {dim('/help commands · /keys shortcuts · /permissions policy · /new context · /exit')}")
+        print(f"  {dim('/help · /command <name> [args] · /runtime native-light · /plan · /new · /exit')}")
         print(f"  {C.DIM}{rule}{C.RESET}")
 
     _print_repl_header()
@@ -508,7 +582,9 @@ def run_repl(skip_setup: bool = False) -> int:
             elif cmd == "/model":
                 if val:
                     set_model(val)
-                    model = val
+                    refreshed = get_state()
+                    model = refreshed.get("selected_model")
+                    fallback = refreshed.get("fallback_model")
                     print(f"  model → {val}")
                 else:
                     new = model_picker_interactive(current_model=model or "")
@@ -518,8 +594,8 @@ def run_repl(skip_setup: bool = False) -> int:
                         print(f"  model → {cyan(model)}")
             elif cmd == "/fallback" and val:
                 set_fallback(val)
-                fallback = val
-                print(f"  fallback → {val}")
+                fallback = get_state().get("fallback_model") or ""
+                print(f"  fallback → {fallback or 'disabled'}")
             elif cmd == "/swarm" and val:
                 try:
                     set_swarm(val)
@@ -529,6 +605,95 @@ def run_repl(skip_setup: bool = False) -> int:
                     print(f"  Fehler: {e}")
             elif cmd == "/status":
                 _print_repl_header()
+            elif cmd == "/tools":
+                if val:
+                    try:
+                        set_tool_mode(val.strip())
+                        print(f"  tools → {val.strip()}")
+                        _print_repl_header()
+                    except ValueError as e:
+                        print(f"  Fehler: {e}")
+                else:
+                    print(f"  tools = {get_state().get('tool_mode', 'on_demand')}")
+                    print("  set: /tools off|on_demand|always")
+            elif cmd == "/settings":
+                _repl_settings_command(val)
+                state = get_state()
+                model = state.get("selected_model")
+                fallback = state.get("fallback_model")
+                swarm = state.get("swarm_mode", "off")
+            elif cmd == "/runtime":
+                if val:
+                    try:
+                        set_runtime_mode(val.strip())
+                        print(f"  runtime → {val.strip()}")
+                        _print_repl_header()
+                    except ValueError as e:
+                        print(f"  Fehler: {e}")
+                else:
+                    print(f"  runtime = {get_state().get('runtime_mode', DEFAULT_RUNTIME_MODE)}")
+            elif cmd == "/guidelines":
+                from .guidelines import load_guidelines
+                workspace = str(active_workspace(get_state().get("workspace_root")))
+                rows = load_guidelines(workspace)
+                if not rows:
+                    print("  no guidelines discovered")
+                for scope, text in rows:
+                    print(f"\n  [{scope}]\n{text}")
+            elif cmd == "/commands":
+                from .commands import discover_commands
+                workspace = str(active_workspace(get_state().get("workspace_root")))
+                commands = discover_commands(workspace)
+                if not commands:
+                    print("  no commands discovered")
+                for item in commands:
+                    print(f"  {item.name:<20} {item.scope:<18} {item.description}")
+            elif cmd == "/command":
+                from .commands import expand_command
+                command_parts = val.split(None, 1)
+                if not command_parts:
+                    print("  usage: /command <name> [arguments]")
+                else:
+                    command_name = command_parts[0]
+                    command_args = command_parts[1] if len(command_parts) > 1 else ""
+                    expanded, is_error = expand_command(
+                        str(active_workspace(get_state().get("workspace_root"))),
+                        command_name,
+                        command_args,
+                    )
+                    if is_error:
+                        print(f"  {expanded}")
+                    else:
+                        try:
+                            run_agent(
+                                initial_prompt=expanded,
+                                model=model,
+                                fallback_model=fallback,
+                                conversation=conversation,
+                                runtime_mode="native-light",
+                            )
+                        except KeyboardInterrupt:
+                            print(f"\n{_c('yellow','[unterbrochen]')}")
+                        except Exception as e:
+                            print(f"\n[Fehler] {e}", file=sys.stderr)
+            elif cmd == "/plan":
+                from .agent_plan import PlanStore, format_plan
+                workspace = str(active_workspace(get_state().get("workspace_root")))
+                store = PlanStore()
+                if val.strip().lower() == "clear":
+                    print("  current plan cleared" if store.clear_current(workspace) else "  no current plan")
+                elif val.strip().lower() == "list":
+                    plans = store.list(workspace, limit=10)
+                    if not plans:
+                        print("  no plans")
+                    for plan in plans:
+                        print(f"  {plan.id}  {plan.status:<9} iter={plan.iteration:<3} {plan.task[:60]}")
+                else:
+                    plan = store.load_current(workspace)
+                    if plan is None:
+                        print("  no current plan")
+                    else:
+                        print("\n" + format_plan(plan))
             elif cmd == "/clear":
                 if sys.stdout.isatty():
                     print("\033[2J\033[H", end="")
@@ -546,37 +711,35 @@ def run_repl(skip_setup: bool = False) -> int:
                 print("  Ctrl+L       Terminal neu zeichnen")
                 print("  Tab          Slash-Kommandos vervollständigen")
             elif cmd == "/permissions":
-                print("  Lokale Berechtigungsrichtlinie")
-                print("  read       automatisch · keine Änderung")
-                print("  write      jedes Erstellen/Ändern einzeln bestätigen")
-                print("  delete     hohe Warnstufe · jedes Löschen einzeln bestätigen")
-                print("  sudo       einzeln bestätigen + Authentifizierung direkt durch lokales sudo")
-                print("  password   wird nie von ai-coder gelesen, gespeichert oder an TriForce gesendet")
-                print("  GUI sudo   blockiert · erhöhte Rechte nur im interaktiven Terminal-REPL")
-            elif cmd == "/shell":
                 if val:
-                    import subprocess, time as _t
-                    _t0 = _t.time()
-                    # NOTE: shell=True is intentional here — this is an explicit user-shell mode
-                    # (not model-generated commands). User types commands directly in /shell.
-                    r = subprocess.run(val, shell=True, capture_output=True, text=True, timeout=60)
-                    _dur = _t.time() - _t0
-                    out = (r.stdout or "") + (r.stderr or "")
-                    if r.stdout: print(r.stdout.rstrip())
-                    if r.stderr: print(r.stderr.rstrip(), file=sys.stderr)
+                    aliases = {"manual": "ask", "auto": "autopilot"}
+                    requested = aliases.get(val.strip().lower(), val.strip().lower())
                     try:
-                        from . import audit
-                        audit.log_tool(tool_name="repl_shell", arguments={"command": val}, result=out[:2000], duration_s=_dur, is_error=r.returncode != 0, model="user/repl")
-                    except Exception: pass
+                        set_approval_mode(requested)
+                        print(f"  approvals → {requested}")
+                    except ValueError as e:
+                        print(f"  Fehler: {e}")
                 else:
-                    print("  Bsp: /shell uptime")
+                    active = get_state().get("approval_mode", "ask")
+                    print(f"  Lokale Berechtigungsrichtlinie · aktiv: {active}")
+                    print("  ask        jede Änderung einzeln bestätigen")
+                    print("  autopilot  normale Schreibzugriffe automatisch; sudo/delete weiter bestätigen")
+                    print("  all        Workspace-Schreibzugriffe automatisch; Löschen weiter bestätigen")
+                    print("  root/sudo  im Coding-only-Profil grundsätzlich deaktiviert")
+                    print("  Setzen: /permissions ask|autopilot|all")
+            elif cmd == "/shell":
+                print("  /shell ist im Coding-only-Profil deaktiviert.")
             elif cmd == "/models":
                 try:
                     from .client import TriForceClient
                     s = load_session()
                     c = TriForceClient(s.base_url, token=s.token, timeout=10)
                     data = c._request("GET", "/v1/client/models", require_auth=True, _label="models")
-                    models = sorted(data.get("models", []))
+                    from .client import model_identifier
+                    models = sorted(
+                        model_id for item in data.get("models", [])
+                        if (model_id := model_identifier(item))
+                    )
                     tier = data.get("tier", "?")
                     groups: dict = {}
                     for m in models:
@@ -589,7 +752,9 @@ def run_repl(skip_setup: bool = False) -> int:
                     print(f"  Fehler: {e}")
             elif cmd == "/help":
                 print("  /model <n> · /fallback <n> · /swarm <m> · /models · /status")
-                print("  /shell <cmd> · /setup · /new · /clear · /keys · /permissions · /exit")
+                print("  /runtime classic|native-light · /tools off|on_demand|always · /settings · /plan [list|clear]")
+                print("  /commands · /command <name> [args] · /guidelines")
+                print("  /setup · /new · /clear · /keys · /permissions · /exit")
             else:
                 print(f"  Unbekannt: {cmd}  — /help für Hilfe")
             continue
