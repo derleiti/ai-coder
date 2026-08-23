@@ -194,7 +194,7 @@ class _AgentWorker(QThread):
             elif kind == "model_start":
                 phase = str(payload.get("phase") or "planning")
                 model_name = str(payload.get("model") or self.model or "backend")
-                self.activity.emit(f"Waiting for model · {model_name} · {phase} · timeout {int(payload.get('timeout') or 0)}s")
+                self.activity.emit(f"Waiting for model · {model_name} · {phase} · idle timeout {int(payload.get('timeout') or 0)}s")
             elif kind == "model_response":
                 requested = str(payload.get("requested") or "default")
                 used = str(payload.get("model") or requested)

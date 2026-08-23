@@ -10,26 +10,26 @@ from aicoder.executor import adaptive_request_timeout
 
 
 class AdaptiveContinuationTimeoutTests(unittest.TestCase):
-    def test_continuation_does_not_inherit_five_minute_task_timeout(self):
+    def test_continuation_uses_configured_idle_timeout(self):
         prompt = "vollstaendiger integration test " * 200
         self.assertEqual(
             adaptive_request_timeout(
-                300, prompt=prompt, iteration=20,
+                150, prompt=prompt, iteration=20,
                 model="openrouter/qwen/qwen3.8-27b", continuation=True,
             ),
-            90,
+            150,
         )
 
-    def test_slow_reasoning_continuation_has_bounded_extra_room(self):
+    def test_reasoning_model_uses_same_configured_idle_timeout(self):
         self.assertEqual(
             adaptive_request_timeout(
-                300, prompt="tool result", iteration=20,
+                150, prompt="tool result", iteration=20,
                 model="provider/reasoning-model", continuation=True,
             ),
-            120,
+            150,
         )
 
-    def test_named_reasoning_models_get_bounded_extra_continuation_time(self):
+    def test_named_reasoning_models_do_not_override_idle_timeout(self):
         for model in (
             "deepseek/deepseek-r1", "openai/o3-mini", "openai/o1",
             "anthropic/claude-3.7-sonnet", "qwen/qwq-32b",
@@ -37,19 +37,19 @@ class AdaptiveContinuationTimeoutTests(unittest.TestCase):
             with self.subTest(model=model):
                 self.assertEqual(
                     adaptive_request_timeout(
-                        300, prompt="tool result", iteration=2,
+                        150, prompt="tool result", iteration=2,
                         model=model, continuation=True,
                     ),
-                    120,
+                    150,
                 )
 
     def test_first_turn_keeps_configured_budget(self):
         self.assertEqual(
             adaptive_request_timeout(
-                300, prompt="large repository build", iteration=0,
+                150, prompt="large repository build", iteration=0,
                 model="openrouter/qwen/qwen3.8-27b", continuation=False,
             ),
-            300,
+            150,
         )
 
 
@@ -105,7 +105,7 @@ class CompletionAuditTests(unittest.TestCase):
             self.assertEqual(starts[0]["phase"], "planning")
             self.assertEqual(starts[0]["timeout"], 300)
             self.assertEqual(starts[1]["phase"], "continuation")
-            self.assertEqual(starts[1]["timeout"], 90)
+            self.assertEqual(starts[1]["timeout"], 300)
 
 
 class PlanVerificationSemanticsTests(unittest.TestCase):
