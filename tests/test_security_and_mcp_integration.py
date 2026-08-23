@@ -22,6 +22,7 @@ from aicoder.tool_policy import (
     INTERNAL_MCP_TOOLS,
     filter_tool_catalog,
     require_allowed_tool,
+    triforce_host_forbidden_reason,
 )
 
 
@@ -61,20 +62,30 @@ class ToolPolicyIntegrationTests(unittest.TestCase):
         ]
         self.assertEqual(filter_tool_catalog(catalog, OPERATOR_MCP_TOOLS), [])
 
-    def test_catalog_filter_rejects_malformed_but_not_operator_names(self):
+    def test_catalog_filter_rejects_malformed_and_triforce_host_tools(self):
         catalog = [
             {"name": "code_read", "inputSchema": {}},
+            {"name": "dev_refactor", "inputSchema": {}},
+            {"name": "service_control", "inputSchema": {}},
+            {"name": "remote_task", "inputSchema": {}},
             {"name": "vault_keys", "inputSchema": {}},
+            {"name": "search", "inputSchema": {}},
             {"description": "missing name"},
             "invalid",
         ]
         self.assertEqual(
-            filter_tool_catalog(catalog, {"code_read", "vault_keys"}),
+            filter_tool_catalog(catalog, None),
             [
-                {"name": "code_read", "inputSchema": {}},
                 {"name": "vault_keys", "inputSchema": {}},
+                {"name": "search", "inputSchema": {}},
             ],
         )
+        for name in ("code_read", "dev_refactor", "service_control", "remote_task"):
+            with self.subTest(name=name):
+                self.assertIsNotNone(triforce_host_forbidden_reason(name))
+        for name in ("search", "models", "memory_search", "memory_store", "specialist"):
+            with self.subTest(name=name):
+                self.assertIsNone(triforce_host_forbidden_reason(name))
 
     def test_only_canonical_search_is_allowed(self):
         catalog = [
@@ -233,6 +244,40 @@ class LocalCapabilityTests(unittest.TestCase):
                 result, error = executor.run_file_read({"command": "find . -delete"})
         self.assertTrue(error)
         self.assertIn("path", result)
+
+
+class TriForceHostBoundaryTests(unittest.TestCase):
+    def test_direct_host_tool_mcp_call_is_blocked_before_network(self):
+        client = TriForceClient("https://example.invalid")
+        client.token = "opaque"
+        client._request = MagicMock()
+        with self.assertRaises(ClientError) as ctx:
+            client.mcp_call("dev_refactor", {"path": "a.py"})
+        self.assertIn("backend service", str(ctx.exception))
+        client._request.assert_not_called()
+
+    def test_backend_service_mcp_call_remains_available(self):
+        client = TriForceClient("https://example.invalid")
+        client.token = "opaque"
+        client._request = MagicMock(return_value={
+            "jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "ok"}]},
+        })
+        response = client.mcp_call("search", {"query": "hello"})
+        self.assertIn("result", response)
+        client._request.assert_called_once()
+
+    def test_local_code_tool_rejects_legacy_remote_target_without_mcp(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "x.py").write_text("print(1)\n", encoding="utf-8")
+            client = MagicMock()
+            result, is_error = executor.run_tool(
+                client, "code_read", {"path": "x.py", "target": "remote"},
+                workspace_root=root,
+            )
+            self.assertTrue(is_error)
+            self.assertIn("remote code targets are disabled", result)
+            client.mcp_call.assert_not_called()
 
 
 class McpProtocolTests(unittest.TestCase):
