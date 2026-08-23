@@ -235,7 +235,8 @@ jobs:
           if (-not $envar) { throw 'EnVar.dll was not installed into the NSIS tree' }
           Write-Host "Using EnVar plugin: $($envar.FullName)"
 
-          & $makensis /V3 /DVERSION=$env:APP_VERSION /DEXE_PATH='dist\aicoder.exe' packaging\windows\installer.nsi
+          $exePath = (Resolve-Path 'dist\aicoder.exe').Path
+          & $makensis /V3 /DVERSION=$env:APP_VERSION "/DEXE_PATH=$exePath" packaging\windows\installer.nsi
           if ($LASTEXITCODE -ne 0) { throw "makensis failed with exit code $LASTEXITCODE" }
           if (-not (Test-Path "aicoder-$env:APP_VERSION-setup.exe")) {
             throw "NSIS installer was not created"
