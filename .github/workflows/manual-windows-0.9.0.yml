@@ -37,41 +37,30 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel pyinstaller
           python -m pip install -e .
 
-      - name: Build EXE using spec file
+      - name: Build Windows executable
         shell: pwsh
         run: |
-          python -m PyInstaller `
-            --onefile `
-            --name aicoder `
-            --console `
-            --noconfirm `
-            --clean `
-            --collect-submodules=aicoder `
-            --hidden-import=PyQt6.QtWidgets `
-            --hidden-import=PyQt6.QtGui `
-            --hidden-import=PyQt6.QtCore `
-            --hidden-import=PyQt6.QtNetwork `
-            --add-data "src/aicoder/assets:aicoder/assets" `
-            src/aicoder/cli.py
+          python -m PyInstaller aicoder-windows.spec --noconfirm --clean
           if (-not (Test-Path 'dist\aicoder.exe')) { throw 'aicoder.exe was not created' }
-          python -m PyInstaller aicoder-windows.spec --noconfirm --clean --verbose
-          Write-Host "=== dist/ Verzeichnis ===" 
-          Get-ChildItem -Recurse dist/ | ForEach-Object { Write-Host $_.FullName }
-          if (-not (Test-Path 'dist\aicoder.exe')) { 
-            Write-Host "ERROR: aicoder.exe nicht gefunden" -ForegroundColor Red
-            throw 'aicoder.exe was not created' 
-          }
           $size = (Get-Item dist\aicoder.exe).Length / 1MB
           Write-Host "aicoder.exe: $([math]::Round($size,1)) MB"
 
       - name: Build NSIS installer
         shell: pwsh
         run: |
-          choco install nsis nsis-envar -y --no-progress
-          $parts = $env:VERSION.Split('.'); while ($parts.Count -lt 4) { $parts += '0' }
-          $nsisVer = ($parts[0..3] -join '.')
+          choco install nsis -y --no-progress
+          $pluginZip = Join-Path $env:RUNNER_TEMP 'EnVar-Plugin.zip'
+          Invoke-WebRequest -Uri 'https://github.com/GsNSIS/EnVar/releases/download/v0.3.1/EnVar-Plugin.zip' -OutFile $pluginZip
+          & 7z x $pluginZip '-oC:\Program Files (x86)\NSIS' -y | Out-Host
+
           $makensis = 'C:\Program Files (x86)\NSIS\makensis.exe'
-          & $makensis /V2 /DVERSION="$env:VERSION" /DVERSIONINFO="$nsisVer" /DEXE_PATH="dist\aicoder.exe" packaging\windows\installer.nsi
+          if (-not (Test-Path $makensis)) { throw "makensis not found: $makensis" }
+          $envar = Get-ChildItem 'C:\Program Files (x86)\NSIS' -Recurse -Filter EnVar.dll | Select-Object -First 1
+          if (-not $envar) { throw 'EnVar.dll was not installed into the NSIS tree' }
+          Write-Host "Using EnVar plugin: $($envar.FullName)"
+
+          & $makensis /V3 /DVERSION=$env:VERSION /DEXE_PATH='dist\aicoder.exe' packaging\windows\installer.nsi
+          if ($LASTEXITCODE -ne 0) { throw "makensis failed with exit code $LASTEXITCODE" }
           if (-not (Test-Path "aicoder-$env:VERSION-setup.exe")) { throw 'NSIS installer was not created' }
 
       - name: Prepare artifacts and checksums

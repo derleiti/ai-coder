@@ -224,15 +224,19 @@ jobs:
         env:
           APP_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
-          choco install nsis nsis-envar -y --no-progress
-          $ver = $env:APP_VERSION -replace '[^0-9.]', ''
-          $parts = $ver.Split('.'); while ($parts.Count -lt 4) { $parts += '0' }
-          $nsisVer = ($parts[0..3] -join '.')
-          $makensis = "C:\Program Files (x86)\NSIS\makensis.exe"
-          & $makensis /V2 /DVERSION="$env:APP_VERSION" `
-            /DVERSIONINFO="$nsisVer" `
-            /DEXE_PATH="dist\aicoder.exe" `
-            packaging\windows\installer.nsi
+          choco install nsis -y --no-progress
+          $pluginZip = Join-Path $env:RUNNER_TEMP 'EnVar-Plugin.zip'
+          Invoke-WebRequest -Uri 'https://github.com/GsNSIS/EnVar/releases/download/v0.3.1/EnVar-Plugin.zip' -OutFile $pluginZip
+          & 7z x $pluginZip '-oC:\Program Files (x86)\NSIS' -y | Out-Host
+
+          $makensis = 'C:\Program Files (x86)\NSIS\makensis.exe'
+          if (-not (Test-Path $makensis)) { throw "makensis not found: $makensis" }
+          $envar = Get-ChildItem 'C:\Program Files (x86)\NSIS' -Recurse -Filter EnVar.dll | Select-Object -First 1
+          if (-not $envar) { throw 'EnVar.dll was not installed into the NSIS tree' }
+          Write-Host "Using EnVar plugin: $($envar.FullName)"
+
+          & $makensis /V3 /DVERSION=$env:APP_VERSION /DEXE_PATH='dist\aicoder.exe' packaging\windows\installer.nsi
+          if ($LASTEXITCODE -ne 0) { throw "makensis failed with exit code $LASTEXITCODE" }
           if (-not (Test-Path "aicoder-$env:APP_VERSION-setup.exe")) {
             throw "NSIS installer was not created"
           }
