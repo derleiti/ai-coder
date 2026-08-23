@@ -40,6 +40,20 @@ jobs:
       - name: Build EXE using spec file
         shell: pwsh
         run: |
+          python -m PyInstaller `
+            --onefile `
+            --name aicoder `
+            --console `
+            --noconfirm `
+            --clean `
+            --collect-submodules=aicoder `
+            --hidden-import=PyQt6.QtWidgets `
+            --hidden-import=PyQt6.QtGui `
+            --hidden-import=PyQt6.QtCore `
+            --hidden-import=PyQt6.QtNetwork `
+            --add-data "src/aicoder/assets:aicoder/assets" `
+            src/aicoder/cli.py
+          if (-not (Test-Path 'dist\aicoder.exe')) { throw 'aicoder.exe was not created' }
           python -m PyInstaller aicoder-windows.spec --noconfirm --clean --verbose
           Write-Host "=== dist/ Verzeichnis ===" 
           Get-ChildItem -Recurse dist/ | ForEach-Object { Write-Host $_.FullName }
