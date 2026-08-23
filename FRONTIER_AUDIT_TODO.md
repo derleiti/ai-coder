@@ -7,22 +7,24 @@ Status legend: `TODO` -> not yet reproduced on current HEAD; `CONFIRMED` -> repr
 
 ## P0/P1 - correctness and reliability
 
-- [ ] **F01 HIGH - GUI Stop does not cancel the underlying HTTP/provider request** (`TODO`)
-  - Reproduce on current HEAD.
-  - Define cancellable transport contract without reintroducing hard model-turn deadlines.
-  - Ensure Stop cannot leave an orphan request that races a later Retry/Resume.
-  - Add regression test observing transport cancellation.
+- [x] **F01 HIGH - GUI Stop does not cancel the underlying HTTP/provider request** (`FIXED`)
+  - Reproduced: Stop exits the runtime while the blocking provider thread can continue until transport return.
+  - Added optional transport `cancel_current_request()` contract without reintroducing hard model-turn deadlines.
+  - TriForce and direct OpenAI-compatible transports close the active HTTP response handle best-effort on Stop.
+  - Regression coverage verifies runtime cancellation and active-response closure.
 
-- [ ] **F02 HIGH - Successful fallback is not promoted to the effective model for later turns** (`TODO`)
+- [x] **F02 HIGH - Successful fallback is not promoted to the effective model for later turns** (`FIXED`)
   - Reproduce on current HEAD.
   - Decide explicit policy: promote fallback for the remainder of the run unless configured otherwise.
   - Keep tool-protocol/capability mode consistent with the effective model.
-  - Add multi-turn regression test.
+  - Fixed: successful provider fallback is promoted for the remainder of the run and capability/tool-protocol selection follows it.
+  - Multi-turn regression added.
 
-- [ ] **F03 HIGH - Completion audit can be bypassed when final tool turn also contains `DONE:`** (`TODO`)
+- [x] **F03 HIGH - Completion audit can be bypassed when final tool turn also contains `DONE:`** (`FIXED`)
   - Reproduce on current HEAD.
   - Route every final completion through one shared finalization gate.
-  - Add structured-task regression: mutation + verification + final tool call + `DONE:` must still receive exactly one completion-audit turn.
+  - Fixed: final tool-call `DONE:` path now passes through the same one-shot completion-audit requirement.
+  - Structured-task regression added: mutation + verification + final tool call + `DONE:` receives exactly one audit turn.
 
 - [x] **F04 MEDIUM - Read-only shell/binary_exec incorrectly counted as mutation** (`FIXED`)
   - Fixed in `14df94b` with separate mutation-effect classification.
@@ -30,78 +32,78 @@ Status legend: `TODO` -> not yet reproduced on current HEAD; `CONFIRMED` -> repr
 
 ## P1 - model state, context, transport
 
-- [ ] **F05 MEDIUM - Chat and Settings model selection can temporarily diverge** (`TODO`)
+- [x] **F05 MEDIUM - Chat and Settings model selection can temporarily diverge** (`FIXED`)
   - Verify precedence and intended override semantics on current HEAD.
-  - Add explicit run-start observability: configured/chat/effective/fallback/provider/tool mode.
-  - Add regression test for deliberate chat override.
+  - Added run-start route observability: configured/effective/fallback/provider/transport/tool protocol/context budget.
+  - Deliberate Chat override is explicit per-run behavior and covered by GUI model-selection regressions.
 
-- [ ] **F06 MEDIUM - Async model-list refresh can overwrite a manual Chat selection** (`TODO`)
-  - Reproduce with delayed model loader.
-  - Add generation/dirty guard so user edits after load start win.
-  - Add GUI regression test.
+- [x] **F06 MEDIUM - Async model-list refresh can overwrite a manual Chat selection** (`FIXED`)
+  - Reproduced in the Chat-tab refresh path. Added dirty guards so manual Chat edits after load start win.
+  - GUI regressions cover manual override, settings sync, and dirty reset.
 
-- [ ] **F07 MEDIUM - Reselecting same model may resync GUI but does not prove provider-route reset** (`TODO`)
+- [x] **F07 MEDIUM - Reselecting same model may resync GUI but does not prove provider-route reset** (`ACCEPTED`)
   - Treat as observability/state-consistency item, not assumed provider bug.
   - Verify same-ID save behavior and cache invalidation behavior.
-  - Close as `ACCEPTED` if no hidden local state remains after F05/F06/F08.
+  - Accepted after F05/F06/F08: no additional same-ID provider-route state was found locally; endpoint/account capability cache is now scoped.
 
-- [ ] **F08 MEDIUM - Model capability cache is global rather than endpoint/account scoped** (`TODO`)
+- [x] **F08 MEDIUM - Model capability cache is global rather than endpoint/account scoped** (`FIXED`)
   - Reproduce with two clients exposing different metadata.
-  - Partition cache by endpoint + anonymized account/token identifier.
-  - Add isolation regression test.
+  - Cache partitioned by endpoint + anonymized token/account identifier, with client-instance fallback.
+  - Isolation regression added.
 
-- [ ] **F09 MEDIUM - Context trimming uses message count only, not model/token budget** (`TODO`)
+- [x] **F09 MEDIUM - Context trimming uses message count only, not model/token budget** (`FIXED`)
   - Preserve native assistant/tool adjacency.
-  - Add bounded token/character budget using effective model context metadata.
-  - Add large text/native tool-history regressions.
+  - Added model-context-derived character budget with conservative fallback.
+  - Large-text and native assistant/tool adjacency regressions added.
 
-- [ ] **F10 MEDIUM - Keepalive telemetry is not separated from real model output** (`TODO`)
+- [x] **F10 MEDIUM - Keepalive telemetry is not separated from real model output** (`FIXED`)
   - Preserve keepalive as inactivity activity.
-  - Record keepalive count/timestamps separately from provider/model data.
-  - Add stream regression with multiple keepalives then final JSON.
+  - Keepalive chunks/timestamps and payload chunks are recorded separately.
+  - Stream telemetry regression added.
 
-- [ ] **F11 MEDIUM - Direct OpenAI-compatible transport has different timeout/keepalive semantics** (`TODO`)
+- [x] **F11 MEDIUM - Direct OpenAI-compatible transport has different timeout/keepalive semantics** (`FIXED`)
   - Verify current preview path.
-  - Document semantic difference and add activity-aware streaming/telemetry if appropriate.
-  - Add long-turn transport regression.
+  - Direct preview transport now explicitly reports non-streaming blocking-request timeout semantics in telemetry.
+  - Transport regression added; true streaming/cancellation remains future transport work.
 
 ## P2/P3 - documentation, persistence, edge cases
 
-- [ ] **F12 MEDIUM - Architecture docs still describe removed continuation timeout policy** (`TODO`)
+- [x] **F12 MEDIUM - Architecture/docs timeout wording stale after inactivity-only change** (`FIXED`)
   - Update docs to the current inactivity-only semantics.
-  - Ensure GUI/help/docs describe one meaning for `request_timeout`.
+  - Settings/help wording now defines `request_timeout` as provider/network inactivity, reset by streaming keepalive activity, not a hard turn deadline.
 
-- [ ] **F13 LOW - Resume intentionally does not persist raw tool evidence** (`TODO`)
+- [x] **F13 LOW - Resume intentionally does not persist raw tool evidence** (`ACCEPTED`)
   - Verify privacy/security behavior and fresh-inspection gate.
-  - Expected likely resolution: `ACCEPTED`, with clearer UX/status wording.
+  - Accepted privacy behavior: journals persist sanitized context/tool metadata only; resume mutation is gated on fresh inspection.
+  - GUI now states this explicitly on resumed runs.
 
-- [ ] **F14 LOW - Evidence fast-path can miss same-size content with restored mtime** (`TODO`)
+- [x] **F14 LOW - Evidence fast-path can miss same-size content with restored mtime** (`FIXED`)
   - Reproduce edge case.
-  - Add optional forced hash/recheck for explicit or security-sensitive verification.
-  - Add regression test.
+  - Repeated-read evidence recall now forces a content hash before reusing cached evidence.
+  - Same-size/restored-mtime regression added.
 
-- [ ] **F15 LOW - Duplicate guard can block legitimate repeated read-only polling** (`TODO`)
+- [x] **F15 LOW - Duplicate guard can block legitimate repeated read-only polling** (`FIXED`)
   - Reproduce legitimate polling case.
   - Keep repeated mutations blocked.
-  - Permit justified read-only polling only with bounded/state-aware policy.
+  - Explicit polling/monitoring intent may repeat identical read-only calls up to a small bound; mutations remain strictly duplicate-blocked.
 
 ## Verified mechanisms / findings that should normally be preserved
 
-- [ ] **F16 INFO - Tool-result handoff works in the normal live loop** (`TODO verification on current HEAD`)
+- [x] **F16 INFO - Tool-result handoff works in the normal live loop** (`VERIFIED`)
   - Preserve text `current_input` handoff and native `assistant.tool_calls -> role=tool` history.
-  - Extend regressions for multi-result, transient failure, trim boundary and resume.
+  - Verified by normal handoff, native tool-role, trim-boundary, fallback, resume, and multi-result regressions on current HEAD.
 
-- [ ] **F17 INFO - TriForce host boundary is strong but name filtering alone is not a mathematical guarantee** (`TODO verification on current HEAD`)
+- [x] **F17 INFO - TriForce host boundary is strong but name filtering alone is not a mathematical guarantee** (`VERIFIED`)
   - Preserve catalogue filtering + dispatch-time blocking + local/remote separation.
-  - Review semantic target metadata/RBAC hardening without weakening local operator power.
+  - Verified catalogue filtering plus dispatch-time TriForce-host blocking and local-only shell/binary/task boundaries; backend RBAC remains authoritative.
 
 ## Cross-cutting test/UX work from the audit
 
-- [ ] **X01** Full regression suite after every coherent fix; document environment-only skips/errors separately.
-- [ ] **X02** Provider/transport/local-handoff timing instrumentation with request IDs.
-- [ ] **X03** Status UI must distinguish `tool completed` from subsequent `waiting for model`.
-- [ ] **X04** Resume UI should state that raw evidence is not restored and fresh inspection is required.
-- [ ] **X05** Keep provider-specific quirks in capability/transport layers; no scattered model-name hacks.
+- [x] **X01** Final full regression suite: 435/435 tests passed; expected security-block diagnostics are not failures.
+- [x] **X02** Provider/transport/local-handoff timing instrumentation uses per-turn request IDs.
+- [x] **X03** Status UI distinguishes `tool completed` from subsequent `waiting for model`.
+- [x] **X04** Resume UI states that raw evidence is not restored and fresh inspection is required.
+- [x] **X05** Provider-specific quirks remain in capability/transport layers; no new scattered model-name hacks.
 
 ## Do not regress
 

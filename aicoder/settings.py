@@ -151,7 +151,9 @@ _register(SettingSpec(
 _register(SettingSpec(
     key="request_timeout", type="int", default=300, minimum=10, maximum=300,
     group="runtime", aliases=("timeout",),
-    description="Seconds to wait for a single LLM request. Unrelated to shell/subprocess timeouts.",
+    description=("Seconds of provider/network inactivity allowed while waiting for an LLM request. "
+        "Streaming keepalive activity resets this idle timer; it is not a hard total turn deadline "
+        "and is unrelated to shell/subprocess timeouts."),
 ))
 _register(SettingSpec(
     key="max_output_tokens", type="int", default=16384, minimum=256, maximum=200000,

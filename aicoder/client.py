@@ -3,6 +3,7 @@ import base64
 import json
 import ssl
 import sys
+import threading
 import time
 from typing import Any, Dict, Optional
 from urllib.error import HTTPError, URLError
@@ -232,6 +233,35 @@ class TriForceClient:
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.timeout = timeout
+        self._active_response_lock = threading.Lock()
+        self._active_response = None
+
+    def _set_active_response(self, response: Any) -> None:
+        with self._active_response_lock:
+            self._active_response = response
+
+    def _clear_active_response(self, response: Any) -> None:
+        with self._active_response_lock:
+            if self._active_response is response:
+                self._active_response = None
+
+    def cancel_current_request(self) -> bool:
+        """Best-effort cancellation by closing the active HTTP response handle."""
+        with self._active_response_lock:
+            response = self._active_response
+            self._active_response = None
+        if response is None:
+            return False
+        closed = False
+        for method_name in ("close", "release_conn"):
+            method = getattr(response, method_name, None)
+            if callable(method):
+                try:
+                    method()
+                    closed = True
+                except Exception:
+                    pass
+        return closed
 
     def token_expires_in(self) -> Optional[float]:
         """Seconds until token expires. None if unknown, negative if expired."""
@@ -330,6 +360,7 @@ class TriForceClient:
                     timeout=self.timeout, redirect=False,
                     preload_content=not keepalive_stream,
                 )
+                self._set_active_response(resp)
                 if resp.status >= 400:
                     raw_error = resp.read() if keepalive_stream else resp.data
                     body = raw_error.decode("utf-8", errors="replace")
@@ -345,6 +376,7 @@ class TriForceClient:
                                 f"Token expired (HTTP {resp.status}). Please re-login: aicoder setup"
                             )
                     status, retryable, retry_after = _error_metadata(parsed, resp.status)
+                    self._clear_active_response(resp)
                     raise ClientError(
                         f"HTTP {resp.status}{label} bei {url}: {parsed}",
                         status_code=status, retryable=retryable, retry_after=retry_after, payload=parsed,
@@ -355,6 +387,9 @@ class TriForceClient:
                     max_gap = 0.0
                     chunks = 0
                     byte_count = 0
+                    keepalive_chunks = 0
+                    payload_chunks = 0
+                    keepalive_times_s: list[float] = []
                     parts: list[bytes] = []
                     try:
                         while True:
@@ -370,9 +405,18 @@ class TriForceClient:
                             last_rx = now
                             chunks += 1
                             byte_count += len(chunk)
+                            if not chunk.strip():
+                                keepalive_chunks += 1
+                                keepalive_times_s.append(round(now - started, 3))
+                            else:
+                                payload_chunks += 1
                             parts.append(chunk)
                     finally:
-                        resp.release_conn()
+                        self._clear_active_response(resp)
+                        try:
+                            resp.release_conn()
+                        except Exception:
+                            pass
                     raw = b"".join(parts).decode("utf-8")
                     result = json.loads(raw) if raw else {}
                     if isinstance(result, dict):
@@ -381,12 +425,18 @@ class TriForceClient:
                             "elapsed_s": round(time.monotonic() - started, 3),
                             "chunks": chunks,
                             "bytes": byte_count,
+                            "keepalive_chunks": keepalive_chunks,
+                            "payload_chunks": payload_chunks,
+                            "keepalive_times_s": keepalive_times_s[-32:],
                             "max_rx_gap_s": round(max_gap, 3),
                             "last_rx_age_s": round(max(0.0, time.monotonic() - last_rx), 3),
                         }
                     return result
-                raw = resp.data.decode("utf-8")
-                return json.loads(raw) if raw else {}
+                try:
+                    raw = resp.data.decode("utf-8")
+                    return json.loads(raw) if raw else {}
+                finally:
+                    self._clear_active_response(resp)
             except (TokenExpiredError, ClientError):
                 raise
             except Exception as e:
@@ -401,9 +451,17 @@ class TriForceClient:
         # Fallback: plain urlopen (no pool)
         req = Request(url=url, data=data, headers=headers, method=method.upper())
         try:
-            with urlopen(req, timeout=self.timeout, context=_ssl_context()) as resp:
+            resp = urlopen(req, timeout=self.timeout, context=_ssl_context())
+            self._set_active_response(resp)
+            try:
                 raw = resp.read().decode("utf-8")
                 return json.loads(raw) if raw else {}
+            finally:
+                self._clear_active_response(resp)
+                try:
+                    resp.close()
+                except Exception:
+                    pass
         except HTTPError as e:
             body = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else ""
             try:
@@ -535,6 +593,7 @@ class TriForceClient:
         messages: Optional[list] = None,
         tools: Optional[list] = None,
         tool_choice: Any = "auto",
+        request_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Call /v1/client/chat. Supports messages array for multi-turn context."""
         payload: Dict[str, Any] = {
@@ -553,11 +612,17 @@ class TriForceClient:
             payload["tools"] = tools
             payload["tool_choice"] = tool_choice
         try:
-            return _normalize_chat_response(self._request(
+            primary_result = _normalize_chat_response(self._request(
                 "POST", "/v1/client/chat", payload, require_auth=True,
                 _label=f"chat/{model or 'default'}", _retries=0,
-                _extra_headers={"X-AICoder-Keepalive": "json"},
+                _extra_headers={"X-AICoder-Keepalive": "json", **({"X-AICoder-Request-ID": request_id} if request_id else {})},
             ))
+            if isinstance(primary_result, dict) and request_id:
+                primary_result = dict(primary_result)
+                telemetry = dict(primary_result.get("_transport_telemetry") or {})
+                telemetry["request_id"] = request_id
+                primary_result["_transport_telemetry"] = telemetry
+            return primary_result
         except TokenExpiredError:
             raise
         except ClientError as e:
@@ -573,11 +638,15 @@ class TriForceClient:
                 fallback_result = _normalize_chat_response(self._request(
                     "POST", "/v1/client/chat", payload, require_auth=True,
                     _label=f"chat/{fallback_model}(fallback)", _retries=0,
-                    _extra_headers={"X-AICoder-Keepalive": "json"},
+                    _extra_headers={"X-AICoder-Keepalive": "json", **({"X-AICoder-Request-ID": request_id} if request_id else {})},
                 ))
                 if isinstance(fallback_result, dict):
                     fallback_result = dict(fallback_result)
                     fallback_result["fallback_used"] = True
                     fallback_result.setdefault("primary_model", model)
+                    if request_id:
+                        telemetry = dict(fallback_result.get("_transport_telemetry") or {})
+                        telemetry["request_id"] = request_id
+                        fallback_result["_transport_telemetry"] = telemetry
                 return fallback_result
             raise

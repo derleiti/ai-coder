@@ -129,8 +129,13 @@ class ProjectEvidenceStore:
             path = Path(self.workspace) / path
         return path.resolve(strict=True)
 
-    def inspect_file(self, path: str, start_line: int = 1, end_line: int = 0) -> tuple[FileEvidence, bool]:
-        """Record file identity/range and return (record, unchanged_from_previous)."""
+    def inspect_file(
+        self, path: str, start_line: int = 1, end_line: int = 0, *, force_hash: bool = False
+    ) -> tuple[FileEvidence, bool]:
+        """Record file identity/range and return (record, unchanged_from_previous).
+
+        ``force_hash`` bypasses the size+mtime fast path for explicit rechecks.
+        """
         resolved = self._resolve_file(path)
         if not resolved.is_file():
             raise ValueError(f"not a regular file: {resolved}")
@@ -142,7 +147,12 @@ class ProjectEvidenceStore:
 
         # Avoid hashing an unchanged file repeatedly inside one run. mtime+size is
         # only the fast path; a changed stat always gets a content digest.
-        if previous and previous.size == stat.st_size and previous.mtime_ns == stat.st_mtime_ns:
+        if (
+            not force_hash
+            and previous
+            and previous.size == stat.st_size
+            and previous.mtime_ns == stat.st_mtime_ns
+        ):
             return previous, True
 
         content_hash = _file_digest(resolved)

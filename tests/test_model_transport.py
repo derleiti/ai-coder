@@ -50,6 +50,27 @@ class OpenAICompatibleTransportTests(unittest.TestCase):
         self.assertEqual(payload["tools"][0]["function"]["name"], "file_read")
         self.assertEqual(payload["model"], "qwen-test")
 
+    def test_direct_transport_cancel_closes_active_response(self):
+        transport = OpenAICompatibleTransport("https://example.invalid/v1", api_key="x")
+        response = MagicMock()
+        with transport._active_response_lock:
+            transport._active_response = response
+        self.assertTrue(transport.cancel_current_request())
+        response.close.assert_called_once()
+        self.assertFalse(transport.cancel_current_request())
+
+    def test_direct_transport_reports_blocking_timeout_semantics(self):
+        transport = OpenAICompatibleTransport("https://example.invalid/v1", api_key="x", timeout=45)
+        with patch.object(transport, "_post_json", return_value={
+            "choices": [{"message": {"content": "ok"}}], "model": "direct/model"
+        }):
+            result = transport.chat(message="hello", model="direct/model")
+        telemetry = result["_transport_telemetry"]
+        self.assertEqual(telemetry["transport"], "openai-compatible-direct")
+        self.assertFalse(telemetry["streaming"])
+        self.assertEqual(telemetry["timeout_semantics"], "blocking-request")
+        self.assertEqual(telemetry["keepalive_chunks"], 0)
+
     def test_fallback_retries_same_endpoint_with_other_model(self):
         transport = OpenAICompatibleTransport("http://localhost:1234/v1", timeout=30)
         transport._post_json = MagicMock(side_effect=[

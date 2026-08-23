@@ -1228,7 +1228,7 @@ def cmd_remote_node(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="aicoder",
-        description="ai-coder — terminal-based coding agent for AILinux / TriForce",
+        description="ai-coder — terminal-based operator agent for AILinux / TriForce",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""        Examples:
           aicoder login --base-url http://127.0.0.1:9000

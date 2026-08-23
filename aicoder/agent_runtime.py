@@ -10,12 +10,13 @@ import queue
 import re
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
 from .agent_journal import ContinuationJournalStore
-from .model_capabilities import supports_tools
+from .model_capabilities import model_context_window, supports_tools
 from .agent_plan import AgentPlan, PlanStore, plan_prompt_context, resume_prompt_context
 from .client import ClientError, TriForceClient
 from .capabilities import (
@@ -127,6 +128,12 @@ _VERIFICATION_REQUIRED_PROMPT = (
     "state. For source-code or behavior changes, run an applicable lint/test/compile/reproducer "
     "or other executable check; rereading the source alone is not behavior verification. "
     "Do not report DONE until the relevant verification succeeds."
+)
+
+_POLLING_INTENT_RE = re.compile(
+    r"\b(?:poll(?:ing)?|monitor(?:ing)?|watch|check\s+again|recheck|wait\s+until|"
+    r"wiederholt(?:e|en)?|erneut\s+pr[uü]f|[uü]berwach|beobacht)\b",
+    re.IGNORECASE,
 )
 
 _STRUCTURED_REQUIREMENT_RE = re.compile(r"(?m)^\s*(?:\\?[-*+]\s+|\d+\\?[.)]\s+)")
@@ -287,6 +294,13 @@ class NativeLightRuntime:
         thread.start()
         while thread.is_alive():
             if self._stopped():
+                cancel = getattr(model_client, "cancel_current_request", None)
+                if callable(cancel):
+                    try:
+                        cancel()
+                    except Exception:
+                        # Cancellation is best-effort; Stop must still return promptly.
+                        pass
                 raise InterruptedError("Agent stopped by user")
             thread.join(0.1)
         ok, value = result_queue.get()
@@ -718,6 +732,13 @@ class NativeLightRuntime:
         active_model = configured_model
         active_fallback = self.fallback_model
         model_used = active_model or "?"
+        context_window_tokens = model_context_window(model_client, active_model)
+        if context_window_tokens:
+            reserved_tokens = max(4096, int(self.max_output_tokens or 0))
+            usable_tokens = max(4096, int(context_window_tokens * 0.80) - reserved_tokens)
+            context_char_budget = max(16384, min(400000, usable_tokens * 4))
+        else:
+            context_char_budget = 240000
         total_latency = 0
         fallback_used = False
         tool_was_called = False
@@ -757,7 +778,14 @@ class NativeLightRuntime:
         self._emit(
             "run_start",
             model=active_model or "backend-default",
+            configured_model=self.model or "backend-default",
+            effective_model=active_model or "backend-default",
             fallback=active_fallback or "",
+            provider=(str(active_model).split("/", 1)[0] if active_model and "/" in str(active_model) else "default"),
+            transport=type(model_client).__name__,
+            native_tool_protocol=self._native_tool_calling_enabled(active_model),
+            context_window_tokens=context_window_tokens or 0,
+            context_char_budget=context_char_budget,
             tools=len(tools),
             workspace=workspace,
             plan_id=plan.id if plan else "",
@@ -792,7 +820,7 @@ class NativeLightRuntime:
             turn_input = current_input
             if turn_input:
                 messages.append({"role": "user", "content": turn_input})
-            messages = trim_messages(messages)
+            messages = trim_messages(messages, max_chars=context_char_budget)
             continuation_turn = i > 0
             timeout = adaptive_request_timeout(
                 self.base_timeout,
@@ -802,9 +830,10 @@ class NativeLightRuntime:
                 model=active_model,
                 continuation=continuation_turn,
             )
+            request_id = f"aicoder-{uuid.uuid4().hex[:16]}"
             self._emit(
                 "model_start", iteration=i + 1, timeout=timeout, model=active_model or "",
-                phase="continuation" if continuation_turn else "planning",
+                phase="continuation" if continuation_turn else "planning", request_id=request_id,
             )
             started = time.monotonic()
             try:
@@ -819,6 +848,7 @@ class NativeLightRuntime:
                     max_tokens=256 if self.quick_chat else self.max_output_tokens,
                     tools=request_tools,
                     tool_choice="auto",
+                    request_id=request_id,
                 )
             except InterruptedError:
                 reason = "Agent stopped by user"
@@ -865,17 +895,29 @@ class NativeLightRuntime:
                     fallback_used=fallback_used, plan_id=plan.id if plan else "",
                     error=reason,
                 )
-            elapsed_ms = int((time.monotonic() - started) * 1000)
+            model_response_received_at = time.monotonic()
+            elapsed_ms = int((model_response_received_at - started) * 1000)
             response = str(result.get("response", "") or "").strip()
             model_used = str(result.get("model", active_model or "?") or "?")
             latency = int(result.get("latency_ms") or elapsed_ms)
             total_latency += latency
             if result.get("fallback_used"):
                 fallback_used = True
+                # A successful provider fallback becomes the effective model for the
+                # rest of this run. Otherwise the next turn would retry the failed
+                # primary and capability/tool-protocol decisions would use stale data.
+                if model_used not in {"", "?"} and model_used != active_model:
+                    previous_model = active_model or "backend-default"
+                    active_model = model_used
+                    active_fallback = None
+                    self._emit(
+                        "model_switch", previous=previous_model, model=active_model,
+                        reason="provider fallback promoted for remainder of run",
+                    )
             transport_telemetry = result.get("_transport_telemetry") if isinstance(result, dict) else None
             self._emit(
                 "model_response", iteration=i + 1, elapsed_ms=elapsed_ms,
-                model=model_used, requested=active_model or "backend-default",
+                model=model_used, requested=active_model or "backend-default", request_id=request_id,
                 transport_telemetry=(transport_telemetry if isinstance(transport_telemetry, dict) else {}),
             )
 
@@ -1002,7 +1044,19 @@ class NativeLightRuntime:
                 )
 
             consecutive_call_batches = loop_guard.observe_calls(calls)
-            if consecutive_call_batches >= 2:
+            polling_read_only_repeat = (
+                consecutive_call_batches <= 3
+                and bool(_POLLING_INTENT_RE.search(self.initial_prompt))
+                and all(
+                    not assess_execution(
+                        str(call.get("name") or ""),
+                        call.get("arguments") if isinstance(call.get("arguments"), dict) else {},
+                        destructive=False,
+                    ).mutation
+                    for call in calls
+                )
+            )
+            if consecutive_call_batches >= 2 and not polling_read_only_repeat:
                 messages.append({"role": "assistant", "content": response})
                 if consecutive_call_batches == 2:
                     current_input = (
@@ -1067,7 +1121,11 @@ class NativeLightRuntime:
 
                 name = str(call.get("name") or "?")
                 args = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
-                self._emit("tool_call", name=name, arguments=args, iteration=i + 1)
+                handoff_ms = int((time.monotonic() - model_response_received_at) * 1000)
+                self._emit(
+                    "tool_call", name=name, arguments=args, iteration=i + 1,
+                    request_id=request_id, handoff_ms=handoff_ms,
+                )
                 if name in META_TOOL_NAMES:
                     started_tool = time.monotonic()
                     tool_result, is_error, tools_changed = self._run_meta_tool(name, args, tools)
@@ -1085,6 +1143,7 @@ class NativeLightRuntime:
                     self._emit(
                         "tool_result", name=name, result=tool_result,
                         is_error=is_error, elapsed=elapsed, iteration=i + 1,
+                        request_id=request_id, handoff_ms=handoff_ms,
                     )
                     tool_results.append(f"Tool {name} result:\n{tool_result}")
                     if native_mode:
@@ -1144,6 +1203,10 @@ class NativeLightRuntime:
                         )
                         if recall_key in run_file_reads:
                             try:
+                                _, unchanged = evidence_store.inspect_file(*recall_key, force_hash=True)
+                            except TypeError:
+                                # Compatibility for alternate/test evidence stores that predate
+                                # the explicit forced-hash API.
                                 _, unchanged = evidence_store.inspect_file(*recall_key)
                             except Exception:
                                 unchanged = False
@@ -1217,6 +1280,7 @@ class NativeLightRuntime:
                 self._emit(
                     "tool_result", name=name, result=tool_result,
                     is_error=is_error, elapsed=elapsed, iteration=i + 1,
+                    request_id=request_id, handoff_ms=handoff_ms,
                 )
                 hook_event = "PostToolUseFailure" if is_error else "PostToolUse"
                 post_hook = self.hooks.emit(hook_event, {
@@ -1452,6 +1516,19 @@ class NativeLightRuntime:
                         iterations=i + 1, latency_ms=total_latency,
                         fallback_used=fallback_used, plan_id=plan.id if plan else "",
                     )
+                if (
+                    mutation_seen
+                    and tool_was_called
+                    and not completion_audit_sent
+                    and _needs_completion_audit(self.initial_prompt)
+                ):
+                    current_input += "\n\n" + _completion_audit_prompt(self.initial_prompt)
+                    completion_audit_sent = True
+                    self._emit("completion_audit", iteration=i + 1)
+                    self._save_journal(
+                        plan, messages, pending_input=current_input, tool_batches=journal_batches
+                    )
+                    continue
                 self._complete_plan(
                     plan, visible or response,
                     mutation_seen=mutation_seen,

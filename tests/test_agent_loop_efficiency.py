@@ -108,6 +108,69 @@ class CompletionAuditTests(unittest.TestCase):
             self.assertEqual(starts[1]["timeout"], 300)
 
 
+class FrontierAuditRuntimeTests(unittest.TestCase):
+    def test_successful_provider_fallback_is_promoted_for_followup_turn(self):
+        client = MagicMock()
+        client.timeout = 300
+        client.chat.side_effect = [
+            {
+                "response": 'TOOL_CALL file_read\n{"path":"probe.txt"}\nEND_TOOL_CALL',
+                "model": "provider/fallback",
+                "fallback_used": True,
+            },
+            {"response": "DONE: fallback continued", "model": "provider/fallback"},
+        ]
+        runtime = NativeLightRuntime(
+            client=client, initial_prompt="inspect probe.txt", model="provider/primary",
+            fallback_model="provider/fallback", workspace_root="/tmp",
+            tools=[{
+                "name": "file_read", "description": "read file",
+                "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+            }], load_tools_on_start=False, persistent_plan=False, base_timeout=300,
+        )
+        with patch("aicoder.agent_runtime.run_tool", return_value=("alpha", False)):
+            result = runtime.run()
+        self.assertEqual(result.status, "completed")
+        self.assertTrue(result.fallback_used)
+        self.assertEqual(client.chat.call_count, 2)
+        second = client.chat.call_args_list[1].kwargs
+        self.assertEqual(second["model"], "provider/fallback")
+        self.assertIsNone(second["fallback_model"])
+
+    def test_done_with_final_tool_call_still_runs_completion_audit(self):
+        client = MagicMock()
+        client.timeout = 300
+        client.chat.side_effect = [
+            {
+                "response": 'DONE: wrote file\nTOOL_CALL file_edit\n{"path":"x.txt","operation":"write","content":"ok"}\nEND_TOOL_CALL',
+                "model": "test/model",
+            },
+            {"response": "DONE: audited", "model": "test/model"},
+        ]
+        events = []
+        runtime = NativeLightRuntime(
+            client=client,
+            initial_prompt="- write x.txt\n- verify x.txt\n- report completion\n",
+            model="test/model", fallback_model=None, workspace_root="/tmp",
+            tools=[{
+                "name": "file_edit", "description": "edit file",
+                "inputSchema": {"type": "object", "properties": {
+                    "path": {"type": "string"}, "operation": {"type": "string"}, "content": {"type": "string"}
+                }, "required": ["path", "operation"]},
+            }], load_tools_on_start=False, persistent_plan=False, base_timeout=300,
+            event_fn=lambda kind, payload: events.append((kind, payload)),
+        )
+        with patch(
+            "aicoder.agent_runtime.run_tool",
+            return_value=("updated x.txt; verified exact content (2 chars)", False),
+        ):
+            result = runtime.run()
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.response, "DONE: audited")
+        self.assertEqual(client.chat.call_count, 2)
+        self.assertEqual(sum(kind == "completion_audit" for kind, _ in events), 1)
+
+
 class PlanVerificationSemanticsTests(unittest.TestCase):
     def test_deterministic_write_result_completes_verification(self):
         from aicoder.agent_plan import PlanStore
@@ -344,3 +407,24 @@ class DuplicateRecoveryRegressionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PollingDuplicateGuardTests(unittest.TestCase):
+    def test_explicit_polling_allows_bounded_repeated_read_only_calls(self):
+        client = MagicMock(); client.timeout = 30
+        call = 'TOOL_CALL file_read\n{"path":"status.txt"}\nEND_TOOL_CALL'
+        client.chat.side_effect = [
+            {"response": call, "model": "test/model"},
+            {"response": call, "model": "test/model"},
+            {"response": "DONE: changed", "model": "test/model"},
+        ]
+        runtime = NativeLightRuntime(
+            client=client, initial_prompt="Monitor status.txt and check again for a change",
+            model="test/model", fallback_model=None, workspace_root="/tmp",
+            tools=[{"name":"file_read","description":"read","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}],
+            load_tools_on_start=False, persistent_plan=False, base_timeout=30,
+        )
+        with patch("aicoder.agent_runtime.run_tool", side_effect=[("old", False), ("new", False)]) as run:
+            result = runtime.run()
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(run.call_count, 2)

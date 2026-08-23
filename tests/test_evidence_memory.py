@@ -121,3 +121,25 @@ class RuntimeEvidenceRecallTests(unittest.TestCase):
                 "Duplicate tool call blocked before execution" in str(message.get("content", ""))
                 for message in result.messages
             ))
+
+
+class EvidenceForcedRecheckTests(unittest.TestCase):
+    def test_force_hash_detects_same_size_content_with_restored_mtime(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        from aicoder.evidence_memory import ProjectEvidenceStore
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = root / "probe.txt"
+            target.write_text("alpha", encoding="utf-8")
+            store = ProjectEvidenceStore(str(root), db_path=root / "evidence.db")
+            first, _ = store.inspect_file(str(target))
+            stat = target.stat()
+            target.write_text("bravo", encoding="utf-8")
+            os.utime(target, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+            _, fast_unchanged = store.inspect_file(str(target))
+            self.assertTrue(fast_unchanged)
+            forced, forced_unchanged = store.inspect_file(str(target), force_hash=True)
+            self.assertFalse(forced_unchanged)
+            self.assertNotEqual(forced.content_hash, first.content_hash)
