@@ -238,7 +238,10 @@ jobs:
           $exePath = (Resolve-Path 'dist\aicoder.exe').Path
           & $makensis /V3 /DVERSION=$env:APP_VERSION "/DEXE_PATH=$exePath" packaging\windows\installer.nsi
           if ($LASTEXITCODE -ne 0) { throw "makensis failed with exit code $LASTEXITCODE" }
-          if (-not (Test-Path "aicoder-$env:APP_VERSION-setup.exe")) {
+          $builtInstaller = "packaging\windows\aicoder-$env:APP_VERSION-setup.exe"
+          $rootInstaller = "aicoder-$env:APP_VERSION-setup.exe"
+          if (Test-Path $builtInstaller) { Move-Item -Force $builtInstaller $rootInstaller }
+          if (-not (Test-Path $rootInstaller)) {
             throw "NSIS installer was not created"
           }
 

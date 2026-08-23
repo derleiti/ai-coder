@@ -10,7 +10,7 @@ Unicode True
 !define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\ai-coder"
 
 Name "${APP_NAME} ${VERSION}"
-OutFile "${__FILEDIR__}\..\..\aicoder-${VERSION}-setup.exe"
+OutFile "aicoder-${VERSION}-setup.exe"
 InstallDir "${INSTALL_DIR}"
 InstallDirRegKey HKLM "Software\ai-coder" "Install_Dir"
 RequestExecutionLevel admin
