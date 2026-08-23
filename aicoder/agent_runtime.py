@@ -475,50 +475,69 @@ class NativeLightRuntime:
         is_error: bool,
         mutation_seen: bool,
     ) -> tuple[bool, bool]:
-        if plan is None:
-            return mutation_seen, False
+        """Track safety-relevant progress independently of plan persistence.
+
+        Runtime safety must be identical in classic and persistent-plan modes.
+        Classify the effect first; the AgentPlan is only a persistence/UI view of
+        that state and must never be the source of truth for mutation detection.
+        """
         risk = assess_execution(name, args, destructive=is_destructive(str(args.get("command", ""))))
-        # Persist only execution metadata, never raw tool output. Tool results may
-        # contain source snippets, tokens, credentials, or other sensitive data.
-        plan.record_event(
-            "tool",
-            f"{name} {'failed' if is_error else 'completed'}",
-            tool=name,
-            is_error=is_error,
-        )
+        previous_mutation_seen = mutation_seen
+        verification_seen = False
+
+        if plan is not None:
+            # Persist only execution metadata, never raw tool output. Tool results may
+            # contain source snippets, tokens, credentials, or other sensitive data.
+            plan.record_event(
+                "tool",
+                f"{name} {'failed' if is_error else 'completed'}",
+                tool=name,
+                is_error=is_error,
+            )
+
         if is_error:
-            self._save_plan(plan)
+            if plan is not None:
+                self._save_plan(plan)
             return mutation_seen, False
 
-        verification_seen = False
-        if name in _VERIFY_TOOLS:
-            plan.set_step("inspect", "completed", f"Checked executable state via {name}")
-            if mutation_seen:
-                plan.set_step("verify", "completed", f"Verified via {name}")
-                verification_seen = True
-        elif name in _INSPECTION_TOOLS:
-            plan.set_step("inspect", "completed", f"Checked state via {name}")
-        elif risk.mutation or risk.destructive:
+        deterministic_verified = False
+        if risk.mutation or risk.destructive:
             mutation_seen = True
-            plan.set_step("inspect", "completed", "Relevant state inspected before mutation")
-            plan.set_step("implement", "completed", f"Successful mutation via {name}")
-            deterministic_verified = False
             if "verified" in str(result).lower():
                 if name == "directory_create":
                     deterministic_verified = True
                 elif name == "file_edit":
-                    # Exact read-back proves the bytes landed, but source/config
-                    # changes still need a behavioral/syntax check. Only plain
-                    # document/data artifacts may finish verification here.
-                    suffix = Path(str(args.get("path") or "")).suffix.lower()
+                    # Exact read-back proves artifact state. For source code this is
+                    # not behavior verification, so code still requires lint/test or
+                    # another executable check before DONE.
+                    target = Path(str(args.get("path") or ""))
+                    suffix = target.suffix.lower()
+                    name_lower = target.name.lower()
                     deterministic_verified = suffix in {
                         ".txt", ".md", ".rst", ".csv", ".log",
-                    }
+                        ".json", ".jsonl", ".yaml", ".yml", ".toml",
+                        ".ini", ".cfg", ".conf", ".properties",
+                    } or name_lower == ".env" or name_lower.startswith(".env.")
+            verification_seen = deterministic_verified
+        elif name in _VERIFY_TOOLS and previous_mutation_seen:
+            verification_seen = True
+
+        if plan is None:
+            return mutation_seen, verification_seen
+
+        if risk.mutation or risk.destructive:
+            plan.set_step("inspect", "completed", "Relevant state inspected before mutation")
+            plan.set_step("implement", "completed", f"Successful mutation via {name}")
             if deterministic_verified:
                 plan.set_step("verify", "completed", f"Deterministically verified by {name}")
-                verification_seen = True
             else:
                 plan.set_step("verify", "in_progress", "Waiting for post-change verification")
+        elif name in _VERIFY_TOOLS:
+            plan.set_step("inspect", "completed", f"Checked executable state via {name}")
+            if verification_seen:
+                plan.set_step("verify", "completed", f"Verified via {name}")
+        elif name in _INSPECTION_TOOLS:
+            plan.set_step("inspect", "completed", f"Checked state via {name}")
         else:
             inspect = next((step for step in plan.steps if step.id == "inspect"), None)
             if inspect is not None and inspect.status == "in_progress":
@@ -710,12 +729,14 @@ class NativeLightRuntime:
                 messages[0]["content"] = self._with_plan_context(protocol_system, plan)
                 system = messages[0]["content"]
 
-            messages.append({"role": "user", "content": current_input})
+            turn_input = current_input
+            if turn_input:
+                messages.append({"role": "user", "content": turn_input})
             messages = trim_messages(messages)
-            continuation_turn = i > 0 and current_input != self.initial_prompt
+            continuation_turn = i > 0
             timeout = adaptive_request_timeout(
                 self.base_timeout,
-                prompt=current_input,
+                prompt=turn_input,
                 iteration=i,
                 quick_chat=self.quick_chat,
                 model=active_model,
@@ -808,11 +829,10 @@ class NativeLightRuntime:
                 text_calls = parse_tool_calls(response)
                 recovered_calls = []
             calls = merge_tool_calls(native_calls, text_calls, recovered_calls)
-            if native_calls and not response:
-                response = "\n".join(
-                    f"<tool_call>{json.dumps(call, ensure_ascii=False)}</tool_call>"
-                    for call in native_calls
-                )
+            if native_mode:
+                for call_index, call in enumerate(calls):
+                    if not call.get("id"):
+                        call["id"] = f"call_aicoder_{i + 1}_{call_index + 1}"
             visible = strip_tool_calls(response)
 
             if visible and calls:
@@ -891,7 +911,7 @@ class NativeLightRuntime:
                     tool_nudge_sent = True
                     self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
                     continue
-                if tool_was_called and not completion_audit_sent and _needs_completion_audit(self.initial_prompt):
+                if mutation_seen and tool_was_called and not completion_audit_sent and _needs_completion_audit(self.initial_prompt):
                     messages.append({"role": "assistant", "content": response})
                     current_input = _completion_audit_prompt(self.initial_prompt)
                     completion_audit_sent = True
@@ -965,6 +985,7 @@ class NativeLightRuntime:
 
             tool_was_called = True
             tool_results: list[str] = []
+            native_tool_messages: list[dict[str, Any]] = []
             batch_records: list[dict[str, Any]] = []
             batch_failure_repeats = 0
             batch_failure_category = ""
@@ -1002,6 +1023,11 @@ class NativeLightRuntime:
                         is_error=is_error, elapsed=elapsed, iteration=i + 1,
                     )
                     tool_results.append(f"Tool {name} result:\n{tool_result}")
+                    if native_mode:
+                        native_tool_messages.append({
+                            "role": "tool", "tool_call_id": str(call.get("id") or ""),
+                            "name": name, "content": str(tool_result),
+                        })
                     batch_records.append({
                         "id": str(call.get("id") or ""), "name": name,
                         "provider": str(call.get("provider") or ""),
@@ -1044,8 +1070,12 @@ class NativeLightRuntime:
                     recall_key = None
                     if name == "file_read" and evidence_store is not None:
                         raw_path = str(args.get("path") or "")
+                        evidence_path = Path(raw_path).expanduser()
+                        if not evidence_path.is_absolute():
+                            evidence_path = Path(workspace) / evidence_path
+                        normalized_path = str(evidence_path.resolve(strict=False))
                         recall_key = (
-                            raw_path,
+                            normalized_path,
                             max(1, int(args.get("start_line") or 1)),
                             max(0, int(args.get("end_line") or 0)),
                         )
@@ -1064,6 +1094,11 @@ class NativeLightRuntime:
                                 elapsed = time.monotonic() - started_tool
                                 self._emit("evidence_recall", path=raw_path, start_line=recall_key[1], end_line=recall_key[2])
                                 tool_results.append(f"Tool {name} result:\n{tool_result}")
+                                if native_mode:
+                                    native_tool_messages.append({
+                                        "role": "tool", "tool_call_id": str(call.get("id") or ""),
+                                        "name": name, "content": str(tool_result),
+                                    })
                                 mutation_seen, verified_now = self._record_tool_progress(
                                     plan, name, args, tool_result, is_error, mutation_seen,
                                 )
@@ -1128,11 +1163,20 @@ class NativeLightRuntime:
                 for diagnostic in post_hook.diagnostics:
                     self._emit("hook_diagnostic", event=hook_event, message=diagnostic, tool=name)
                 tool_results.append(f"Tool {name} result:\n{tool_result}")
+                if native_mode:
+                    native_tool_messages.append({
+                        "role": "tool", "tool_call_id": str(call.get("id") or ""),
+                        "name": name, "content": str(tool_result),
+                    })
                 if not is_error and name == "file_read" and evidence_store is not None:
                     try:
                         raw_path = str(args.get("path") or "")
+                        evidence_path = Path(raw_path).expanduser()
+                        if not evidence_path.is_absolute():
+                            evidence_path = Path(workspace) / evidence_path
+                        normalized_path = str(evidence_path.resolve(strict=False))
                         key = (
-                            raw_path,
+                            normalized_path,
                             max(1, int(args.get("start_line") or 1)),
                             max(0, int(args.get("end_line") or 0)),
                         )
@@ -1152,8 +1196,25 @@ class NativeLightRuntime:
                         batch_failure_category = failure.category
                 if is_error and str(tool_result).strip().endswith(": aborted by user"):
                     reason = f"Agent paused because the user rejected {name}."
-                    messages.append({"role": "assistant", "content": response})
-                    messages.append({"role": "user", "content": format_untrusted_tool_results(tool_results)})
+                    if native_mode:
+                        processed_calls = calls[:len(native_tool_messages)]
+                        messages.append({
+                            "role": "assistant", "content": response or None,
+                            "tool_calls": [
+                                {
+                                    "id": str(item.get("id") or ""), "type": "function",
+                                    "function": {
+                                        "name": str(item.get("name") or ""),
+                                        "arguments": json.dumps(item.get("arguments") or {}, ensure_ascii=False),
+                                    },
+                                }
+                                for item in processed_calls
+                            ],
+                        })
+                        messages.extend(native_tool_messages)
+                    else:
+                        messages.append({"role": "assistant", "content": response})
+                        messages.append({"role": "user", "content": format_untrusted_tool_results(tool_results)})
                     self._pause_plan(plan, reason, response)
                     self._save_journal(plan, messages, tool_batches=journal_batches)
                     self._emit("paused", reason=reason)
@@ -1183,6 +1244,7 @@ class NativeLightRuntime:
                 })
                 journal_batches = journal_batches[-20:]
 
+            base_tool_result_count = len(tool_results)
             repeats = loop_guard.observe(calls, tool_results)
             all_failed = bool(batch_records) and all(record.get("is_error") for record in batch_records)
             research_tools = {
@@ -1249,8 +1311,24 @@ class NativeLightRuntime:
                         "progress. Resume the persistent plan with 'continue' after correcting "
                         "the approach or environment."
                     )
-                    messages.append({"role": "assistant", "content": response})
-                    messages.append({"role": "user", "content": format_untrusted_tool_results(tool_results)})
+                    if native_mode:
+                        messages.append({
+                            "role": "assistant", "content": response or None,
+                            "tool_calls": [
+                                {
+                                    "id": str(item.get("id") or ""), "type": "function",
+                                    "function": {
+                                        "name": str(item.get("name") or ""),
+                                        "arguments": json.dumps(item.get("arguments") or {}, ensure_ascii=False),
+                                    },
+                                }
+                                for item in calls
+                            ],
+                        })
+                        messages.extend(native_tool_messages)
+                    else:
+                        messages.append({"role": "assistant", "content": response})
+                        messages.append({"role": "user", "content": format_untrusted_tool_results(tool_results)})
                     self._pause_plan(plan, reason, response)
                     self._save_journal(plan, messages, tool_batches=journal_batches)
                     self._emit("paused", reason=reason)
@@ -1265,8 +1343,29 @@ class NativeLightRuntime:
             if (i + 1) % AGENT_CHECKPOINT_INTERVAL == 0:
                 tool_results.append(agent_checkpoint(i + 1))
 
-            messages.append({"role": "assistant", "content": response})
-            current_input = format_untrusted_tool_results(tool_results)
+            if native_mode:
+                assistant_tool_calls = [
+                    {
+                        "id": str(call.get("id") or ""),
+                        "type": "function",
+                        "function": {
+                            "name": str(call.get("name") or ""),
+                            "arguments": json.dumps(call.get("arguments") or {}, ensure_ascii=False),
+                        },
+                    }
+                    for call in calls
+                ]
+                messages.append({
+                    "role": "assistant",
+                    "content": response or None,
+                    "tool_calls": assistant_tool_calls,
+                })
+                messages.extend(native_tool_messages)
+                followup_notes = tool_results[base_tool_result_count:]
+                current_input = "\n\n".join(followup_notes)
+            else:
+                messages.append({"role": "assistant", "content": response})
+                current_input = format_untrusted_tool_results(tool_results)
             self._save_journal(plan, messages, tool_batches=journal_batches)
 
             if response.strip().upper().startswith("DONE:"):

@@ -29,6 +29,20 @@ class AdaptiveContinuationTimeoutTests(unittest.TestCase):
             120,
         )
 
+    def test_named_reasoning_models_get_bounded_extra_continuation_time(self):
+        for model in (
+            "deepseek/deepseek-r1", "openai/o3-mini", "openai/o1",
+            "anthropic/claude-3.7-sonnet", "qwen/qwq-32b",
+        ):
+            with self.subTest(model=model):
+                self.assertEqual(
+                    adaptive_request_timeout(
+                        300, prompt="tool result", iteration=2,
+                        model=model, continuation=True,
+                    ),
+                    120,
+                )
+
     def test_first_turn_keeps_configured_budget(self):
         self.assertEqual(
             adaptive_request_timeout(
@@ -45,7 +59,7 @@ class CompletionAuditTests(unittest.TestCase):
         self.assertTrue(_needs_completion_audit(structured))
         self.assertFalse(_needs_completion_audit("fix one typo"))
 
-    def test_runtime_audits_once_before_accepting_done(self):
+    def test_read_only_structured_task_does_not_add_completion_audit(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             (root / "probe.txt").write_text("alpha", encoding="utf-8")
@@ -84,9 +98,9 @@ class CompletionAuditTests(unittest.TestCase):
                 result = runtime.run()
 
             self.assertEqual(result.status, "completed")
-            self.assertEqual(result.response, "DONE: audited")
-            self.assertEqual(client.chat.call_count, 3)
-            self.assertEqual(sum(kind == "completion_audit" for kind, _ in events), 1)
+            self.assertEqual(result.response, "DONE: premature")
+            self.assertEqual(client.chat.call_count, 2)
+            self.assertEqual(sum(kind == "completion_audit" for kind, _ in events), 0)
             starts = [payload for kind, payload in events if kind == "model_start"]
             self.assertEqual(starts[0]["phase"], "planning")
             self.assertEqual(starts[0]["timeout"], 300)
@@ -109,6 +123,25 @@ class PlanVerificationSemanticsTests(unittest.TestCase):
                 plan, "file_edit",
                 {"path": "x.txt", "operation": "create", "content": "alpha"},
                 "updated x.txt; verified exact content (5 chars)", False, False,
+            )
+            self.assertTrue(mutation)
+            self.assertTrue(verified)
+            self.assertEqual(next(x.status for x in plan.steps if x.id == "verify"), "completed")
+
+    def test_config_write_readback_counts_as_artifact_verification(self):
+        from aicoder.agent_plan import PlanStore
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            store = PlanStore(root / "plans")
+            plan = store.create("change config", str(root), "test/model")
+            runtime = NativeLightRuntime(
+                client=MagicMock(), initial_prompt="change config", model="test/model",
+                fallback_model=None, workspace_root=str(root), plan_store=store,
+            )
+            mutation, verified = runtime._record_tool_progress(
+                plan, "file_edit",
+                {"path": "settings.json", "operation": "write", "content": '{"port":8080}'},
+                "updated settings.json; verified exact content (13 chars)", False, False,
             )
             self.assertTrue(mutation)
             self.assertTrue(verified)
@@ -154,15 +187,10 @@ class DuplicateRecoveryRegressionTests(unittest.TestCase):
                 'TOOL_CALL directory_create\n{"path":"sub"}\nEND_TOOL_CALL\n'
                 'TOOL_CALL file_edit\n{"path":"alpha.txt","operation":"create","content":"alpha"}\nEND_TOOL_CALL'
             )
-            clean = (
-                'TOOL_CALL directory_create\n{"path":"sub"}\nEND_TOOL_CALL\n'
-                'TOOL_CALL file_edit\n{"path":"alpha.txt","operation":"create","content":"alpha"}\nEND_TOOL_CALL'
-            )
             client.chat.side_effect = [
                 {"response": first, "model": "openrouter/qwen/qwen3.8-27b"},
                 {"response": first, "model": "openrouter/qwen/qwen3.8-27b"},
                 {"response": mixed, "model": "openrouter/qwen/qwen3.8-27b"},
-                {"response": clean, "model": "openrouter/qwen/qwen3.8-27b"},
                 {"response": "DONE: work complete", "model": "openrouter/qwen/qwen3.8-27b"},
                 {"response": "DONE: audited", "model": "openrouter/qwen/qwen3.8-27b"},
             ]
@@ -205,8 +233,9 @@ class DuplicateRecoveryRegressionTests(unittest.TestCase):
             self.assertEqual(executed.count("file_edit"), 1)
             self.assertEqual(sum(kind == "loop_prevented" for kind, _ in events), 1)
             repairs = [payload for kind, payload in events if kind == "final_response_repair"]
-            self.assertEqual(len(repairs), 1)
-            self.assertEqual(repairs[0].get("reason"), "mixed_tool_protocol")
+            self.assertEqual(repairs, [])
+            self.assertTrue(any(kind == "thought" and "directory is empty" in str(payload.get("text", "")).lower()
+                                for kind, payload in events))
             self.assertEqual(sum(kind == "completion_audit" for kind, _ in events), 1)
 
 

@@ -181,7 +181,7 @@ class RuntimeGateTests(unittest.TestCase):
         runtime.native_openrouter_tool_calling = True
         base = build_system_prompt([{"name":"file_read","inputSchema":{"type":"object"}}], "/tmp")
         native = runtime._system_for_tool_protocol(base, native=True)
-        self.assertNotIn("## Tool Call Format (one per response):", native)
+        self.assertNotIn("TOOL_CALL tool_name", native)
         self.assertIn("Use only the provider-native function/tool calls", native)
 
     def test_empty_tool_list_stays_none(self):

@@ -185,6 +185,7 @@ _HEAVY_TASK_RE = re.compile(
 
 _SLOW_AGENT_MODEL_HINTS = (
     "code-agent", "devstral", "codestral", "coder", "reasoning", "thinking",
+    "deepseek-r1", "/r1", "qwq", "/o1", "/o3", "/o4", "sonnet",
 )
 
 
@@ -1075,17 +1076,33 @@ def normalize_tool_calls(value: Any) -> list[dict]:
     return calls
 
 
-def _parse_text_tool_v2_sequence(text: str) -> list[dict]:
-    """Parse one or more complete v2 blocks when they are the whole response."""
+def _v2_block_inside_fence(raw: str, start: int) -> bool:
+    """Keep documentation/examples inert when TOOL_CALL appears inside Markdown fences."""
+    for fence in re.finditer(r"```.*?```", raw, re.DOTALL):
+        if fence.start() <= start < fence.end():
+            return True
+    return False
+
+
+def _parse_text_tool_v2_sequence(text: str, *, allow_prose: bool = False) -> list[dict]:
+    """Parse complete v2 blocks, optionally tolerating ordinary surrounding prose.
+
+    The parser remains fail-closed: every protocol marker must belong to a complete
+    valid block, fenced examples stay inert, and a malformed extra block rejects the
+    whole sequence instead of partially executing it.
+    """
     raw = str(text or "")
     matches = list(TEXT_TOOL_V2_BLOCK_RE.finditer(raw))
-    if not matches:
+    if not matches or any(_v2_block_inside_fence(raw, match.start()) for match in matches):
         return []
     calls: list[dict] = []
     cursor = 0
+    residual: list[str] = []
     for match in matches:
-        if raw[cursor:match.start()].strip():
+        gap = raw[cursor:match.start()]
+        if gap.strip() and not allow_prose:
             return []
+        residual.append(gap)
         raw_args = match.group("args").strip()
         try:
             args = json.loads(raw_args) if raw_args else {}
@@ -1096,7 +1113,12 @@ def _parse_text_tool_v2_sequence(text: str) -> list[dict]:
             return []
         calls.append(call)
         cursor = match.end()
-    if raw[cursor:].strip():
+    tail = raw[cursor:]
+    if tail.strip() and not allow_prose:
+        return []
+    residual.append(tail)
+    leftover = "\n".join(residual)
+    if re.search(r"(?mi)^\s*(?:TOOL_CALL\s+|END_TOOL_CALL\s*$)", leftover):
         return []
     return calls
 
@@ -1108,6 +1130,11 @@ def parse_tool_calls(text: str) -> list[dict]:
     # Preferred protocol v2. Several independent calls may share one model turn,
     # but every block must be complete and the response may contain no prose.
     v2_calls = _parse_text_tool_v2_sequence(str(text or ""))
+    if not v2_calls:
+        # Provider/model tolerance: accept valid complete blocks surrounded by
+        # ordinary assistant prose. The system prompt still requests tool-only
+        # output, but a harmless preface must not stall the operator.
+        v2_calls = _parse_text_tool_v2_sequence(str(text or ""), allow_prose=True)
     if v2_calls:
         return v2_calls
 
@@ -1175,10 +1202,12 @@ def parse_tool_calls(text: str) -> list[dict]:
 
 
 def strip_tool_calls(text: str) -> str:
-    """Remove complete tool-call blocks from text."""
+    """Remove executable tool-call blocks while preserving surrounding thought text."""
     raw = str(text or "")
     if _parse_text_tool_v2_sequence(raw):
         return ""
+    if _parse_text_tool_v2_sequence(raw, allow_prose=True):
+        return TEXT_TOOL_V2_BLOCK_RE.sub("", raw).strip()
     return TOOL_RE.sub("", raw).strip()
 
 
@@ -2004,12 +2033,27 @@ def _run_tool_impl(
         result, is_error = run_local_shell(execution_args, task_runner=True)
     elif name == "subagent_run":
         from .subagents import run_subagent
+        subagent_tools = load_tools(client)
+        if allowed_tools is not None:
+            subagent_tools = [
+                tool for tool in subagent_tools
+                if str(tool.get("name") or "") in allowed_tools
+            ]
+        subagent_tools = [
+            tool for tool in subagent_tools
+            if str(tool.get("name") or "") != "subagent_run"
+        ]
         result, is_error = run_subagent(
             client,
             task=str(args.get("task") or ""),
             role=str(args.get("role") or "analyze"),
             context=str(args.get("context") or ""),
             model=model or None,
+            execution_client=client,
+            tools=subagent_tools,
+            workspace_root=str(_workspace_root()),
+            approval_fn=approval_fn,
+            enabled_tool_names=(sorted(allowed_tools) if allowed_tools is not None else None),
         )
     elif name == "skill_read":
         from .skills import read_skill
