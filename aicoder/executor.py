@@ -1125,17 +1125,17 @@ def _parse_text_tool_v2_sequence(text: str, *, allow_prose: bool = False) -> lis
     return calls
 
 
-def parse_tool_calls(text: str) -> list[dict]:
-    """Extract strict AICoder text-tool calls plus read-only legacy formats."""
+def parse_tool_calls(text: str, *, allow_prose: bool = False) -> list[dict]:
+    """Extract AICoder tool calls; surrounding-prose tolerance is opt-in."""
     calls: list[dict] = []
 
     # Preferred protocol v2. Several independent calls may share one model turn,
     # but every block must be complete and the response may contain no prose.
     v2_calls = _parse_text_tool_v2_sequence(str(text or ""))
-    if not v2_calls:
-        # Provider/model tolerance: accept valid complete blocks surrounded by
-        # ordinary assistant prose. The system prompt still requests tool-only
-        # output, but a harmless preface must not stall the operator.
+    if not v2_calls and allow_prose:
+        # Agent-runtime provider tolerance: accept valid complete blocks surrounded
+        # by ordinary assistant prose. Generic parser callers stay strict so
+        # documentation/examples cannot become executable merely by being quoted.
         v2_calls = _parse_text_tool_v2_sequence(str(text or ""), allow_prose=True)
     if v2_calls:
         return v2_calls

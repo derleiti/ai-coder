@@ -849,7 +849,10 @@ class NativeLightRuntime:
                 recovered_calls = []
             else:
                 native_calls = []
-                text_calls = parse_tool_calls(response)
+                text_calls = parse_tool_calls(
+                    response,
+                    allow_prose=bool(must_use_tools or tool_was_called or resumed),
+                )
                 recovered_calls = []
             calls = merge_tool_calls(native_calls, text_calls, recovered_calls)
             if native_mode:
@@ -862,10 +865,11 @@ class NativeLightRuntime:
                 self._emit("thought", text=visible, iteration=i + 1)
 
             if not calls:
+                protocol_expected = bool(must_use_tools or tool_was_called or resumed)
                 unusable_final = (
                     (not response)
                     or _has_incomplete_tool_markup(response)
-                    or _has_embedded_text_tool_protocol(response)
+                    or (protocol_expected and _has_embedded_text_tool_protocol(response))
                 )
                 if unusable_final:
                     if response:

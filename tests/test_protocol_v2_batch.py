@@ -28,8 +28,9 @@ class ProtocolV2BatchTests(unittest.TestCase):
             'TOOL_CALL file_read\n{"path":"b.txt"}\nEND_TOOL_CALL\n'
             'Then I will compare the results.'
         )
+        self.assertEqual(parse_tool_calls(text), [])
         self.assertEqual(
-            [call["name"] for call in parse_tool_calls(text)],
+            [call["name"] for call in parse_tool_calls(text, allow_prose=True)],
             ["file_read", "file_read"],
         )
         visible = strip_tool_calls(text)
