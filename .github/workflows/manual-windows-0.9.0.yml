@@ -40,8 +40,13 @@ jobs:
       - name: Build EXE using spec file
         shell: pwsh
         run: |
-          python -m PyInstaller aicoder-windows.spec --noconfirm --clean
-          if (-not (Test-Path 'dist\aicoder.exe')) { throw 'aicoder.exe was not created' }
+          python -m PyInstaller aicoder-windows.spec --noconfirm --clean --verbose
+          Write-Host "=== dist/ Verzeichnis ===" 
+          Get-ChildItem -Recurse dist/ | ForEach-Object { Write-Host $_.FullName }
+          if (-not (Test-Path 'dist\aicoder.exe')) { 
+            Write-Host "ERROR: aicoder.exe nicht gefunden" -ForegroundColor Red
+            throw 'aicoder.exe was not created' 
+          }
           $size = (Get-Item dist\aicoder.exe).Length / 1MB
           Write-Host "aicoder.exe: $([math]::Round($size,1)) MB"
 
