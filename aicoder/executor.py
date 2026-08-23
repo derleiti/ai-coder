@@ -198,38 +198,19 @@ def adaptive_request_timeout(
     *,
     continuation: bool = False,
 ) -> int:
-    """Return a timeout for one model turn, not for the whole agent task.
+    """Return the configured inactivity timeout for a model request.
 
-    The first/planning turn may need a generous budget for a large coding task.
-    Turns that immediately follow tool output are different: they normally only
-    need to interpret bounded evidence and choose the next action.  Do not make
-    every continuation inherit a five-minute timeout merely because the original
-    task was long or because the run has accumulated many iterations.
+    This value is intentionally *not* a maximum reasoning/turn duration. Long
+    provider inference may continue as long as the backend connection remains
+    alive. The timeout only protects against a genuinely silent/stalled network
+    or backend connection. Keeping one user-configured value also avoids GUI,
+    runtime and operator-policy disagreement about 90/120/150 second limits.
     """
     try:
         base = int(base_timeout)
     except (TypeError, ValueError):
         base = 30
-    base = max(10, min(300, base))
-    if quick_chat:
-        return min(base, 60)
-
-    model_key = (model or "").lower()
-    slow_model = any(hint in model_key for hint in _SLOW_AGENT_MODEL_HINTS)
-
-    if continuation:
-        # A continuation is deliberately capped even when the persisted request
-        # timeout is 300s.  Slow/reasoning models get a little more room, while
-        # normal tool-followup turns fail fast enough to recover or use fallback.
-        return min(base, 120 if slow_model else 90)
-
-    effective = max(base, 60)
-    if slow_model:
-        effective = max(effective, 120)
-    text = prompt or ""
-    if len(text) >= 1500 or _HEAVY_TASK_RE.search(text):
-        effective = max(effective, 180)
-    return min(300, effective)
+    return max(10, min(300, base))
 
 
 def chat_with_timeout(client: TriForceClient, timeout: int, **kwargs: Any) -> Dict[str, Any]:
