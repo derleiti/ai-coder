@@ -213,6 +213,30 @@ class PlanIndependentProgressTests(unittest.TestCase):
         self.assertFalse(verified)
 
 
+class ToolResultHandoffTests(unittest.TestCase):
+    def test_empty_file_tree_result_is_present_in_next_model_request(self):
+        client = MagicMock()
+        client.timeout = 150
+        client.chat.side_effect = [
+            {"response": 'TOOL_CALL file_tree\n{"path":"."}\nEND_TOOL_CALL', "model": "openrouter/qwen/qwen3.8-27b"},
+            {"response": "DONE: saw empty workspace", "model": "openrouter/qwen/qwen3.8-27b"},
+        ]
+        runtime = NativeLightRuntime(
+            client=client, initial_prompt="inspect and report",
+            model="openrouter/qwen/qwen3.8-27b", fallback_model=None,
+            workspace_root="/tmp",
+            tools=[{"name":"file_tree","inputSchema":{"type":"object","properties":{"path":{"type":"string"}}}}],
+            load_tools_on_start=False, persistent_plan=False, base_timeout=150,
+        )
+        with patch("aicoder.agent_runtime.run_tool", return_value=("(empty directory)", False)):
+            result = runtime.run()
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(client.chat.call_count, 2)
+        second_messages = client.chat.call_args_list[1].kwargs["messages"]
+        joined = "\n".join(str(m.get("content", "")) for m in second_messages)
+        self.assertIn("Tool file_tree result:\n(empty directory)", joined)
+
+
 class DuplicateRecoveryRegressionTests(unittest.TestCase):
     def test_escaped_markdown_requirements_are_structured(self):
         escaped = "1\\. inspect\n2\\. mutate\n3\\. verify\n\\* cleanup\n"
