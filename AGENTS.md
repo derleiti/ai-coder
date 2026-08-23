@@ -50,6 +50,7 @@ Dieses File hat operative Priorität. ai-coder liest es vor Tasks.
 - Der aktive Workspace ist der Standard-Arbeitsbereich, aber keine künstliche Fähigkeitsgrenze.
 - Ein Workspace-Escape muss über die bestehende Approval-Policy sichtbar und freigegeben werden.
 - Remote-Systeme dürfen bearbeitet werden, wenn der Benutzer das Ziel ausdrücklich benannt hat oder es eindeutig Teil des aktuellen Auftrags ist.
+- **TriForce selbst ist davon ausgenommen:** TriForce ist für AICoder ausschließlich Backend-Service und niemals Remote-/Admin-/Code-Ziel. AICoder darf den TriForce-Host, dessen Repository, Prozesse, Services, Container oder Federation-Nodes weder lesen noch verändern.
 - Keine eigenmächtigen Änderungen an unbekannten oder nicht zum Auftrag gehörenden Systemen.
 
 ## Sensible Fähigkeiten

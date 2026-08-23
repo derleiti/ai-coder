@@ -31,14 +31,31 @@ TRIFORCE_HOST_MCP_TOOLS = frozenset({
     "package_manager", "service_control", "service_status", "container_control", "container_status",
     "remote_task", "remote_admin", "remote_status", "mesh_task", "safe_probe",
     "agent_start", "agent_stop", "agent_review", "agent_broadcast", "restart",
-    "template_list", "task_reference", "binary_list",
+    "template_list", "task_reference", "binary_list", "restart_backend",
+})
+
+TRIFORCE_HOST_MCP_PREFIXES = (
+    "admin_", "agent_", "code_", "container_", "dev_", "doc_", "docker_", "federation_",
+    "file_", "git_", "host_", "mesh_", "package_", "process_", "remote_",
+    "restart_", "service_", "system_", "triforce_",
+)
+TRIFORCE_HOST_MCP_NAMESPACES = frozenset({
+    "admin", "agent", "code", "container", "dev", "doc", "docker", "federation", "file",
+    "git", "host", "mesh", "package", "process", "remote", "restart", "service",
+    "system", "triforce",
 })
 
 
 def triforce_host_forbidden_reason(name: str) -> str | None:
     """Return a reason when an MCP call would treat TriForce as an operator target."""
+    normalized = str(name or "").strip().lower()
     canonical = canonical_tool_name(name)
-    if canonical in TRIFORCE_HOST_MCP_TOOLS:
+    namespace = re.split(r"[./:]", normalized, maxsplit=1)[0] if re.search(r"[./:]", normalized) else ""
+    if (
+        canonical in TRIFORCE_HOST_MCP_TOOLS
+        or canonical.startswith(TRIFORCE_HOST_MCP_PREFIXES)
+        or namespace in TRIFORCE_HOST_MCP_NAMESPACES
+    ):
         return (
             f"tool '{name}' is blocked over TriForce MCP: TriForce is a backend service, "
             "not a remotely administrable AICoder target"

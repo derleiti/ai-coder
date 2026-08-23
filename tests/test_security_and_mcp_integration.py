@@ -41,11 +41,10 @@ class ToolPolicyIntegrationTests(unittest.TestCase):
         self.assertIsNone(migrate_enabled_tools(legacy))
         self.assertEqual(migrate_enabled_tools(["file_read", "test"]), ["file_read", "test"])
 
-    def test_operator_scopes_are_not_denied_by_name(self):
+    def test_run_subset_policy_is_separate_from_mcp_transport_boundary(self):
         for name in (
-            "admin_users", "vault_keys", "mail_send", "notify_send",
-            "restart_backend", "service_control", "remote_task",
-            "devops", "memory_clear", "remote.search", "admin:health",
+            "vault_keys", "mail_send", "notify_send", "memory_clear",
+            "search", "models", "specialist",
         ):
             with self.subTest(name=name):
                 allowed, reason = require_allowed_tool(name, None)
@@ -80,7 +79,11 @@ class ToolPolicyIntegrationTests(unittest.TestCase):
                 {"name": "search", "inputSchema": {}},
             ],
         )
-        for name in ("code_read", "dev_refactor", "service_control", "remote_task"):
+        for name in (
+            "code_read", "dev_refactor", "service_control", "remote_task",
+            "restart_backend", "admin_users", "docker_ps", "federation_status",
+            "admin:health", "remote.search", "triforce.shell", "doc_read", "doc_search",
+        ):
             with self.subTest(name=name):
                 self.assertIsNotNone(triforce_host_forbidden_reason(name))
         for name in ("search", "models", "memory_search", "memory_store", "specialist"):
@@ -308,11 +311,12 @@ class McpProtocolTests(unittest.TestCase):
                 client.mcp_call("shell", {"command": "id"})
         request.assert_not_called()
 
-    def test_client_allows_backend_advertised_operator_tool_name(self):
+    def test_client_blocks_backend_host_operator_tool_name(self):
         client = TriForceClient("https://example.invalid", token="opaque")
         with patch.object(client, "_request", return_value={"result": {}}) as request:
-            client.mcp_call("service_control", {"action": "status"})
-        request.assert_called_once()
+            with self.assertRaises(ClientError):
+                client.mcp_call("service_control", {"action": "status"})
+        request.assert_not_called()
 
     def test_mcp_call_has_no_automatic_http_retry(self):
         client = TriForceClient("https://example.invalid", token="opaque")

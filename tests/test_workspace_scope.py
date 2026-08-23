@@ -346,7 +346,7 @@ class LocalCodeToolRoutingTests(unittest.TestCase):
                     approval_fn=lambda *_: True, allowed_tools={"code_search"},
                 )
             self.assertTrue(is_error)
-            self.assertIn("target must be one of", result)
+            self.assertIn("remote code targets are disabled", result)
 
     def test_code_tool_project_outside_workspace_needs_scope_approval(self):
         with tempfile.TemporaryDirectory() as temp:
