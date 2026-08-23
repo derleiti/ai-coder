@@ -79,6 +79,43 @@ def _is_behavior_verification_call(name: str, args: dict) -> bool:
         argv = " ".join(str(item) for item in (args.get("arguments") or []))
         return bool(_SHELL_VERIFY_RE.search(f"{program} {argv}"))
     return False
+
+
+_COMMAND_EXECUTION_TOOLS = {"shell", "task_runner", "binary_exec", "custom_exec", "local_exec"}
+
+
+def _has_mutation_effect(name: str, args: dict) -> bool:
+    """Classify progress effects separately from conservative approval risk.
+
+    Command runners always require write approval because arbitrary programs may
+    mutate state. That conservative policy is not evidence that a successful
+    read-only command actually changed state, however. For progress tracking,
+    inspect the concrete command and explicit provider effect metadata instead.
+    """
+    canonical_name = re.split(r"[./:]", str(name or "").lower())[-1]
+    if canonical_name not in _COMMAND_EXECUTION_TOOLS:
+        risk = assess_execution(name, args, destructive=is_destructive(str(args.get("command", ""))))
+        return bool(risk.mutation or risk.destructive)
+
+    command = str(args.get("command") or "").strip()
+    if canonical_name == "binary_exec":
+        program = str(args.get("program") or "").strip()
+        arguments = " ".join(str(item) for item in (args.get("arguments") or []))
+        command = f"{program} {arguments}".strip()
+    effect_args = {
+        "command": command,
+        "_mutating": args.get("_mutating"),
+        "_destructive": args.get("_destructive"),
+        "_security_change": args.get("_security_change"),
+    }
+    risk = assess_execution(
+        "command_effect",
+        effect_args,
+        destructive=is_destructive(command),
+    )
+    return bool(risk.mutation or risk.destructive)
+
+
 _INSPECTION_TOOLS = {
     "git", "file_read", "code_grep", "code_read", "code_search",
     "file_tree", "code_tree",
@@ -498,7 +535,7 @@ class NativeLightRuntime:
         Classify the effect first; the AgentPlan is only a persistence/UI view of
         that state and must never be the source of truth for mutation detection.
         """
-        risk = assess_execution(name, args, destructive=is_destructive(str(args.get("command", ""))))
+        mutation_effect = _has_mutation_effect(name, args)
         previous_mutation_seen = mutation_seen
         verification_seen = False
 
@@ -525,7 +562,7 @@ class NativeLightRuntime:
             # a check, even if the privilege layer conservatively treats the tool
             # as potentially mutating for approval purposes.
             verification_seen = previous_mutation_seen
-        elif risk.mutation or risk.destructive:
+        elif mutation_effect:
             mutation_seen = True
             if "verified" in str(result).lower():
                 if name == "directory_create":
@@ -550,7 +587,7 @@ class NativeLightRuntime:
         if behavior_verified and previous_mutation_seen:
             plan.set_step("inspect", "completed", f"Checked executable state via {name}")
             plan.set_step("verify", "completed", f"Verified via {name}")
-        elif risk.mutation or risk.destructive:
+        elif mutation_effect:
             plan.set_step("inspect", "completed", "Relevant state inspected before mutation")
             plan.set_step("implement", "completed", f"Successful mutation via {name}")
             if deterministic_verified:
