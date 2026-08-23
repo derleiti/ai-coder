@@ -17,7 +17,7 @@ permissions:
   contents: write
 
 env:
-  PYTHON_VERSION: '3.12'
+  PYTHON_VERSION: '3.11'
 
 jobs:
   # Single source of truth for every package and artifact.
