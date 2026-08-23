@@ -511,13 +511,12 @@ LOCAL_FILE_TREE_SCHEMA = {
 
 LOCAL_CODE_READ_SCHEMA = {
     "name": "code_read",
-    "description": "Read code/text locally or via TriForce. target=auto/local uses the AICoder host; target=remote uses the TriForce host.",
+    "description": "Read code/text on the LOCAL AICoder host. TriForce is never a code execution target.",
     "inputSchema": {
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "File path, absolute or relative to root"},
-            "root": {"type": "string", "description": "Optional project root on the selected target"},
-            "target": {"type": "string", "enum": ["auto", "local", "remote"], "description": "Execution target; auto defaults to local"},
+            "root": {"type": "string", "description": "Optional LOCAL project root"},
             "start_line": {"type": "integer", "minimum": 1},
             "end_line": {"type": "integer", "minimum": 1},
         },
@@ -527,13 +526,12 @@ LOCAL_CODE_READ_SCHEMA = {
 
 LOCAL_CODE_TREE_SCHEMA = {
     "name": "code_tree",
-    "description": "Recursively inspect a project locally or via TriForce. target=auto/local uses AICoder; target=remote uses TriForce.",
+    "description": "Recursively inspect a project on the LOCAL AICoder host. TriForce is never a code execution target.",
     "inputSchema": {
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "Directory path, absolute or relative to root"},
-            "root": {"type": "string", "description": "Optional project root on the selected target"},
-            "target": {"type": "string", "enum": ["auto", "local", "remote"], "description": "Execution target; auto defaults to local"},
+            "root": {"type": "string", "description": "Optional LOCAL project root"},
             "depth": {"type": "integer", "minimum": 1, "maximum": 8},
             "ignore": {"type": "array", "items": {"type": "string"}},
             "max_entries": {"type": "integer", "minimum": 1, "maximum": 1000},
@@ -543,14 +541,13 @@ LOCAL_CODE_TREE_SCHEMA = {
 
 LOCAL_CODE_SEARCH_SCHEMA = {
     "name": "code_search",
-    "description": "Recursively search project files locally or via TriForce. target=auto/local uses AICoder; target=remote uses TriForce.",
+    "description": "Recursively search project files on the LOCAL AICoder host. TriForce is never a code execution target.",
     "inputSchema": {
         "type": "object",
         "properties": {
             "query": {"type": "string"},
             "path": {"type": "string", "description": "Search scope, absolute or relative to root"},
-            "root": {"type": "string", "description": "Optional project root on the selected target"},
-            "target": {"type": "string", "enum": ["auto", "local", "remote"], "description": "Execution target; auto defaults to local"},
+            "root": {"type": "string", "description": "Optional LOCAL project root"},
             "file_pattern": {"type": "string", "description": "Glob such as *.py; defaults to *"},
             "case_sensitive": {"type": "boolean"},
             "regex": {"type": "boolean", "description": "Treat query as regular expression"},
@@ -1278,10 +1275,11 @@ def _workspace_path(
 
 
 def _code_execution_target(args: dict) -> str:
-    target = str(args.get("target") or "auto").strip().lower()
-    if target not in {"auto", "local", "remote"}:
-        raise ValueError("target must be one of: auto, local, remote")
-    return "local" if target == "auto" else target
+    """Code tools are local-only; reject legacy/forged remote targets explicitly."""
+    target = str(args.get("target") or "local").strip().lower()
+    if target not in {"auto", "local"}:
+        raise ValueError("remote code targets are disabled; TriForce is a backend service only")
+    return "local"
 
 
 def _code_project_path(args: dict, default_path: str = ".") -> Path:
@@ -1305,8 +1303,7 @@ def _workspace_escape_target(tool_name: str, args: dict) -> Path | None:
     elif tool_name == "binary_exec":
         field = "work_dir"
     elif tool_name in {"code_read", "code_tree", "code_search"}:
-        if _code_execution_target(args) == "remote":
-            return None
+        _code_execution_target(args)
         resolved = _code_project_path(args)
         _, inside = path_within_workspace(str(resolved), _workspace_root())
         return None if inside else resolved
@@ -2096,11 +2093,7 @@ def _run_tool_impl(
         except ValueError as exc:
             result, is_error = f"{name} error: {exc}", True
         else:
-            if code_target == "remote":
-                remote_args = dict(args)
-                remote_args.pop("target", None)
-                result, is_error = run_mcp_tool(client, name, remote_args, mutating=False)
-            elif name == "code_read":
+            if name == "code_read":
                 result, is_error = run_local_code_read(execution_args)
             elif name == "code_tree":
                 result, is_error = run_local_code_tree(execution_args)

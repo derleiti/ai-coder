@@ -34,6 +34,7 @@ User prompt
 GUI, CLI-Agent und direkte `aicoder mcp`-Aufrufe verwenden dieselbe Policy.
 Lokale typisierte Workspace-Tools, progressive Capability-Discovery und der
 Local-OS-Provider und lokale Runtime-Tools laufen clientseitig. Backend-Tools werden aus dem authentisierten TriForce-Katalog übernommen statt durch eine zusätzliche Coding-only-Allowlist beschnitten.
+TriForce ist dabei ausschließlich Backend-Service und niemals Operator-Ziel: Host-/Repository-/Service-/Container-/Remote-Admin-Fähigkeiten des TriForce-Hosts werden aus dem AICoder-Katalog entfernt und am MCP-Transport nochmals blockiert. Lokale gleichnamige Workspace-Tools bleiben verfügbar.
 Lokale und MCP-gestützte Mutationen, Workspace-Escapes, Elevation, destruktive Aktionen und Security-Änderungen werden transportunabhängig vom PrivilegeBroker bzw. der zentralen Approval-Policy klassifiziert.
 
 ### Tool-Protokoll, Fortsetzung und Verifikation

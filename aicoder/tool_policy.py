@@ -19,6 +19,32 @@ INTERNAL_MCP_TOOLS = {"swarm_broadcast"}
 # advertise an identically named tool.
 LOCAL_ONLY_TOOLS = frozenset({"shell", "binary_exec", "task_runner"})
 
+# TriForce is a backend service, never an operator target. These MCP tools expose
+# the backend host, its repository, local process/container/service state, or
+# remote-node administration. AICoder may have identically named LOCAL tools,
+# but must never dispatch these capabilities over the TriForce MCP transport.
+TRIFORCE_HOST_MCP_TOOLS = frozenset({
+    "code_read", "code_tree", "code_search", "code_edit", "code_patch", "code_grep",
+    "dev_analyze", "dev_debug", "dev_links", "dev_lint", "dev_refactor", "dev_summarize", "devops",
+    "file_ops", "file_read", "file_write", "file_edit", "file_tree", "directory_create",
+    "git", "git_ops", "custom_exec", "custom_binary", "binary_exec", "task_runner", "shell",
+    "package_manager", "service_control", "service_status", "container_control", "container_status",
+    "remote_task", "remote_admin", "remote_status", "mesh_task", "safe_probe",
+    "agent_start", "agent_stop", "agent_review", "agent_broadcast", "restart",
+    "template_list", "task_reference", "binary_list",
+})
+
+
+def triforce_host_forbidden_reason(name: str) -> str | None:
+    """Return a reason when an MCP call would treat TriForce as an operator target."""
+    canonical = canonical_tool_name(name)
+    if canonical in TRIFORCE_HOST_MCP_TOOLS:
+        return (
+            f"tool '{name}' is blocked over TriForce MCP: TriForce is a backend service, "
+            "not a remotely administrable AICoder target"
+        )
+    return None
+
 # None means: trust the authenticated backend catalogue instead of maintaining
 # a stale duplicate allowlist in the client. Kept under the historical name for
 # import compatibility while callers migrate to OPERATOR_MCP_TOOLS.
@@ -110,6 +136,8 @@ def filter_tool_catalog(
             continue
         canonical = canonical_tool_name(name)
         if canonical in LOCAL_ONLY_TOOLS:
+            continue
+        if triforce_host_forbidden_reason(name):
             continue
         # Keep the canonical unified search surface when a backend also
         # advertises a legacy alias. This is schema hygiene, not a permission

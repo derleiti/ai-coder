@@ -25,6 +25,7 @@ Ein exakter atomarer Write-Readback beweist den resultierenden Artefaktzustand. 
 Coding, Builds, Tests, Paketmanagement, Services, Container, Deployment, Netzwerkdiagnostik, Systemadministration, DevOps und Infrastruktur sind legitime Operator-Aufgaben. Ein Tool wird nicht allein wegen seines Namens oder einer Kategorie wie `admin`, `service`, `remote` oder `devops` blockiert.
 
 Backend-advertisierte Fähigkeiten bleiben weiterhin an serverseitige Authentisierung/RBAC gebunden. AICoder erweitert niemals die Rechte des angemeldeten Kontos; es entfernt lediglich den früheren zusätzlichen Coding-only-Filter im Client.
+Zusätzlich gilt eine feste Richtungsgrenze: TriForce darf als Modell-/Search-/Memory-/Service-Backend genutzt werden, aber AICoder darf den TriForce-Host, dessen Repository, Prozesse, Services, Container oder Federation-Nodes weder inspizieren noch administrieren. Diese Host-Grenze wird sowohl beim Toolkatalog als auch vor jedem MCP-Dispatch erzwungen.
 
 Besonders sensible Aktionen wie Secrets/Vault, Mailversand, Notifications oder Account-/Identity-Änderungen sollen nur für einen konkreten Benutzerauftrag verwendet werden und müssen entsprechend ihrer Wirkung als Mutation/Security-Änderung klassifiziert werden.
 
