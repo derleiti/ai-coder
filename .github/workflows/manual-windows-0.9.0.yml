@@ -1,9 +1,10 @@
-name: Windows Build 0.9.0
+name: Windows Build 1.0.0
+
 
 on:
   push:
     branches:
-      - ci/windows-aicoder-0.9.0
+      - ci/windows-aicoder-1.0.0
   workflow_dispatch:
 
 permissions:
@@ -11,7 +12,7 @@ permissions:
 
 env:
   PYTHON_VERSION: '3.12'
-  VERSION: '0.9.0'
+  VERSION: '1.0.0'
 
 jobs:
   build-windows:
