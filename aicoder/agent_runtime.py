@@ -65,7 +65,8 @@ _BEHAVIOR_VERIFY_TOOLS = {"test", "lint", "dev_lint", "dev_analyze"}
 _SHELL_VERIFY_RE = re.compile(
     r"(?:^|\s)(?:pytest|unittest|ruff|mypy|pylint|flake8|pyright|shellcheck|"
     r"cargo\s+(?:test|check|clippy)|go\s+test|npm\s+test|pnpm\s+test|yarn\s+test|"
-    r"make\s+(?:test|check)|python(?:3)?\s+-m\s+(?:pytest|unittest|compileall|py_compile))\b",
+    r"make\s+(?:test|check)|python(?:3)?\s+-m\s+(?:pytest|unittest|compileall|py_compile)|"
+    r"python(?:3)?\s+(?:[^\s]*/)?test_[^\s]+\.py)\b",
     re.IGNORECASE,
 )
 

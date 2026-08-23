@@ -37,7 +37,6 @@ _PROTECTED_PATH_RE = re.compile(
 # a tool happens to run. Exact names avoid false positives for read helpers.
 _MUTATING_TOOL_NAMES = {
     "file_edit", "directory_create", "file_write", "file_ops", "code_edit", "code_patch",
-    "shell", "task_runner", "custom_exec", "binary_exec", "local_exec",
     "git_ops", "lint", "test", "devops",
     "config_set", "prompt_set", "vault_add", "settings_apply_patch", "settings_reset",
     "memory_store", "memory_clear", "clipboard_write",
@@ -49,6 +48,67 @@ _MUTATING_TOOL_NAMES = {
     "wp_update_post", "wp_delete_post", "mail_send", "notify_send",
 }
 _DESTRUCTIVE_TOOL_NAMES = {"memory_clear", "ollama_delete", "wp_delete_post"}
+
+_COMMAND_RUNNER_TOOLS = {"shell", "task_runner", "custom_exec", "binary_exec", "local_exec"}
+_READ_ONLY_PROGRAMS = {
+    "cat", "cut", "df", "du", "env", "false", "find", "getprop", "grep", "head",
+    "hostname", "id", "ip", "ls", "lsblk", "printf", "ps", "pwd", "readlink", "realpath",
+    "sed", "ss", "stat", "tail", "termux-info", "true", "uname", "uptime", "wc", "which",
+}
+
+def _binary_exec_command(args: dict[str, Any]) -> str:
+    program = str(args.get("program") or "").strip()
+    argv = " ".join(str(item) for item in (args.get("arguments") or []))
+    return f"{program} {argv}".strip()
+
+def _known_read_only_command_runner(canonical_tool: str, args: dict[str, Any], command: str) -> bool:
+    if canonical_tool == "binary_exec":
+        program = str(args.get("program") or "").strip().lower().rsplit("/", 1)[-1]
+        argv = [str(item) for item in (args.get("arguments") or [])]
+        if program in _READ_ONLY_PROGRAMS:
+            # find is read-only only without execution/deletion actions. sed is read-only without -i.
+            joined = " ".join(argv)
+            if program == "find" and re.search(r"(?:^|\s)-(?:delete|exec|execdir|ok|okdir)\b", joined):
+                return False
+            if program == "sed" and re.search(r"(?:^|\s)-[^\s]*i(?:\s|$)", joined):
+                return False
+            return True
+        if program == "git":
+            return bool(argv) and argv[0] in {"status", "log", "show", "diff", "grep", "rev-parse", "ls-files", "branch"} or argv[:1] == ["--version"]
+        if program in {"python", "python3"} and argv[:1] in [["--version"], ["-V"]]:
+            return True
+        if program == "ssh" and argv[:1] == ["-V"]:
+            return True
+        if program == "curl" and argv[:1] == ["--version"]:
+            return True
+        if program == "pkg" and (argv[:1] in [["list-installed"], ["--version"], ["help"]]):
+            return True
+        return False
+    # For free-form shells, remain conservative unless every command token is from a small
+    # diagnostic vocabulary and no mutation syntax was detected elsewhere.
+    if canonical_tool in {"shell", "task_runner", "custom_exec", "local_exec"}:
+        if not command:
+            return False
+        if re.search(r"[><]", command):
+            return False
+        segments = re.split(r"(?:&&|\|\||;|\|)", command)
+        for segment in segments:
+            text = segment.strip()
+            if not text:
+                continue
+            # Allow simple env assignment/echo separators used in diagnostic probes.
+            token = text.split()[0].lower().rsplit("/", 1)[-1]
+            if token in {"echo"}:
+                continue
+            if token == "git":
+                parts = text.split()
+                if len(parts) >= 2 and (parts[1] in {"status","log","show","diff","grep","rev-parse","ls-files","branch"} or parts[1] == "--version"):
+                    continue
+                return False
+            if token not in _READ_ONLY_PROGRAMS:
+                return False
+        return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -78,15 +138,16 @@ class ExecutionRisk:
 def assess_execution(tool_name: str, args: dict[str, Any], *, destructive: bool = False) -> ExecutionRisk:
     """Classify a local tool call without executing or modifying it."""
     command = str(args.get("command") or "").strip()
+    normalized_tool = str(tool_name or "").strip().lower()
+    canonical_tool = re.split(r"[./:]", normalized_tool)[-1]
+    if not command and canonical_tool == "binary_exec":
+        command = _binary_exec_command(args)
     if not command and args.get("path"):
         operation = str(args.get("operation") or "access").strip()
         command = f"{operation} {args.get('path')}"
     cwd = str(args.get("cwd") or "").strip()
-    normalized_tool = str(tool_name or "").strip().lower()
-    # Providers and MCP gateways may namespace tool names (for example
-    # ``mcp.code_edit`` or ``server/code_edit``). Security classification must
-    # use the canonical leaf name while execution keeps the original name.
-    canonical_tool = re.split(r"[./:]", normalized_tool)[-1]
+    # Providers and MCP gateways may namespace tool names. Security classification
+    # uses the canonical leaf while execution keeps the original name.
     metadata_mutating = args.get("_mutating")
     metadata_destructive = args.get("_destructive")
     security_change = args.get("_security_change") is True
@@ -99,9 +160,12 @@ def assess_execution(tool_name: str, args: dict[str, Any], *, destructive: bool 
         or metadata_destructive is True
     )
     protected_path = bool(_PROTECTED_PATH_RE.search(command))
+    runner_known_read_only = _known_read_only_command_runner(canonical_tool, args, command)
+    runner_default_mutation = canonical_tool in _COMMAND_RUNNER_TOOLS and not runner_known_read_only
     mutation = (
         metadata_mutating is True
         or canonical_tool in _MUTATING_TOOL_NAMES
+        or runner_default_mutation
         or deletion
         or bool(_CREATE_OR_WRITE_RE.search(command))
         or bool(_PACKAGE_OR_SERVICE_RE.search(command))

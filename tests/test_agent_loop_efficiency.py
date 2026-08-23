@@ -299,6 +299,18 @@ class PlanIndependentProgressTests(unittest.TestCase):
         self.assertFalse(mutation)
         self.assertFalse(verified)
 
+    def test_direct_python_unittest_script_counts_as_verification(self):
+        runtime = NativeLightRuntime(
+            client=MagicMock(), initial_prompt="write and test", model="test/model",
+            fallback_model=None, workspace_root="/tmp", persistent_plan=False,
+        )
+        mutation, verified = runtime._record_tool_progress(
+            None, "binary_exec", {"program": "python3", "arguments": ["test_system_report.py"]},
+            "OK", False, True,
+        )
+        self.assertTrue(mutation)
+        self.assertTrue(verified)
+
     def test_mutating_binary_exec_creates_mutation_progress(self):
         runtime = NativeLightRuntime(
             client=MagicMock(), initial_prompt="move file", model="test/model",

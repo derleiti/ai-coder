@@ -4,6 +4,8 @@ agent.py — CLI Agent runner. Uses shared executor for tool execution.
 """
 import json
 import sys
+import threading
+import time
 from typing import Optional
 
 from .client import TriForceClient
@@ -128,6 +130,36 @@ def _run_native_light_agent(
         )
 
     header_printed = False
+    heartbeat_lock = threading.Lock()
+    heartbeat_stop: threading.Event | None = None
+
+    def stop_model_heartbeat() -> None:
+        nonlocal heartbeat_stop
+        with heartbeat_lock:
+            if heartbeat_stop is not None:
+                heartbeat_stop.set()
+                heartbeat_stop = None
+
+    def start_model_heartbeat(payload: dict) -> None:
+        nonlocal heartbeat_stop
+        stop_model_heartbeat()
+        stop = threading.Event()
+        with heartbeat_lock:
+            heartbeat_stop = stop
+        started = time.monotonic()
+        model_name = str(payload.get("model") or "backend")
+        phase = str(payload.get("phase") or "planning")
+        timeout_s = int(payload.get("timeout") or request_timeout)
+        request_id = str(payload.get("request_id") or "")
+        req = f" · req {request_id[-8:]}" if request_id else ""
+        print(f"\n  {C.DIM}⏳ Waiting for model · {model_name} · {phase} · idle timeout {timeout_s}s{req}{C.RESET}", file=sys.stderr, flush=True)
+
+        def heartbeat() -> None:
+            while not stop.wait(10.0):
+                elapsed = int(time.monotonic() - started)
+                print(f"  {C.DIM}… model still running · {elapsed}s elapsed · idle timeout {timeout_s}s{req}{C.RESET}", file=sys.stderr, flush=True)
+
+        threading.Thread(target=heartbeat, name="aicoder-cli-model-heartbeat", daemon=True).start()
 
     def on_event(kind: str, payload: dict) -> None:
         nonlocal header_printed
@@ -149,6 +181,14 @@ def _run_native_light_agent(
             if plan_id:
                 print(f"  {C.DIM}plan {plan_id} · persistent native-light runtime{C.RESET}")
             header_printed = True
+        elif kind == "model_start":
+            start_model_heartbeat(payload)
+        elif kind == "model_response":
+            stop_model_heartbeat()
+            elapsed = int(payload.get("elapsed_ms") or 0) / 1000.0
+            request_id = str(payload.get("request_id") or "")
+            req = f" · req {request_id[-8:]}" if request_id else ""
+            print(f"  {C.DIM}✓ Model response · {elapsed:.1f}s{req}{C.RESET}", file=sys.stderr, flush=True)
         elif kind == "model_without_tool_support":
             model_name = payload.get("model") or "?"
             print(
@@ -160,6 +200,7 @@ def _run_native_light_agent(
         elif kind == "thought":
             print_thought(str(payload.get("text") or ""))
         elif kind == "tool_call":
+            stop_model_heartbeat()
             print_tool_call(
                 str(payload.get("name") or "?"),
                 payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {},
@@ -177,6 +218,7 @@ def _run_native_light_agent(
                 f"Loop recovery: {payload.get('previous', '?')} → {payload.get('model', '?')}"
             )
         elif kind == "final":
+            stop_model_heartbeat()
             print_final(
                 response=str(payload.get("response") or ""),
                 model=str(payload.get("model") or "?"),
@@ -185,8 +227,10 @@ def _run_native_light_agent(
                 fallback_used=bool(payload.get("fallback_used")),
             )
         elif kind == "error":
+            stop_model_heartbeat()
             print_error(str(payload.get("message") or "native-light runtime failed"))
         elif kind == "paused":
+            stop_model_heartbeat()
             print_error(str(payload.get("reason") or "native-light runtime paused"))
 
     runtime = NativeLightRuntime(
@@ -212,6 +256,7 @@ def _run_native_light_agent(
         native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
     )
     result = runtime.run()
+    stop_model_heartbeat()
     if not header_printed and not (json_output or json_events):
         print_header(
             model=model or "backend-default", fallback=fallback_model or "", tools=0,
