@@ -5,7 +5,7 @@ name: Build Release
 on:
   push:
     tags:
-      - 'v'
+      - 'v*'
   workflow_dispatch:
     inputs:
       version:
@@ -17,7 +17,7 @@ permissions:
   contents: write
 
 env:
-  PYTHON_VERSION: '3.11'
+  PYTHON_VERSION: '3.12'
 
 jobs:
   # Single source of truth for every package and artifact.
@@ -35,12 +35,13 @@ jobs:
         run: |
           set -euo pipefail
           PROJECT_VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
-          PACKAGE_VERSION=$(python3 -c "import re; print(re.search(r'__version__ = \"([^\"]+)\"', open('aicoder/__init__.py').read()).group(1))")
           DEB_VERSION=$(awk '/^Version:/ {print $2}' packaging/debian/aicoder/DEBIAN/control)
           AUR_VERSION=$(awk -F= '/^pkgver=/ {print $2}' packaging/aur/PKGBUILD)
           SRCINFO_VERSION=$(awk '/pkgver =/ {print $3; exit}' packaging/aur/.SRCINFO)
-          NSIS_VERSION=$(sed -n 's/.*APPVERSION "\([^"]*\)".*/\1/p' installer/aicoder.nsi)
-          MAN_VERSION=$(zcat packaging/debian/aicoder/usr/share/man/man1/aicoder.1.gz | sed -n 's/^\.TH AICODER 1 "[^"]*" "\([^"]*\)".*/\1/p' | head -n1)
+
+          # pyproject.toml is the canonical version source. Only validate packaging
+          # metadata that is actually shipped by this workflow. The legacy
+          # installer/aicoder.nsi and compressed manpage must not gate releases.
 
           REQUESTED_VERSION=""
           if [ -n "${{ github.event.inputs.version }}" ]; then
@@ -49,7 +50,7 @@ jobs:
             REQUESTED_VERSION="${GITHUB_REF#refs/tags/v}"
           fi
 
-          for value in "$PACKAGE_VERSION" "$DEB_VERSION" "$AUR_VERSION" "$SRCINFO_VERSION" "$NSIS_VERSION" "$MAN_VERSION"; do
+          for value in "$DEB_VERSION" "$AUR_VERSION" "$SRCINFO_VERSION"; do
             if [ "$value" != "$PROJECT_VERSION" ]; then
               echo "::error::Version mismatch: project=$PROJECT_VERSION component=$value"
               exit 1

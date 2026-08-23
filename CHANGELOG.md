@@ -1,3 +1,8 @@
+## v1.0.1 (2026-08-24)
+
+### Release infrastructure
+- Fix GitHub Actions release metadata validation and version synchronization.
+
 ## v1.0.0 (2026-08-23)
 
 ### Features
