@@ -734,7 +734,9 @@ You are ai-coder — an autonomous coding agent on AILinux/TriForce (api.ailinux
   write tool and let the local client request the required approval.
 - After a tool error, use its result to correct the command or path. Do not
   abandon the task or repeat the same failing command unchanged.
-- After a change, verify the result. A successful typed write result that explicitly says it was deterministically verified already satisfies exact write verification; use an additional read/check only when the task requests independent verification or when behavior still needs checking.
+- After a change, verify at the level the task requires. Exact deterministic read-back is sufficient for plain data/config artifact state; source-code byte equality is NOT behavior verification. For behavior changes use an applicable lint/test/compile/reproducer or other executable check.
+- Do not reread an unchanged artifact merely to confirm a typed write that already reported exact deterministic verification, unless independent verification is explicitly required.
+- Bundle independent tool calls in one response when safe. If a later action depends on an earlier result, wait for that result first.
 - When done: start reply with DONE:
 
 ## OS: {os_name}
@@ -1212,10 +1214,32 @@ def strip_tool_calls(text: str) -> str:
 
 
 def trim_messages(msgs: list[dict]) -> list[dict]:
-    """Keep system prompt (msgs[0]) + last MAX_CONTEXT_MESSAGES conversation messages."""
+    """Trim context without orphaning provider-native tool result messages.
+
+    Native OpenAI/OpenRouter history requires each ``role=tool`` message to follow
+    the assistant message that declared the corresponding ``tool_calls``. The
+    context bound is therefore soft by the size of one tool-call batch: when the
+    normal window would begin inside such a batch, include its assistant parent.
+    """
     if len(msgs) <= 1 + MAX_CONTEXT_MESSAGES:
         return msgs
-    return [msgs[0]] + msgs[-(MAX_CONTEXT_MESSAGES):]
+    start = max(1, len(msgs) - MAX_CONTEXT_MESSAGES)
+    if str(msgs[start].get("role") or "") == "tool":
+        parent = start - 1
+        while parent >= 1 and str(msgs[parent].get("role") or "") == "tool":
+            parent -= 1
+        if (
+            parent >= 1
+            and str(msgs[parent].get("role") or "") == "assistant"
+            and isinstance(msgs[parent].get("tool_calls"), list)
+            and msgs[parent].get("tool_calls")
+        ):
+            start = parent
+        else:
+            # Malformed/orphaned provider history is safer to drop than resend.
+            while start < len(msgs) and str(msgs[start].get("role") or "") == "tool":
+                start += 1
+    return [msgs[0]] + msgs[start:]
 
 
 def format_untrusted_tool_results(results: list[str]) -> str:

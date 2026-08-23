@@ -36,6 +36,16 @@ Lokale typisierte Workspace-Tools, progressive Capability-Discovery und der
 Local-OS-Provider und lokale Runtime-Tools laufen clientseitig. Backend-Tools werden aus dem authentisierten TriForce-Katalog übernommen statt durch eine zusätzliche Coding-only-Allowlist beschnitten.
 Lokale und MCP-gestützte Mutationen, Workspace-Escapes, Elevation, destruktive Aktionen und Security-Änderungen werden transportunabhängig vom PrivilegeBroker bzw. der zentralen Approval-Policy klassifiziert.
 
+### Tool-Protokoll, Fortsetzung und Verifikation
+
+Das modellseitige Text-Protokoll bevorzugt vollständige `TOOL_CALL ... END_TOOL_CALL`-Blöcke ohne Prosa. Mehrere unabhängige Blöcke dürfen in einem Turn gebündelt werden. Die Runtime toleriert vollständige valide Blöcke mit gewöhnlicher Begleitprosa als Provider-Recovery, führt jedoch keine gefenceten Dokumentationsbeispiele und keine teilweise/malformed Sequenz aus.
+
+Im opt-in nativen OpenRouter-Modus wird der Provider-Verlauf nativ erhalten: `assistant.tool_calls` wird von `role: tool` mit passender `tool_call_id` beantwortet. Text-Toolresultate werden dort nicht als künstliche User-Nachricht dupliziert.
+
+Fortschritt und Sicherheitsrisiko sind getrennte Zustände. `PrivilegeBroker` darf Tests/Shell konservativ als potentiell mutierend klassifizieren; die Agent-Runtime entscheidet separat, ob ein Aufruf Implementation, Verifikation oder reine Inspektion war. Deterministischer Read-back bestätigt Daten-/Konfigurationsartefakte. Code-/Verhaltensänderungen benötigen weiterhin einen geeigneten ausführbaren Check. Diese Progress-Semantik gilt identisch mit und ohne persistenten `AgentPlan`.
+
+Continuation-Turns bekommen ein kleineres eigenes Timeout als der initiale Planungsturn; bekannte Reasoning-Modelle erhalten ein höheres, aber weiterhin begrenztes Continuation-Budget. Unveränderte File-Evidence wird über normalisierte absolute Workspace-Pfade wiederverwendet.
+
 ## Lokale Dateien
 
 ```

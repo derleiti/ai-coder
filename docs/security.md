@@ -11,6 +11,14 @@ AICoder verwendet keine künstliche Coding-only-Grenze als Sicherheitsmechanismu
 - Destruktive oder sicherheitsreduzierende Änderungen benötigen explizite Einmal-Freigabe.
 - Passwörter und Tokens dürfen nicht vom Modell angefordert, gelesen, geloggt oder übertragen werden.
 - Tool-Ergebnisse gelten als untrusted data und dürfen keine Benutzer-/Policy-Anweisungen überschreiben.
+- Ausführbare Text-Toolblöcke werden strukturell validiert. Gefencete Beispiele bleiben inert; eine malformed zusätzliche Tool-Sequenz führt nicht zu partieller Ausführung.
+- Native Provider-Toolresults werden mit der jeweiligen Provider-Korrelation (`tool_call_id`) fortgeführt; Tooldaten werden nicht als neue Benutzeranweisung umgedeutet.
+
+## Verifikation ist nicht Berechtigung
+
+Die Security-Klassifikation beantwortet „braucht diese Aktion Approval/Elevation?“, nicht „hat diese Aktion das Benutzerziel verifiziert?“. Deshalb bleiben Tools wie Tests oder Shell für die Freigabepolicy konservativ klassifiziert, während die Agent-Runtime Fortschritt separat bewertet. Ein mutierender Shell-Aufruf kann sich dadurch nicht selbst als erfolgreiche Verifikation deklarieren.
+
+Ein exakter atomarer Write-Readback beweist den resultierenden Artefaktzustand. Für Source-Code und Verhalten ist zusätzlich ein geeigneter ausführbarer Check erforderlich; ein bloßes erneutes Lesen des Quelltexts ist keine Verhaltensgarantie.
 
 ## Operator-Fähigkeiten
 

@@ -20,6 +20,21 @@ Dieses File hat operative Priorität. ai-coder liest es vor Tasks.
 7. Bei Regression oder schlechterem Ergebnis auf die Sicherung bzw. den letzten bekannten guten Stand zurückgehen.
 8. Unsicherheit klar benennen und nach Möglichkeit mit Tools verifizieren statt zu raten.
 
+## Tool-Protokoll und Roundtrip-Effizienz
+
+- Das Modell soll Tool-Aufrufe sauber im angebotenen Tool-Protokoll ausgeben, ohne erklärende Prosa innerhalb der ausführbaren Tool-Sequenz. Die Runtime darf harmlose Begleitprosa robust abtrennen, aber Dokumentationsbeispiele oder gefencete `TOOL_CALL`-Blöcke bleiben inert.
+- Mehrere Tool-Aufrufe in einem Modellturn nur bündeln, wenn sie voneinander unabhängig sind. Hängt ein späterer Aufruf vom Ergebnis eines früheren ab, zuerst auf dieses Ergebnis warten.
+- Unveränderte Evidenz nicht ohne konkreten Grund erneut lesen. Ein bereits deterministisch verifizierter typisierter Write soll keinen zusätzlichen Read-Roundtrip erzeugen, sofern keine unabhängige Verifikation verlangt wird.
+- Duplicate- oder fehlerhafte Tool-Aufrufe nicht unverändert wiederholen; vorhandenes Ergebnis verwenden, Argumente korrigieren oder den Ansatz wechseln.
+
+## Verifikationsstufen und Abschluss
+
+- Exakte deterministische Read-back-Verifikation bestätigt den **Artefaktzustand** bei Text-, Daten- und Konfigurationsdateien.
+- Bei Source-Code oder Änderungen am Programmverhalten bestätigt Bytegleichheit nur, dass der Write angekommen ist. Verhalten mit passendem Lint, Test, Compile, Reproducer oder anderem ausführbaren Check verifizieren.
+- Ein reines `file_read`/`code_read` nach einer Codeänderung ersetzt keine Verhaltensprüfung.
+- Strukturierte mutierende Tasks vor `DONE:` gegen noch offene Anforderungen/Cleanup prüfen. Reine Read-/Review-Aufgaben sollen keinen unnötigen zusätzlichen Completion-Turn erzeugen.
+- Sicherheitsklassifikation und Fortschrittsklassifikation sind getrennt: Ein Tool darf für Approval konservativ als potentiell mutierend gelten, ohne deshalb automatisch als Implementierungsänderung zu zählen.
+
 ## Operator-Rechte und Privilegien
 
 - Coding, Builds, Tests, Paketpflege, Services, Container, Deployment, Netzwerkdiagnostik, Systemadministration und Infrastrukturarbeiten sind zulässige Aufgaben.

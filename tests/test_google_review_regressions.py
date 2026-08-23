@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from aicoder.agent_runtime import NativeLightRuntime
-from aicoder.executor import LOCAL_FILE_READ_SCHEMA, LOCAL_SUBAGENT_SCHEMA, run_tool
+from aicoder.executor import (MAX_CONTEXT_MESSAGES, LOCAL_FILE_READ_SCHEMA, LOCAL_SUBAGENT_SCHEMA, run_tool, trim_messages)
 
 
 class _NativeTransport:
@@ -28,6 +28,32 @@ class _NativeTransport:
                 }],
             }
         return {"response": "DONE: read complete", "model": "openrouter/test/tool-model"}
+
+
+class NativeContextTrimTests(unittest.TestCase):
+    def test_trim_keeps_assistant_parent_when_window_starts_inside_tool_batch(self):
+        prefix = [
+            {"role": "system", "content": "system"},
+            *({"role": "user", "content": f"old-{i}"} for i in range(MAX_CONTEXT_MESSAGES - 2)),
+        ]
+        assistant = {
+            "role": "assistant", "content": None,
+            "tool_calls": [
+                {"id": "call_a", "type": "function", "function": {"name": "a", "arguments": "{}"}},
+                {"id": "call_b", "type": "function", "function": {"name": "b", "arguments": "{}"}},
+            ],
+        }
+        messages = prefix + [
+            assistant,
+            {"role": "tool", "tool_call_id": "call_a", "content": "A"},
+            {"role": "tool", "tool_call_id": "call_b", "content": "B"},
+            {"role": "user", "content": "continue"},
+        ]
+        trimmed = trim_messages(messages)
+        first_tool = next(i for i, msg in enumerate(trimmed) if msg.get("role") == "tool")
+        self.assertGreater(first_tool, 1)
+        self.assertEqual(trimmed[first_tool - 1].get("role"), "assistant")
+        self.assertTrue(trimmed[first_tool - 1].get("tool_calls"))
 
 
 class NativeOpenRouterMessageTests(unittest.TestCase):

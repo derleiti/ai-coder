@@ -60,19 +60,36 @@ RuntimeEventFn = Callable[[str, dict[str, Any]], None]
 ApprovalFn = Callable[[str, dict], bool]
 StopFn = Callable[[], bool]
 
-_VERIFY_TOOLS = {
-    "test", "lint", "dev_lint", "dev_analyze",
-    "shell", "binary_exec", "task_runner",
-}
+_BEHAVIOR_VERIFY_TOOLS = {"test", "lint", "dev_lint", "dev_analyze"}
+_SHELL_VERIFY_RE = re.compile(
+    r"(?:^|\s)(?:pytest|unittest|ruff|mypy|pylint|flake8|pyright|shellcheck|"
+    r"cargo\s+(?:test|check|clippy)|go\s+test|npm\s+test|pnpm\s+test|yarn\s+test|"
+    r"make\s+(?:test|check)|python(?:3)?\s+-m\s+(?:pytest|unittest|compileall|py_compile))\b",
+    re.IGNORECASE,
+)
+
+
+def _is_behavior_verification_call(name: str, args: dict) -> bool:
+    if name in _BEHAVIOR_VERIFY_TOOLS:
+        return True
+    if name in {"shell", "task_runner"}:
+        return bool(_SHELL_VERIFY_RE.search(str(args.get("command") or "")))
+    if name == "binary_exec":
+        program = str(args.get("program") or "").lower()
+        argv = " ".join(str(item) for item in (args.get("arguments") or []))
+        return bool(_SHELL_VERIFY_RE.search(f"{program} {argv}"))
+    return False
 _INSPECTION_TOOLS = {
     "git", "file_read", "code_grep", "code_read", "code_search",
     "file_tree", "code_tree",
 }
 
 _VERIFICATION_REQUIRED_PROMPT = (
-    "Verification required: a state-changing tool succeeded, but no successful "
-    "post-change verification has been observed. Inspect the resulting state with "
-    "a read/check/lint/test tool now. Do not report DONE until verification succeeds."
+    "Verification required: a state-changing tool succeeded, but no sufficient post-change "
+    "verification has been observed. For data/config artifacts, confirm the intended artifact "
+    "state. For source-code or behavior changes, run an applicable lint/test/compile/reproducer "
+    "or other executable check; rereading the source alone is not behavior verification. "
+    "Do not report DONE until the relevant verification succeeds."
 )
 
 _STRUCTURED_REQUIREMENT_RE = re.compile(r"(?m)^\s*(?:\\?[-*+]\s+|\d+\\?[.)]\s+)")
@@ -501,7 +518,14 @@ class NativeLightRuntime:
             return mutation_seen, False
 
         deterministic_verified = False
-        if risk.mutation or risk.destructive:
+        behavior_verified = _is_behavior_verification_call(name, args)
+        if behavior_verified:
+            # Verification/check execution is not itself the task implementation.
+            # It verifies a prior mutation when one exists; otherwise it is simply
+            # a check, even if the privilege layer conservatively treats the tool
+            # as potentially mutating for approval purposes.
+            verification_seen = previous_mutation_seen
+        elif risk.mutation or risk.destructive:
             mutation_seen = True
             if "verified" in str(result).lower():
                 if name == "directory_create":
@@ -519,23 +543,22 @@ class NativeLightRuntime:
                         ".ini", ".cfg", ".conf", ".properties",
                     } or name_lower == ".env" or name_lower.startswith(".env.")
             verification_seen = deterministic_verified
-        elif name in _VERIFY_TOOLS and previous_mutation_seen:
-            verification_seen = True
 
         if plan is None:
             return mutation_seen, verification_seen
 
-        if risk.mutation or risk.destructive:
+        if behavior_verified and previous_mutation_seen:
+            plan.set_step("inspect", "completed", f"Checked executable state via {name}")
+            plan.set_step("verify", "completed", f"Verified via {name}")
+        elif risk.mutation or risk.destructive:
             plan.set_step("inspect", "completed", "Relevant state inspected before mutation")
             plan.set_step("implement", "completed", f"Successful mutation via {name}")
             if deterministic_verified:
                 plan.set_step("verify", "completed", f"Deterministically verified by {name}")
             else:
                 plan.set_step("verify", "in_progress", "Waiting for post-change verification")
-        elif name in _VERIFY_TOOLS:
+        elif behavior_verified:
             plan.set_step("inspect", "completed", f"Checked executable state via {name}")
-            if verification_seen:
-                plan.set_step("verify", "completed", f"Verified via {name}")
         elif name in _INSPECTION_TOOLS:
             plan.set_step("inspect", "completed", f"Checked state via {name}")
         else:
@@ -1056,7 +1079,6 @@ class NativeLightRuntime:
                 elif (
                     resumed
                     and not fresh_inspection_after_resume
-                    and name not in _VERIFY_TOOLS
                     and (risk.mutation or risk.destructive)
                 ):
                     tool_result = (

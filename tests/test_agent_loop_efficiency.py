@@ -171,6 +171,48 @@ class PlanVerificationSemanticsTests(unittest.TestCase):
             self.assertEqual(next(x.status for x in plan.steps if x.id == "verify"), "in_progress")
 
 
+class PlanIndependentProgressTests(unittest.TestCase):
+    def test_classic_runtime_tracks_mutation_without_persistent_plan(self):
+        runtime = NativeLightRuntime(
+            client=MagicMock(), initial_prompt="change code", model="test/model",
+            fallback_model=None, workspace_root="/tmp", persistent_plan=False,
+        )
+        mutation, verified = runtime._record_tool_progress(
+            None, "file_edit",
+            {"path": "x.py", "operation": "write", "content": "print(1)"},
+            "updated x.py; verified exact content (8 chars)", False, False,
+        )
+        self.assertTrue(mutation)
+        self.assertFalse(verified)
+        mutation, verified = runtime._record_tool_progress(
+            None, "test", {"command": "python3 -m unittest"}, "OK", False, mutation,
+        )
+        self.assertTrue(mutation)
+        self.assertTrue(verified)
+
+    def test_verification_command_is_not_itself_an_implementation_mutation(self):
+        runtime = NativeLightRuntime(
+            client=MagicMock(), initial_prompt="run tests", model="test/model",
+            fallback_model=None, workspace_root="/tmp", persistent_plan=False,
+        )
+        mutation, verified = runtime._record_tool_progress(
+            None, "test", {"command": "python3 -m unittest"}, "OK", False, False,
+        )
+        self.assertFalse(mutation)
+        self.assertFalse(verified)
+
+    def test_mutating_shell_does_not_self_verify(self):
+        runtime = NativeLightRuntime(
+            client=MagicMock(), initial_prompt="move file", model="test/model",
+            fallback_model=None, workspace_root="/tmp", persistent_plan=False,
+        )
+        mutation, verified = runtime._record_tool_progress(
+            None, "shell", {"command": "mv a.txt b.txt"}, "", False, False,
+        )
+        self.assertTrue(mutation)
+        self.assertFalse(verified)
+
+
 class DuplicateRecoveryRegressionTests(unittest.TestCase):
     def test_escaped_markdown_requirements_are_structured(self):
         escaped = "1\\. inspect\n2\\. mutate\n3\\. verify\n\\* cleanup\n"
