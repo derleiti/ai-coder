@@ -351,6 +351,7 @@ class TriForceClient:
                     )
                 if keepalive_stream:
                     started = time.monotonic()
+                    deadline = started + float(self.timeout)
                     last_rx = started
                     max_gap = 0.0
                     chunks = 0
@@ -358,7 +359,32 @@ class TriForceClient:
                     parts: list[bytes] = []
                     try:
                         while True:
-                            chunk = resp.read(2048)
+                            now = time.monotonic()
+                            remaining = deadline - now
+                            if remaining <= 0:
+                                raise ClientError(
+                                    f"Model turn exceeded hard deadline of {self.timeout}s [{_label}]",
+                                    status_code=408, retryable=True,
+                                )
+                            # urllib3's read timeout is inactivity-based and resets whenever
+                            # a keepalive chunk arrives. Clamp the underlying socket to the
+                            # remaining turn budget so keepalives cannot extend total runtime.
+                            connection = getattr(resp, "connection", None)
+                            sock = getattr(connection, "sock", None) if connection is not None else None
+                            if sock is not None and hasattr(sock, "settimeout"):
+                                try:
+                                    sock.settimeout(max(0.05, remaining))
+                                except Exception:
+                                    pass
+                            try:
+                                chunk = resp.read(2048)
+                            except Exception as exc:
+                                if time.monotonic() >= deadline:
+                                    raise ClientError(
+                                        f"Model turn exceeded hard deadline of {self.timeout}s [{_label}]",
+                                        status_code=408, retryable=True,
+                                    ) from exc
+                                raise
                             if not chunk:
                                 break
                             now = time.monotonic()
@@ -367,6 +393,11 @@ class TriForceClient:
                             chunks += 1
                             byte_count += len(chunk)
                             parts.append(chunk)
+                            if now >= deadline:
+                                raise ClientError(
+                                    f"Model turn exceeded hard deadline of {self.timeout}s [{_label}]",
+                                    status_code=408, retryable=True,
+                                )
                     finally:
                         resp.release_conn()
                     raw = b"".join(parts).decode("utf-8")

@@ -124,6 +124,43 @@ class RuntimeResilienceTests(unittest.TestCase):
         self.assertEqual(result["response"], "ok")
         self.assertEqual(request.call_args.kwargs["_extra_headers"], {"X-AICoder-Keepalive": "json"})
 
+    def test_keepalive_chunks_cannot_extend_hard_turn_deadline(self):
+        class FakeSocket:
+            def __init__(self):
+                self.timeouts = []
+            def settimeout(self, value):
+                self.timeouts.append(value)
+
+        class FakeResponse:
+            status = 200
+            def __init__(self):
+                self.connection = type("Conn", (), {"sock": FakeSocket()})()
+                self.parts = [b'{"response":"still reasoning"}', b'']
+                self.released = False
+            def read(self, _size=None):
+                return self.parts.pop(0)
+            def release_conn(self):
+                self.released = True
+
+        response = FakeResponse()
+        pool = MagicMock()
+        pool.request.return_value = response
+        client = TriForceClient("http://example.invalid", timeout=1)
+        # started=0.0, first pre-read=0.0, post-chunk=0.7, second pre-read=1.1
+        with patch("aicoder.client._get_pool", return_value=pool), patch(
+            "aicoder.client.time.monotonic", side_effect=[0.0, 0.0, 0.7, 1.1]
+        ):
+            with self.assertRaises(ClientError) as caught:
+                client._do_request(
+                    "POST", "http://example.invalid/chat",
+                    {"X-AICoder-Keepalive": "json"}, b"{}", "chat/test",
+                )
+        self.assertEqual(caught.exception.status_code, 408)
+        self.assertTrue(caught.exception.retryable)
+        self.assertIn("hard deadline", str(caught.exception))
+        self.assertTrue(response.released)
+        self.assertTrue(response.connection.sock.timeouts)
+
     def test_structured_stream_error_preserves_retry_after(self):
         from aicoder.client import _normalize_chat_response
         with self.assertRaises(ClientError) as caught:
