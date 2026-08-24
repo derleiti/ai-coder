@@ -17,6 +17,7 @@ from typing import Any, Callable
 
 from .agent_journal import ContinuationJournalStore
 from .model_capabilities import model_context_window, supports_tools
+from .performance import RuntimePerformance
 from .agent_plan import AgentPlan, PlanStore, plan_prompt_context, resume_prompt_context
 from .client import ClientError, TriForceClient
 from .capabilities import (
@@ -665,6 +666,13 @@ class NativeLightRuntime:
         self._save_plan(plan)
 
     def run(self) -> AgentRunResult:
+        performance = RuntimePerformance()
+        model_latency_warned = False
+        filesystem_latency_warned = False
+
+        def performance_snapshot() -> dict[str, Any]:
+            return performance.snapshot()
+
         workspace = str(Path(self.workspace_root or ".").resolve())
         self.workspace_root = workspace
         tools = self._prepare_tools()
@@ -898,6 +906,16 @@ class NativeLightRuntime:
                 )
             model_response_received_at = time.monotonic()
             elapsed_ms = int((model_response_received_at - started) * 1000)
+            performance.record_model(elapsed_ms)
+            if elapsed_ms >= 10_000 and not model_latency_warned:
+                model_latency_warned = True
+                self._emit(
+                    "performance_warning",
+                    kind="model_latency",
+                    message="Model/API response latency is high.",
+                    elapsed_ms=elapsed_ms,
+                    model=active_model or "backend-default",
+                )
             response = str(result.get("response", "") or "").strip()
             model_used = str(result.get("model", active_model or "?") or "?")
             latency = int(result.get("latency_ms") or elapsed_ms)
@@ -1031,10 +1049,12 @@ class NativeLightRuntime:
                     mutation_seen=mutation_seen,
                     verification_seen=verification_seen,
                 )
+                perf = performance_snapshot()
+                self._emit("performance_summary", **perf)
                 self._emit(
                     "final", response=response, model=model_used,
                     iterations=i + 1, latency_ms=total_latency,
-                    fallback_used=fallback_used,
+                    fallback_used=fallback_used, performance=perf,
                 )
                 if self.conversation is not None:
                     self.conversation[:] = [dict(message) for message in messages[1:]][-MAX_CONTEXT_MESSAGES:]
@@ -1141,6 +1161,18 @@ class NativeLightRuntime:
                         )
                         messages[0]["content"] = self._with_plan_context(protocol_system, plan)
                         system = messages[0]["content"]
+                    performance.record_tool(name, elapsed, is_error=is_error)
+                    if (
+                        name in {"file_read", "file_edit", "file_tree", "code_search", "code_grep"}
+                        and elapsed >= 2.0
+                        and not filesystem_latency_warned
+                    ):
+                        filesystem_latency_warned = True
+                        self._emit(
+                            "performance_warning", kind="filesystem_latency",
+                            message="A filesystem operation is unusually slow.",
+                            elapsed_ms=int(elapsed * 1000), tool=name,
+                        )
                     self._emit(
                         "tool_result", name=name, result=tool_result,
                         is_error=is_error, elapsed=elapsed, iteration=i + 1,
@@ -1278,6 +1310,18 @@ class NativeLightRuntime:
                     elapsed = time.monotonic() - started_tool
                 if not is_error and name in _INSPECTION_TOOLS:
                     fresh_inspection_after_resume = True
+                performance.record_tool(name, elapsed, is_error=is_error)
+                if (
+                    name in {"file_read", "file_edit", "file_tree", "code_search", "code_grep"}
+                    and elapsed >= 2.0
+                    and not filesystem_latency_warned
+                ):
+                    filesystem_latency_warned = True
+                    self._emit(
+                        "performance_warning", kind="filesystem_latency",
+                        message="A filesystem operation is unusually slow.",
+                        elapsed_ms=int(elapsed * 1000), tool=name,
+                    )
                 self._emit(
                     "tool_result", name=name, result=tool_result,
                     is_error=is_error, elapsed=elapsed, iteration=i + 1,
@@ -1535,10 +1579,12 @@ class NativeLightRuntime:
                     mutation_seen=mutation_seen,
                     verification_seen=verification_seen,
                 )
+                perf = performance_snapshot()
+                self._emit("performance_summary", **perf)
                 self._emit(
                     "final", response=visible or response, model=model_used,
                     iterations=i + 1, latency_ms=total_latency,
-                    fallback_used=fallback_used,
+                    fallback_used=fallback_used, performance=perf,
                 )
                 if self.conversation is not None:
                     self.conversation[:] = [dict(message) for message in messages[1:]][-MAX_CONTEXT_MESSAGES:]

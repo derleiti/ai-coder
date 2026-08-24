@@ -189,6 +189,31 @@ def _run_native_light_agent(
             request_id = str(payload.get("request_id") or "")
             req = f" · req {request_id[-8:]}" if request_id else ""
             print(f"  {C.DIM}✓ Model response · {elapsed:.1f}s{req}{C.RESET}", file=sys.stderr, flush=True)
+        elif kind == "performance_warning":
+            warning_kind = str(payload.get("kind") or "performance")
+            elapsed = int(payload.get("elapsed_ms") or 0) / 1000.0
+            if warning_kind == "model_latency":
+                print(
+                    f"  {C.BYELLOW}⚠ Performance · hohe Model/API-Latenz: {elapsed:.1f}s{C.RESET}",
+                    file=sys.stderr, flush=True,
+                )
+            elif warning_kind == "filesystem_latency":
+                tool_name = str(payload.get("tool") or "filesystem")
+                print(
+                    f"  {C.BYELLOW}⚠ Performance · langsames I/O: {tool_name} {elapsed:.1f}s{C.RESET}",
+                    file=sys.stderr, flush=True,
+                )
+        elif kind == "performance_summary":
+            wall = int(payload.get("wall_ms") or 0) / 1000.0
+            model_s = int(payload.get("model_ms") or 0) / 1000.0
+            tools_s = int(payload.get("tool_ms") or 0) / 1000.0
+            io_s = int(payload.get("filesystem_ms") or 0) / 1000.0
+            bottleneck = str(payload.get("bottleneck") or "?")
+            print(
+                f"  {C.DIM}⚡ Performance · wall {wall:.1f}s · model {model_s:.1f}s · "
+                f"tools {tools_s:.1f}s · I/O {io_s:.1f}s · bottleneck {bottleneck}{C.RESET}",
+                file=sys.stderr, flush=True,
+            )
         elif kind == "model_without_tool_support":
             model_name = payload.get("model") or "?"
             print(

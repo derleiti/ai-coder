@@ -193,6 +193,27 @@ class _AgentWorker(QThread):
                         "Resume safety",
                         "Raw tool evidence is not restored · fresh inspection required before mutation",
                     )
+            elif kind == "performance_warning":
+                warning_kind = str(payload.get("kind") or "performance")
+                elapsed = int(payload.get("elapsed_ms") or 0) / 1000.0
+                if warning_kind == "model_latency":
+                    text = f"High model/API latency detected: {elapsed:.1f}s"
+                elif warning_kind == "filesystem_latency":
+                    text = f"Slow filesystem operation: {payload.get('tool') or 'I/O'} {elapsed:.1f}s"
+                else:
+                    text = str(payload.get("message") or "Performance bottleneck detected")
+                self.msg.emit("system", text, "performance")
+            elif kind == "performance_summary":
+                wall = int(payload.get("wall_ms") or 0) / 1000.0
+                model_s = int(payload.get("model_ms") or 0) / 1000.0
+                tools_s = int(payload.get("tool_ms") or 0) / 1000.0
+                io_s = int(payload.get("filesystem_ms") or 0) / 1000.0
+                bottleneck = str(payload.get("bottleneck") or "?")
+                self.msg.emit(
+                    "system",
+                    f"Performance: {wall:.1f}s wall · {model_s:.1f}s model · {tools_s:.1f}s tools · {io_s:.1f}s I/O",
+                    f"bottleneck={bottleneck}",
+                )
             elif kind == "model_without_tool_support":
                 _msg = (
                     f"{payload.get('model') or '?'} meldet kein natives Function Calling — "
