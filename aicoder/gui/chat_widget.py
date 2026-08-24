@@ -308,7 +308,7 @@ class _AgentWorker(QThread):
         from ..team_runtime import config_from_state
 
         state = get_state()
-        source_workspace = str(active_workspace(state.get("workspace_root")))
+        source_workspace = str(workspace_from_task(initial_prompt, state.get("workspace_root")))
         config = config_from_state(state)
         model_client, _ = native_model_transport_from_env(self.client, default_model=self.model or None)
 

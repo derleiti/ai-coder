@@ -33,6 +33,28 @@ class DiskWorkspaceTests(unittest.TestCase):
 
 
 class RamWorkspaceTests(unittest.TestCase):
+    def test_project_contents_are_materialized_at_candidate_root_not_parent_container(self):
+        with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as ram:
+            container = Path(temp) / "workspace"
+            project = container / "aicoder-experimental"
+            sibling = container / "other-project"
+            project.mkdir(parents=True)
+            sibling.mkdir()
+            (project / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
+            (project / "README.md").write_text("project", encoding="utf-8")
+            (sibling / "secret.txt").write_text("sibling", encoding="utf-8")
+
+            backend = RamWorkspace(project, ram_root=ram)
+            execution = backend.prepare()
+            try:
+                self.assertTrue((execution / "pyproject.toml").is_file())
+                self.assertTrue((execution / "README.md").is_file())
+                self.assertFalse((execution / "aicoder-experimental").exists())
+                self.assertFalse((execution / "other-project").exists())
+                self.assertEqual(backend.info.source_root, project.resolve())
+            finally:
+                backend.abort()
+
     def test_ram_workspace_is_isolated_until_verified_finalize(self):
         with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as ram:
             root = Path(temp)
