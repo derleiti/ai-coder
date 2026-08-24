@@ -244,6 +244,9 @@ class NativeLightRuntime:
     model: str | None
     fallback_model: str | None
     workspace_root: str
+    plan_workspace_root: str | None = None
+    protected_workspace_root: str | None = None
+    completion_guard: Callable[[], None] | None = None
     model_client: ModelTransport | None = None
     tools: list[dict] | None = None
     system_prompt: str | None = None
@@ -368,6 +371,9 @@ class NativeLightRuntime:
             )
         return None
 
+    def _plan_workspace(self) -> str:
+        return str(Path(self.plan_workspace_root or self.workspace_root or ".").expanduser().resolve(strict=False))
+
     def _prepare_tools(self) -> list[dict]:
         if self.tools is None and self.load_tools_on_start:
             started = time.monotonic()
@@ -381,11 +387,11 @@ class NativeLightRuntime:
                 if self.resume and self.persistent_plan:
                     try:
                         if self.resume_plan_id == "current":
-                            resume_plan = self.plan_store.load_current(self.workspace_root)
+                            resume_plan = self.plan_store.load_current(self._plan_workspace())
                         elif self.resume_plan_id:
-                            resume_plan = self.plan_store.load(self.workspace_root, self.resume_plan_id)
+                            resume_plan = self.plan_store.load(self._plan_workspace(), self.resume_plan_id)
                         else:
-                            resume_plan = self.plan_store.load_current(self.workspace_root)
+                            resume_plan = self.plan_store.load_current(self._plan_workspace())
                     except (OSError, ValueError):
                         resume_plan = None
                     if resume_plan is not None and resume_plan.task:
@@ -459,15 +465,15 @@ class NativeLightRuntime:
         plan: AgentPlan | None = None
         if self.resume:
             if self.resume_plan_id == "current":
-                plan = self.plan_store.load_current(self.workspace_root)
+                plan = self.plan_store.load_current(self._plan_workspace())
                 if plan is None:
                     raise ValueError("no current persistent plan to resume in this workspace")
             elif self.resume_plan_id:
-                plan = self.plan_store.load(self.workspace_root, self.resume_plan_id)
+                plan = self.plan_store.load(self._plan_workspace(), self.resume_plan_id)
                 if plan is None:
                     raise ValueError(f"resume plan not found in this workspace: {self.resume_plan_id}")
             else:
-                plan = self.plan_store.load_current(self.workspace_root)
+                plan = self.plan_store.load_current(self._plan_workspace())
             if plan is not None and plan.status in {"running", "paused", "failed"}:
                 previous_reason = plan.pause_reason
                 plan.status = "running"
@@ -483,7 +489,7 @@ class NativeLightRuntime:
                     f"resume plan is not resumable (status={plan.status}): {plan.id}"
                 )
         plan = self.plan_store.create(
-            self.initial_prompt, self.workspace_root, str(self.model or "")
+            self.initial_prompt, self._plan_workspace(), str(self.model or "")
         )
         self._emit("plan", action="created", plan=plan)
         return plan, False
@@ -621,6 +627,25 @@ class NativeLightRuntime:
                 plan.set_step("implement", "in_progress", "Inspection completed")
         self._save_plan(plan)
         return mutation_seen, verification_seen
+
+    def _guard_completion(self, plan: AgentPlan | None, messages: list[dict], tools: list[dict], system: str, *,
+                          model_used: str, iterations: int, total_latency: int, fallback_used: bool,
+                          journal_batches: list[dict[str, Any]]) -> AgentRunResult | None:
+        if self.completion_guard is None:
+            return None
+        try:
+            self.completion_guard()
+            return None
+        except Exception as exc:
+            reason = f"Workspace finalization failed: {type(exc).__name__}: {exc}"
+            self._fail_plan(plan, reason)
+            self._save_journal(plan, messages, pending_input=reason, tool_batches=journal_batches)
+            self._emit("error", message=reason)
+            return AgentRunResult(
+                "failed", "", model_used, messages, tools, system,
+                iterations=iterations, latency_ms=total_latency,
+                fallback_used=fallback_used, plan_id=plan.id if plan else "", error=reason,
+            )
 
     def _complete_plan(
         self,
@@ -797,6 +822,7 @@ class NativeLightRuntime:
             context_char_budget=context_char_budget,
             tools=len(tools),
             workspace=workspace,
+            source_workspace=self._plan_workspace(),
             plan_id=plan.id if plan else "",
             resumed=resumed,
         )
@@ -1044,6 +1070,12 @@ class NativeLightRuntime:
                     self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
                     continue
                 messages.append({"role": "assistant", "content": response})
+                guarded = self._guard_completion(
+                    plan, messages, tools, system, model_used=model_used, iterations=i + 1,
+                    total_latency=total_latency, fallback_used=fallback_used, journal_batches=journal_batches,
+                )
+                if guarded is not None:
+                    return guarded
                 self._complete_plan(
                     plan, response,
                     mutation_seen=mutation_seen,
@@ -1286,6 +1318,7 @@ class NativeLightRuntime:
                             execution_client=self.client,
                             tools=[tool for tool in tools if tool.get("name") != "subagent_run"],
                             workspace_root=self.workspace_root,
+                            protected_workspace_root=self.protected_workspace_root,
                             approval_fn=self.approval_fn,
                             enabled_tool_names=self.enabled_tool_names,
                             fallback_model=active_fallback,
@@ -1306,6 +1339,7 @@ class NativeLightRuntime:
                             iteration=i,
                             allowed_tools=allowed_tool_names,
                             workspace_root=self.workspace_root,
+                            protected_workspace_root=self.protected_workspace_root,
                         )
                     elapsed = time.monotonic() - started_tool
                 if not is_error and name in _INSPECTION_TOOLS:
@@ -1574,6 +1608,12 @@ class NativeLightRuntime:
                         plan, messages, pending_input=current_input, tool_batches=journal_batches
                     )
                     continue
+                guarded = self._guard_completion(
+                    plan, messages, tools, system, model_used=model_used, iterations=i + 1,
+                    total_latency=total_latency, fallback_used=fallback_used, journal_batches=journal_batches,
+                )
+                if guarded is not None:
+                    return guarded
                 self._complete_plan(
                     plan, visible or response,
                     mutation_seen=mutation_seen,

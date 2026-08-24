@@ -1248,6 +1248,9 @@ def format_untrusted_tool_results(results: list[str]) -> str:
 _RUNTIME_WORKSPACE_ROOT: ContextVar[str | None] = ContextVar(
     "aicoder_runtime_workspace_root", default=None
 )
+_RUNTIME_PROTECTED_ROOT: ContextVar[str | None] = ContextVar(
+    "aicoder_runtime_protected_root", default=None
+)
 
 
 def _workspace_root() -> Path:
@@ -1255,6 +1258,19 @@ def _workspace_root() -> Path:
     if override:
         return Path(override).expanduser().resolve(strict=False)
     return active_workspace(get_state().get("workspace_root"))
+
+
+def _protected_root() -> Path | None:
+    value = _RUNTIME_PROTECTED_ROOT.get()
+    return Path(value).expanduser().resolve(strict=False) if value else None
+
+
+def _inside(path: Path, root: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(root.resolve(strict=False))
+        return True
+    except ValueError:
+        return False
 
 
 def _workspace_path(
@@ -1909,9 +1925,13 @@ def run_tool(
     iteration: int = 0,
     allowed_tools: Optional[set[str]] = None,
     workspace_root: str | Path | None = None,
+    protected_workspace_root: str | Path | None = None,
 ) -> Tuple[str, bool]:
     token = _RUNTIME_WORKSPACE_ROOT.set(
         str(Path(workspace_root).expanduser().resolve(strict=False)) if workspace_root is not None else None
+    )
+    protected_token = _RUNTIME_PROTECTED_ROOT.set(
+        str(Path(protected_workspace_root).expanduser().resolve(strict=False)) if protected_workspace_root is not None else None
     )
     try:
         return _run_tool_impl(
@@ -1919,6 +1939,7 @@ def run_tool(
             allowed_tools=allowed_tools,
         )
     finally:
+        _RUNTIME_PROTECTED_ROOT.reset(protected_token)
         _RUNTIME_WORKSPACE_ROOT.reset(token)
 
 
@@ -1984,6 +2005,17 @@ def _run_tool_impl(
         approval_args["_destructive"] = destructive_hint
     escape_target = _workspace_escape_target(name, args)
     if escape_target is not None:
+        protected = _protected_root()
+        if protected is not None and _inside(escape_target, protected):
+            result = (
+                f"{name}: blocked — source workspace is protected during transactional RAM execution; "
+                "use the active RAM workspace path instead"
+            )
+            audit.log_tool(
+                tool_name=name, arguments=args, result=result, duration_s=0,
+                is_error=True, model=model, iteration=iteration,
+            )
+            return result, True
         approval_args["_workspace_escape"] = str(escape_target)
         approval_args["_workspace_root"] = str(_workspace_root())
     risk = assess_execution(name, approval_args, destructive=is_destructive(cmd))

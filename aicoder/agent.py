@@ -21,6 +21,7 @@ from .privileges import (
 )
 from .session_state import DEFAULT_RUNTIME_MODE, get_state
 from .workspace import active_workspace
+from .workspace_backend import open_workspace_for_run, preserve_workspace_for_resume
 from .ui import (
     C,
     print_header, print_task, print_thought,
@@ -258,12 +259,31 @@ def _run_native_light_agent(
             stop_model_heartbeat()
             print_error(str(payload.get("reason") or "native-light runtime paused"))
 
+    workspace_mode = str(state.get("workspace_mode", "auto") or "auto")
+    workspace_backend = open_workspace_for_run(
+        str(ws_path), workspace_mode, resume=resume_requested, resume_plan_id=resume_plan_id,
+    )
+    execution_root = workspace_backend.info.execution_root
+    if not (json_output or json_events):
+        info = workspace_backend.info
+        detail = f"execution workspace: {info.mode}"
+        if info.mode == "ram":
+            detail += f" · RAM transactional · budget {info.safe_budget_bytes // (1024**2)} MiB"
+            if info.restored_checkpoint:
+                detail += " · checkpoint restored"
+        elif info.fallback_reason:
+            detail += f" · fallback: {info.fallback_reason}"
+        print(f"  {C.DIM}⚙ {detail}{C.RESET}", file=sys.stderr, flush=True)
+
     runtime = NativeLightRuntime(
         client=client,
         initial_prompt=initial_prompt,
         model=model,
         fallback_model=fallback_model,
-        workspace_root=str(ws_path),
+        workspace_root=str(execution_root),
+        plan_workspace_root=str(ws_path),
+        protected_workspace_root=(str(ws_path) if workspace_backend.info.transactional else None),
+        completion_guard=(lambda: workspace_backend.finalize(verified=True)),
         tools=None if should_load_tools_now else [],
         load_tools_on_start=should_load_tools_now,
         enabled_tool_names=enabled_tool_names,
@@ -281,6 +301,8 @@ def _run_native_light_agent(
         native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
     )
     result = runtime.run()
+    if result.status != "completed":
+        preserve_workspace_for_resume(workspace_backend, result.plan_id or None)
     stop_model_heartbeat()
     if not header_printed and not (json_output or json_events):
         print_header(

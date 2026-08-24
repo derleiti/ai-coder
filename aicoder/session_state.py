@@ -22,6 +22,7 @@ from .settings import (  # noqa: F401 - re-exported for existing importers
     RUNTIME_MODES,
     SWARM_MODES,
     TOOL_MODES,
+    WORKSPACE_MODES,
     migrate_enabled_tools,
 )
 
@@ -120,3 +121,7 @@ def set_swarm(mode: str) -> None:
 
 def set_workspace(path: Optional[str]) -> None:
     _apply(workspace_root=path)
+
+
+def set_workspace_mode(mode: str) -> None:
+    _apply(workspace_mode=mode)

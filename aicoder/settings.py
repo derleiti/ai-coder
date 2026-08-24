@@ -50,6 +50,7 @@ SWARM_MODES = {"off", "auto", "on", "review"}
 TOOL_MODES = {"off", "on_demand", "always"}
 APPROVAL_MODES = {"ask", "autopilot", "all"}
 RUNTIME_MODES = {"classic", "native-light"}
+WORKSPACE_MODES = {"auto", "ram", "disk"}
 DEFAULT_RUNTIME_MODE = "native-light"
 DEFAULT_FALLBACK_MODEL = "ollama/llama3.2:latest"
 
@@ -122,6 +123,14 @@ _register(SettingSpec(
     key="workspace_root", type="path", default=None, nullable=True,
     group="workspace", aliases=("workspace",),
     description="Active workspace directory. All file tools are scoped to this root.",
+))
+_register(SettingSpec(
+    key="workspace_mode", type="enum", default="auto", choices=frozenset(WORKSPACE_MODES),
+    group="workspace", aliases=("execution_workspace", "workspace_execution"),
+    description=(
+        "Execution workspace: auto prefers an isolated transactional RAM workspace when safe, "
+        "ram requests RAM with automatic disk fallback, disk uses the source tree directly."
+    ),
 ))
 _register(SettingSpec(
     key="tool_mode", type="enum", default="on_demand", choices=frozenset(TOOL_MODES),

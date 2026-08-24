@@ -28,6 +28,7 @@ from ..privileges import (
 )
 from ..session_state import DEFAULT_RUNTIME_MODE, get_state
 from ..workspace import active_workspace
+from ..workspace_backend import open_workspace_for_run, preserve_workspace_for_resume
 from ..client import TriForceClient
 from .. import chat_history
 from ..executor import (
@@ -288,12 +289,29 @@ class _AgentWorker(QThread):
                 )
 
         resume_requested = persistent_plan and is_short_confirmation(initial_prompt)
+        source_workspace = str(active_workspace(state.get("workspace_root")))
+        workspace_mode = str(state.get("workspace_mode", "auto") or "auto")
+        workspace_backend = open_workspace_for_run(
+            source_workspace, workspace_mode, resume=resume_requested, resume_plan_id=None,
+        )
+        info = workspace_backend.info
+        workspace_detail = info.mode
+        if info.mode == "ram":
+            workspace_detail += f" · transactional · budget {info.safe_budget_bytes // (1024**2)} MiB"
+            if info.restored_checkpoint:
+                workspace_detail += " · restored"
+        elif info.fallback_reason:
+            workspace_detail += f" · fallback: {info.fallback_reason}"
+        self.msg.emit("system", f"Execution workspace: {workspace_detail}", runtime_label)
         runtime = NativeLightRuntime(
             client=self.client,
             initial_prompt=initial_prompt,
             model=self.model or None,
             fallback_model=self.fallback or None,
-            workspace_root=str(active_workspace(state.get("workspace_root"))),
+            workspace_root=str(info.execution_root),
+            plan_workspace_root=source_workspace,
+            protected_workspace_root=(source_workspace if workspace_backend.info.transactional else None),
+            completion_guard=(lambda: workspace_backend.finalize(verified=True)),
             tools=self.tools,
             system_prompt=self.system,
             conversation=prior,
@@ -312,6 +330,8 @@ class _AgentWorker(QThread):
             native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
         )
         result = runtime.run()
+        if result.status != "completed":
+            preserve_workspace_for_resume(workspace_backend, result.plan_id or None)
         self.tools = result.tools
         self.system = result.system_prompt
         self.messages = result.messages

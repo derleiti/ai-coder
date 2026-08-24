@@ -174,6 +174,29 @@ class WorkspaceEscapeTests(unittest.TestCase):
             self.assertFalse(_cli_approval("file_read", args))
         prompt.assert_called_once()
 
+    def test_transactional_runtime_hard_blocks_original_source_workspace(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            source = base / "source"
+            execution = base / "ram"
+            source.mkdir(); execution.mkdir()
+            target = source / "protected.txt"
+            target.write_text("original", encoding="utf-8")
+            approvals = []
+
+            result, is_error = run_tool(
+                MagicMock(), "file_edit",
+                {"path": str(target), "operation": "replace", "old": "original", "new": "changed"},
+                approval_fn=lambda name, args: approvals.append((name, dict(args))) or True,
+                allowed_tools={"file_edit"},
+                workspace_root=execution,
+                protected_workspace_root=source,
+            )
+            self.assertTrue(is_error)
+            self.assertIn("source workspace is protected", result)
+            self.assertEqual(target.read_text(encoding="utf-8"), "original")
+            self.assertEqual(approvals, [], "protected source must be blocked before approval")
+
     def test_headless_never_silently_escapes_workspace(self):
         args = {
             "path": "/outside/file.txt",
