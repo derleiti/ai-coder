@@ -17,7 +17,7 @@ dependencies = [
   "markdown>=3.7.0",
   "prompt-toolkit>=3.0.48",
   "pyte>=0.8.2",
-  "websockets>=13.0",
+  "websockets>=16.1.1",
   "tomli>=2.1.0; python_version < '3.11'",
 ]
 
