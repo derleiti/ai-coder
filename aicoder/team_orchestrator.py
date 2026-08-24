@@ -9,8 +9,10 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 import json
+import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import time
 from typing import Any, Callable
@@ -20,9 +22,13 @@ from .executor import build_system_prompt, load_tools
 from .model_transport import ModelTransport
 from .performance import RuntimePerformance
 from .team_runtime import (
-    CODER_SYSTEM_TEMPLATE, COORDINATOR_SYSTEM_PROMPT, FINALIZER_SYSTEM_PROMPT,
-    MERGE_SYSTEM_PROMPT, PLANNER_SYSTEM_PROMPT, RESEARCH_INSTRUCTIONS,
-    RESEARCH_OUTPUT_CONTRACT, TeamConfig,
+    CODER_SYSTEM_TEMPLATE, MERGE_PLANNER_SYSTEM_PROMPT, MERGE_SYSTEM_PROMPT,
+    PLANNER_SYSTEM_PROMPT, RESEARCH_INSTRUCTIONS, RESEARCH_OUTPUT_CONTRACT,
+    RESEARCH_PLANNER_SYSTEM_PROMPT, TEST_PLANNER_SYSTEM_PROMPT, TeamConfig,
+)
+from .team_pipeline import (
+    StageLedger, TeamStage, blind_candidate_id, execute_verification_plan,
+    objective_rank_key, project_verification_plan, verification_passed,
 )
 from .workspace_backend import RamWorkspace, WorkspaceBackend, WorkspaceError, create_workspace_backend
 
@@ -113,9 +119,11 @@ def _filtered_tools(catalogue: list[dict], names: frozenset[str]) -> list[dict]:
 def _run_researcher(
     *, client, model_client: ModelTransport, model: str, role: str, task: str,
     source_workspace: str, tools: list[dict], stop_requested: StopFn | None,
+    research_plan: str = "",
 ) -> AgentStageResult:
     prompt = (
         f"User task:\n{task}\n\nRepository root for read-only inspection: {source_workspace}\n\n"
+        f"RESEARCH CONTRACT:\n{research_plan or '(none)'}\n\n"
         + RESEARCH_INSTRUCTIONS[role] + "\n\n" + RESEARCH_OUTPUT_CONTRACT
     )
     system = build_system_prompt(tools, source_workspace).rstrip() + (
@@ -245,19 +253,22 @@ def _run_check(root: Path, command: list[str], timeout: int = 90) -> dict[str, A
 def evaluate_candidate(candidate: CandidateResult) -> dict[str, Any]:
     root = Path(candidate.workspace.info.execution_root)
     delta = candidate.workspace.delta_summary() if isinstance(candidate.workspace, RamWorkspace) else {}
-    checks: dict[str, Any] = {}
-    # Portable, deterministic baseline checks. Project-specific tests still run
-    # inside the coder runtime according to the shared plan.
-    checks["compile"] = _run_check(root, ["python3", "-m", "compileall", "-q", "."], timeout=120)
-    if (root / "tests").is_dir():
-        checks["tests"] = _run_check(root, ["python3", "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py"], timeout=180)
-    score = 0
-    if candidate.run.status == "completed": score += 40
-    if delta.get("changed_count", 0) or delta.get("deleted_count", 0): score += 10
-    for check in checks.values():
-        score += 25 if check.get("ok") else -35
-    if candidate.run.error: score -= 20
-    return {"score": score, "delta": delta, "checks": checks, "diff": _git_diff(root)}
+    plan = project_verification_plan(root)
+    results = execute_verification_plan(root, plan)
+    checks = {row.name: row.as_dict() for row in results}
+    passed = sum(1 for row in results if row.ok and row.required)
+    failed = sum(1 for row in results if (not row.ok) and row.required)
+    score = (40 if candidate.run.status == "completed" else 0) + passed * 25 - failed * 60
+    if delta.get("changed_count", 0) or delta.get("deleted_count", 0):
+        score += 10
+    if candidate.run.error:
+        score -= 20
+    diff = _git_diff(root)
+    return {
+        "score": score, "delta": delta, "checks": checks, "diff": diff,
+        "candidate_id": blind_candidate_id(diff),
+        "verification_passed": verification_passed(results),
+    }
 
 
 def _evaluation_prompt(candidates: list[CandidateResult]) -> str:
@@ -272,6 +283,59 @@ def _evaluation_prompt(candidates: list[CandidateResult]) -> str:
     return "\n\n".join(rows)
 
 
+
+def _stage_start(ledger: StageLedger, stage: TeamStage, event_fn: EventFn | None) -> None:
+    ledger.start(stage)
+    _emit(event_fn, "team_pipeline", stage=stage.value, status="started", ledger=ledger.as_dict())
+
+
+def _stage_complete(ledger: StageLedger, stage: TeamStage, event_fn: EventFn | None) -> None:
+    ledger.complete(stage)
+    _emit(event_fn, "team_pipeline", stage=stage.value, status="completed", ledger=ledger.as_dict())
+
+
+def _link_or_copy(src: str, dst: str) -> str:
+    try:
+        os.link(src, dst)
+        return dst
+    except OSError:
+        return shutil.copy2(src, dst)
+
+
+def _attach_blind_candidate_snapshots(integration: RamWorkspace, candidates: list[CandidateResult]) -> list[dict[str, Any]]:
+    base = integration.info.execution_root / ".aicoder-team" / "candidates"
+    base.mkdir(parents=True, exist_ok=True)
+    evidence: list[dict[str, Any]] = []
+    for candidate in sorted(candidates, key=lambda item: str(item.evaluation.get("candidate_id") or "")):
+        cid = str(candidate.evaluation.get("candidate_id") or blind_candidate_id(candidate.evaluation.get("diff", "")))
+        target = base / cid
+        shutil.copytree(
+            candidate.workspace.info.execution_root, target, symlinks=True,
+            ignore=shutil.ignore_patterns(".git", ".aicoder-team", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"),
+            copy_function=_link_or_copy, dirs_exist_ok=True,
+        )
+        evidence.append({
+            "candidate_id": cid,
+            "score": int(candidate.evaluation.get("score") or 0),
+            "verification_passed": bool(candidate.evaluation.get("verification_passed")),
+            "checks": candidate.evaluation.get("checks") or {},
+            "delta": candidate.evaluation.get("delta") or {},
+            "diff": str(candidate.evaluation.get("diff") or "")[:50000],
+            "snapshot": f".aicoder-team/candidates/{cid}",
+        })
+    integration.write_candidate_artifact(
+        ".aicoder-team/candidates.json", json.dumps(evidence, ensure_ascii=False, indent=2)
+    )
+    return evidence
+
+
+def _blind_merge_prompt(task: str, code_plan: str, evidence: list[dict[str, Any]]) -> str:
+    return (
+        f"USER TASK:\n{task}\n\nSHARED CODE CONTRACT:\n{code_plan}\n\n"
+        "ANONYMIZED CANDIDATE EVIDENCE:\n" + json.dumps(evidence, ensure_ascii=False, indent=2)
+    )
+
+
 def run_team(
     *, task: str, state: dict[str, Any], config: TeamConfig, client,
     model_client: ModelTransport, source_workspace: str,
@@ -280,16 +344,31 @@ def run_team(
     errors = config.validate()
     if errors:
         return TeamRunResult("failed", "", "", [], [], {}, "; ".join(errors))
+
     started = time.monotonic()
+    ledger = StageLedger()
     stages: list[AgentStageResult] = []
     candidates: list[CandidateResult] = []
     all_tools = load_tools(client)
     research_tools = _filtered_tools(all_tools, _RESEARCH_TOOL_NAMES)
     coder_tools = _filtered_tools(all_tools, _CODER_TOOL_NAMES)
-
     _emit(event_fn, "team_start", agents=config.active_count, research=len(config.research), coders=len(config.coders))
 
-    # Research in parallel. Read-only against the authoritative source workspace.
+    # 1) plan_research
+    _stage_start(ledger, TeamStage.PLAN_RESEARCH, event_fn)
+    research_planner_model = config.coordinator_model or config.planner_model or ""
+    research_plan = _call_advisor(
+        model_client, model=research_planner_model, system=RESEARCH_PLANNER_SYSTEM_PROMPT,
+        prompt=f"USER TASK:\n{task}\n\nREPOSITORY CONTEXT:\n{_repository_context(source_workspace)}",
+        max_tokens=5000,
+    )
+    research_plan.role = "plan_research"; stages.append(research_plan)
+    if research_plan.status != "completed":
+        return TeamRunResult("failed", "", research_plan.model, stages, [], {"ledger": ledger.as_dict()}, research_plan.error)
+    _stage_complete(ledger, TeamStage.PLAN_RESEARCH, event_fn)
+
+    # 2) research
+    _stage_start(ledger, TeamStage.RESEARCH, event_fn)
     research_results: list[AgentStageResult] = []
     if config.research:
         with ThreadPoolExecutor(max_workers=len(config.research), thread_name_prefix="aicoder-research") as pool:
@@ -298,6 +377,7 @@ def run_team(
                     _run_researcher, client=client, model_client=model_client, model=slot.model,
                     role=slot.role, task=task, source_workspace=source_workspace,
                     tools=research_tools, stop_requested=stop_requested,
+                    research_plan=research_plan.response,
                 ): slot for slot in config.research
             }
             for future in as_completed(futures):
@@ -308,35 +388,29 @@ def run_team(
                     result = AgentStageResult(f"research:{slot.role}", slot.model, "failed", "", 0, f"{type(exc).__name__}: {exc}")
                 research_results.append(result); stages.append(result)
                 _emit(event_fn, "team_stage", role=result.role, status=result.status, model=result.model, elapsed_ms=result.elapsed_ms)
+    _stage_complete(ledger, TeamStage.RESEARCH, event_fn)
 
-    planner = _call_advisor(
-        model_client, model=config.planner_model or "",
-        system=PLANNER_SYSTEM_PROMPT,
-        prompt=_build_planner_prompt(task, _repository_context(source_workspace), research_results),
+    # 3) plan_code
+    _stage_start(ledger, TeamStage.PLAN_CODE, event_fn)
+    code_plan = _call_advisor(
+        model_client, model=config.planner_model or "", system=PLANNER_SYSTEM_PROMPT,
+        prompt=_build_planner_prompt(task, _repository_context(source_workspace), research_results)
+        + "\n\nRESEARCH CONTRACT:\n" + research_plan.response,
         max_tokens=9000,
     )
-    planner.role = "planner"; stages.append(planner)
-    _emit(event_fn, "team_stage", role="planner", status=planner.status, model=planner.model, elapsed_ms=planner.elapsed_ms)
-    if planner.status != "completed":
-        return TeamRunResult("failed", "", planner.model, stages, [], {"wall_ms": int((time.monotonic()-started)*1000)}, planner.error)
+    code_plan.role = "plan_code"; stages.append(code_plan)
+    if code_plan.status != "completed":
+        return TeamRunResult("failed", "", code_plan.model, stages, [], {"ledger": ledger.as_dict()}, code_plan.error)
+    _stage_complete(ledger, TeamStage.PLAN_CODE, event_fn)
 
-    coordinator_text = ""
-    if config.coordinator_model:
-        coordinator = _call_advisor(
-            model_client, model=config.coordinator_model, system=COORDINATOR_SYSTEM_PROMPT,
-            prompt=f"USER TASK:\n{task}\n\nSHARED PLAN:\n{planner.response}", max_tokens=4000,
-        )
-        coordinator.role = "coordinator"; stages.append(coordinator)
-        coordinator_text = coordinator.response if coordinator.status == "completed" else ""
-        _emit(event_fn, "team_stage", role="coordinator", status=coordinator.status, model=coordinator.model, elapsed_ms=coordinator.elapsed_ms)
-
-    # Candidate coders in parallel, each with its own RAM tree.
+    # 4) code — isolated parallel candidates
+    _stage_start(ledger, TeamStage.CODE, event_fn)
     with ThreadPoolExecutor(max_workers=len(config.coders), thread_name_prefix="aicoder-coder") as pool:
         futures = {
             pool.submit(
                 _run_candidate, client=client, model_client=model_client, source_workspace=source_workspace,
                 workspace_mode=str(state.get("workspace_mode") or "auto"), slot=slot.slot, model=slot.model,
-                strategy=slot.strategy, task=task, plan=planner.response, coordinator=coordinator_text,
+                strategy=slot.strategy, task=task, plan=code_plan.response, coordinator="",
                 tools=coder_tools, stop_requested=stop_requested,
             ): slot for slot in config.coders
         }
@@ -349,94 +423,119 @@ def run_team(
                 candidate.evaluation_ms = int((time.monotonic() - evaluation_started) * 1000)
                 candidate.score = int(candidate.evaluation.get("score") or 0)
                 candidates.append(candidate)
-                _emit(
-                    event_fn, "team_candidate", slot=candidate.slot, status=candidate.run.status,
-                    model=candidate.model, score=candidate.score, elapsed_ms=candidate.elapsed_ms,
-                    evaluation_ms=candidate.evaluation_ms,
-                )
+                _emit(event_fn, "team_candidate", candidate_id=candidate.evaluation.get("candidate_id"),
+                      status=candidate.run.status, score=candidate.score,
+                      elapsed_ms=candidate.elapsed_ms, evaluation_ms=candidate.evaluation_ms)
             except Exception as exc:
-                _emit(event_fn, "team_candidate", slot=slot.slot, status="failed", model=slot.model, score=-999, error=f"{type(exc).__name__}: {exc}")
-
+                _emit(event_fn, "team_candidate", candidate_id="failed", status="failed", score=-999,
+                      error=f"{type(exc).__name__}: {exc}")
     viable = [candidate for candidate in candidates if candidate.run.status == "completed"]
     if not viable:
         for c in candidates: c.workspace.abort()
-        return TeamRunResult("failed", "", "", stages, candidates, {"wall_ms": int((time.monotonic()-started)*1000)}, "no coding candidate completed")
-    winner = max(viable, key=lambda item: (item.score, -item.slot))
+        return TeamRunResult("failed", "", "", stages, candidates, {"ledger": ledger.as_dict()}, "no coding candidate completed")
+    winner = max(viable, key=lambda item: objective_rank_key(item.evaluation))
+    _stage_complete(ledger, TeamStage.CODE, event_fn)
 
-    # Integration workspace starts from the strongest measured candidate and gets
-    # read-only snapshots of the alternatives for the merge model to inspect.
+    # Build fresh integration workspace and attach anonymized full snapshots.
     integration = create_workspace_backend(source_workspace, "ram")
     integration.prepare()
     if not isinstance(integration, RamWorkspace):
         for c in candidates: c.workspace.abort()
         integration.abort()
-        return TeamRunResult("failed", "", "", stages, candidates, {}, "integration requires RAM isolation")
+        return TeamRunResult("failed", "", "", stages, candidates, {"ledger": ledger.as_dict()}, "integration requires RAM isolation")
     integration.seed_from(winner.workspace.info.execution_root)
-    candidate_meta = []
-    for c in candidates:
-        candidate_meta.append({
-            "slot": c.slot, "model": c.model, "strategy": c.strategy, "score": c.score,
-            "evaluation": {k: v for k, v in c.evaluation.items() if k != "diff"},
-            "diff": c.evaluation.get("diff", "")[:50000],
-        })
-    integration.write_candidate_artifact(
-        ".aicoder-team/candidates.json", json.dumps(candidate_meta, ensure_ascii=False, indent=2)
-    )
-    merge_prompt = (
-        f"USER TASK:\n{task}\n\nSHARED PLAN:\n{planner.response}\n\n"
-        f"The integration workspace is seeded from candidate {winner.slot}, the highest deterministic score. "
-        "Candidate evidence is in .aicoder-team/candidates.json. Inspect it and the current code. Integrate only "
-        "changes that improve contract compliance and verification. Then run tests/checks."
-    )
-    merge_model = config.merge_model or winner.model
-    merge_runtime = NativeLightRuntime(
-        client=client, model_client=model_client, initial_prompt=merge_prompt,
-        model=merge_model, fallback_model=None, workspace_root=str(integration.info.execution_root),
-        plan_workspace_root=source_workspace, protected_workspace_root=source_workspace,
-        tools=coder_tools, system_prompt=build_system_prompt(coder_tools, str(integration.info.execution_root)).rstrip()+"\n\n"+MERGE_SYSTEM_PROMPT,
-        load_tools_on_start=True, quick_chat=False, persistent_plan=False,
-        approval_fn=_candidate_approval, max_iterations=14, max_output_tokens=10000, stop_requested=stop_requested,
-    )
-    merge_started = time.monotonic()
-    merge_run = merge_runtime.run()
-    merge_elapsed = int((time.monotonic() - merge_started) * 1000)
-    stages.append(AgentStageResult("merge", merge_run.model or merge_model, merge_run.status, merge_run.response, merge_elapsed, merge_run.error))
-    _emit(event_fn, "team_stage", role="merge", status=merge_run.status, model=merge_run.model or merge_model, elapsed_ms=merge_elapsed)
-    if merge_run.status != "completed":
-        integration.abort(); [c.workspace.abort() for c in candidates]
-        return TeamRunResult("failed", "", merge_run.model, stages, candidates, {}, merge_run.error or "merge failed")
+    blind_evidence = _attach_blind_candidate_snapshots(integration, candidates)
+    winner_id = str(winner.evaluation.get("candidate_id"))
 
-    final_model = config.finalizer_model or merge_model
-    final_runtime = NativeLightRuntime(
-        client=client, model_client=model_client,
-        initial_prompt=f"USER TASK:\n{task}\n\nSHARED PLAN:\n{planner.response}\n\nFinalize and fully verify the integrated candidate.",
-        model=final_model, fallback_model=None, workspace_root=str(integration.info.execution_root),
-        plan_workspace_root=source_workspace, protected_workspace_root=source_workspace,
-        tools=coder_tools, system_prompt=build_system_prompt(coder_tools, str(integration.info.execution_root)).rstrip()+"\n\n"+FINALIZER_SYSTEM_PROMPT,
-        load_tools_on_start=True, quick_chat=False, persistent_plan=False,
-        approval_fn=_candidate_approval, max_iterations=10, max_output_tokens=8000, stop_requested=stop_requested,
+    # 5) merge_plan — blind to model/provider/slot identity.
+    _stage_start(ledger, TeamStage.MERGE_PLAN, event_fn)
+    merge_planner_model = config.coordinator_model or config.planner_model or ""
+    merge_plan = _call_advisor(
+        model_client, model=merge_planner_model, system=MERGE_PLANNER_SYSTEM_PROMPT,
+        prompt=_blind_merge_prompt(task, code_plan.response, blind_evidence)
+        + f"\n\nDETERMINISTIC BASE CANDIDATE: {winner_id}",
+        max_tokens=6000,
     )
-    final_started = time.monotonic()
-    final_run = final_runtime.run()
-    final_elapsed = int((time.monotonic() - final_started) * 1000)
-    stages.append(AgentStageResult("finalizer", final_run.model or final_model, final_run.status, final_run.response, final_elapsed, final_run.error))
-    _emit(event_fn, "team_stage", role="finalizer", status=final_run.status, model=final_run.model or final_model, elapsed_ms=final_elapsed)
-    if final_run.status != "completed":
+    merge_plan.role = "merge_plan"; stages.append(merge_plan)
+    if merge_plan.status != "completed":
         integration.abort(); [c.workspace.abort() for c in candidates]
-        return TeamRunResult("failed", "", final_run.model, stages, candidates, {}, final_run.error or "finalizer failed")
+        return TeamRunResult("failed", "", merge_plan.model, stages, candidates, {"ledger": ledger.as_dict()}, merge_plan.error)
+    integration.write_candidate_artifact(".aicoder-team/merge-plan.txt", merge_plan.response)
+    _stage_complete(ledger, TeamStage.MERGE_PLAN, event_fn)
 
-    final_eval_candidate = CandidateResult(0, final_model, "integrated", integration, final_run)
-    final_eval_candidate.evaluation = evaluate_candidate(final_eval_candidate)
-    final_eval_candidate.score = int(final_eval_candidate.evaluation.get("score") or 0)
-    critical_checks = final_eval_candidate.evaluation.get("checks", {})
-    if any(not bool(value.get("ok")) for value in critical_checks.values()):
+    # 6) merge — optional LLM. Empty merge slot means deterministic winner only.
+    _stage_start(ledger, TeamStage.MERGE, event_fn)
+    merge_model = config.merge_model
+    if merge_model:
+        merge_runtime = NativeLightRuntime(
+            client=client, model_client=model_client,
+            initial_prompt=(f"USER TASK:\n{task}\n\nCODE CONTRACT:\n{code_plan.response}\n\n"
+                            f"BLIND MERGE CONTRACT:\n{merge_plan.response}\n\n"
+                            "Candidate snapshots are under .aicoder-team/candidates/. Integrate only evidence-backed improvements."),
+            model=merge_model, fallback_model=None, workspace_root=str(integration.info.execution_root),
+            plan_workspace_root=source_workspace, protected_workspace_root=source_workspace,
+            tools=coder_tools, system_prompt=build_system_prompt(coder_tools, str(integration.info.execution_root)).rstrip()+"\n\n"+MERGE_SYSTEM_PROMPT,
+            load_tools_on_start=True, quick_chat=False, persistent_plan=False,
+            approval_fn=_candidate_approval, max_iterations=14, max_output_tokens=10000, stop_requested=stop_requested,
+        )
+        merge_started = time.monotonic(); merge_run = merge_runtime.run()
+        merge_elapsed = int((time.monotonic() - merge_started) * 1000)
+        stages.append(AgentStageResult("merge", merge_run.model or merge_model, merge_run.status, merge_run.response, merge_elapsed, merge_run.error))
+        if merge_run.status != "completed":
+            integration.abort(); [c.workspace.abort() for c in candidates]
+            return TeamRunResult("failed", "", merge_run.model, stages, candidates, {"ledger": ledger.as_dict()}, merge_run.error or "merge failed")
+        final_response = merge_run.response
+        result_model = merge_run.model or merge_model
+    else:
+        stages.append(AgentStageResult("merge", "deterministic", "completed", f"Selected {winner_id} without LLM merge", 0))
+        final_response = f"Selected verified base candidate {winner_id}."
+        result_model = winner.run.model
+    _stage_complete(ledger, TeamStage.MERGE, event_fn)
+
+    # 7) plan_tests — model may explain/extend intent, deterministic commands remain authoritative.
+    _stage_start(ledger, TeamStage.PLAN_TESTS, event_fn)
+    deterministic_plan = project_verification_plan(integration.info.execution_root)
+    test_plan_text = json.dumps([
+        {"name": item.name, "argv": list(item.argv), "timeout": item.timeout, "required": item.required}
+        for item in deterministic_plan
+    ], ensure_ascii=False, indent=2)
+    if config.test_planner_model:
+        test_plan = _call_advisor(
+            model_client, model=config.test_planner_model, system=TEST_PLANNER_SYSTEM_PROMPT,
+            prompt=(f"USER TASK:\n{task}\n\nCODE CONTRACT:\n{code_plan.response}\n\nMERGE CONTRACT:\n{merge_plan.response}\n\n"
+                    f"DETERMINISTIC REPOSITORY CHECKS (authoritative):\n{test_plan_text}"),
+            max_tokens=5000,
+        )
+        test_plan.role = "plan_tests"; stages.append(test_plan)
+        if test_plan.status != "completed":
+            integration.abort(); [c.workspace.abort() for c in candidates]
+            return TeamRunResult("failed", "", test_plan.model, stages, candidates, {"ledger": ledger.as_dict()}, test_plan.error)
+        integration.write_candidate_artifact(".aicoder-team/test-plan.txt", test_plan.response)
+    else:
+        stages.append(AgentStageResult("plan_tests", "deterministic", "completed", test_plan_text, 0))
+    _stage_complete(ledger, TeamStage.PLAN_TESTS, event_fn)
+
+    # 8) tests_function_ok — only executable evidence can open the disk-write gate.
+    _stage_start(ledger, TeamStage.TESTS_FUNCTION_OK, event_fn)
+    verification_results = execute_verification_plan(integration.info.execution_root, deterministic_plan)
+    verification_payload = [item.as_dict() for item in verification_results]
+    integration.write_candidate_artifact(".aicoder-team/final-verification.json", json.dumps(verification_payload, ensure_ascii=False, indent=2))
+    if not verification_passed(verification_results):
         integration.abort(); [c.workspace.abort() for c in candidates]
-        return TeamRunResult("failed", "", final_run.model, stages, candidates, {}, "integrated candidate failed deterministic verification")
+        return TeamRunResult(
+            "failed", "", result_model, stages, candidates,
+            {"ledger": ledger.as_dict(), "verification": verification_payload},
+            "tests_function_ok gate failed; persistent workspace was not modified",
+        )
+    _stage_complete(ledger, TeamStage.TESTS_FUNCTION_OK, event_fn)
 
-    # Only this point may touch the persistent workspace.
+    # 9) atomic_disk_write — the only persistent mutation stage.
+    _stage_start(ledger, TeamStage.ATOMIC_DISK_WRITE, event_fn)
     integration.finalize(verified=True)
     for c in candidates:
         c.workspace.abort()
+    _stage_complete(ledger, TeamStage.ATOMIC_DISK_WRITE, event_fn)
+
     wall_ms = int((time.monotonic() - started) * 1000)
     accumulated_agent_ms = sum(stage.elapsed_ms for stage in stages) + sum(
         candidate.elapsed_ms + candidate.evaluation_ms for candidate in candidates
@@ -446,20 +545,12 @@ def run_team(
         "accumulated_agent_ms": accumulated_agent_ms,
         "parallelism": round(accumulated_agent_ms / wall_ms, 2) if wall_ms else 0.0,
         "research_agents": len(research_results), "coding_candidates": len(candidates),
-        "winner_slot": winner.slot, "winner_score": winner.score,
-        "final_score": final_eval_candidate.score,
+        "winner_candidate_id": winner_id, "winner_score": winner.score,
+        "ledger": ledger.as_dict(), "verification": verification_payload,
         "stage_timings": [
             {"role": stage.role, "model": stage.model, "status": stage.status, "elapsed_ms": stage.elapsed_ms}
             for stage in stages
         ],
-        "candidate_timings": [
-            {
-                "slot": candidate.slot, "model": candidate.model,
-                "elapsed_ms": candidate.elapsed_ms, "evaluation_ms": candidate.evaluation_ms,
-                "score": candidate.score,
-            }
-            for candidate in sorted(candidates, key=lambda item: item.slot)
-        ],
     }
     _emit(event_fn, "team_complete", **perf)
-    return TeamRunResult("completed", final_run.response, final_run.model or final_model, stages, candidates, perf)
+    return TeamRunResult("completed", final_response, result_model or "", stages, candidates, perf)

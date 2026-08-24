@@ -229,8 +229,8 @@ _register(SettingSpec(
     description="Merge/integration model. @primary reuses the base model; empty/off disables optional roles.",
 ))
 _register(SettingSpec(
-    key="team_finalizer_model", type="model", default="@primary", group="team",
-    description="Finalizer model. @primary reuses the base model; empty/off disables optional roles.",
+    key="team_test_planner_model", type="model", default="@primary", group="team",
+    description="Test-planner model. @primary reuses the base model; empty/off disables optional roles.",
 ))
 
 

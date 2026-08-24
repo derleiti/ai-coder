@@ -248,7 +248,7 @@ class SettingsWidget(QWidget):
             ("team_coder_model_3", "Coder 3 · Performance / Effizienz"),
             ("team_coder_model_4", "Coder 4 · Robustheit / Sicherheit"),
             ("team_merge_model", "Merge · Integration der besten Kandidaten"),
-            ("team_finalizer_model", "Finalisierung · Reparatur / Abschlussprüfung"),
+            ("team_test_planner_model", "Test-Planer · Verifikationsplan"),
         ]
         for key, label in team_labels:
             combo = QComboBox()

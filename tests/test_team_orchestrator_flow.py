@@ -39,7 +39,10 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
         FakeIntegrationRuntime.calls = 0
         with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as ram_dir:
             source = Path(source_dir)
-            (source / "app.py").write_text("base\n", encoding="utf-8")
+            (source / "app.py").write_text("value = 0\n", encoding="utf-8")
+            (source / "pyproject.toml").write_text("[project]\nname=\"demo\"\nversion=\"0.1.0\"\n", encoding="utf-8")
+            (source / "tests").mkdir()
+            (source / "tests" / "test_app.py").write_text("import unittest\nimport app\nclass T(unittest.TestCase):\n    def test_value(self): self.assertGreaterEqual(app.value, 0)\n", encoding="utf-8")
             state = {
                 "selected_model": "test/model",
                 "team_runtime_mode": "on",
@@ -55,7 +58,7 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
                 "team_coder_model_3": "",
                 "team_coder_model_4": "",
                 "team_merge_model": "test/model",
-                "team_finalizer_model": "test/model",
+                "team_test_planner_model": "test/model",
             }
             config = config_from_state(state)
 
@@ -73,7 +76,7 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
                 backend = RamWorkspace(source, ram_root=ram_dir)
                 backend.prepare()
                 slot = kwargs["slot"]
-                (backend.info.execution_root / "app.py").write_text(f"candidate-{slot}\n", encoding="utf-8")
+                (backend.info.execution_root / "app.py").write_text(f"value = {slot}\n", encoding="utf-8")
                 item = CandidateResult(slot, kwargs["model"], kwargs["strategy"], backend, _result(f"DONE: candidate {slot}"))
                 candidates.append(item)
                 return item
@@ -84,6 +87,8 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
                     "delta": item.workspace.delta_summary(),
                     "checks": {"compile": {"ok": True}, "tests": {"ok": True}},
                     "diff": f"candidate {item.slot}",
+                    "candidate_id": f"cand-{item.slot}",
+                    "verification_passed": True,
                 }
 
             original_create = __import__("aicoder.workspace_backend", fromlist=["create_workspace_backend"]).create_workspace_backend
@@ -105,9 +110,13 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
                 )
 
             self.assertEqual(result.status, "completed", result.error)
-            self.assertEqual(result.performance["winner_slot"], 2)
-            self.assertEqual((source / "app.py").read_text(encoding="utf-8"), "candidate-2\n")
-            self.assertEqual((source / "integrated.txt").read_text(encoding="utf-8"), "final\n")
+            self.assertEqual(result.performance["winner_candidate_id"], "cand-2")
+            self.assertEqual(result.performance["ledger"]["completed"], [
+                "plan_research", "research", "plan_code", "code", "merge_plan", "merge",
+                "plan_tests", "tests_function_ok", "atomic_disk_write",
+            ])
+            self.assertEqual((source / "app.py").read_text(encoding="utf-8"), "value = 2\n")
+            self.assertEqual((source / "integrated.txt").read_text(encoding="utf-8"), "merged\n")
             self.assertFalse((source / ".aicoder-team").exists())
 
 

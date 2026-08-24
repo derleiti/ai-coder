@@ -302,7 +302,11 @@ class NativeLightRuntime:
                 cancel = getattr(model_client, "cancel_current_request", None)
                 if callable(cancel):
                     try:
-                        cancel()
+                        request_id = kwargs.get("request_id")
+                        try:
+                            cancel(request_id)
+                        except TypeError:
+                            cancel()
                     except Exception:
                         # Cancellation is best-effort; Stop must still return promptly.
                         pass

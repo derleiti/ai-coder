@@ -75,23 +75,30 @@ class OpenAICompatibleTransport:
         self.timeout = max(10, min(300, int(timeout)))
         self.headers = {str(k): str(v) for k, v in (headers or {}).items()}
         self._active_response_lock = threading.Lock()
-        self._active_response = None
+        self._active_responses: dict[str, Any] = {}
 
-    def cancel_current_request(self) -> bool:
-        """Best-effort cancellation once the HTTP response handle exists."""
+    def cancel_current_request(self, request_id: str | None = None) -> bool:
+        """Best-effort cancellation of one request, safe under parallel team calls."""
         with self._active_response_lock:
-            response = self._active_response
-            self._active_response = None
-        if response is None:
-            return False
-        close = getattr(response, "close", None)
-        if callable(close):
-            try:
-                close()
-                return True
-            except Exception:
-                return False
-        return False
+            if request_id:
+                responses = [self._active_responses.pop(str(request_id), None)]
+            elif len(self._active_responses) == 1:
+                key, response = next(iter(self._active_responses.items()))
+                self._active_responses.pop(key, None); responses = [response]
+            else:
+                responses = list(self._active_responses.values())
+                self._active_responses.clear()
+        closed = False
+        for response in responses:
+            if response is None:
+                continue
+            close = getattr(response, "close", None)
+            if callable(close):
+                try:
+                    close(); closed = True
+                except Exception:
+                    pass
+        return closed
 
     @property
     def endpoint(self) -> str:
@@ -119,14 +126,15 @@ class OpenAICompatibleTransport:
         context = ssl.create_default_context()
         try:
             response = urlopen(request, timeout=self.timeout, context=context)
+            active_key = str(request_id or f"thread-{threading.get_ident()}")
             with self._active_response_lock:
-                self._active_response = response
+                self._active_responses[active_key] = response
             try:
                 raw = response.read().decode("utf-8", errors="replace")
             finally:
                 with self._active_response_lock:
-                    if self._active_response is response:
-                        self._active_response = None
+                    if self._active_responses.get(active_key) is response:
+                        self._active_responses.pop(active_key, None)
                 try:
                     response.close()
                 except Exception:

@@ -234,33 +234,48 @@ class TriForceClient:
         self.token = token
         self.timeout = timeout
         self._active_response_lock = threading.Lock()
-        self._active_response = None
+        self._active_responses: dict[str, Any] = {}
 
-    def _set_active_response(self, response: Any) -> None:
+    def _set_active_response(self, response: Any, request_id: str | None = None) -> str:
+        key = str(request_id or f"thread-{threading.get_ident()}")
         with self._active_response_lock:
-            self._active_response = response
+            self._active_responses[key] = response
+        return key
 
-    def _clear_active_response(self, response: Any) -> None:
+    def _clear_active_response(self, response: Any, request_id: str | None = None) -> None:
         with self._active_response_lock:
-            if self._active_response is response:
-                self._active_response = None
+            if request_id:
+                key = str(request_id)
+                if self._active_responses.get(key) is response:
+                    self._active_responses.pop(key, None)
+                return
+            for key, active in list(self._active_responses.items()):
+                if active is response:
+                    self._active_responses.pop(key, None)
+                    return
 
-    def cancel_current_request(self) -> bool:
-        """Best-effort cancellation by closing the active HTTP response handle."""
+    def cancel_current_request(self, request_id: str | None = None) -> bool:
+        """Cancel a specific parallel request when possible; no-id keeps legacy semantics."""
         with self._active_response_lock:
-            response = self._active_response
-            self._active_response = None
-        if response is None:
-            return False
+            if request_id:
+                responses = [self._active_responses.pop(str(request_id), None)]
+            elif len(self._active_responses) == 1:
+                key, response = next(iter(self._active_responses.items()))
+                self._active_responses.pop(key, None); responses = [response]
+            else:
+                responses = list(self._active_responses.values())
+                self._active_responses.clear()
         closed = False
-        for method_name in ("close", "release_conn"):
-            method = getattr(response, method_name, None)
-            if callable(method):
-                try:
-                    method()
-                    closed = True
-                except Exception:
-                    pass
+        for response in responses:
+            if response is None:
+                continue
+            for method_name in ("close", "release_conn"):
+                method = getattr(response, method_name, None)
+                if callable(method):
+                    try:
+                        method(); closed = True
+                    except Exception:
+                        pass
         return closed
 
     def token_expires_in(self) -> Optional[float]:
@@ -351,6 +366,7 @@ class TriForceClient:
         self, method: str, url: str, headers: dict, data: Optional[bytes], _label: str
     ) -> Dict[str, Any]:
         """Execute single HTTP request. Uses urllib3 pool if available, else urlopen."""
+        request_id = str(headers.get("X-AICoder-Request-ID") or "") or None
         pool = _get_pool()
         if pool is not None:
             try:
@@ -360,7 +376,7 @@ class TriForceClient:
                     timeout=self.timeout, redirect=False,
                     preload_content=not keepalive_stream,
                 )
-                self._set_active_response(resp)
+                self._set_active_response(resp, request_id)
                 if resp.status >= 400:
                     raw_error = resp.read() if keepalive_stream else resp.data
                     body = raw_error.decode("utf-8", errors="replace")
@@ -376,7 +392,7 @@ class TriForceClient:
                                 f"Token expired (HTTP {resp.status}). Please re-login: aicoder setup"
                             )
                     status, retryable, retry_after = _error_metadata(parsed, resp.status)
-                    self._clear_active_response(resp)
+                    self._clear_active_response(resp, request_id)
                     raise ClientError(
                         f"HTTP {resp.status}{label} bei {url}: {parsed}",
                         status_code=status, retryable=retryable, retry_after=retry_after, payload=parsed,
@@ -412,7 +428,7 @@ class TriForceClient:
                                 payload_chunks += 1
                             parts.append(chunk)
                     finally:
-                        self._clear_active_response(resp)
+                        self._clear_active_response(resp, request_id)
                         try:
                             resp.release_conn()
                         except Exception:
@@ -436,7 +452,7 @@ class TriForceClient:
                     raw = resp.data.decode("utf-8")
                     return json.loads(raw) if raw else {}
                 finally:
-                    self._clear_active_response(resp)
+                    self._clear_active_response(resp, request_id)
             except (TokenExpiredError, ClientError):
                 raise
             except Exception as e:
@@ -452,12 +468,12 @@ class TriForceClient:
         req = Request(url=url, data=data, headers=headers, method=method.upper())
         try:
             resp = urlopen(req, timeout=self.timeout, context=_ssl_context())
-            self._set_active_response(resp)
+            self._set_active_response(resp, request_id)
             try:
                 raw = resp.read().decode("utf-8")
                 return json.loads(raw) if raw else {}
             finally:
-                self._clear_active_response(resp)
+                self._clear_active_response(resp, request_id)
                 try:
                     resp.close()
                 except Exception:

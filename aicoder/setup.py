@@ -460,7 +460,7 @@ _MODEL_ROLE_KEYS = {
     "c2": "team_coder_model_2", "coder2": "team_coder_model_2",
     "c3": "team_coder_model_3", "coder3": "team_coder_model_3",
     "c4": "team_coder_model_4", "coder4": "team_coder_model_4",
-    "merge": "team_merge_model", "finalizer": "team_finalizer_model", "final": "team_finalizer_model",
+    "merge": "team_merge_model", "tests": "team_test_planner_model", "testplan": "team_test_planner_model",
 }
 
 
@@ -478,7 +478,7 @@ def _team_model_rows(state: dict) -> list[tuple[str, str, str]]:
         ("c3", "Coder 3 · Performance", str(state.get("team_coder_model_3") or "off")),
         ("c4", "Coder 4 · Robustheit/Security", str(state.get("team_coder_model_4") or "off")),
         ("merge", "Merge/Integration", str(state.get("team_merge_model") or "off")),
-        ("finalizer", "Finalisierung", str(state.get("team_finalizer_model") or "off")),
+        ("tests", "Test-Planer", str(state.get("team_test_planner_model") or "off")),
     ]
 
 

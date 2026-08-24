@@ -24,7 +24,7 @@ class TeamConfigurationTests(unittest.TestCase):
             "team_coder_model_3": "",
             "team_coder_model_4": "provider/other",
             "team_merge_model": "provider/main",
-            "team_finalizer_model": "provider/main",
+            "team_test_planner_model": "provider/main",
         }
         config = config_from_state(state)
         self.assertEqual(len(config.research), 2)

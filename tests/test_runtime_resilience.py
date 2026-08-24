@@ -158,6 +158,16 @@ class RuntimeResilienceTests(unittest.TestCase):
         response.release_conn.assert_called_once()
         self.assertFalse(client.cancel_current_request())
 
+    def test_triforce_cancel_targets_named_parallel_request(self):
+        client = TriForceClient("http://example.invalid", token="token", timeout=1)
+        first, second = MagicMock(), MagicMock()
+        client._set_active_response(first, "req-a")
+        client._set_active_response(second, "req-b")
+        self.assertTrue(client.cancel_current_request("req-a"))
+        first.close.assert_called_once()
+        second.close.assert_not_called()
+        self.assertIn("req-b", client._active_responses)
+
     def test_chat_sets_keepalive_header(self):
         client = TriForceClient("http://example.invalid", token="token", timeout=1)
         with patch.object(client, "_request", return_value={"response": "ok", "model": "m"}) as request:

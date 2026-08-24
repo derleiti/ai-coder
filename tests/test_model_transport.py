@@ -54,10 +54,22 @@ class OpenAICompatibleTransportTests(unittest.TestCase):
         transport = OpenAICompatibleTransport("https://example.invalid/v1", api_key="x")
         response = MagicMock()
         with transport._active_response_lock:
-            transport._active_response = response
-        self.assertTrue(transport.cancel_current_request())
+            transport._active_responses["req-one"] = response
+        self.assertTrue(transport.cancel_current_request("req-one"))
         response.close.assert_called_once()
         self.assertFalse(transport.cancel_current_request())
+
+
+    def test_direct_transport_cancels_only_named_parallel_request(self):
+        transport = OpenAICompatibleTransport("https://example.invalid/v1", api_key="x")
+        first, second = MagicMock(), MagicMock()
+        with transport._active_response_lock:
+            transport._active_responses["req-a"] = first
+            transport._active_responses["req-b"] = second
+        self.assertTrue(transport.cancel_current_request("req-a"))
+        first.close.assert_called_once()
+        second.close.assert_not_called()
+        self.assertIn("req-b", transport._active_responses)
 
     def test_direct_transport_reports_blocking_timeout_semantics(self):
         transport = OpenAICompatibleTransport("https://example.invalid/v1", api_key="x", timeout=45)
