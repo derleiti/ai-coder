@@ -198,6 +198,7 @@ def _run_native_light_agent(
         tools=None if should_load_tools_now else [],
         load_tools_on_start=should_load_tools_now,
         enabled_tool_names=enabled_tool_names,
+        tool_mode=tool_mode,
         quick_chat=quick_chat,
         approval_fn=_headless_approval if (json_output or json_events) else _cli_approval,
         event_fn=on_event,

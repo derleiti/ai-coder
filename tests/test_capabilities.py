@@ -24,4 +24,45 @@ class CapabilityTests(unittest.TestCase):
     def test_unknown_tool_not_auto_selected(self):
         self.assertEqual(select_tools([{'name':'mystery_root_tool'}],resolve_capabilities('fix error')),[])
 
+
+class WorkingSetTests(unittest.TestCase):
+    def setUp(self):
+        from aicoder.capabilities import runtime_meta_tools
+        self.tools = [
+            {'name':'shell','description':'local shell'},
+            {'name':'file_read','description':'read files'},
+            {'name':'file_edit','description':'edit files'},
+            {'name':'test','description':'run tests'},
+            {'name':'search','description':'search the web'},
+            {'name':'crawl','description':'crawl web pages'},
+            {'name':'memory_search','description':'search memory'},
+            *runtime_meta_tools(),
+        ]
+
+    def test_working_set_keeps_primitives_and_task_specific_tools(self):
+        from aicoder.capabilities import build_working_set
+        selected = build_working_set(self.tools, resolve_capabilities('research latest release'), budget=12)
+        names = {tool['name'] for tool in selected}
+        self.assertIn('shell', names)
+        self.assertIn('file_read', names)
+        self.assertIn('search', names)
+
+    def test_toolbox_search_hides_active_tools(self):
+        from aicoder.capabilities import search_toolbox
+        matches = search_toolbox(self.tools, 'web search', active_names={'shell','search'})
+        names = [item['name'] for item in matches]
+        self.assertNotIn('search', names)
+        self.assertIn('crawl', names)
+
+    def test_expansion_accepts_capability_name(self):
+        from aicoder.capabilities import expansion_tools
+        added = expansion_tools(self.tools, ['memory'], active_names={'shell'}, slots=2)
+        self.assertEqual([tool['name'] for tool in added], ['memory_search'])
+
+    def test_improvisation_never_auto_activates_code(self):
+        from aicoder.capabilities import improvisation_advice
+        advice = improvisation_advice('special missing thing', [])
+        self.assertEqual(advice['action'], 'improvise')
+        self.assertIn('disabled plugin/MCP', advice['reason'])
+
 if __name__ == '__main__': unittest.main()

@@ -163,3 +163,24 @@ def improvisation_advice(query: str, matches: Iterable[dict]) -> dict:
         "reason": "No matching tool found. Combine primitive tools first; if the gap repeats, draft a skill or a disabled plugin/MCP provider with tests. Activation still requires normal host policy/approval.",
         "query": str(query or ""),
     }
+
+
+def runtime_meta_tools() -> list[dict]:
+    """Small model-facing control surface for on-demand catalogue expansion."""
+    return [
+        {
+            "name": "toolbox_search",
+            "description": "Search inactive tools in the host-side catalogue when the current toolbox is missing a capability.",
+            "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 12}}, "required": ["query"]},
+        },
+        {
+            "name": "capability_request",
+            "description": "Add matching inactive tools/capabilities to this run's working set. Use after toolbox_search or when the missing capability is clear.",
+            "inputSchema": {"type": "object", "properties": {"tools": {"type": "array", "items": {"type": "string"}}, "capabilities": {"type": "array", "items": {"type": "string"}}}},
+        },
+        {
+            "name": "toolbox_improvise",
+            "description": "Ask how to proceed when no existing tool fits. Prefer combining primitive tools; recurring gaps may justify drafting a tested disabled skill/plugin/MCP extension.",
+            "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+        },
+    ]

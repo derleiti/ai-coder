@@ -518,5 +518,72 @@ class NativeLightGuiTests(unittest.TestCase):
             self.assertEqual(len(current_plans), 1)
 
 
+
+class NativeLightOnDemandTests(unittest.TestCase):
+    def test_prepare_tools_keeps_full_catalogue_host_side(self):
+        client = MagicMock(); client.timeout = 30
+        catalogue = [
+            {"name":"shell","description":"shell"},
+            {"name":"file_read","description":"read"},
+            {"name":"file_edit","description":"edit"},
+            {"name":"test","description":"test"},
+            {"name":"search","description":"web search"},
+            {"name":"memory_search","description":"memory"},
+        ]
+        runtime = NativeLightRuntime(
+            client=client, initial_prompt="fix app.py and test it", model="test/model",
+            fallback_model=None, workspace_root=".", tool_mode="on_demand",
+        )
+        with patch("aicoder.agent_runtime.load_tools", return_value=catalogue):
+            active, full = runtime._prepare_tools()
+        self.assertEqual(full, catalogue)
+        self.assertIn("shell", {tool["name"] for tool in active})
+        self.assertIn("toolbox_search", {tool["name"] for tool in active})
+        self.assertNotIn("toolbox_search", {tool["name"] for tool in full})
+
+    def test_on_demand_can_expand_and_use_new_tool_next_turn(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = MagicMock(); client.timeout = 30
+            client.chat.side_effect = [
+                {"response": '<tool_call>{"name":"capability_request","arguments":{"capabilities":["memory"]}}</tool_call>', "model":"test/model"},
+                {"response": '<tool_call>{"name":"memory_search","arguments":{"query":"parser"}}</tool_call>', "model":"test/model"},
+                {"response": "DONE: memory inspected", "model":"test/model"},
+            ]
+            catalogue = [
+                {"name":"shell","description":"shell"},
+                {"name":"file_read","description":"read files"},
+                {"name":"file_edit","description":"edit files"},
+                {"name":"test","description":"tests"},
+                {"name":"memory_search","description":"search project memory"},
+            ]
+            runtime = NativeLightRuntime(
+                client=client, initial_prompt="fix app.py", model="test/model",
+                fallback_model=None, workspace_root=temp, tool_mode="on_demand",
+                persistent_plan=False, base_timeout=30,
+            )
+            events = []
+            runtime.event_fn = lambda kind, payload: events.append((kind, payload))
+            with patch("aicoder.agent_runtime.load_tools", return_value=catalogue), \
+                 patch("aicoder.agent_runtime.supports_tools", return_value=True), \
+                 patch("aicoder.agent_runtime.run_tool", return_value=("memory result", False)) as execute:
+                result = runtime.run()
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(execute.call_args.args[1], "memory_search")
+            self.assertTrue(any(kind == "tools_expanded" and "memory_search" in payload["names"] for kind, payload in events))
+            sent_tools = client.chat.call_args_list[1].kwargs["tools"]
+            self.assertIn("memory_search", {tool["name"] for tool in sent_tools})
+
+    def test_always_mode_exposes_full_catalogue_without_meta_tools(self):
+        client = MagicMock(); client.timeout = 30
+        catalogue = [{"name":"shell"}, {"name":"search"}]
+        runtime = NativeLightRuntime(
+            client=client, initial_prompt="anything", model="test/model",
+            fallback_model=None, workspace_root=".", tool_mode="always",
+        )
+        with patch("aicoder.agent_runtime.load_tools", return_value=catalogue):
+            active, full = runtime._prepare_tools()
+        self.assertEqual(active, catalogue)
+        self.assertEqual(full, catalogue)
+
 if __name__ == "__main__":
     unittest.main()

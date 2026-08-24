@@ -17,6 +17,10 @@ from .agent_journal import ContinuationJournalStore
 from .model_capabilities import supports_tools, tool_capable_alternative
 from .agent_plan import AgentPlan, PlanStore, plan_prompt_context, resume_prompt_context
 from .client import ClientError, TriForceClient
+from .capabilities import (
+    MAX_ACTIVE_TOOLS, MAX_EXPANSION_ROUNDS, build_working_set,
+    expansion_tools, improvisation_advice, resolve_capabilities, runtime_meta_tools, search_toolbox,
+)
 from .evidence_memory import ProjectEvidenceStore
 from .failure_tracking import FailureTracker
 from .executor import (
@@ -97,6 +101,7 @@ class NativeLightRuntime:
     conversation: list[dict] | None = None
     load_tools_on_start: bool = True
     enabled_tool_names: list[str] | None = None
+    tool_mode: str = "always"
     quick_chat: bool = False
     approval_fn: ApprovalFn | None = None
     event_fn: RuntimeEventFn | None = None
@@ -165,18 +170,37 @@ class NativeLightRuntime:
             )
         return None
 
-    def _prepare_tools(self) -> list[dict]:
+    def _prepare_tools(self) -> tuple[list[dict], list[dict]]:
+        """Return (active tools, full host-side catalogue).
+
+        on_demand keeps the full catalogue out of the model context and exposes
+        only a useful working set. always preserves the legacy full-catalogue
+        behaviour; off is handled by load_tools_on_start=False.
+        """
         if self.tools is None and self.load_tools_on_start:
             started = time.monotonic()
-            tools = load_tools(self.client)
+            catalogue = load_tools(self.client)
             if self.enabled_tool_names is not None:
                 enabled = set(self.enabled_tool_names)
-                tools = [tool for tool in tools if tool.get("name") in enabled]
-            self.tools = tools
-            self._emit("tools_ready", count=len(tools), elapsed=time.monotonic() - started)
-        elif self.tools is None:
+                catalogue = [tool for tool in catalogue if tool.get("name") in enabled]
+            active = catalogue
+            if self.tool_mode == "on_demand":
+                resolution = resolve_capabilities(self.initial_prompt, resume=self.resume)
+                active = build_working_set(catalogue, resolution)
+                active_names = {str(tool.get("name") or "") for tool in active}
+                meta = [tool for tool in runtime_meta_tools() if tool.get("name") not in active_names]
+                # Meta controls consume slots too; never exceed the global model-facing cap.
+                active = active[:max(0, MAX_ACTIVE_TOOLS - len(meta))] + meta
+            self.tools = active
+            self._emit(
+                "tools_ready", count=len(active), catalogue_count=len(catalogue),
+                mode=self.tool_mode, elapsed=time.monotonic() - started,
+            )
+            return active, catalogue
+        if self.tools is None:
             self.tools = []
-        return self.tools
+        # Explicit tools supplied by tests/callers are already the allowed catalogue.
+        return self.tools, list(self.tools)
 
     def _prepare_plan(self) -> tuple[AgentPlan | None, bool]:
         if not self.persistent_plan:
@@ -354,7 +378,7 @@ class NativeLightRuntime:
     def run(self) -> AgentRunResult:
         workspace = str(Path(self.workspace_root or ".").resolve())
         self.workspace_root = workspace
-        tools = self._prepare_tools()
+        tools, tool_catalogue = self._prepare_tools()
         if self.tools_unavailable_reason:
             reason = self.tools_unavailable_reason
             self._emit("error", message=reason)
@@ -442,6 +466,7 @@ class NativeLightRuntime:
         allowed_tool_names = {
             str(tool.get("name")) for tool in tools if tool.get("name")
         }
+        expansion_rounds = 0
 
         self._emit(
             "run_start",
@@ -617,6 +642,46 @@ class NativeLightRuntime:
                 name = str(call.get("name") or "?")
                 args = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
                 self._emit("tool_call", name=name, arguments=args, iteration=i + 1)
+
+                if self.tool_mode == "on_demand" and name in {"toolbox_search", "capability_request", "toolbox_improvise"}:
+                    if name == "toolbox_search":
+                        matches = search_toolbox(
+                            tool_catalogue, str(args.get("query") or ""),
+                            active_names=allowed_tool_names, limit=int(args.get("limit") or 8),
+                        )
+                        tool_result, is_error = json.dumps({"matches": matches}, ensure_ascii=False), False
+                    elif name == "toolbox_improvise":
+                        query = str(args.get("query") or "")
+                        matches = search_toolbox(tool_catalogue, query, active_names=allowed_tool_names)
+                        tool_result, is_error = json.dumps(improvisation_advice(query, matches), ensure_ascii=False), False
+                    else:
+                        requested = args.get("tools") or args.get("capabilities") or []
+                        if isinstance(requested, str):
+                            requested = [requested]
+                        if expansion_rounds >= MAX_EXPANSION_ROUNDS:
+                            tool_result, is_error = "capability_request: expansion round limit reached", True
+                        else:
+                            additions = expansion_tools(
+                                tool_catalogue, requested, active_names=allowed_tool_names,
+                                slots=MAX_ACTIVE_TOOLS - len(tools),
+                            )
+                            if additions:
+                                tools.extend(additions)
+                                allowed_tool_names.update(str(tool.get("name")) for tool in additions if tool.get("name"))
+                                expansion_rounds += 1
+                                base_system = build_system_prompt(tools, workspace)
+                                messages[0]["content"] = self._with_plan_context(base_system, plan)
+                                system = messages[0]["content"]
+                                self._emit("tools_expanded", names=[tool.get("name") for tool in additions], count=len(tools), round=expansion_rounds)
+                                tool_result, is_error = json.dumps({"added": [tool.get("name") for tool in additions], "active_count": len(tools)}, ensure_ascii=False), False
+                            else:
+                                tool_result, is_error = "capability_request: no matching inactive tools", True
+                    elapsed = 0.0
+                    self._emit("tool_result", name=name, result=tool_result, is_error=is_error, elapsed=elapsed)
+                    tool_results.append(f"Tool {name} result:\n{tool_result}")
+                    batch_records.append({"id": str(call.get("id") or ""), "name": name, "arguments": args, "is_error": is_error})
+                    continue
+
                 allowed, reason = require_allowed_tool(name, allowed_tool_names)
                 risk = assess_execution(
                     name, args, destructive=is_destructive(str(args.get("command", "")))

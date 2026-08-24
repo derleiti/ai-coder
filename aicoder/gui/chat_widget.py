@@ -45,7 +45,7 @@ class _AgentWorker(QThread):
 
     def __init__(
         self, client, messages_array, model, fallback, tools, system_prompt,
-        load_tools_on_start=True, enabled_tool_names=None, quick_chat=False,
+        load_tools_on_start=True, enabled_tool_names=None, tool_mode="always", quick_chat=False,
         tools_unavailable_reason="",
     ):
         super().__init__()
@@ -57,6 +57,7 @@ class _AgentWorker(QThread):
         self.system = system_prompt
         self.load_tools_on_start = load_tools_on_start
         self.enabled_tool_names = enabled_tool_names
+        self.tool_mode = tool_mode
         self.quick_chat = quick_chat
         self.tools_unavailable_reason = str(tools_unavailable_reason or "")
         # Approval mechanism: threading.Event + result flag
@@ -215,6 +216,7 @@ class _AgentWorker(QThread):
             conversation=prior,
             load_tools_on_start=self.load_tools_on_start,
             enabled_tool_names=self.enabled_tool_names,
+            tool_mode=self.tool_mode,
             quick_chat=self.quick_chat and not resume_requested,
             approval_fn=self._gui_approval,
             event_fn=on_event,
@@ -760,6 +762,7 @@ class ChatWidget(QWidget):
             client, self._messages, model, fallback, run_tools, run_system,
             load_tools_on_start=should_load_tools_now,
             enabled_tool_names=enabled_tool_names,
+            tool_mode=tool_mode,
             quick_chat=quick_chat,
             tools_unavailable_reason=tools_unavailable_reason,
         )
