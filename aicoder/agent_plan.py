@@ -309,7 +309,11 @@ def plan_prompt_context(plan: AgentPlan) -> str:
 
 
 def resume_prompt_context(plan: AgentPlan, user_input: str = "") -> str:
-    """Build a safe process-restart continuation without persisting raw tool results."""
+    """Build a safe process-restart continuation without persisting raw tool results.
+    
+    Uses the original plan.task to ensure the model has full context for capability resolution
+    and decision making during resume operations.
+    """
     extra = str(user_input or "").strip()
     if extra.lower() in {
         "continue", "weiter", "fortfahren", "ok", "okay", "ja", "yes",

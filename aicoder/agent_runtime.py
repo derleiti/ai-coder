@@ -13,7 +13,7 @@ from typing import Any, Callable
 
 from .agent_journal import ContinuationJournalStore
 from .agent_plan import AgentPlan, PlanStore, plan_prompt_context, resume_prompt_context
-from .client import ClientError, TriForceClient
+from .client import AuthError, ClientError, TransportError, TriForceClient
 from .executor import (
     AGENT_CHECKPOINT_INTERVAL,
     MAX_CONTEXT_MESSAGES,
@@ -365,6 +365,8 @@ class NativeLightRuntime:
                     pending_continuation = is_action_request(content)
                     break
         intent_prompt = plan.task if resumed and plan is not None else self.initial_prompt
+        # Use the original plan.task for capability resolution during resume
+        # This ensures the model has the full original task context for decision making
         must_use_tools = bool(tools) and (
             is_action_request(intent_prompt) or pending_continuation or resumed
         )
@@ -380,6 +382,7 @@ class NativeLightRuntime:
             workspace=workspace,
             plan_id=plan.id if plan else "",
             resumed=resumed,
+            plan_task=plan.task if plan else None,
         )
 
         for i in range(MAX_ITERATIONS):
@@ -429,7 +432,33 @@ class NativeLightRuntime:
                     tools=tools if self.load_tools_on_start else None,
                     tool_choice="auto",
                 )
+            except TransportError as exc:
+                # Transient transport errors (5xx, 429, timeout, connection reset, temporary unavailability)
+                # Pause the plan for resumption and preserve the plan/journal state
+                reason = str(exc)
+                response = str(exc)
+                self._pause_plan(plan, reason, response)
+                self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
+                self._emit("paused", reason=reason)
+                return AgentRunResult(
+                    "paused", reason, model_used, messages, tools, system,
+                    iterations=i + 1, latency_ms=total_latency,
+                    fallback_used=fallback_used, plan_id=plan.id if plan else "",
+                )
+            except AuthError as exc:
+                # Authentication/authorization errors - permanent failure
+                reason = str(exc)
+                self._fail_plan(plan, reason)
+                self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
+                self._emit("error", message=reason)
+                return AgentRunResult(
+                    "failed", "", model_used, messages, tools, system,
+                    iterations=i + 1, latency_ms=total_latency,
+                    fallback_used=fallback_used, plan_id=plan.id if plan else "",
+                    error=reason,
+                )
             except (ClientError, RuntimeError) as exc:
+                # Other client errors - treat as permanent failure
                 reason = str(exc)
                 self._fail_plan(plan, reason)
                 self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)

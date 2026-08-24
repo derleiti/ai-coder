@@ -69,6 +69,16 @@ class TokenExpiredError(ClientError):
     pass
 
 
+class TransportError(ClientError):
+    """Transient transport errors that should pause rather than fail the plan."""
+    pass
+
+
+class AuthError(ClientError):
+    """Authentication/authorization errors (4xx) that should fail permanently."""
+    pass
+
+
 def _content_text(value: Any) -> str:
     """Extract visible text without destroying structured provider blocks."""
     if isinstance(value, str):
@@ -265,22 +275,84 @@ class TriForceClient:
                 print(f"  ↻ retry {attempt}/{_retries} [{_label}]", file=sys.stderr)
             try:
                 return self._do_request(method, url, headers, data, _label)
+            except AuthError as e:
+                # Don't retry auth errors - they are permanent
+                raise e
+            except TransportError as e:
+                # Don't retry transport errors - they will be handled as transient by the runtime
+                raise e
             except ClientError as e:
                 last_err = e
                 err_str = str(e)
-                # Don't retry auth errors or 4xx
+                # Don't retry auth errors or 4xx (except 429 which is TransportError now)
                 if "HTTP 4" in err_str or "Token expired" in err_str:
                     raise
-                # Retry on 5xx, timeout, connection errors
+                # Retry on other client errors that might be transient
                 if attempt < _retries:
                     continue
                 raise
         raise last_err  # unreachable but satisfies type checker
 
+    def _classify_error(self, exc: Exception, status_code: Optional[int] = None) -> Exception:
+        """Classify an error as transient (TransportError) or permanent (AuthError/ClientError).
+        
+        Returns the original exception if it's already classified, otherwise wraps it
+        in the appropriate error class based on HTTP status code or exception type.
+        """
+        if isinstance(exc, TransportError):
+            return exc
+        if isinstance(exc, AuthError):
+            return exc
+        if isinstance(exc, TokenExpiredError):
+            return exc
+        if isinstance(exc, ClientError):
+            # Check if the ClientError represents an auth error (4xx)
+            exc_str = str(exc)
+            if status_code and 400 <= status_code < 500:
+                # Check for specific 4xx auth-related errors
+                if status_code in (401, 403):
+                    return AuthError(f"Auth failed (HTTP {status_code}): {exc_str}")
+                # Treat 429 (rate limit) as transient since it's temporary
+                if status_code == 429:
+                    return TransportError(f"Rate limited (HTTP 429): {exc_str}")
+                # Other 4xx errors (except 429) are typically permanent
+                return AuthError(f"Client error (HTTP {status_code}): {exc_str}")
+            # Check error message for 4xx patterns
+            if "HTTP 4" in exc_str:
+                if "HTTP 401" in exc_str or "HTTP 403" in exc_str:
+                    return AuthError(exc_str)
+                if "HTTP 429" in exc_str:
+                    return TransportError(exc_str)
+                # Other 4xx errors
+                return AuthError(exc_str)
+            return exc
+        
+        # Classify based on exception type
+        if isinstance(exc, TimeoutError):
+            return TransportError(f"Timeout: {exc}")
+        if isinstance(exc, URLError):
+            exc_str = str(exc)
+            if "connection refused" in exc_str.lower() or "temporarily unavailable" in exc_str.lower():
+                return TransportError(exc_str)
+            return TransportError(exc_str)
+        if isinstance(exc, RuntimeError):
+            exc_str = str(exc)
+            if "connection reset" in exc_str.lower() or "timeout" in exc_str.lower():
+                return TransportError(exc_str)
+            return exc
+        
+        return exc
+
     def _do_request(
         self, method: str, url: str, headers: dict, data: Optional[bytes], _label: str
     ) -> Dict[str, Any]:
-        """Execute single HTTP request. Uses urllib3 pool if available, else urlopen."""
+        """Execute single HTTP request. Uses urllib3 pool if available, else urlopen.
+        
+        Raises:
+            AuthError: For authentication/authorization errors (4xx) - permanent failure
+            TransportError: For transient transport errors (5xx, 429, timeout, connection issues) - pause plan
+            ClientError: For other client errors
+        """
         pool = _get_pool()
         if pool is not None:
             try:
@@ -295,25 +367,37 @@ class TriForceClient:
                     except Exception:
                         parsed = {"raw": body}
                     label = f" [{_label}]" if _label else ""
+                    
+                    # Classify the error based on status code
                     if resp.status in (401, 403):
                         detail = parsed.get("detail", "") or parsed.get("raw", "")
                         if "expire" in str(detail).lower() or "token" in str(detail).lower():
                             raise TokenExpiredError(
                                 f"Token expired (HTTP {resp.status}). Please re-login: aicoder setup"
                             )
-                    raise ClientError(f"HTTP {resp.status}{label} bei {url}: {parsed}")
+                        raise AuthError(f"HTTP {resp.status}{label} bei {url}: {parsed}")
+                    elif resp.status == 429:
+                        raise TransportError(f"HTTP {resp.status}{label} (Rate Limited) bei {url}: {parsed}")
+                    elif resp.status >= 500:
+                        raise TransportError(f"HTTP {resp.status}{label} bei {url}: {parsed}")
+                    else:
+                        # Other 4xx errors
+                        raise ClientError(f"HTTP {resp.status}{label} bei {url}: {parsed}")
+                
                 raw = resp.data.decode("utf-8")
                 return json.loads(raw) if raw else {}
-            except (TokenExpiredError, ClientError):
-                raise
+            except (TokenExpiredError, AuthError, TransportError, ClientError) as e:
+                # Re-raise already classified errors
+                raise self._classify_error(e)
             except Exception as e:
                 # urllib3 already performed the request. Falling through to
                 # urlopen here sends it a second time and can double the wait
                 # after a read timeout.
                 label = f" [{_label}]" if _label else ""
-                raise ClientError(
+                exc = ClientError(
                     f"Verbindung/Timeout nach {self.timeout}s{label} bei {url}: {e}"
-                ) from e
+                )
+                raise self._classify_error(exc) from e
 
         # Fallback: plain urlopen (no pool)
         req = Request(url=url, data=data, headers=headers, method=method.upper())
@@ -328,21 +412,32 @@ class TriForceClient:
             except Exception:
                 parsed = {"raw": body}
             label = f" [{_label}]" if _label else ""
+            
+            # Classify the error based on status code
             if e.code in (401, 403):
                 detail = parsed.get("detail", "") or parsed.get("raw", "")
                 if "expire" in str(detail).lower() or "token" in str(detail).lower():
                     raise TokenExpiredError(
                         f"Token expired (HTTP {e.code}). Please re-login: aicoder setup"
                     ) from e
-            raise ClientError(f"HTTP {e.code}{label} bei {url}: {parsed}") from e
-        except TimeoutError:
+                raise AuthError(f"HTTP {e.code}{label} bei {url}: {parsed}") from e
+            elif e.code == 429:
+                raise TransportError(f"HTTP {e.code}{label} (Rate Limited) bei {url}: {parsed}") from e
+            elif e.code >= 500:
+                raise TransportError(f"HTTP {e.code}{label} bei {url}: {parsed}") from e
+            else:
+                # Other 4xx errors
+                raise ClientError(f"HTTP {e.code}{label} bei {url}: {parsed}") from e
+        except TimeoutError as e:
             label = f" [{_label}]" if _label else ""
-            raise ClientError(
+            exc = ClientError(
                 f"Timeout nach {self.timeout}s{label} bei {url}. "
                 "Backend reachable? Increase timeout via --timeout."
             )
+            raise self._classify_error(exc) from e
         except URLError as e:
-            raise ClientError(f"Verbindung fehlgeschlagen zu {url}: {e}") from e
+            exc = ClientError(f"Verbindung fehlgeschlagen zu {url}: {e}")
+            raise self._classify_error(exc) from e
 
     def login(self, email: str, password: str) -> Dict[str, Any]:
         result = self._request(
@@ -465,13 +560,18 @@ class TriForceClient:
             ))
         except TokenExpiredError:
             raise
+        except TransportError as e:
+            # Transport errors are transient - let the runtime handle them
+            raise e
         except ClientError as e:
             if fallback_model and fallback_model != model:
-                # Authentication/authorization and other client-side 4xx errors
-                # cannot be repaired by selecting another model.
+                # Authentication/authorization errors cannot be repaired by selecting another model.
                 message = str(e)
-                if "HTTP 4" in message and "HTTP 408" not in message and "HTTP 429" not in message:
+                if "HTTP 4" in message and "HTTP 401" in message:
                     raise
+                if "HTTP 4" in message and "HTTP 403" in message:
+                    raise
+                # Other errors can potentially be retried with fallback
                 import sys
                 print(f"\n[FALLBACK: {model} failed → {fallback_model}]", file=sys.stderr)
                 payload["model"] = fallback_model

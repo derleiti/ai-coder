@@ -15,7 +15,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
-from .client import ClientError, USER_AGENT, _normalize_chat_response
+from .client import ClientError, TransportError, USER_AGENT, _normalize_chat_response
 
 
 class ModelTransport(Protocol):
@@ -145,6 +145,9 @@ class OpenAICompatibleTransport:
         started = time.monotonic()
         try:
             normalized = _normalize_chat_response(self._post_json(payload))
+        except TransportError:
+            # Transport errors are transient - let caller handle them
+            raise
         except ClientError:
             if fallback_model and fallback_model != model:
                 payload["model"] = fallback_model
