@@ -101,7 +101,7 @@ class PrivilegeBrokerPolicyTests(unittest.TestCase):
             patch.object(executor.audit, "log_tool"),
         ):
             result, is_error=executor.run_tool(
-                client, "shell", {"command":"printf hello"}, approval_fn=approve
+                client, "shell", {"command":"printf hello", "sudo":True}, approval_fn=approve
             )
         self.assertFalse(is_error)
         self.assertEqual(result, "ok")

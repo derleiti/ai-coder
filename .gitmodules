@@ -1,3 +1,0 @@
-[submodule "packaging/aur/aicoder"]
-	path = packaging/aur/aicoder
-	url = https://github.com/derleiti/ai-coder

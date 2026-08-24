@@ -1,5 +1,6 @@
 from __future__ import annotations
-import json, unittest
+import json, os, unittest
+from unittest.mock import patch
 from aicoder.local_os import LocalOSToolProvider
 from aicoder.plugins import discover_plugins
 

@@ -251,7 +251,7 @@ class _AgentWorker(QThread):
                     except Exception:
                         pass
                 status = f"{'ERROR' if is_error else 'OK'} ({float(payload.get('elapsed') or 0.0):.1f}s)"
-                self.activity.emit(f"Tool completed · {name} · {"ERROR" if is_error else "OK"}")
+                self.activity.emit(f"Tool completed · {name} · {'ERROR' if is_error else 'OK'}")
                 self.msg.emit("tool_result", result[:2000], f"{name} {status}")
             elif kind == "loop_prevented":
                 self.activity.emit("Duplicate tool call blocked · waiting for corrected model action")
