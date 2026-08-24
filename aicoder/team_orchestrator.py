@@ -27,7 +27,7 @@ from .team_runtime import (
     RESEARCH_PLANNER_SYSTEM_PROMPT, TEST_PLANNER_SYSTEM_PROMPT, TeamConfig,
 )
 from .team_pipeline import (
-    StageLedger, TeamStage, blind_candidate_id, execute_verification_plan,
+    StageLedger, TeamStage, blind_candidate_id, content_fingerprint, execute_verification_plan,
     objective_rank_key, project_verification_plan, verification_passed,
 )
 from .workspace_backend import (
@@ -342,22 +342,39 @@ def _attach_blind_candidate_snapshots(integration: RamWorkspace, candidates: lis
     base = integration.info.execution_root / ".aicoder-team" / "candidates"
     base.mkdir(parents=True, exist_ok=True)
     evidence: list[dict[str, Any]] = []
-    for candidate in sorted(candidates, key=lambda item: str(item.evaluation.get("candidate_id") or "")):
-        cid = str(candidate.evaluation.get("candidate_id") or blind_candidate_id(candidate.evaluation.get("diff", "")))
-        target = base / cid
+    seen_fingerprints: dict[str, str] = {}
+    ordered = sorted(candidates, key=lambda item: (str(item.evaluation.get("candidate_id") or ""), item.slot))
+    for ordinal, candidate in enumerate(ordered, start=1):
+        diff = str(candidate.evaluation.get("diff") or "")
+        fingerprint = content_fingerprint(diff)
+        content_id = str(candidate.evaluation.get("candidate_id") or blind_candidate_id(diff))
+        # content_id intentionally remains model/slot blind. snapshot_id only prevents
+        # filesystem collisions when multiple candidates have identical content.
+        snapshot_id = f"{content_id}-{ordinal:02d}"
+        duplicate_of = seen_fingerprints.get(fingerprint)
+        if duplicate_of is None:
+            seen_fingerprints[fingerprint] = snapshot_id
+        target = base / snapshot_id
         shutil.copytree(
             candidate.workspace.info.execution_root, target, symlinks=True,
-            ignore=shutil.ignore_patterns(".git", ".aicoder-team", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"),
-            copy_function=_link_or_copy, dirs_exist_ok=True,
+            ignore=shutil.ignore_patterns(
+                ".git", ".aicoder-team", ".venv", "venv", "env", ".env",
+                "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+                "build", "dist", "*.egg-info",
+            ),
+            copy_function=_link_or_copy, dirs_exist_ok=False,
         )
         evidence.append({
-            "candidate_id": cid,
+            "candidate_id": snapshot_id,
+            "content_id": content_id,
+            "content_fingerprint": fingerprint,
+            "duplicate_of": duplicate_of,
             "score": int(candidate.evaluation.get("score") or 0),
             "verification_passed": bool(candidate.evaluation.get("verification_passed")),
             "checks": candidate.evaluation.get("checks") or {},
             "delta": candidate.evaluation.get("delta") or {},
-            "diff": str(candidate.evaluation.get("diff") or "")[:50000],
-            "snapshot": f".aicoder-team/candidates/{cid}",
+            "diff": diff[:50000],
+            "snapshot": f".aicoder-team/candidates/{snapshot_id}",
         })
     integration.write_candidate_artifact(
         ".aicoder-team/candidates.json", json.dumps(evidence, ensure_ascii=False, indent=2)
