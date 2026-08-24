@@ -697,5 +697,19 @@ class NativeLightGuiTests(unittest.TestCase):
 
 
 
+
+
+class RuntimeEventPayloadRegressionTests(unittest.TestCase):
+    def test_emit_allows_payload_field_named_kind(self):
+        events = []
+        runtime = NativeLightRuntime(
+            client=MagicMock(), initial_prompt="test", model="test/model", fallback_model=None,
+            workspace_root=".", event_fn=lambda event_kind, payload: events.append((event_kind, payload)),
+        )
+        runtime._emit("performance_warning", kind="model_latency", elapsed_ms=12000)
+        self.assertEqual(events[0][0], "performance_warning")
+        self.assertEqual(events[0][1]["kind"], "model_latency")
+
+
 if __name__ == "__main__":
     unittest.main()

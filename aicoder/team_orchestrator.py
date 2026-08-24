@@ -123,7 +123,7 @@ def _filtered_tools(catalogue: list[dict], names: frozenset[str]) -> list[dict]:
 def _run_researcher(
     *, client, model_client: ModelTransport, model: str, role: str, task: str,
     source_workspace: str, tools: list[dict], stop_requested: StopFn | None,
-    research_plan: str = "",
+    research_plan: str = "", request_timeout: int = 300,
 ) -> AgentStageResult:
     prompt = (
         f"User task:\n{task}\n\nRepository root for read-only inspection: {source_workspace}\n\n"
@@ -148,7 +148,7 @@ def _run_researcher(
         tools=tools, system_prompt=system, load_tools_on_start=True,
         quick_chat=False, persistent_plan=False, approval_fn=lambda *_: False,
         max_iterations=10, max_output_tokens=6000, stop_requested=stop_requested,
-        event_fn=research_event,
+        base_timeout=request_timeout, event_fn=research_event,
     )
     result = runtime.run()
     research_tool_names = {
@@ -198,16 +198,18 @@ def _build_planner_prompt(task: str, repo_context: str, research: list[AgentStag
             f"{item.response or item.error}"
         )
     return (
-        f"ORIGINAL USER TASK:\n{task}\n\nREPOSITORY CONTEXT:\n{repo_context}\n\n"
-        "INDEPENDENT RESEARCH REPORTS:\n" + "\n\n".join(reports)
+        f"[ORIGINAL_USER_TASK]\n{task}\n\n[AUTHORITATIVE_REPOSITORY_CONTEXT]\n{repo_context}\n\n"
+        "[INDEPENDENT_RESEARCH_REPORTS]\n" + "\n\n".join(reports)
     )
 
 
 def _candidate_prompt(task: str, plan: str, coordinator: str, strategy: str) -> str:
     return (
-        f"ORIGINAL USER TASK:\n{task}\n\nSHARED IMPLEMENTATION CONTRACT:\n{plan}\n\n"
-        f"COORDINATION NOTES:\n{coordinator or '(none)'}\n\n"
-        f"Your strategy emphasis is {strategy}. Implement the complete shared contract, not only the strategy-specific parts."
+        f"[ORIGINAL_USER_TASK]\n{task}\n\n[SHARED_IMPLEMENTATION_CONTRACT]\n{plan}\n\n"
+        f"[COORDINATION_NOTES]\n{coordinator or '(none)'}\n\n"
+        f"[CANDIDATE_STRATEGY]\n{strategy}\n\n"
+        "[EXECUTION_RULE]\nUse the current Native-Light runtime workspace as the only project tree. "
+        "Do not follow source/engine paths embedded in the original user text. Implement the complete shared contract."
     )
 
 
@@ -224,7 +226,7 @@ def _candidate_approval(tool_name: str, args: dict) -> bool:
 def _run_candidate(
     *, client, model_client: ModelTransport, source_workspace: str, backend_mode: str,
     slot: int, model: str, strategy: str, task: str, plan: str, coordinator: str,
-    tools: list[dict], stop_requested: StopFn | None,
+    tools: list[dict], stop_requested: StopFn | None, request_timeout: int = 300,
 ) -> CandidateResult:
     backend = create_isolated_team_workspace(source_workspace, backend_mode)
     try:
@@ -241,6 +243,7 @@ def _run_candidate(
             tools=tools, system_prompt=system, load_tools_on_start=True,
             quick_chat=False, persistent_plan=False, approval_fn=_candidate_approval,
             max_iterations=18, max_output_tokens=12000, stop_requested=stop_requested,
+            base_timeout=request_timeout,
         )
         run = runtime.run()
         return CandidateResult(
@@ -364,8 +367,8 @@ def _attach_blind_candidate_snapshots(integration: RamWorkspace, candidates: lis
 
 def _blind_merge_prompt(task: str, code_plan: str, evidence: list[dict[str, Any]]) -> str:
     return (
-        f"USER TASK:\n{task}\n\nSHARED CODE CONTRACT:\n{code_plan}\n\n"
-        "ANONYMIZED CANDIDATE EVIDENCE:\n" + json.dumps(evidence, ensure_ascii=False, indent=2)
+        f"[USER_TASK]\n{task}\n\n[SHARED_IMPLEMENTATION_CONTRACT]\n{code_plan}\n\n"
+        "[ANONYMIZED_CANDIDATE_EVIDENCE]\n" + json.dumps(evidence, ensure_ascii=False, indent=2)
     )
 
 
@@ -375,8 +378,15 @@ def run_team(
     event_fn: EventFn | None = None, stop_requested: StopFn | None = None,
 ) -> TeamRunResult:
     errors = config.validate()
+    runtime_mode = str(state.get("runtime_mode") or "native-light").strip().lower()
+    if runtime_mode != "native-light":
+        errors.append(f"team runtime requires native-light; configured runtime is {runtime_mode}")
     if errors:
-        return TeamRunResult("failed", "", "", [], [], {}, "; ".join(errors))
+        return TeamRunResult("failed", "", "", [], [], {"runtime_mode": runtime_mode}, "; ".join(errors))
+    try:
+        request_timeout = max(10, min(300, int(state.get("request_timeout") or 300)))
+    except (TypeError, ValueError):
+        request_timeout = 300
 
     started = time.monotonic()
     ledger = StageLedger()
@@ -385,7 +395,7 @@ def run_team(
     all_tools = load_tools(client)
     research_tools = _filtered_tools(all_tools, _RESEARCH_TOOL_NAMES)
     coder_tools = _filtered_tools(all_tools, _CODER_TOOL_NAMES)
-    _emit(event_fn, "team_start", agents=config.active_count, research=len(config.research), coders=len(config.coders))
+    _emit(event_fn, "team_start", agents=config.active_count, research=len(config.research), coders=len(config.coders), runtime_mode=runtime_mode, request_timeout=request_timeout)
 
     # 1) plan_research
     _stage_start(ledger, TeamStage.PLAN_RESEARCH, event_fn)
@@ -410,7 +420,7 @@ def run_team(
                     _run_researcher, client=client, model_client=model_client, model=slot.model,
                     role=slot.role, task=task, source_workspace=source_workspace,
                     tools=research_tools, stop_requested=stop_requested,
-                    research_plan=research_plan.response,
+                    research_plan=research_plan.response, request_timeout=request_timeout,
                 ): slot for slot in config.research
             }
             for future in as_completed(futures):
@@ -448,7 +458,7 @@ def run_team(
                 _run_candidate, client=client, model_client=model_client, source_workspace=source_workspace,
                 backend_mode=workspace_plan.backend_mode, slot=slot.slot, model=slot.model,
                 strategy=slot.strategy, task=task, plan=code_plan.response, coordinator="",
-                tools=coder_tools, stop_requested=stop_requested,
+                tools=coder_tools, stop_requested=stop_requested, request_timeout=request_timeout,
             ): slot for slot in config.coders
         }
         for future in as_completed(futures):
@@ -518,6 +528,7 @@ def run_team(
             tools=coder_tools, system_prompt=build_system_prompt(coder_tools, str(integration.info.execution_root)).rstrip()+"\n\n"+MERGE_SYSTEM_PROMPT,
             load_tools_on_start=True, quick_chat=False, persistent_plan=False,
             approval_fn=_candidate_approval, max_iterations=14, max_output_tokens=10000, stop_requested=stop_requested,
+            base_timeout=request_timeout,
         )
         merge_started = time.monotonic(); merge_run = merge_runtime.run()
         merge_elapsed = int((time.monotonic() - merge_started) * 1000)
@@ -543,8 +554,9 @@ def run_team(
     if config.test_planner_model:
         test_plan = _call_advisor(
             model_client, model=config.test_planner_model, system=TEST_PLANNER_SYSTEM_PROMPT,
-            prompt=(f"USER TASK:\n{task}\n\nCODE CONTRACT:\n{code_plan.response}\n\nMERGE CONTRACT:\n{merge_plan.response}\n\n"
-                    f"DETERMINISTIC REPOSITORY CHECKS (authoritative):\n{test_plan_text}"),
+            prompt=(f"[USER_TASK]\n{task}\n\n[SHARED_IMPLEMENTATION_CONTRACT]\n{code_plan.response}\n\n"
+                    f"[BLIND_MERGE_CONTRACT]\n{merge_plan.response}\n\n"
+                    f"[DETERMINISTIC_REPOSITORY_CHECKS_AUTHORITATIVE]\n{test_plan_text}"),
             max_tokens=5000,
         )
         test_plan.role = "plan_tests"; stages.append(test_plan)
@@ -583,6 +595,7 @@ def run_team(
     )
     perf = {
         "wall_ms": wall_ms,
+        "runtime_mode": runtime_mode, "request_timeout": request_timeout,
         "accumulated_agent_ms": accumulated_agent_ms,
         "parallelism": round(accumulated_agent_ms / wall_ms, 2) if wall_ms else 0.0,
         "research_agents": len(research_results), "coding_candidates": len(candidates),

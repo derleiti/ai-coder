@@ -105,6 +105,123 @@ class _ModelProbe(QThread):
             self.error.emit(str(e), time.monotonic() - started)
 
 
+class _TeamModelProbe(QThread):
+    """Exercise configured team models through a real NativeLight tool roundtrip."""
+    finished_probe = pyqtSignal(list)
+
+    def __init__(self, base_url: str, token: str, models: list[str], timeout: int, native_tools: bool):
+        super().__init__()
+        self.base_url = base_url
+        self.token = token
+        self.models = list(models)
+        self.timeout = max(10, int(timeout))
+        self.native_tools = bool(native_tools)
+
+    @staticmethod
+    def _probe_one(base_url: str, token: str, model: str, timeout: int, native_tools: bool) -> dict:
+        import tempfile
+        import time
+        from pathlib import Path
+        from ..agent_runtime import NativeLightRuntime
+        from ..executor import LOCAL_FILE_READ_SCHEMA, build_system_prompt
+
+        started = time.monotonic()
+        events = []
+        try:
+            with tempfile.TemporaryDirectory(prefix="aicoder-team-probe-") as temp:
+                root = Path(temp)
+                (root / "probe.txt").write_text("TEAM_PROBE_VALUE=4172\n", encoding="utf-8")
+                client = TriForceClient(base_url, token=token, timeout=timeout)
+                tools = [dict(LOCAL_FILE_READ_SCHEMA)]
+                runtime = NativeLightRuntime(
+                    client=client,
+                    initial_prompt=(
+                        "This is a read-only Native-Light capability probe. Use file_read on probe.txt. "
+                        "After the tool result is returned, reply exactly: DONE: TEAM_PROBE_OK_4172"
+                    ),
+                    model=model,
+                    fallback_model=None,
+                    workspace_root=str(root),
+                    plan_workspace_root=str(root),
+                    protected_workspace_root=str(root),
+                    tools=tools,
+                    system_prompt=build_system_prompt(tools, str(root)),
+                    load_tools_on_start=True,
+                    quick_chat=False,
+                    persistent_plan=False,
+                    approval_fn=lambda *_: False,
+                    event_fn=lambda kind, payload: events.append((kind, dict(payload))),
+                    base_timeout=timeout,
+                    max_iterations=4,
+                    max_output_tokens=256,
+                    native_openrouter_tool_calling=native_tools,
+                )
+                result = runtime.run()
+                read_ok = any(
+                    kind == "tool_result"
+                    and payload.get("name") == "file_read"
+                    and not payload.get("is_error")
+                    and "4172" in str(payload.get("result") or "")
+                    for kind, payload in events
+                )
+                final_ok = "TEAM_PROBE_OK_4172" in str(result.response or "")
+                ok = result.status == "completed" and read_ok and final_ok
+                reachable = True
+                basic_response = True
+                diagnostic = str(result.error or (result.response if result.status != "completed" else ""))
+                if not ok:
+                    # Separate provider reachability from Native-Light/tool compatibility.
+                    try:
+                        basic = client.chat(
+                            message="Reply exactly: TEAM_BASIC_OK", model=model, temperature=0, max_tokens=32
+                        )
+                        basic_text = str((basic or {}).get("response") or "") if isinstance(basic, dict) else ""
+                        basic_response = "TEAM_BASIC_OK" in basic_text
+                        if not basic_response and not diagnostic:
+                            diagnostic = "API reachable but model returned no usable basic chat response"
+                    except Exception as exc:
+                        reachable = False
+                        basic_response = False
+                        diagnostic = f"{type(exc).__name__}: {exc}"
+                return {
+                    "model": model,
+                    "ok": ok,
+                    "reachable": reachable,
+                    "basic_response": basic_response,
+                    "status": result.status,
+                    "elapsed": round(time.monotonic() - started, 2),
+                    "tool_roundtrip": read_ok,
+                    "final_marker": final_ok,
+                    "error": diagnostic,
+                }
+        except Exception as exc:
+            return {
+                "model": model, "ok": False, "reachable": False, "basic_response": False, "status": "failed",
+                "elapsed": round(time.monotonic() - started, 2),
+                "tool_roundtrip": False, "final_marker": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+    def run(self):
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        results = []
+        workers = max(1, min(4, len(self.models)))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="team-model-probe") as pool:
+            futures = {
+                pool.submit(self._probe_one, self.base_url, self.token, model, self.timeout, self.native_tools): model
+                for model in self.models
+            }
+            for future in as_completed(futures):
+                try:
+                    results.append(future.result())
+                except Exception as exc:
+                    results.append({"model": futures[future], "ok": False, "reachable": False, "basic_response": False,
+                                    "status": "failed", "elapsed": 0.0, "tool_roundtrip": False,
+                                    "final_marker": False, "error": str(exc)})
+        results.sort(key=lambda row: row.get("model", ""))
+        self.finished_probe.emit(results)
+
+
 class SettingsWidget(QWidget):
     models_loaded = pyqtSignal(list)  # emitted with sorted model list
     selection_changed = pyqtSignal(str)  # base model
@@ -115,6 +232,7 @@ class SettingsWidget(QWidget):
         self._loader = None
         self._tool_loader = None
         self._probe = None
+        self._team_probe = None
         self._models = []
         self._tools = []
         self._schema_widgets = {}
@@ -273,10 +391,16 @@ class SettingsWidget(QWidget):
 
         team_save = QPushButton("Agent-Team speichern")
         team_save.clicked.connect(self._save_team_config)
+        self.team_probe_btn = QPushButton("Team-KIs prüfen")
+        self.team_probe_btn.setToolTip(
+            "Prüft jedes konfigurierte eindeutige Team-Modell mit einem echten Native-Light file_read-Roundtrip."
+        )
+        self.team_probe_btn.clicked.connect(self._test_team_models)
         self.team_status = QLabel("")
         self.team_status.setStyleSheet("color: #888; font-size: 11px;")
         team_row = QHBoxLayout()
         team_row.addWidget(team_save)
+        team_row.addWidget(self.team_probe_btn)
         team_row.addWidget(self.team_status)
         team_row.addStretch()
         team_form.addRow(team_row)
@@ -748,6 +872,66 @@ class SettingsWidget(QWidget):
         self.tool_status.setStyleSheet("color: #00ff88; font-size: 11px;")
         self._settings_snapshot = self._state_signature(get_state())
         self.tools_changed.emit(mode, selected)
+
+
+    def _test_team_models(self):
+        # Probe the values currently visible in Settings so unsaved edits can be checked first.
+        state = get_state()
+        primary = self.model_combo.currentText().strip() or str(state.get("selected_model") or "").strip()
+        models = []
+        for combo in self._team_model_combos.values():
+            value = combo.currentText().strip()
+            if value.lower() in {"", "off", "none", "disabled"}:
+                continue
+            if value == "@primary":
+                value = primary
+            if value and value not in models:
+                models.append(value)
+        if not models:
+            self.team_status.setText("Keine aktiven Team-Modelle zum Prüfen.")
+            self.team_status.setStyleSheet("color: #ffb020; font-size: 11px;")
+            return
+        if str(state.get("runtime_mode") or "native-light") != "native-light":
+            self.team_status.setText("Team-Test benötigt Runtime native-light.")
+            self.team_status.setStyleSheet("color: #ff6b6b; font-size: 11px;")
+            return
+        try:
+            session = load_session()
+        except Exception as exc:
+            self.team_status.setText(f"Team-Test nicht verfügbar: {exc}")
+            self.team_status.setStyleSheet("color: #ff6b6b; font-size: 11px;")
+            return
+        timeout = max(10, min(60, int(self.timeout_spin.value())))
+        self.team_probe_btn.setEnabled(False)
+        self.team_status.setText(f"Prüfe {len(models)} Team-KI(s) · Native-Light Tool-Roundtrip …")
+        self.team_status.setStyleSheet("color: #00d4ff; font-size: 11px;")
+        self._team_probe = _TeamModelProbe(
+            session.base_url, session.token, models, timeout,
+            bool(state.get("native_openrouter_tool_calling", False)),
+        )
+        self._team_probe.finished_probe.connect(self._on_team_probe_finished)
+        self._team_probe.start()
+
+    def _on_team_probe_finished(self, results: list):
+        self.team_probe_btn.setEnabled(True)
+        ok_count = sum(1 for row in results if row.get("ok"))
+        total = len(results)
+        color = "#00ff88" if ok_count == total else "#ff6b6b"
+        self.team_status.setText(f"Team-KI-Test · {ok_count}/{total} coding-ready")
+        self.team_status.setStyleSheet(f"color: {color}; font-size: 11px;")
+        lines = []
+        for row in results:
+            mark = "OK" if row.get("ok") else "FEHLER"
+            reach = "online" if row.get("reachable", True) else "nicht erreichbar"
+            detail = (
+                f"{mark} · {row.get('model')} · {row.get('elapsed', 0):.1f}s · {reach} · "
+                f"tool={'OK' if row.get('tool_roundtrip') else 'nein'} · "
+                f"final={'OK' if row.get('final_marker') else 'nein'}"
+            )
+            if row.get("error"):
+                detail += f" · {str(row.get('error'))[:180]}"
+            lines.append(detail)
+        QMessageBox.information(self, "Team-KIs prüfen", "\n".join(lines))
 
 
     def _save_team_config(self):

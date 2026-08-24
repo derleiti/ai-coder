@@ -275,9 +275,10 @@ class NativeLightRuntime:
     _tool_catalog: list[dict] = field(default_factory=list, init=False, repr=False)
     _expansion_rounds: int = field(default=0, init=False, repr=False)
 
-    def _emit(self, kind: str, **payload: Any) -> None:
+    def _emit(self, event_kind: str, **payload: Any) -> None:
+        """Emit a runtime event without colliding with payload fields named ``kind``."""
         if self.event_fn is not None:
-            self.event_fn(kind, payload)
+            self.event_fn(event_kind, payload)
 
     def _stopped(self) -> bool:
         return bool(self.stop_requested and self.stop_requested())
