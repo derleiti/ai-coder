@@ -55,6 +55,25 @@ class NativeContextTrimTests(unittest.TestCase):
         self.assertEqual(trimmed[first_tool - 1].get("role"), "assistant")
         self.assertTrue(trimmed[first_tool - 1].get("tool_calls"))
 
+    def test_trim_applies_character_budget_and_keeps_latest_context(self):
+        messages = [{"role": "system", "content": "system"}]
+        messages.extend({"role": "user", "content": str(i) + ("x" * 5000)} for i in range(12))
+        trimmed = trim_messages(messages, max_chars=12000)
+        self.assertLess(len(trimmed), len(messages))
+        self.assertEqual(trimmed[0]["role"], "system")
+        self.assertTrue(trimmed[-1]["content"].startswith("11"))
+
+    def test_char_trim_keeps_native_assistant_parent(self):
+        messages = [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "x" * 12000},
+            {"role": "assistant", "content": None, "tool_calls": [{"id":"c","type":"function","function":{"name":"read","arguments":"{}"}}]},
+            {"role": "tool", "tool_call_id": "c", "content": "result"},
+        ]
+        trimmed = trim_messages(messages, max_chars=5000)
+        self.assertEqual(trimmed[1]["role"], "assistant")
+        self.assertEqual(trimmed[2]["role"], "tool")
+
 
 class NativeOpenRouterMessageTests(unittest.TestCase):
     def test_native_tool_result_uses_assistant_tool_calls_and_role_tool(self):

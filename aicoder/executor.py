@@ -653,7 +653,7 @@ LOCAL_TOOL_SCHEMAS = [
 LOCAL_TOOL_NAMES = {t["name"] for t in LOCAL_TOOL_SCHEMAS}
 
 SYSTEM_TEMPLATE = """\
-You are ai-coder — an autonomous coding agent on AILinux/TriForce (api.ailinux.me).
+You are ai-coder — an autonomous AILinux operator agent for coding, DevOps, system work, and infrastructure through controlled tools (api.ailinux.me).
 {guidelines}
 {agents_md}
 {skills}
@@ -1191,17 +1191,31 @@ def strip_tool_calls(text: str) -> str:
     return TOOL_RE.sub("", raw).strip()
 
 
-def trim_messages(msgs: list[dict]) -> list[dict]:
-    """Trim context without orphaning provider-native tool result messages.
+def _message_context_chars(message: dict) -> int:
+    total = len(str(message.get("content") or ""))
+    if message.get("tool_calls"):
+        total += len(json.dumps(message.get("tool_calls"), ensure_ascii=False, default=str))
+    return total + 32
 
-    Native OpenAI/OpenRouter history requires each ``role=tool`` message to follow
-    the assistant message that declared the corresponding ``tool_calls``. The
-    context bound is therefore soft by the size of one tool-call batch: when the
-    normal window would begin inside such a batch, include its assistant parent.
-    """
-    if len(msgs) <= 1 + MAX_CONTEXT_MESSAGES:
+
+def trim_messages(msgs: list[dict], *, max_chars: int | None = None) -> list[dict]:
+    """Trim by message count and a soft character budget without orphaning tool results."""
+    if not msgs:
         return msgs
     start = max(1, len(msgs) - MAX_CONTEXT_MESSAGES)
+    if max_chars is not None and max_chars > 0:
+        budget = max(4096, int(max_chars))
+        used = _message_context_chars(msgs[0])
+        char_start = len(msgs)
+        for index in range(len(msgs) - 1, 0, -1):
+            size = _message_context_chars(msgs[index])
+            if char_start < len(msgs) and used + size > budget:
+                break
+            used += size
+            char_start = index
+        start = max(start, char_start)
+    if start >= len(msgs):
+        start = max(1, len(msgs) - 1)
     if str(msgs[start].get("role") or "") == "tool":
         parent = start - 1
         while parent >= 1 and str(msgs[parent].get("role") or "") == "tool":
@@ -1214,7 +1228,6 @@ def trim_messages(msgs: list[dict]) -> list[dict]:
         ):
             start = parent
         else:
-            # Malformed/orphaned provider history is safer to drop than resend.
             while start < len(msgs) and str(msgs[start].get("role") or "") == "tool":
                 start += 1
     return [msgs[0]] + msgs[start:]

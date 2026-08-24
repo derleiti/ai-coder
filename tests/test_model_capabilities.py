@@ -15,9 +15,11 @@ from aicoder import model_capabilities as mc
 
 
 class _FakeClient:
-    def __init__(self, models):
+    def __init__(self, models, base_url="", token=""):
         self._models = models
         self.calls = 0
+        self.base_url = base_url
+        self.token = token
 
     def list_models(self):
         self.calls += 1
@@ -85,6 +87,27 @@ class CapabilityDetectionTests(unittest.TestCase):
         mc.supports_tools(self.client, "mistral/mistral-code-agent-latest")
         mc.supports_tools(self.client, "nvidia/nvidia/nemotron-3-ultra-550b-a55b")
         self.assertEqual(self.client.calls, 1, "agent loop must not refetch per request")
+
+    def test_context_window_metadata_is_available_and_cached(self):
+        client = _FakeClient([{"id": "provider/large", "context_window": 131072}])
+        self.assertEqual(mc.model_context_window(client, "provider/large"), 131072)
+        self.assertEqual(mc.model_context_window(client, "provider/large"), 131072)
+        self.assertEqual(client.calls, 1)
+
+    def test_catalogue_cache_is_isolated_by_endpoint_and_account(self):
+        model = "provider/shared-model"
+        first = _FakeClient(
+            [{"id": model, "capabilities": ["chat"]}],
+            base_url="https://one.example", token="account-a",
+        )
+        second = _FakeClient(
+            [{"id": model, "capabilities": ["chat", "function_calling"]}],
+            base_url="https://two.example", token="account-b",
+        )
+        self.assertFalse(mc.supports_tools(first, model))
+        self.assertTrue(mc.supports_tools(second, model))
+        self.assertEqual(first.calls, 1)
+        self.assertEqual(second.calls, 1)
 
 
 class RuntimeGateTests(unittest.TestCase):

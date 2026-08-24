@@ -12,7 +12,10 @@ def _source_version() -> str | None:
     if not project.is_file():
         return None
     try:
-        import tomllib
+        try:
+            import tomllib
+        except ModuleNotFoundError:
+            import tomli as tomllib
         with project.open("rb") as handle:
             value = tomllib.load(handle).get("project", {}).get("version")
         return str(value) if value else None

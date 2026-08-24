@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import ssl
+import threading
 import time
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
@@ -73,6 +74,24 @@ class OpenAICompatibleTransport:
         self.api_key = str(api_key or "")
         self.timeout = max(10, min(300, int(timeout)))
         self.headers = {str(k): str(v) for k, v in (headers or {}).items()}
+        self._active_response_lock = threading.Lock()
+        self._active_response = None
+
+    def cancel_current_request(self) -> bool:
+        """Best-effort cancellation once the HTTP response handle exists."""
+        with self._active_response_lock:
+            response = self._active_response
+            self._active_response = None
+        if response is None:
+            return False
+        close = getattr(response, "close", None)
+        if callable(close):
+            try:
+                close()
+                return True
+            except Exception:
+                return False
+        return False
 
     @property
     def endpoint(self) -> str:
@@ -80,7 +99,7 @@ class OpenAICompatibleTransport:
             return self.base_url
         return urljoin(self.base_url + "/", "chat/completions")
 
-    def _post_json(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _post_json(self, payload: dict[str, Any], *, request_id: str | None = None) -> dict[str, Any]:
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
@@ -89,6 +108,8 @@ class OpenAICompatibleTransport:
         }
         if self.api_key and not any(key.lower() == "authorization" for key in headers):
             headers["Authorization"] = f"Bearer {self.api_key}"
+        if request_id:
+            headers["X-AICoder-Request-ID"] = request_id
         request = Request(
             self.endpoint,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -97,8 +118,19 @@ class OpenAICompatibleTransport:
         )
         context = ssl.create_default_context()
         try:
-            with urlopen(request, timeout=self.timeout, context=context) as response:
+            response = urlopen(request, timeout=self.timeout, context=context)
+            with self._active_response_lock:
+                self._active_response = response
+            try:
                 raw = response.read().decode("utf-8", errors="replace")
+            finally:
+                with self._active_response_lock:
+                    if self._active_response is response:
+                        self._active_response = None
+                try:
+                    response.close()
+                except Exception:
+                    pass
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:2000]
             raise ClientError(f"OpenAI-compatible HTTP {exc.code}: {detail}") from exc
@@ -123,6 +155,7 @@ class OpenAICompatibleTransport:
         messages: list | None = None,
         tools: list | None = None,
         tool_choice: Any = "auto",
+        request_id: str | None = None,
     ) -> dict[str, Any]:
         request_messages = [dict(item) for item in (messages or []) if isinstance(item, dict)]
         if not request_messages:
@@ -144,11 +177,11 @@ class OpenAICompatibleTransport:
 
         started = time.monotonic()
         try:
-            normalized = _normalize_chat_response(self._post_json(payload))
+            normalized = _normalize_chat_response(self._post_json(payload, request_id=request_id))
         except ClientError:
             if fallback_model and fallback_model != model:
                 payload["model"] = fallback_model
-                normalized = _normalize_chat_response(self._post_json(payload))
+                normalized = _normalize_chat_response(self._post_json(payload, request_id=request_id))
                 normalized = dict(normalized)
                 normalized["fallback_used"] = True
                 normalized.setdefault("primary_model", model)
@@ -157,7 +190,17 @@ class OpenAICompatibleTransport:
         normalized = dict(normalized)
         normalized.setdefault("model", payload["model"])
         normalized.setdefault("backend", "openai-compatible-direct")
-        normalized.setdefault("latency_ms", int((time.monotonic() - started) * 1000))
+        elapsed_s = time.monotonic() - started
+        normalized.setdefault("latency_ms", int(elapsed_s * 1000))
+        normalized.setdefault("_transport_telemetry", {
+            "transport": "openai-compatible-direct",
+            "streaming": False,
+            "timeout_semantics": "blocking-request",
+            "elapsed_s": round(elapsed_s, 3),
+            "keepalive_chunks": 0,
+            "payload_chunks": 1,
+            "request_id": request_id or "",
+        })
         return normalized
 
 

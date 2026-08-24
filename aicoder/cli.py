@@ -1169,8 +1169,9 @@ def cmd_sysinfo(args: argparse.Namespace) -> int:
             if label == "cpu":
                 # CPU kompakt
                 try:
-                    out = sp.check_output(["grep", "-m1", "model name", "/proc/cpuinfo"],
-                                          text=True, timeout=3).strip().split(":")[1].strip()
+                    cpu_info = sp.check_output(["grep", "-m1", "model name", "/proc/cpuinfo"],
+                                               text=True, timeout=3).strip()
+                    out = cpu_info.split(":", 1)[1].strip() if ":" in cpu_info else "(unknown)"
                     cores = sp.check_output(["nproc"], text=True, timeout=3).strip()
                     print(f"  \033[36mcpu\033[0m       {out} ({cores} cores)")
                 except Exception:
@@ -1228,7 +1229,7 @@ def cmd_remote_node(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="aicoder",
-        description="ai-coder — terminal-based coding agent for AILinux / TriForce",
+        description="ai-coder — terminal-based operator agent for AILinux / TriForce",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""        Examples:
           aicoder login --base-url http://127.0.0.1:9000

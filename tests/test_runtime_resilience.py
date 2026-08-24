@@ -117,12 +117,62 @@ class RuntimeResilienceTests(unittest.TestCase):
             self.assertEqual(resumed.status, "completed")
 
 
+    def test_interruptible_runtime_cancels_active_transport_on_stop(self):
+        import threading
+        from aicoder.agent_runtime import NativeLightRuntime
+
+        class CancellableTransport:
+            timeout = 30
+            def __init__(self):
+                self.started = threading.Event()
+                self.cancelled = threading.Event()
+                self.finished = threading.Event()
+            def list_models(self):
+                return []
+            def chat(self, **_kwargs):
+                self.started.set()
+                self.cancelled.wait(2)
+                self.finished.set()
+                raise RuntimeError("cancelled")
+            def cancel_current_request(self):
+                self.cancelled.set()
+                return True
+
+        transport = CancellableTransport()
+        runtime = NativeLightRuntime(
+            client=transport, model_client=transport, initial_prompt="inspect", model="test/model",
+            fallback_model=None, workspace_root=".", tools=[], load_tools_on_start=False,
+            persistent_plan=False, stop_requested=lambda: transport.started.is_set(),
+        )
+        result = runtime.run()
+        self.assertEqual(result.status, "paused")
+        self.assertTrue(transport.cancelled.is_set())
+        self.assertTrue(transport.finished.wait(1))
+
+    def test_triforce_cancel_closes_active_response(self):
+        client = TriForceClient("http://example.invalid", token="token", timeout=1)
+        response = MagicMock()
+        client._set_active_response(response)
+        self.assertTrue(client.cancel_current_request())
+        response.close.assert_called_once()
+        response.release_conn.assert_called_once()
+        self.assertFalse(client.cancel_current_request())
+
     def test_chat_sets_keepalive_header(self):
         client = TriForceClient("http://example.invalid", token="token", timeout=1)
         with patch.object(client, "_request", return_value={"response": "ok", "model": "m"}) as request:
             result = client.chat(message="hi", model="m")
         self.assertEqual(result["response"], "ok")
         self.assertEqual(request.call_args.kwargs["_extra_headers"], {"X-AICoder-Keepalive": "json"})
+
+    def test_chat_propagates_request_id_to_transport_header_and_telemetry(self):
+        client = TriForceClient("http://example.invalid", token="token", timeout=1)
+        with patch.object(client, "_request", return_value={
+            "response": "ok", "model": "m", "_transport_telemetry": {"elapsed_s": 1.0}
+        }) as request:
+            result = client.chat(message="hi", model="m", request_id="req-123")
+        self.assertEqual(request.call_args.kwargs["_extra_headers"]["X-AICoder-Request-ID"], "req-123")
+        self.assertEqual(result["_transport_telemetry"]["request_id"], "req-123")
 
     def test_keepalive_chunks_may_extend_total_turn_duration(self):
         class FakeResponse:
@@ -148,7 +198,11 @@ class RuntimeResilienceTests(unittest.TestCase):
             )
         self.assertEqual(result["response"], "OK")
         self.assertTrue(response.released)
-        self.assertGreaterEqual(result["_transport_telemetry"]["elapsed_s"], 120.0)
+        telemetry = result["_transport_telemetry"]
+        self.assertGreaterEqual(telemetry["elapsed_s"], 120.0)
+        self.assertEqual(telemetry["keepalive_chunks"], 1)
+        self.assertEqual(telemetry["payload_chunks"], 1)
+        self.assertEqual(telemetry["keepalive_times_s"], [0.5])
 
     def test_structured_stream_error_preserves_retry_after(self):
         from aicoder.client import _normalize_chat_response

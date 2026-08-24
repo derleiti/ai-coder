@@ -58,6 +58,10 @@ def _elevated_argv(argv: list[str], args: dict[str, Any]) -> tuple[list[str] | N
     return None, "elevated Local OS action reached provider without an approved elevation strategy"
 
 
+def _is_termux() -> bool:
+    return bool(os.environ.get("TERMUX_VERSION") or os.environ.get("TERMUX__PREFIX")) or platform.system().lower() == "android"
+
+
 def _manager() -> str | None:
     for name in ("apt-get", "dnf", "yum", "pacman", "zypper"):
         if shutil.which(name):
@@ -73,6 +77,7 @@ def _system_overview() -> dict[str, Any]:
         "machine": platform.machine(),
         "python": platform.python_version(),
         "package_manager": _manager(),
+        "environment": "termux" if _is_termux() else "linux",
     }
     try:
         data["loadavg"] = list(os.getloadavg())
@@ -155,14 +160,28 @@ class LocalOSToolProvider:
             data=json.loads(text); lines=data.get("stdout", "").splitlines()[:limit+1]; data["stdout"]="\n".join(lines)+("\n" if lines else "")
             return json.dumps(data, ensure_ascii=False), False
         if name == "os_network_routes":
-            addr, e1=_run(["ip", "-brief", "address"], timeout=5); routes, e2=_run(["ip", "route", "show"], timeout=5)
-            return json.dumps({"addresses": json.loads(addr), "routes": json.loads(routes)}, ensure_ascii=False), e1 or e2
+            addr_argv = ["ip", "address", "show"] if _is_termux() else ["ip", "-brief", "address"]
+            addr, e1=_run(addr_argv, timeout=5); routes, e2=_run(["ip", "route", "show"], timeout=5)
+            payload={"addresses": json.loads(addr), "routes": json.loads(routes)}
+            if _is_termux() and (e1 or e2):
+                payload["limited"] = "Android may deny netlink route/address details to unprivileged Termux apps"
+            return json.dumps(payload, ensure_ascii=False), e1 and e2
         if name == "os_network_ports":
             return _run(["ss", "-lntup"], timeout=8)
         if name == "os_storage_overview":
-            df, e1=_run(["df", "-h", "-x", "tmpfs", "-x", "devtmpfs"], timeout=8)
-            lsblk, e2=_run(["lsblk", "-o", "NAME,SIZE,FSTYPE,TYPE,MOUNTPOINTS"], timeout=8)
-            return json.dumps({"filesystems": json.loads(df), "block_devices": json.loads(lsblk)}, ensure_ascii=False), e1 or e2
+            df_argv = ["df", "-h"] if _is_termux() else ["df", "-h", "-x", "tmpfs", "-x", "devtmpfs"]
+            df, e1=_run(df_argv, timeout=8)
+            if shutil.which("lsblk"):
+                lsblk, e2=_run(["lsblk", "-o", "NAME,SIZE,FSTYPE,TYPE,MOUNTPOINTS"], timeout=8)
+                block_devices=json.loads(lsblk)
+            else:
+                e2=True
+                block_devices={"available": False, "reason": "lsblk not installed; common on Termux/Android"}
+            payload={"filesystems": json.loads(df), "block_devices": block_devices}
+            if _is_termux():
+                payload["environment"]="termux"
+                payload["limited"]="Android does not expose a traditional Linux block-device view to unprivileged Termux apps"
+            return json.dumps(payload, ensure_ascii=False), e1
         if name == "os_package_list_upgradable":
             manager=_manager()
             if manager == "apt-get": argv=["apt", "list", "--upgradable"]

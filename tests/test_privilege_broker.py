@@ -101,11 +101,22 @@ class PrivilegeBrokerPolicyTests(unittest.TestCase):
             patch.object(executor.audit, "log_tool"),
         ):
             result, is_error=executor.run_tool(
-                client, "shell", {"command":"printf hello"}, approval_fn=approve
+                client, "shell", {"command":"printf hello", "sudo":True}, approval_fn=approve
             )
         self.assertFalse(is_error)
         self.assertEqual(result, "ok")
         self.assertEqual(local.call_args.args[0]["_elevation_strategy"], "sudo")
+
+    def test_known_read_only_binary_exec_does_not_require_approval(self):
+        for program, arguments in (("uname", ["-a"]), ("cat", ["/proc/cpuinfo"]), ("git", ["--version"]), ("df", ["-h"])):
+            with self.subTest(program=program):
+                risk = assess_execution("binary_exec", {"program": program, "arguments": arguments})
+                self.assertFalse(risk.needs_approval)
+                self.assertFalse(risk.mutation)
+
+    def test_unknown_or_mutating_binary_exec_remains_approval_gated(self):
+        self.assertTrue(assess_execution("binary_exec", {"program": "python3", "arguments": ["-c", "open('x','w').write('y')"]}).needs_approval)
+        self.assertTrue(assess_execution("binary_exec", {"program": "mv", "arguments": ["a", "b"]}).needs_approval)
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ every model the backend has not annotated yet.
 
 from __future__ import annotations
 
+import hashlib
 import time
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
@@ -27,8 +28,7 @@ _TOOL_CAPABILITIES = frozenset({
 
 _CACHE_TTL_SECONDS = 300
 
-_catalogue: dict[str, frozenset[str]] | None = None
-_catalogue_ts: float = 0.0
+_catalogues: dict[tuple[str, str], tuple[float, dict[str, frozenset[str]]]] = {}
 
 
 def _capabilities_of(entry: Any) -> frozenset[str]:
@@ -55,6 +55,8 @@ class ModelInfo:
     available: bool = True
     raw: dict[str, Any] | None = None
 
+_info_catalogues: dict[tuple[str, str], tuple[float, dict[str, ModelInfo]]] = {}
+
 
 def normalize_model_info(entry: Any) -> ModelInfo | None:
     model_id = model_identifier(entry)
@@ -80,24 +82,48 @@ def normalize_model_info(entry: Any) -> ModelInfo | None:
     )
 
 
-def load_model_info(client: Any) -> dict[str, ModelInfo]:
+def load_model_info(client: Any, *, force: bool = False) -> dict[str, ModelInfo]:
+    key = _catalogue_cache_key(client)
+    cached = _info_catalogues.get(key)
+    if cached is not None and not force and (time.monotonic() - cached[0]) < _CACHE_TTL_SECONDS:
+        return cached[1]
     result: dict[str, ModelInfo] = {}
     try:
         entries = client.list_models() or []
     except Exception:
-        return result
+        return cached[1] if cached is not None else result
     for entry in entries:
         info = normalize_model_info(entry)
         if info is not None:
             result[info.id] = info
+    _info_catalogues[key] = (time.monotonic(), result)
     return result
 
+
+def model_context_window(client: Any, model: str | None) -> int | None:
+    if not model:
+        return None
+    info = load_model_info(client).get(str(model))
+    return info.context_window if info is not None else None
+
+def _catalogue_cache_key(client: Any) -> tuple[str, str]:
+    """Scope capability metadata to one endpoint/account without storing secrets."""
+    endpoint = str(getattr(client, "base_url", "") or getattr(client, "endpoint", "")).rstrip("/")
+    token = str(getattr(client, "token", "") or "")
+    if endpoint or token:
+        token_id = hashlib.sha256(token.encode("utf-8")).hexdigest()[:16] if token else "anonymous"
+        return endpoint or "default", token_id
+    return "client-instance", str(id(client))
+
+
 def load_catalogue(client: Any, *, force: bool = False) -> dict[str, frozenset[str]]:
-    """Model id -> capability set, cached briefly to keep the agent loop cheap."""
-    global _catalogue, _catalogue_ts
-    fresh = _catalogue is not None and (time.monotonic() - _catalogue_ts) < _CACHE_TTL_SECONDS
-    if fresh and not force:
-        return _catalogue  # type: ignore[return-value]
+    """Model id -> capabilities, cached briefly per endpoint/account."""
+    key = _catalogue_cache_key(client)
+    cached = _catalogues.get(key)
+    if cached is not None and not force:
+        cached_ts, cached_catalogue = cached
+        if (time.monotonic() - cached_ts) < _CACHE_TTL_SECONDS:
+            return cached_catalogue
     catalogue: dict[str, frozenset[str]] = {}
     try:
         for entry in client.list_models() or []:
@@ -106,16 +132,14 @@ def load_catalogue(client: Any, *, force: bool = False) -> dict[str, frozenset[s
                 catalogue[model_id] = _capabilities_of(entry)
     except Exception:
         # A catalogue lookup must never break the run it was meant to protect.
-        return _catalogue or {}
-    _catalogue = catalogue
-    _catalogue_ts = time.monotonic()
+        return cached[1] if cached is not None else {}
+    _catalogues[key] = (time.monotonic(), catalogue)
     return catalogue
 
 
 def reset_cache() -> None:
-    global _catalogue, _catalogue_ts
-    _catalogue = None
-    _catalogue_ts = 0.0
+    _catalogues.clear()
+    _info_catalogues.clear()
 
 
 def capabilities(client: Any, model: str | None) -> Optional[frozenset[str]]:

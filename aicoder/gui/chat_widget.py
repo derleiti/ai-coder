@@ -177,6 +177,22 @@ class _AgentWorker(QThread):
                     f"{int(payload.get('count') or 0)} tools ready in {float(payload.get('elapsed') or 0.0):.2f}s",
                     runtime_label,
                 )
+            elif kind == "run_start":
+                configured = str(payload.get("configured_model") or payload.get("model") or "default")
+                effective = str(payload.get("effective_model") or payload.get("model") or configured)
+                fallback = str(payload.get("fallback") or "")
+                route = configured if configured == effective else f"{configured} → {effective}"
+                detail = f"effective={route}"
+                if fallback:
+                    detail += f" · fallback={fallback}"
+                detail += f" · transport={payload.get('transport') or 'default'}"
+                self.msg.emit("system", "Run route", detail)
+                if bool(payload.get("resumed")):
+                    self.msg.emit(
+                        "system",
+                        "Resume safety",
+                        "Raw tool evidence is not restored · fresh inspection required before mutation",
+                    )
             elif kind == "model_without_tool_support":
                 _msg = (
                     f"{payload.get('model') or '?'} meldet kein natives Function Calling — "
@@ -201,6 +217,9 @@ class _AgentWorker(QThread):
                 route = used if used == requested else f"{requested} → {used}"
                 telemetry = payload.get("transport_telemetry") if isinstance(payload.get("transport_telemetry"), dict) else {}
                 meta = route
+                request_id = str(payload.get("request_id") or telemetry.get("request_id") or "")
+                if request_id:
+                    meta += f" · req {request_id[-8:]}"
                 if telemetry:
                     meta += (
                         f" · transport {float(telemetry.get('elapsed_s') or 0.0):.1f}s"
@@ -232,6 +251,7 @@ class _AgentWorker(QThread):
                     except Exception:
                         pass
                 status = f"{'ERROR' if is_error else 'OK'} ({float(payload.get('elapsed') or 0.0):.1f}s)"
+                self.activity.emit(f"Tool completed · {name} · {'ERROR' if is_error else 'OK'}")
                 self.msg.emit("tool_result", result[:2000], f"{name} {status}")
             elif kind == "loop_prevented":
                 self.activity.emit("Duplicate tool call blocked · waiting for corrected model action")
@@ -318,6 +338,8 @@ class ChatWidget(QWidget):
         self._system = None
         self._messages = []
         self._syncing = False
+        self._model_override_dirty = False
+        self._fallback_override_dirty = False
         self._session_id = None
         self._dropped_files = []
         self._activity_started = 0.0
@@ -346,8 +368,18 @@ class ChatWidget(QWidget):
         self._tools = None
         self._system = None
 
+    def _mark_model_override_dirty(self, *_args):
+        if not self._syncing:
+            self._model_override_dirty = True
+
+    def _mark_fallback_override_dirty(self, *_args):
+        if not self._syncing:
+            self._fallback_override_dirty = True
+
     def _on_models_updated(self, models: list):
-        """Update model dropdowns with list from backend."""
+        """Refresh model choices without clobbering manual Chat overrides."""
+        current_model = self.model_combo.currentText()
+        current_fallback = self.fallback_combo.currentText()
         self._syncing = True
         self.model_combo.clear()
         self.fallback_combo.clear()
@@ -356,17 +388,23 @@ class ChatWidget(QWidget):
         for m in models:
             self.model_combo.addItem(m)
             self.fallback_combo.addItem(m)
-        # Sync selection from settings (if user hasn't overridden)
-        if self.settings_ref:
+        if self._model_override_dirty:
+            self.model_combo.setCurrentText(current_model)
+        elif self.settings_ref:
             self.model_combo.setCurrentText(self.settings_ref.get_current_model())
+        if self._fallback_override_dirty:
+            self.fallback_combo.setCurrentText(current_fallback)
+        elif self.settings_ref:
             self.fallback_combo.setCurrentText(self.settings_ref.get_current_fallback())
         self._syncing = False
 
     def _on_settings_selection_changed(self, model: str, fallback: str):
-        """Settings tab selection changed — sync chat tab."""
+        """Settings tab selection changed — explicitly resync Chat routing."""
         self._syncing = True
         self.model_combo.setCurrentText(model)
         self.fallback_combo.setCurrentText(fallback)
+        self._model_override_dirty = False
+        self._fallback_override_dirty = False
         self._syncing = False
 
     # ── Drag & Drop ──────────────────────────────────────────────
@@ -472,6 +510,8 @@ class ChatWidget(QWidget):
         self.model_combo.addItem("")  # Backend-Default (liste wird dynamisch geladen)
         self.model_combo.setCurrentText("")
         self.model_combo.setToolTip("Select model (empty = backend default)")
+        self.model_combo.lineEdit().textEdited.connect(self._mark_model_override_dirty)
+        self.model_combo.activated.connect(self._mark_model_override_dirty)
         model_row.addWidget(self.model_combo, stretch=1)
 
         fb_label = QLabel("Fallback:")
@@ -485,6 +525,8 @@ class ChatWidget(QWidget):
         self.fallback_combo.addItem("")  # (liste wird dynamisch geladen)
         self.fallback_combo.setCurrentText("")
         self.fallback_combo.setToolTip("Fallback model (optional)")
+        self.fallback_combo.lineEdit().textEdited.connect(self._mark_fallback_override_dirty)
+        self.fallback_combo.activated.connect(self._mark_fallback_override_dirty)
         model_row.addWidget(self.fallback_combo, stretch=1)
 
         layout.addLayout(model_row)
