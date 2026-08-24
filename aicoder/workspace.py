@@ -44,7 +44,16 @@ def workspace_from_task(task: str, configured: str | Path | None = None) -> Path
         raw = match.group("path").strip().strip("`\"'")
         if not raw:
             continue
-        candidate = Path(raw).expanduser().resolve(strict=False)
+        requested = Path(raw).expanduser()
+        if requested.is_absolute():
+            candidate = requested.resolve(strict=False)
+        else:
+            base = Path(configured).expanduser().resolve(strict=False) if configured is not None else active_workspace()
+            candidate = (base / requested).resolve(strict=False)
+            try:
+                candidate.relative_to(base)
+            except ValueError as exc:
+                raise ValueError(f"relative workspace must stay inside configured workspace root: {candidate}") from exc
         if not candidate.exists() or not candidate.is_dir():
             raise ValueError(f"declared workspace is not an existing directory: {candidate}")
         return candidate

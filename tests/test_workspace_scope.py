@@ -37,6 +37,23 @@ class ActiveWorkspaceTests(unittest.TestCase):
                 os.environ.pop(ACTIVE_WORKSPACE_ENV, None)
                 self.assertEqual(workspace_from_task(prompt, parent), project.resolve())
 
+    def test_relative_declared_workspace_resolves_inside_configured_project_container(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            project = root / "aicoder-experimental"
+            project.mkdir(parents=True)
+            prompt = "Workspace-Projekt: aicoder-experimental\n\nOptimize this project."
+            self.assertEqual(workspace_from_task(prompt, root), project.resolve())
+
+    def test_relative_declared_workspace_cannot_escape_project_container(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            root.mkdir()
+            outside = root.parent / "outside"
+            outside.mkdir()
+            with self.assertRaises(ValueError):
+                workspace_from_task("Workspace-Projekt: ../outside", root)
+
     def test_declared_missing_workspace_fails_closed(self):
         with tempfile.TemporaryDirectory() as temp:
             missing = Path(temp) / "missing"
