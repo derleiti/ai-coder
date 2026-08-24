@@ -212,6 +212,43 @@ class PlanIndependentProgressTests(unittest.TestCase):
         self.assertTrue(mutation)
         self.assertFalse(verified)
 
+    def test_read_only_shell_does_not_create_mutation_progress(self):
+        runtime = NativeLightRuntime(
+            client=MagicMock(), initial_prompt="inspect git", model="test/model",
+            fallback_model=None, workspace_root="/tmp", persistent_plan=False,
+        )
+        mutation, verified = runtime._record_tool_progress(
+            None, "shell", {"command": "git status --short"}, "", False, False,
+        )
+        self.assertFalse(mutation)
+        self.assertFalse(verified)
+
+    def test_read_only_binary_exec_does_not_create_mutation_progress(self):
+        runtime = NativeLightRuntime(
+            client=MagicMock(), initial_prompt="inspect python", model="test/model",
+            fallback_model=None, workspace_root="/tmp", persistent_plan=False,
+        )
+        mutation, verified = runtime._record_tool_progress(
+            None, "binary_exec",
+            {"program": "python", "arguments": ["--version"]},
+            "Python 3", False, False,
+        )
+        self.assertFalse(mutation)
+        self.assertFalse(verified)
+
+    def test_mutating_binary_exec_creates_mutation_progress(self):
+        runtime = NativeLightRuntime(
+            client=MagicMock(), initial_prompt="move file", model="test/model",
+            fallback_model=None, workspace_root="/tmp", persistent_plan=False,
+        )
+        mutation, verified = runtime._record_tool_progress(
+            None, "binary_exec",
+            {"program": "mv", "arguments": ["a.txt", "b.txt"]},
+            "", False, False,
+        )
+        self.assertTrue(mutation)
+        self.assertFalse(verified)
+
 
 class ToolResultHandoffTests(unittest.TestCase):
     def test_empty_file_tree_result_is_present_in_next_model_request(self):
