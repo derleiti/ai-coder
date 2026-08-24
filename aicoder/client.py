@@ -595,7 +595,11 @@ class TriForceClient:
         tool_choice: Any = "auto",
         request_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Call /v1/client/chat. Supports messages array for multi-turn context."""
+        """Call /v1/client/chat. Supports messages array for multi-turn context.
+
+        ``fallback_model`` is accepted only for source compatibility and is intentionally ignored.
+        AICoder never switches models implicitly.
+        """
         payload: Dict[str, Any] = {
             "temperature": temperature,
             "max_tokens": max_tokens,
@@ -625,28 +629,5 @@ class TriForceClient:
             return primary_result
         except TokenExpiredError:
             raise
-        except ClientError as e:
-            if fallback_model and fallback_model != model:
-                # Authentication/authorization and other client-side 4xx errors
-                # cannot be repaired by selecting another model.
-                message = str(e)
-                if "HTTP 4" in message and "HTTP 408" not in message and "HTTP 429" not in message:
-                    raise
-                import sys
-                print(f"\n[FALLBACK: {model} failed → {fallback_model}]", file=sys.stderr)
-                payload["model"] = fallback_model
-                fallback_result = _normalize_chat_response(self._request(
-                    "POST", "/v1/client/chat", payload, require_auth=True,
-                    _label=f"chat/{fallback_model}(fallback)", _retries=0,
-                    _extra_headers={"X-AICoder-Keepalive": "json", **({"X-AICoder-Request-ID": request_id} if request_id else {})},
-                ))
-                if isinstance(fallback_result, dict):
-                    fallback_result = dict(fallback_result)
-                    fallback_result["fallback_used"] = True
-                    fallback_result.setdefault("primary_model", model)
-                    if request_id:
-                        telemetry = dict(fallback_result.get("_transport_telemetry") or {})
-                        telemetry["request_id"] = request_id
-                        fallback_result["_transport_telemetry"] = telemetry
-                return fallback_result
+        except ClientError:
             raise

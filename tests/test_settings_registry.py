@@ -19,7 +19,6 @@ class RegistrySchemaTests(unittest.TestCase):
     def test_aliases_resolve_to_canonical_keys(self):
         for alias, expected in (
             ("model", "selected_model"),
-            ("fallback", "fallback_model"),
             ("tool-mode", "tool_mode"),
             ("tool_mode", "tool_mode"),
             ("TIMEOUT", "request_timeout"),
@@ -92,10 +91,16 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(raw["_schema_version"], settings.SCHEMA_VERSION)
         self.assertEqual(raw["swarm_mode"], "auto")
 
-    def test_fallback_invariant_is_enforced_by_the_store(self):
-        self.store.set("fallback_model", "prov/m")
-        self.store.set("selected_model", "prov/m")
-        self.assertEqual(self.store.get("fallback_model"), "")
+    def test_team_model_slots_allow_duplicates_and_disabled_values(self):
+        self.store.update(
+            selected_model="prov/m",
+            team_coder_model_1="prov/m",
+            team_coder_model_2="prov/m",
+            team_coder_model_3="",
+        )
+        self.assertEqual(self.store.get("team_coder_model_1"), "prov/m")
+        self.assertEqual(self.store.get("team_coder_model_2"), "prov/m")
+        self.assertEqual(self.store.get("team_coder_model_3"), "")
 
     def test_invalid_value_is_rejected_before_it_reaches_disk(self):
         self.store.set("tool_mode", "always")

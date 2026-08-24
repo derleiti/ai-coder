@@ -71,20 +71,17 @@ class OpenAICompatibleTransportTests(unittest.TestCase):
         self.assertEqual(telemetry["timeout_semantics"], "blocking-request")
         self.assertEqual(telemetry["keepalive_chunks"], 0)
 
-    def test_fallback_retries_same_endpoint_with_other_model(self):
+    def test_legacy_fallback_argument_never_switches_models(self):
         transport = OpenAICompatibleTransport("http://localhost:1234/v1", timeout=30)
-        transport._post_json = MagicMock(side_effect=[
-            ClientError("primary failed"),
-            {"choices": [{"message": {"content": "ok"}}], "model": "fallback/model"},
-        ])
-        result = transport.chat(
-            model="primary/model",
-            fallback_model="fallback/model",
-            messages=[{"role": "user", "content": "hello"}],
-        )
-        self.assertEqual(result["response"], "ok")
-        self.assertTrue(result["fallback_used"])
-        self.assertEqual(transport._post_json.call_args.args[0]["model"], "fallback/model")
+        transport._post_json = MagicMock(side_effect=ClientError("primary failed"))
+        with self.assertRaises(ClientError):
+            transport.chat(
+                model="primary/model",
+                fallback_model="fallback/model",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+        self.assertEqual(transport._post_json.call_count, 1)
+        self.assertEqual(transport._post_json.call_args.args[0]["model"], "primary/model")
 
     def test_env_opt_in_does_not_persist_api_key(self):
         default = MagicMock()

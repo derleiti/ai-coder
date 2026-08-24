@@ -651,7 +651,7 @@ class NativeLightGuiTests(unittest.TestCase):
                     {"role": "system", "content": "simple"},
                     {"role": "user", "content": "Run the tests"},
                 ],
-                "test/model", "", [LOCAL_TEST_SCHEMA], "simple",
+                "test/model", [LOCAL_TEST_SCHEMA], "simple",
                 load_tools_on_start=True,
             )
             finished = []

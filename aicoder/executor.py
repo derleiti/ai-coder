@@ -745,8 +745,8 @@ Rules:
 
 # Fallback tool definitions if tools/list fails
 # Fallback: READ-ONLY only -- must match AGENT_TOOLS whitelist
-FALLBACK_TOOLS: list[dict] = [
-    # READ-ONLY Fallback Tools — keine destruktiven Tools
+RECOVERY_TOOLS: list[dict] = [
+    # READ-ONLY Recovery Tools — keine destruktiven Tools
     {"name": "code_read",      "description": "Read source file (remote, read-only)", "inputSchema": {"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
     {"name": "code_search",    "description": "Search codebase (regex, read-only)", "inputSchema": {"type":"object","properties":{"pattern":{"type":"string"}},"required":["pattern"]}},
     {"name": "code_tree",      "description": "Show directory structure (read-only)", "inputSchema": {"type":"object","properties":{"path":{"type":"string"}}}},
@@ -850,9 +850,9 @@ def load_tools(client: TriForceClient, force_refresh: bool = False) -> list[dict
     if not mcp_tools:
         hint = f" ({err_msg[:80]})" if err_msg else ""
         print(f"\n  \033[1;33m⚠ MCP tools/list fehlgeschlagen{hint}\033[0m", file=sys.stderr)
-        print(f"  \033[33m  → Agent läuft mit {len(FALLBACK_TOOLS)} Fallback-Tools (eingeschränkt)\033[0m", file=sys.stderr)
+        print(f"  \033[33m  → Agent läuft mit {len(RECOVERY_TOOLS)} Recovery-Tools (eingeschränkt)\033[0m", file=sys.stderr)
         print(f"  \033[33m  → Backend erreichbar? Versuch: aicoder mcp health\033[0m", file=sys.stderr)
-        mcp_tools = FALLBACK_TOOLS
+        mcp_tools = RECOVERY_TOOLS
 
     # Trusted built-in ToolProviders share the same model-facing catalog. External
     # providers remain declarative until the later trust/privilege phase.

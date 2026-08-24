@@ -25,7 +25,8 @@ from .config import CONFIG_DIR
 
 WORKSPACE_MODES = frozenset({"auto", "ram", "disk"})
 _MANIFEST_FILE = ".aicoder-checkpoint.json"
-_INTERNAL_NAMES = frozenset({_MANIFEST_FILE})
+_INTERNAL_NAMES = frozenset({_MANIFEST_FILE, ".aicoder-team"})
+_TRANSIENT_DIRS = frozenset({"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".nox"})
 _MIN_RAM_RESERVE = 512 * 1024 * 1024
 _RAM_OVERHEAD = 64 * 1024 * 1024
 
@@ -200,7 +201,7 @@ def _iter_tree(root: Path, *, include_git: bool = False) -> Iterable[tuple[Path,
         for entry in entries:
             rel = Path(entry.path).relative_to(root).as_posix()
             top = rel.split("/", 1)[0]
-            if (not include_git and top == ".git") or top in _INTERNAL_NAMES:
+            if (not include_git and top == ".git") or top in _INTERNAL_NAMES or entry.name in _TRANSIENT_DIRS:
                 continue
             path = Path(entry.path)
             yield path, rel
@@ -382,6 +383,45 @@ class RamWorkspace(WorkspaceBackend):
         except Exception:
             self.abort()
             raise
+
+    def delta_summary(self) -> dict[str, Any]:
+        current, changed, deleted = self._delta()
+        return {
+            "changed": sorted(changed),
+            "deleted": sorted(deleted),
+            "changed_count": len(changed),
+            "deleted_count": len(deleted),
+            "current_entries": len(current),
+        }
+
+    def seed_from(self, other_root: str | Path) -> None:
+        """Replace RAM working-tree content from another candidate, keeping private .git metadata."""
+        if not self._prepared:
+            raise WorkspaceError("RAM workspace was not prepared")
+        source = Path(other_root).expanduser().resolve(strict=True)
+        if not source.is_dir():
+            raise WorkspaceError(f"candidate seed is not a directory: {source}")
+        for path, rel in sorted(
+            list(_iter_tree(self._execution, include_git=False)),
+            key=lambda item: (item[1].count("/"), item[1]), reverse=True,
+        ):
+            self._remove_path(path)
+        shutil.copytree(
+            source, self._execution, dirs_exist_ok=True, symlinks=True,
+            ignore=shutil.ignore_patterns(".git", *_INTERNAL_NAMES),
+        )
+
+    def write_candidate_artifact(self, relative_path: str, content: str) -> Path:
+        """Write orchestration evidence inside RAM without exposing the persistent source workspace."""
+        if not self._prepared:
+            raise WorkspaceError("RAM workspace was not prepared")
+        rel = PurePosixPath(str(relative_path))
+        if rel.is_absolute() or ".." in rel.parts:
+            raise WorkspaceError("unsafe candidate artifact path")
+        target = self._execution.joinpath(*rel.parts)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(str(content), encoding="utf-8")
+        return target
 
     def _delta(self) -> tuple[dict[str, _Entry], set[str], set[str]]:
         if not self._prepared:

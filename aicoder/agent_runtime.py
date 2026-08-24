@@ -242,7 +242,7 @@ class NativeLightRuntime:
     client: TriForceClient
     initial_prompt: str
     model: str | None
-    fallback_model: str | None
+    fallback_model: str | None  # deprecated compatibility input; never activated
     workspace_root: str
     plan_workspace_root: str | None = None
     protected_workspace_root: str | None = None
@@ -764,7 +764,7 @@ class NativeLightRuntime:
             self.model_client or self.client, default_model=self.model
         )
         active_model = configured_model
-        active_fallback = self.fallback_model
+        active_fallback = None  # automatic fallback routing intentionally removed
         model_used = active_model or "?"
         context_window_tokens = model_context_window(model_client, active_model)
         if context_window_tokens:
@@ -946,19 +946,6 @@ class NativeLightRuntime:
             model_used = str(result.get("model", active_model or "?") or "?")
             latency = int(result.get("latency_ms") or elapsed_ms)
             total_latency += latency
-            if result.get("fallback_used"):
-                fallback_used = True
-                # A successful provider fallback becomes the effective model for the
-                # rest of this run. Otherwise the next turn would retry the failed
-                # primary and capability/tool-protocol decisions would use stale data.
-                if model_used not in {"", "?"} and model_used != active_model:
-                    previous_model = active_model or "backend-default"
-                    active_model = model_used
-                    active_fallback = None
-                    self._emit(
-                        "model_switch", previous=previous_model, model=active_model,
-                        reason="provider fallback promoted for remainder of run",
-                    )
             transport_telemetry = result.get("_transport_telemetry") if isinstance(result, dict) else None
             self._emit(
                 "model_response", iteration=i + 1, elapsed_ms=elapsed_ms,
@@ -1121,22 +1108,6 @@ class NativeLightRuntime:
                     self._emit(
                         "loop_prevented", iteration=i + 1, repeats=consecutive_call_batches,
                         action="nudge",
-                    )
-                    self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
-                    continue
-                if active_fallback and active_fallback != model_used:
-                    previous_model = model_used
-                    active_model = active_fallback
-                    active_fallback = None
-                    fallback_used = True
-                    loop_guard.reset()
-                    current_input = (
-                        "Repeated duplicate tool call blocked. Continue with a different approach "
-                        "using the prior tool result; do not repeat the blocked call unchanged."
-                    )
-                    self._emit(
-                        "model_switch", previous=previous_model, model=active_model,
-                        reason="duplicate tool call prevented before execution",
                     )
                     self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
                     continue
@@ -1498,53 +1469,39 @@ class NativeLightRuntime:
                     tool_results.append(STALL_RECOVERY_PROMPT)
 
             if repeats >= STALL_FALLBACK_REPEATS:
-                if active_fallback and active_fallback != model_used:
-                    self._emit(
-                        "model_switch", previous=model_used, model=active_fallback,
-                        reason="repeated tool loop",
-                    )
-                    tool_results.append(
-                        f"Loop recovery: switch to {active_fallback} and continue the task "
-                        "with a different approach. Do not repeat the prior call."
-                    )
-                    active_model = active_fallback
-                    active_fallback = None
-                    fallback_used = True
-                    loop_guard.reset()
+                reason = (
+                    "Agent paused because the same tool operation kept repeating without "
+                    "progress. Resume the persistent plan with 'continue' after correcting "
+                    "the approach or environment."
+                )
+                if native_mode:
+                    messages.append({
+                        "role": "assistant", "content": response or None,
+                        "tool_calls": [
+                            {
+                                "id": str(item.get("id") or ""), "type": "function",
+                                "function": {
+                                    "name": str(item.get("name") or ""),
+                                    "arguments": json.dumps(item.get("arguments") or {}, ensure_ascii=False),
+                                },
+                            }
+                            for item in calls
+                        ],
+                    })
+                    messages.extend(native_tool_messages)
                 else:
-                    reason = (
-                        "Agent paused because the same tool operation kept repeating without "
-                        "progress. Resume the persistent plan with 'continue' after correcting "
-                        "the approach or environment."
-                    )
-                    if native_mode:
-                        messages.append({
-                            "role": "assistant", "content": response or None,
-                            "tool_calls": [
-                                {
-                                    "id": str(item.get("id") or ""), "type": "function",
-                                    "function": {
-                                        "name": str(item.get("name") or ""),
-                                        "arguments": json.dumps(item.get("arguments") or {}, ensure_ascii=False),
-                                    },
-                                }
-                                for item in calls
-                            ],
-                        })
-                        messages.extend(native_tool_messages)
-                    else:
-                        messages.append({"role": "assistant", "content": response})
-                        messages.append({"role": "user", "content": format_untrusted_tool_results(tool_results)})
-                    self._pause_plan(plan, reason, response)
-                    self._save_journal(plan, messages, tool_batches=journal_batches)
-                    self._emit("paused", reason=reason)
-                    if self.conversation is not None:
-                        self.conversation[:] = [dict(message) for message in messages[1:]][-MAX_CONTEXT_MESSAGES:]
-                    return AgentRunResult(
-                        "paused", reason, model_used, messages, tools, system,
-                        iterations=i + 1, latency_ms=total_latency,
-                        fallback_used=fallback_used, plan_id=plan.id if plan else "",
-                    )
+                    messages.append({"role": "assistant", "content": response})
+                    messages.append({"role": "user", "content": format_untrusted_tool_results(tool_results)})
+                self._pause_plan(plan, reason, response)
+                self._save_journal(plan, messages, tool_batches=journal_batches)
+                self._emit("paused", reason=reason)
+                if self.conversation is not None:
+                    self.conversation[:] = [dict(message) for message in messages[1:]][-MAX_CONTEXT_MESSAGES:]
+                return AgentRunResult(
+                    "paused", reason, model_used, messages, tools, system,
+                    iterations=i + 1, latency_ms=total_latency,
+                    fallback_used=fallback_used, plan_id=plan.id if plan else "",
+                )
 
             if (i + 1) % AGENT_CHECKPOINT_INTERVAL == 0:
                 tool_results.append(agent_checkpoint(i + 1))

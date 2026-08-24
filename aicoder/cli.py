@@ -10,7 +10,7 @@ from .docs_context import context_summary, read_agents_md
 from .history import record as history_record, get_history, clear_history
 from .session_state import (
     RUNTIME_MODES, DEFAULT_RUNTIME_MODE, SWARM_MODES, TOOL_MODES, get_state,
-    set_fallback, set_model, set_runtime_mode, set_swarm, set_tool_mode, set_workspace,
+    set_model, set_runtime_mode, set_swarm, set_tool_mode, set_workspace,
 )
 from .status import Spinner, phase_label
 from . import settings as settings_core
@@ -254,21 +254,6 @@ def cmd_model(args: argparse.Namespace) -> int:
         state = get_state()
         val = state.get("selected_model") or "(not set)"
         print(f"model = {val}")
-    return 0
-
-
-def cmd_fallback(args: argparse.Namespace) -> int:
-    if args.value:
-        set_fallback(args.value)
-        effective = get_state().get("fallback_model") or ""
-        if effective:
-            print(f"fallback → {effective}")
-        else:
-            print("fallback → disabled (same as operator)")
-    else:
-        state = get_state()
-        val = state.get("fallback_model") or "(not set)"
-        print(f"fallback = {val}")
     return 0
 
 
@@ -705,7 +690,7 @@ def cmd_command(args: argparse.Namespace) -> int:
     return run_agent(
         initial_prompt=text,
         model=getattr(args, "model", None) or state.get("selected_model"),
-        fallback_model=state.get("fallback_model"),
+        fallback_model=None,
         verbose=getattr(args, "verbose", False),
         runtime_mode="native-light",
         json_output=bool(getattr(args, "json_out", False)),
@@ -781,11 +766,13 @@ def cmd_status(_: argparse.Namespace) -> int:
 
 
 def _print_header(state: dict, model_override: str | None = None) -> None:
-    """Print active model/fallback/swarm before any LLM task."""
+    """Print the settings-driven model/runtime route before an LLM task."""
     model = model_override or state.get("selected_model") or "(backend default)"
-    fallback = state.get("fallback_model") or "(not set)"
-    swarm = state.get("swarm_mode", "off")
-    print(f"model={model}  fallback={fallback}  swarm={swarm}", file=sys.stderr)
+    print(
+        f"model={model}  runtime={state.get('runtime_mode','native-light')}  "
+        f"workspace={state.get('workspace_mode','auto')}  team={state.get('team_runtime_mode','auto')}",
+        file=sys.stderr,
+    )
 
 def _resolve_model(state: dict, override: str | None) -> str | None:
     """Return model to use: CLI arg > state selected_model > None (backend default)."""
@@ -798,7 +785,6 @@ def _print_response(result: dict) -> None:
     model_used = result.get("model", "?")
     backend = result.get("backend", "?")
     latency = result.get("latency_ms")
-    fallback = result.get("fallback_used", False)
 
     print()
     print(resp)
@@ -806,8 +792,6 @@ def _print_response(result: dict) -> None:
     meta = f"[{model_used} · {backend}"
     if latency:
         meta += f" · {latency}ms"
-    if fallback:
-        meta += " · FALLBACK"
     meta += "]"
     print(meta, file=sys.stderr)
 
@@ -819,7 +803,6 @@ def cmd_ask(args: argparse.Namespace) -> int:
     client = TriForceClient(session.base_url, token=session.token, timeout=_timeout)
     state = get_state()
     model = _resolve_model(state, getattr(args, "model", None))
-    swarm = state.get("swarm_mode", "off")
 
     # Collect prompt: args.prompt (joined) or stdin
     if args.prompt:
@@ -846,25 +829,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
 
     _print_header(state, model)
 
-    # Swarm V2: on|review → parallel; auto → Heuristik
-    _effective_swarm = swarm
-    if swarm == "auto":
-        from .swarm_runner import should_auto_swarm
-        if should_auto_swarm(message):
-            _effective_swarm = "on"
-            print("swarm: auto-triggered (complex prompt)", file=sys.stderr)
-
-    if _effective_swarm in ("on", "review"):
-        from .swarm_runner import run_swarm_ask
-        return run_swarm_ask(
-            message=message,
-            operator_model=model,
-            fallback_model=state.get("fallback_model"),
-            system_prompt=system_prompt,
-            mode=_effective_swarm,
-        )
-
-    label = phase_label(swarm if swarm != "off" else "work")
+    label = phase_label("work")
 
     with Spinner(label):
         result = client.chat(
@@ -873,7 +838,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
             system_prompt=system_prompt,
             temperature=getattr(args, "temperature", 0.7),
             max_tokens=getattr(args, "max_tokens", 4096),
-            fallback_model=state.get("fallback_model") or None,
+            fallback_model=None,
         )
 
     _print_response(result)
@@ -895,7 +860,6 @@ def cmd_chat(args: argparse.Namespace) -> int:
     client = TriForceClient(session.base_url, token=session.token, timeout=120)
     state = get_state()
     model = _resolve_model(state, getattr(args, "model", None))
-    swarm = state.get("swarm_mode", "off")
 
     workspace = str(active_workspace(state.get("workspace_root")))
     system_prompt = None
@@ -903,8 +867,8 @@ def cmd_chat(args: argparse.Namespace) -> int:
         system_prompt = read_agents_md(workspace)
 
     agents_hint = " [AGENTS.md loaded]" if system_prompt else ""
-    print(f"ai-coder chat · model={model or 'backend default'} · swarm={swarm}{agents_hint}")
-    print("Commands: /exit  /model <name>  /swarm <mode>  /status")
+    print(f"ai-coder chat · model={model or 'backend default'}{agents_hint}")
+    print("Commands: /exit  /model <name>  /models  /status")
     print("─" * 50)
 
     history: list[dict] = []
@@ -932,25 +896,10 @@ def cmd_chat(args: argparse.Namespace) -> int:
                 set_model(val)
                 state = get_state()
                 print(f"model → {val}")
-            elif cmd == "/swarm" and val:
-                try:
-                    set_swarm(val)
-                    swarm = val
-                    print(f"swarm → {val}")
-                except ValueError as e:
-                    print(f"Error: {e}")
             elif cmd == "/status":
-                print(f"model={model or 'backend default'}  swarm={swarm}  turns={len(history)}")
-            elif cmd == "/fallback" and val:
-                set_fallback(val)
-                effective = get_state().get("fallback_model") or ""
-                state["fallback_model"] = effective
-                if effective:
-                    print(f"fallback → {effective}")
-                else:
-                    print("fallback → disabled (same as operator)")
+                print(f"model={model or 'backend default'}  turns={len(history)}")
             elif cmd == "/help":
-                print("  /model <n>  /fallback <n>  /swarm <mode>  /status  /clear  /exit")
+                print("  /model <n>  /models  /status  /clear  /exit")
             elif cmd == "/clear":
                 history.clear()
                 print("History cleared.")
@@ -971,14 +920,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
                 chat_messages.append({"role": "assistant", "content": resp_trimmed})
         chat_messages.append({"role": "user", "content": user_input})
 
-        # Auto-swarm heuristik
-        _cs = swarm
-        if swarm == "auto":
-            from .swarm_runner import should_auto_swarm
-            if should_auto_swarm(user_input):
-                _cs = "on"
-        label = phase_label(_cs if _cs != "off" else "work")
-        fallback = state.get("fallback_model") or None
+        label = phase_label("work")
         with Spinner(label):
             try:
                 result = client.chat(
@@ -987,7 +929,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
                     system_prompt=system_prompt,
                     temperature=0.7,
                     max_tokens=4096,
-                    fallback_model=fallback,
+                    fallback_model=None,
                 )
             except (ClientError, RuntimeError) as e:
                 print(f"\nFehler: {e}", file=sys.stderr)
@@ -1001,22 +943,9 @@ def cmd_chat(args: argparse.Namespace) -> int:
         meta = f"[{model_used}"
         if latency:
             meta += f" · {latency}ms"
-        if result.get("fallback_used"):
-            meta += " · FALLBACK"
         meta += "]"
         print(meta)
         print()
-
-        if _cs in {"on", "review"}:
-            from .swarm_runner import run_swarm_review
-            run_swarm_review(
-                original_task=user_input,
-                operator_response=resp,
-                operator_model=model_used,
-                fallback_model=fallback,
-                system_prompt=system_prompt,
-                client=client,
-            )
 
         history.append({"user": user_input, "assistant": resp})
         try:
@@ -1299,10 +1228,6 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("model", help="Show or set active coding model")
     p.add_argument("value", nargs="?")
     p.set_defaults(func=cmd_model)
-
-    p = sub.add_parser("fallback", help="Show or set fallback model")
-    p.add_argument("value", nargs="?")
-    p.set_defaults(func=cmd_fallback)
 
     p = sub.add_parser("swarm", help=f"Swarm-Modus anzeigen oder setzen ({', '.join(sorted(SWARM_MODES))})")
     p.add_argument("value", nargs="?")
@@ -1604,7 +1529,7 @@ def cmd_agent(args: argparse.Namespace) -> int:
         return run_agent(
             initial_prompt=initial_prompt,
             model=getattr(args, "model", None) or state.get("selected_model"),
-            fallback_model=state.get("fallback_model"),
+            fallback_model=None,
             verbose=getattr(args, "verbose", False),
             runtime_mode="native-light" if resume_requested else None,
             resume_plan_id=(plan_id or "current") if resume_requested else None,

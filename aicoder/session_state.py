@@ -17,7 +17,6 @@ from . import settings as _settings
 from .config import CONFIG_DIR, atomic_write_private  # noqa: F401 - patched by tests
 from .settings import (  # noqa: F401 - re-exported for existing importers
     APPROVAL_MODES,
-    DEFAULT_FALLBACK_MODEL,
     DEFAULT_RUNTIME_MODE,
     RUNTIME_MODES,
     SWARM_MODES,
@@ -83,7 +82,8 @@ def set_model(model: str) -> None:
 
 
 def set_fallback(model: str) -> None:
-    _apply(fallback_model=model)
+    """Deprecated compatibility no-op: automatic fallback routing was removed."""
+    return None
 
 
 def set_tool_mode(mode: str) -> None:

@@ -11,7 +11,7 @@ from typing import Optional
 from .client import TriForceClient
 from .config import load_session
 from .executor import (
-    AGENT_TOOLS, FALLBACK_TOOLS as _FALLBACK_TOOLS, OS_INSTRUCTIONS, OS_NAME,
+    AGENT_TOOLS, RECOVERY_TOOLS as _RECOVERY_TOOLS, OS_INSTRUCTIONS, OS_NAME,
     SYSTEM_TEMPLATE as SYSTEM, is_destructive, is_short_confirmation,
     is_simple_chat_message, run_tool as run_tool, should_load_tools,
 )
@@ -279,7 +279,7 @@ def _run_native_light_agent(
         client=client,
         initial_prompt=initial_prompt,
         model=model,
-        fallback_model=fallback_model,
+        fallback_model=None,
         workspace_root=str(execution_root),
         plan_workspace_root=str(ws_path),
         protected_workspace_root=(str(ws_path) if workspace_backend.info.transactional else None),
@@ -306,30 +306,10 @@ def _run_native_light_agent(
     stop_model_heartbeat()
     if not header_printed and not (json_output or json_events):
         print_header(
-            model=model or "backend-default", fallback=fallback_model or "", tools=0,
+            model=model or "backend-default", fallback="", tools=0,
             workspace=ws_path.name, tool_mode=f"{runtime_label}/{tool_mode}", timeout=request_timeout,
         )
         print_task(initial_prompt)
-
-    swarm_mode = state.get("swarm_mode", "off")
-    if swarm_mode == "auto":
-        from .swarm_runner import should_auto_swarm
-        swarm_mode = "review" if should_auto_swarm(initial_prompt) else "off"
-    if (
-        not (json_output or json_events)
-        and swarm_mode in {"on", "review"}
-        and result.response
-        and result.status == "completed"
-    ):
-        from .swarm_runner import run_swarm_review
-        run_swarm_review(
-            original_task=initial_prompt,
-            operator_response=result.response,
-            operator_model=result.model,
-            fallback_model=state.get("fallback_model"),
-            system_prompt=result.system_prompt,
-            client=client,
-        )
 
     try:
         history_record(
@@ -367,6 +347,51 @@ def run_agent(
     json_events: bool = False,
 ) -> int:
     state = get_state()
+    from .team_runtime import config_from_state, should_use_team
+    if (
+        not resume_plan_id
+        and not is_short_confirmation(initial_prompt)
+        and should_use_team(initial_prompt, str(state.get("team_runtime_mode") or "off"))
+    ):
+        from .model_transport import native_model_transport_from_env
+        from .team_orchestrator import run_team
+        session = load_session()
+        request_timeout = int(state.get("request_timeout", 300))
+        client = TriForceClient(session.base_url, token=session.token, timeout=request_timeout)
+        source_workspace = str(active_workspace(state.get("workspace_root")))
+        model_client, _ = native_model_transport_from_env(client, default_model=model or state.get("selected_model"))
+
+        def team_event(kind: str, payload: dict) -> None:
+            if json_events:
+                print(json.dumps({"type": kind, **payload}, ensure_ascii=False, default=_json_default))
+                return
+            if json_output:
+                return
+            if kind == "team_start":
+                print(f"  {C.DIM}◆ Team runtime · research={payload.get('research')} · coders={payload.get('coders')}{C.RESET}", file=sys.stderr)
+            elif kind == "team_stage":
+                print(f"  {C.DIM}✓ {payload.get('role')} · {payload.get('status')} · {payload.get('model')}{C.RESET}", file=sys.stderr)
+            elif kind == "team_candidate":
+                print(f"  {C.DIM}◆ coder {payload.get('slot')} · {payload.get('status')} · score={payload.get('score')}{C.RESET}", file=sys.stderr)
+            elif kind == "team_complete":
+                print(f"  {C.DIM}⚡ team complete · winner={payload.get('winner_slot')} · wall={int(payload.get('wall_ms') or 0)/1000.0:.1f}s{C.RESET}", file=sys.stderr)
+
+        result = run_team(
+            task=initial_prompt, state=state, config=config_from_state(state), client=client,
+            model_client=model_client, source_workspace=source_workspace, event_fn=team_event,
+        )
+        if json_output or json_events:
+            print(json.dumps({
+                "type": "result", "status": result.status, "response": result.response,
+                "model": result.model, "team": True, "performance": result.performance,
+                "error": result.error,
+            }, ensure_ascii=False))
+        elif result.status == "completed":
+            print_final(response=result.response, model=result.model, latency_ms=int(result.performance.get("wall_ms") or 0), total_iters=0, fallback_used=False)
+        else:
+            print_error(result.error or "Team runtime failed")
+        return 0 if result.status == "completed" else 1
+
     effective_runtime = runtime_mode or state.get("runtime_mode", DEFAULT_RUNTIME_MODE)
     if json_output or json_events:
         effective_runtime = "native-light"

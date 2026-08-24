@@ -157,6 +157,8 @@ class OpenAICompatibleTransport:
         tool_choice: Any = "auto",
         request_id: str | None = None,
     ) -> dict[str, Any]:
+        # ``fallback_model`` is a deprecated compatibility argument. Never route a
+        # failed request to another model implicitly.
         request_messages = [dict(item) for item in (messages or []) if isinstance(item, dict)]
         if not request_messages:
             if system_prompt:
@@ -176,17 +178,7 @@ class OpenAICompatibleTransport:
             payload["tool_choice"] = tool_choice
 
         started = time.monotonic()
-        try:
-            normalized = _normalize_chat_response(self._post_json(payload, request_id=request_id))
-        except ClientError:
-            if fallback_model and fallback_model != model:
-                payload["model"] = fallback_model
-                normalized = _normalize_chat_response(self._post_json(payload, request_id=request_id))
-                normalized = dict(normalized)
-                normalized["fallback_used"] = True
-                normalized.setdefault("primary_model", model)
-            else:
-                raise
+        normalized = _normalize_chat_response(self._post_json(payload, request_id=request_id))
         normalized = dict(normalized)
         normalized.setdefault("model", payload["model"])
         normalized.setdefault("backend", "openai-compatible-direct")

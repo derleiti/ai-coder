@@ -96,7 +96,6 @@ def run_task(
     state = get_state()
 
     effective_model = model or state.get("selected_model") or None
-    swarm = state.get("swarm_mode", "off")
     workspace = str(active_workspace(state.get("workspace_root")))
 
     # System prompt: AGENTS.md + task instructions
@@ -127,16 +126,7 @@ def run_task(
 
     print(f"model={effective_model or '(backend default)'}  files={len(files_content)}  apply={apply}", file=sys.stderr)
 
-    fallback_model = state.get("fallback_model") or None
-    # Auto-Swarm Heuristik
-    _effective_swarm = swarm
-    if swarm == "auto":
-        from .swarm_runner import should_auto_swarm
-        if should_auto_swarm(task):
-            _effective_swarm = "on"
-            print("swarm: auto-triggered", file=sys.stderr)
-
-    label = phase_label(_effective_swarm if _effective_swarm != "off" else "work")
+    label = phase_label("work")
     with Spinner(label):
         result = client.chat(
             message=prompt,
@@ -144,7 +134,7 @@ def run_task(
             system_prompt=system_prompt,
             temperature=temperature,
             max_tokens=8192,
-            fallback_model=fallback_model,
+            fallback_model=None,
         )
 
     response = str(result.get("response", "") or "")
@@ -153,18 +143,6 @@ def run_task(
         return 1
     model_used = result.get("model", effective_model or "?")
     latency = result.get("latency_ms")
-
-    # Swarm is advisory and never writes. Review the operator output before any
-    # optional local apply confirmation.
-    if _effective_swarm in {"on", "review"}:
-        from .swarm_runner import run_swarm_review
-        run_swarm_review(
-            original_task=task,
-            operator_response=response,
-            operator_model=effective_model,
-            fallback_model=state.get("fallback_model"),
-            system_prompt=system_prompt if not no_agents else None,
-        )
 
     # History
     try:

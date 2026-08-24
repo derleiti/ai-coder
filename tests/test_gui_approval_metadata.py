@@ -13,7 +13,7 @@ class GuiApprovalMetadataTests(unittest.TestCase):
 
     def test_worker_emits_complete_security_enriched_arguments(self):
         worker = _AgentWorker(
-            MagicMock(), [], "test", "", [], "",
+            MagicMock(), [], "test", [], "",
             load_tools_on_start=False,
         )
         received = []
@@ -49,8 +49,8 @@ class GuiApprovalMetadataTests(unittest.TestCase):
 
 
     def test_approval_replies_to_signal_sender_not_mutable_current_worker(self):
-        requester = _AgentWorker(MagicMock(), [], "test", "", [], "", load_tools_on_start=False)
-        current = _AgentWorker(MagicMock(), [], "test", "", [], "", load_tools_on_start=False)
+        requester = _AgentWorker(MagicMock(), [], "test", [], "", load_tools_on_start=False)
+        current = _AgentWorker(MagicMock(), [], "test", [], "", load_tools_on_start=False)
         requester.set_approval = MagicMock()
         current.set_approval = MagicMock()
         widget = MagicMock()

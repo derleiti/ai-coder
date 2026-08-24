@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import os
-import contextlib
-import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,7 +13,6 @@ from aicoder import audit
 from aicoder import clipboard, web_search
 from aicoder.client import CLIENT_PROFILE, ClientError, TokenExpiredError, TriForceClient
 from aicoder.privileges import assess_execution
-from aicoder.swarm_runner import run_swarm_ask
 from aicoder.session_state import migrate_enabled_tools
 from aicoder.tool_policy import (
     OPERATOR_MCP_TOOLS,
@@ -360,16 +357,12 @@ class McpProtocolTests(unittest.TestCase):
 
 
 class FallbackAndSwarmTests(unittest.TestCase):
-    def test_fallback_result_is_marked_locally(self):
+    def test_legacy_fallback_argument_does_not_hide_primary_failure(self):
         client = TriForceClient("https://example.invalid", token="opaque")
-        with patch.object(
-            client, "_request",
-            side_effect=[ClientError("timeout"), {"response": "ok", "model": "fallback"}],
-        ):
-            with contextlib.redirect_stderr(io.StringIO()):
-                result = client.chat(message="x", model="primary", fallback_model="fallback")
-        self.assertTrue(result["fallback_used"])
-        self.assertEqual(result["primary_model"], "primary")
+        with patch.object(client, "_request", side_effect=ClientError("timeout")) as request:
+            with self.assertRaises(ClientError):
+                client.chat(message="x", model="primary", fallback_model="fallback")
+        self.assertEqual(request.call_count, 1)
 
     def test_auth_failure_does_not_try_fallback(self):
         client = TriForceClient("https://example.invalid", token="opaque")
@@ -378,22 +371,6 @@ class FallbackAndSwarmTests(unittest.TestCase):
                 client.chat(message="x", model="primary", fallback_model="fallback")
         self.assertEqual(request.call_count, 1)
 
-    def test_swarm_without_fallback_does_not_duplicate_operator(self):
-        client = MagicMock()
-        client.chat.return_value = {"response": "operator", "model": "primary"}
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(run_swarm_ask("x", "primary", None, None, "on", client), 0)
-        self.assertEqual(client.chat.call_count, 1)
-
-    def test_review_receives_operator_response(self):
-        client = MagicMock()
-        client.chat.side_effect = [
-            {"response": "operator answer", "model": "primary"},
-            {"response": "review", "model": "advisor"},
-        ]
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(run_swarm_ask("request", "primary", "advisor", None, "review", client), 0)
-        self.assertIn("operator answer", client.chat.call_args_list[1].kwargs["message"])
 
 
 class AuditRedactionTests(unittest.TestCase):

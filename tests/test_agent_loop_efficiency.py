@@ -109,16 +109,16 @@ class CompletionAuditTests(unittest.TestCase):
 
 
 class FrontierAuditRuntimeTests(unittest.TestCase):
-    def test_successful_provider_fallback_is_promoted_for_followup_turn(self):
+    def test_runtime_never_promotes_a_provider_reported_fallback(self):
         client = MagicMock()
         client.timeout = 300
         client.chat.side_effect = [
             {
                 "response": 'TOOL_CALL file_read\n{"path":"probe.txt"}\nEND_TOOL_CALL',
-                "model": "provider/fallback",
+                "model": "provider/primary",
                 "fallback_used": True,
             },
-            {"response": "DONE: fallback continued", "model": "provider/fallback"},
+            {"response": "DONE: primary continued", "model": "provider/primary"},
         ]
         runtime = NativeLightRuntime(
             client=client, initial_prompt="inspect probe.txt", model="provider/primary",
@@ -131,11 +131,11 @@ class FrontierAuditRuntimeTests(unittest.TestCase):
         with patch("aicoder.agent_runtime.run_tool", return_value=("alpha", False)):
             result = runtime.run()
         self.assertEqual(result.status, "completed")
-        self.assertTrue(result.fallback_used)
+        self.assertFalse(result.fallback_used)
         self.assertEqual(client.chat.call_count, 2)
-        second = client.chat.call_args_list[1].kwargs
-        self.assertEqual(second["model"], "provider/fallback")
-        self.assertIsNone(second["fallback_model"])
+        for call in client.chat.call_args_list:
+            self.assertEqual(call.kwargs["model"], "provider/primary")
+            self.assertIsNone(call.kwargs["fallback_model"])
 
     def test_done_with_final_tool_call_still_runs_completion_audit(self):
         client = MagicMock()

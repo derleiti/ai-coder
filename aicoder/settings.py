@@ -51,8 +51,8 @@ TOOL_MODES = {"off", "on_demand", "always"}
 APPROVAL_MODES = {"ask", "autopilot", "all"}
 RUNTIME_MODES = {"classic", "native-light"}
 WORKSPACE_MODES = {"auto", "ram", "disk"}
+TEAM_RUNTIME_MODES = {"off", "auto", "on"}
 DEFAULT_RUNTIME_MODE = "native-light"
-DEFAULT_FALLBACK_MODEL = "ollama/llama3.2:latest"
 
 
 class SettingsError(ValueError):
@@ -105,14 +105,6 @@ _register(SettingSpec(
     key="selected_model", type="model", default=None, nullable=True,
     group="model", aliases=("model",),
     description="Primary coding model, as 'provider/model'. Unset means the backend default.",
-))
-_register(SettingSpec(
-    key="fallback_model", type="model", default=DEFAULT_FALLBACK_MODEL,
-    group="model", aliases=("fallback",),
-    description=(
-        "Model used when the primary fails. An empty string disables fallback. "
-        "It can never equal the primary — an identical fallback cannot recover a failed request."
-    ),
 ))
 _register(SettingSpec(
     key="swarm_mode", type="enum", default="off", choices=frozenset(SWARM_MODES),
@@ -185,6 +177,60 @@ _register(SettingSpec(
     key="runtime_mode", type="enum", default=DEFAULT_RUNTIME_MODE, choices=frozenset(RUNTIME_MODES),
     group="runtime", aliases=("runtime",), restart_required=True,
     description="Agent engine: native-light (default agentic loop) or classic (compatibility mode).",
+))
+
+_register(SettingSpec(
+    key="team_runtime_mode", type="enum", default="auto", choices=frozenset(TEAM_RUNTIME_MODES),
+    group="team", aliases=("team_runtime",),
+    description="Experimental team runtime: off, auto for complex coding tasks, or on for every action task.",
+))
+_register(SettingSpec(
+    key="team_research_model_1", type="model", default="@primary", group="team",
+    description="Research 1: Primary Sources. @primary reuses the base model; empty/off disables this slot.",
+))
+_register(SettingSpec(
+    key="team_research_model_2", type="model", default="@primary", group="team",
+    description="Research 2: Best Practices. @primary reuses the base model; empty/off disables this slot.",
+))
+_register(SettingSpec(
+    key="team_research_model_3", type="model", default="@primary", group="team",
+    description="Research 3: Security/Reliability. @primary reuses the base model; empty/off disables this slot.",
+))
+_register(SettingSpec(
+    key="team_research_model_4", type="model", default="@primary", group="team",
+    description="Research 4: Alternative Architectures. @primary reuses the base model; empty/off disables this slot.",
+))
+_register(SettingSpec(
+    key="team_coder_model_1", type="model", default="@primary", group="team",
+    description="Coder 1: Conservative/minimal. The same model may be reused in multiple slots; empty/off disables this slot.",
+))
+_register(SettingSpec(
+    key="team_coder_model_2", type="model", default="@primary", group="team",
+    description="Coder 2: Architecture-first. The same model may be reused in multiple slots; empty/off disables this slot.",
+))
+_register(SettingSpec(
+    key="team_coder_model_3", type="model", default="@primary", group="team",
+    description="Coder 3: Performance/efficiency. The same model may be reused in multiple slots; empty/off disables this slot.",
+))
+_register(SettingSpec(
+    key="team_coder_model_4", type="model", default="@primary", group="team",
+    description="Coder 4: Robustness/security. The same model may be reused in multiple slots; empty/off disables this slot.",
+))
+_register(SettingSpec(
+    key="team_planner_model", type="model", default="@primary", group="team",
+    description="Planner model. @primary reuses the base model; empty/off disables optional roles.",
+))
+_register(SettingSpec(
+    key="team_coordinator_model", type="model", default="@primary", group="team",
+    description="Coordinator model. @primary reuses the base model; empty/off disables optional roles.",
+))
+_register(SettingSpec(
+    key="team_merge_model", type="model", default="@primary", group="team",
+    description="Merge/integration model. @primary reuses the base model; empty/off disables optional roles.",
+))
+_register(SettingSpec(
+    key="team_finalizer_model", type="model", default="@primary", group="team",
+    description="Finalizer model. @primary reuses the base model; empty/off disables optional roles.",
 ))
 
 
@@ -316,9 +362,6 @@ def coerce(name: str, value: Any) -> Any:
 
 def apply_invariants(data: Dict[str, Any]) -> Dict[str, Any]:
     """Enforce cross-setting rules centrally, so no UI can bypass them."""
-    # A fallback identical to the primary can never recover a failed request.
-    if data.get("fallback_model") and data.get("fallback_model") == data.get("selected_model"):
-        data["fallback_model"] = ""
     return data
 
 
@@ -449,11 +492,6 @@ class SettingsStore:
             value = raw[key]
             if key == "enabled_tools":
                 data[key] = migrate_enabled_tools(value)
-                continue
-            if key == "fallback_model" and value is None:
-                # Historical "unset" null. An explicit empty string still means
-                # the user intentionally disabled fallback.
-                data[key] = DEFAULT_FALLBACK_MODEL
                 continue
             try:
                 data[key] = coerce(key, value)
