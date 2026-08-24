@@ -9,7 +9,7 @@ description = "Terminalbasierter Coding-Agent für AILinux / TriForce Backend"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-  "rich>=14.0.0",
+  "rich>=15.0.0",
   "typer>=0.13.0",
   "PyQt6>=6.8.0",
   "certifi>=2026.7.22",
