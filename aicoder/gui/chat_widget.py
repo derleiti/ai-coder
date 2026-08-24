@@ -320,6 +320,18 @@ class _AgentWorker(QThread):
                     f"Team runtime started · {payload.get('research', 0)} research · {payload.get('coders', 0)} coders",
                     "RAM candidates",
                 )
+            elif kind == "team_pipeline":
+                stage = str(payload.get("stage") or "stage")
+                status = str(payload.get("status") or "?")
+                self.activity.emit(f"Team · {stage} · {status}")
+                if status == "started":
+                    self.msg.emit("system", f"Pipeline · {stage}", "stage")
+            elif kind == "team_workspace_plan":
+                mode = str(payload.get("backend_mode") or "?")
+                count = int(payload.get("candidate_count") or 0)
+                reason = str(payload.get("reason") or "").strip()
+                detail = f"{count} Kandidaten · {mode}" + (f" · {reason}" if reason else "")
+                self.msg.emit("system", "Workspace-Plan", detail)
             elif kind == "team_stage":
                 role = str(payload.get("role") or "stage")
                 status = str(payload.get("status") or "?")
@@ -328,15 +340,16 @@ class _AgentWorker(QThread):
                 self.activity.emit(f"Team · {role} · {status}")
                 self.msg.emit("system", f"{role} · {status} · {elapsed:.1f}s", model)
             elif kind == "team_candidate":
+                cid = str(payload.get("candidate_id") or "candidate")
                 self.msg.emit(
                     "system",
-                    f"Coder {payload.get('slot')} · {payload.get('status')} · score {payload.get('score')}",
-                    str(payload.get("model") or "?"),
+                    f"{cid} · {payload.get('status')} · score {payload.get('score')}",
+                    "anonymized candidate",
                 )
             elif kind == "team_complete":
                 self.msg.emit(
                     "system",
-                    f"Team merge complete · winner {payload.get('winner_slot')} · final score {payload.get('final_score')}",
+                    f"Team complete · winner {payload.get('winner_candidate_id')} · score {payload.get('winner_score')}",
                     f"wall {int(payload.get('wall_ms') or 0)/1000.0:.1f}s",
                 )
 

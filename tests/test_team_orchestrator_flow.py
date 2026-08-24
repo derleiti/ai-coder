@@ -91,7 +91,6 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
                     "verification_passed": True,
                 }
 
-            original_create = __import__("aicoder.workspace_backend", fromlist=["create_workspace_backend"]).create_workspace_backend
             def create_backend(root, mode, **kwargs):
                 return RamWorkspace(root, ram_root=ram_dir)
 
@@ -101,7 +100,7 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
                 patch("aicoder.team_orchestrator._call_advisor", side_effect=advisor),
                 patch("aicoder.team_orchestrator._run_candidate", side_effect=candidate),
                 patch("aicoder.team_orchestrator.evaluate_candidate", side_effect=evaluate),
-                patch("aicoder.team_orchestrator.create_workspace_backend", side_effect=create_backend),
+                patch("aicoder.team_orchestrator.create_isolated_team_workspace", side_effect=create_backend),
                 patch("aicoder.team_orchestrator.NativeLightRuntime", FakeIntegrationRuntime),
             ):
                 result = run_team(

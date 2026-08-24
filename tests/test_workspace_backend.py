@@ -133,5 +133,34 @@ class RamWorkspaceTests(unittest.TestCase):
             self.assertTrue(backend.info.fallback_reason)
 
 
+
+class TeamWorkspaceBudgetTests(unittest.TestCase):
+    def test_team_plan_accounts_for_all_candidates_plus_integration(self):
+        from aicoder.workspace_backend import team_workspace_plan
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "data.bin").write_bytes(b"x" * 1024)
+            with (
+                patch("aicoder.workspace_backend._mem_available_bytes", return_value=16 * 1024**3),
+                patch("aicoder.workspace_backend._select_ram_root", return_value=(root, 16 * 1024**3)),
+            ):
+                plan = team_workspace_plan(root, 4, "auto")
+            self.assertEqual(plan.candidate_count, 4)
+            self.assertEqual(plan.total_candidate_bytes, plan.per_workspace_bytes * 5)
+            self.assertEqual(plan.backend_mode, "ram")
+
+    def test_low_ram_falls_back_for_whole_team_not_individual_candidates(self):
+        from aicoder.workspace_backend import team_workspace_plan
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "data.bin").write_bytes(b"x" * 1024)
+            with (
+                patch("aicoder.workspace_backend._mem_available_bytes", return_value=700 * 1024**2),
+                patch("aicoder.workspace_backend._select_ram_root", return_value=(root, 700 * 1024**2)),
+            ):
+                plan = team_workspace_plan(root, 4, "auto")
+            self.assertEqual(plan.backend_mode, "disk-isolated")
+            self.assertTrue(plan.reason)
+
 if __name__ == "__main__":
     unittest.main()

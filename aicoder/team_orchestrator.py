@@ -30,7 +30,10 @@ from .team_pipeline import (
     StageLedger, TeamStage, blind_candidate_id, execute_verification_plan,
     objective_rank_key, project_verification_plan, verification_passed,
 )
-from .workspace_backend import RamWorkspace, WorkspaceBackend, WorkspaceError, create_workspace_backend
+from .workspace_backend import (
+    RamWorkspace, WorkspaceBackend, WorkspaceError, create_isolated_team_workspace,
+    team_workspace_plan,
+)
 
 EventFn = Callable[[str, dict[str, Any]], None]
 StopFn = Callable[[], bool]
@@ -55,6 +58,7 @@ class AgentStageResult:
     response: str
     elapsed_ms: int
     error: str = ""
+    evidence: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -130,6 +134,13 @@ def _run_researcher(
         "\n\n## RESEARCH AGENT ROLE\n" + RESEARCH_INSTRUCTIONS[role] + "\n\n" + RESEARCH_OUTPUT_CONTRACT
     )
     started = time.monotonic()
+    evidence_events: list[dict[str, Any]] = []
+
+    def research_event(kind: str, payload: dict[str, Any]) -> None:
+        if kind in {"tool_call", "tool_result"}:
+            row = {"kind": kind, **dict(payload)}
+            evidence_events.append(row)
+
     runtime = NativeLightRuntime(
         client=client, model_client=model_client, initial_prompt=prompt,
         model=model, fallback_model=None, workspace_root=source_workspace,
@@ -137,11 +148,26 @@ def _run_researcher(
         tools=tools, system_prompt=system, load_tools_on_start=True,
         quick_chat=False, persistent_plan=False, approval_fn=lambda *_: False,
         max_iterations=10, max_output_tokens=6000, stop_requested=stop_requested,
+        event_fn=research_event,
     )
     result = runtime.run()
+    research_tool_names = {
+        str(item.get("name") or "") for item in evidence_events
+        if item.get("kind") == "tool_result" and not bool(item.get("is_error"))
+    }
+    external_tools = sorted(name for name in research_tool_names if name in {
+        "search", "crawl", "web_fetch_local", "web_search_local", "doc_search", "doc_read",
+    })
+    evidence = {
+        "successful_tools": sorted(research_tool_names),
+        "external_tools": external_tools,
+        "externally_verified": bool(external_tools),
+        "tool_event_count": len(evidence_events),
+    }
     return AgentStageResult(
         role=f"research:{role}", model=result.model or model, status=result.status,
         response=result.response, elapsed_ms=int((time.monotonic()-started)*1000), error=result.error,
+        evidence=evidence,
     )
 
 
@@ -164,7 +190,13 @@ def _repository_context(source_workspace: str) -> str:
 def _build_planner_prompt(task: str, repo_context: str, research: list[AgentStageResult]) -> str:
     reports = []
     for item in research:
-        reports.append(f"### {item.role} · model={item.model} · status={item.status}\n{item.response or item.error}")
+        evidence = item.evidence or {}
+        verified = "verified-tool-evidence" if evidence.get("externally_verified") else "unverified-or-local-only"
+        tools = ",".join(evidence.get("successful_tools") or []) or "none"
+        reports.append(
+            f"### {item.role} · status={item.status} · evidence={verified} · tools={tools}\n"
+            f"{item.response or item.error}"
+        )
     return (
         f"ORIGINAL USER TASK:\n{task}\n\nREPOSITORY CONTEXT:\n{repo_context}\n\n"
         "INDEPENDENT RESEARCH REPORTS:\n" + "\n\n".join(reports)
@@ -190,17 +222,15 @@ def _candidate_approval(tool_name: str, args: dict) -> bool:
 
 
 def _run_candidate(
-    *, client, model_client: ModelTransport, source_workspace: str, workspace_mode: str,
+    *, client, model_client: ModelTransport, source_workspace: str, backend_mode: str,
     slot: int, model: str, strategy: str, task: str, plan: str, coordinator: str,
     tools: list[dict], stop_requested: StopFn | None,
 ) -> CandidateResult:
-    backend = create_workspace_backend(source_workspace, "ram" if workspace_mode != "disk" else "disk")
+    backend = create_isolated_team_workspace(source_workspace, backend_mode)
     backend.prepare()
     if not isinstance(backend, RamWorkspace):
-        # Multiple candidates must never share the persistent workspace. If RAM is
-        # unavailable, use an isolated temporary disk copy rather than direct DiskWorkspace.
         backend.abort()
-        raise WorkspaceError("parallel candidate runtime requires an isolated RAM workspace")
+        raise WorkspaceError("parallel candidate runtime requires a transactional isolated workspace")
     system = build_system_prompt(tools, str(backend.info.execution_root)).rstrip() + "\n\n" + CODER_SYSTEM_TEMPLATE.format(slot=slot, strategy=strategy)
     started = time.monotonic()
     runtime = NativeLightRuntime(
@@ -403,13 +433,17 @@ def run_team(
         return TeamRunResult("failed", "", code_plan.model, stages, [], {"ledger": ledger.as_dict()}, code_plan.error)
     _stage_complete(ledger, TeamStage.PLAN_CODE, event_fn)
 
-    # 4) code — isolated parallel candidates
+    # 4) code — isolated parallel candidates with one fair global backing mode.
+    workspace_plan = team_workspace_plan(
+        source_workspace, len(config.coders), str(state.get("workspace_mode") or "auto")
+    )
+    _emit(event_fn, "team_workspace_plan", **workspace_plan.as_dict())
     _stage_start(ledger, TeamStage.CODE, event_fn)
     with ThreadPoolExecutor(max_workers=len(config.coders), thread_name_prefix="aicoder-coder") as pool:
         futures = {
             pool.submit(
                 _run_candidate, client=client, model_client=model_client, source_workspace=source_workspace,
-                workspace_mode=str(state.get("workspace_mode") or "auto"), slot=slot.slot, model=slot.model,
+                backend_mode=workspace_plan.backend_mode, slot=slot.slot, model=slot.model,
                 strategy=slot.strategy, task=task, plan=code_plan.response, coordinator="",
                 tools=coder_tools, stop_requested=stop_requested,
             ): slot for slot in config.coders
@@ -437,12 +471,16 @@ def run_team(
     _stage_complete(ledger, TeamStage.CODE, event_fn)
 
     # Build fresh integration workspace and attach anonymized full snapshots.
-    integration = create_workspace_backend(source_workspace, "ram")
+    integration = create_isolated_team_workspace(source_workspace, workspace_plan.backend_mode)
     integration.prepare()
     if not isinstance(integration, RamWorkspace):
         for c in candidates: c.workspace.abort()
         integration.abort()
-        return TeamRunResult("failed", "", "", stages, candidates, {"ledger": ledger.as_dict()}, "integration requires RAM isolation")
+        return TeamRunResult("failed", "", "", stages, candidates, {"ledger": ledger.as_dict()}, "integration requires transactional isolation")
+    _emit(
+        event_fn, "team_integration_workspace", mode=integration.info.mode,
+        fallback_reason=integration.info.fallback_reason,
+    )
     integration.seed_from(winner.workspace.info.execution_root)
     blind_evidence = _attach_blind_candidate_snapshots(integration, candidates)
     winner_id = str(winner.evaluation.get("candidate_id"))
@@ -546,6 +584,8 @@ def run_team(
         "parallelism": round(accumulated_agent_ms / wall_ms, 2) if wall_ms else 0.0,
         "research_agents": len(research_results), "coding_candidates": len(candidates),
         "winner_candidate_id": winner_id, "winner_score": winner.score,
+        "workspace_plan": workspace_plan.as_dict(),
+        "integration_workspace_mode": integration.info.mode,
         "ledger": ledger.as_dict(), "verification": verification_payload,
         "stage_timings": [
             {"role": stage.role, "model": stage.model, "status": stage.status, "elapsed_ms": stage.elapsed_ms}

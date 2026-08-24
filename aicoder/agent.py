@@ -369,12 +369,22 @@ def run_agent(
                 return
             if kind == "team_start":
                 print(f"  {C.DIM}◆ Team runtime · research={payload.get('research')} · coders={payload.get('coders')}{C.RESET}", file=sys.stderr)
+            elif kind == "team_pipeline":
+                if payload.get("status") == "started":
+                    print(f"  {C.DIM}→ {payload.get('stage')}{C.RESET}", file=sys.stderr)
+            elif kind == "team_workspace_plan":
+                reason = str(payload.get("reason") or "")
+                suffix = f" · {reason}" if reason else ""
+                print(
+                    f"  {C.DIM}◆ workspace={payload.get('backend_mode')} · candidates={payload.get('candidate_count')}{suffix}{C.RESET}",
+                    file=sys.stderr,
+                )
             elif kind == "team_stage":
                 print(f"  {C.DIM}✓ {payload.get('role')} · {payload.get('status')} · {payload.get('model')}{C.RESET}", file=sys.stderr)
             elif kind == "team_candidate":
-                print(f"  {C.DIM}◆ coder {payload.get('slot')} · {payload.get('status')} · score={payload.get('score')}{C.RESET}", file=sys.stderr)
+                print(f"  {C.DIM}◆ {payload.get('candidate_id')} · {payload.get('status')} · score={payload.get('score')}{C.RESET}", file=sys.stderr)
             elif kind == "team_complete":
-                print(f"  {C.DIM}⚡ team complete · winner={payload.get('winner_slot')} · wall={int(payload.get('wall_ms') or 0)/1000.0:.1f}s{C.RESET}", file=sys.stderr)
+                print(f"  {C.DIM}⚡ team complete · winner={payload.get('winner_candidate_id')} · wall={int(payload.get('wall_ms') or 0)/1000.0:.1f}s{C.RESET}", file=sys.stderr)
 
         result = run_team(
             task=initial_prompt, state=state, config=config_from_state(state), client=client,

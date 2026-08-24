@@ -47,6 +47,29 @@ class BlindRankingTests(unittest.TestCase):
         self.assertGreater(objective_rank_key(safe), objective_rank_key(broken))
 
 
+class ResearchEvidenceBiasTests(unittest.TestCase):
+    def test_planner_research_prompt_does_not_expose_model_identity(self):
+        from aicoder.team_orchestrator import AgentStageResult, _build_planner_prompt
+        report = AgentStageResult(
+            role="research:primary_sources", model="famous/provider-model", status="completed",
+            response="finding", elapsed_ms=1,
+            evidence={"externally_verified": True, "successful_tools": ["search"]},
+        )
+        prompt = _build_planner_prompt("task", "repo", [report])
+        self.assertNotIn("famous/provider-model", prompt)
+        self.assertIn("verified-tool-evidence", prompt)
+        self.assertIn("tools=search", prompt)
+
+    def test_unverified_research_is_explicitly_marked(self):
+        from aicoder.team_orchestrator import AgentStageResult, _build_planner_prompt
+        report = AgentStageResult(
+            role="research:best_practices", model="model-a", status="completed",
+            response="claim", elapsed_ms=1, evidence={},
+        )
+        prompt = _build_planner_prompt("task", "repo", [report])
+        self.assertIn("unverified-or-local-only", prompt)
+
+
 class ProjectPlanTests(unittest.TestCase):
     def test_python_project_gets_compile_and_test_gates(self):
         with tempfile.TemporaryDirectory() as tmp:

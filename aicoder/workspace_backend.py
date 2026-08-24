@@ -68,6 +68,28 @@ class WorkspaceInfo:
 
 
 @dataclass(frozen=True)
+class TeamWorkspacePlan:
+    backend_mode: str
+    candidate_count: int
+    project_bytes: int
+    per_workspace_bytes: int
+    safe_ram_budget_bytes: int
+    total_candidate_bytes: int
+    reason: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "backend_mode": self.backend_mode,
+            "candidate_count": self.candidate_count,
+            "project_bytes": self.project_bytes,
+            "per_workspace_bytes": self.per_workspace_bytes,
+            "safe_ram_budget_bytes": self.safe_ram_budget_bytes,
+            "total_candidate_bytes": self.total_candidate_bytes,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True)
 class _Entry:
     kind: str
     digest: str = ""
@@ -657,6 +679,75 @@ class RamWorkspace(WorkspaceBackend):
             return
         self._closed = True
         shutil.rmtree(self._execution, ignore_errors=True)
+
+
+class IsolatedDiskWorkspace(RamWorkspace):
+    """Transactional isolated workspace on persistent storage for low-RAM team runs.
+
+    It intentionally reuses RamWorkspace's manifest, Git isolation, rollback and atomic
+    commit semantics; only the backing directory and mode differ.
+    """
+
+    def __init__(self, root: str | Path, *, requested_mode: str = "disk", checkpoint_id: str | None = None):
+        disk_root = CONFIG_DIR / "team-workspaces"
+        disk_root.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(disk_root, 0o700)
+        except OSError:
+            pass
+        super().__init__(
+            root, ram_root=disk_root, requested_mode=requested_mode,
+            estimated_bytes=0, safe_budget_bytes=0, checkpoint_id=checkpoint_id,
+        )
+        self._info = replace(
+            self._info, mode="disk-isolated", volatile=True, transactional=True,
+            fallback_reason="isolated disk candidate workspace",
+        )
+
+
+def team_workspace_plan(root: str | Path, candidate_count: int, requested_mode: str = "auto") -> TeamWorkspacePlan:
+    """Choose one fair backing mode for all parallel coding candidates.
+
+    RAM is selected only when the safe global budget can hold every candidate plus
+    one integration workspace at once. Otherwise every candidate uses the same
+    isolated disk backend, preventing performance-based model bias and RAM overcommit.
+    """
+    source = Path(root).expanduser().resolve(strict=False)
+    count = max(1, int(candidate_count))
+    requested = str(requested_mode or "auto").strip().lower()
+    project_bytes = _estimate_tree_bytes(source, include_git=False)
+    per_workspace = int(project_bytes * 1.35) + _RAM_OVERHEAD
+    ram_root, ram_free = _select_ram_root()
+    mem_available = _mem_available_bytes()
+    memory_budget = max(0, int(mem_available * 0.50) - _MIN_RAM_RESERVE) if mem_available else 0
+    fs_budget = max(0, int(ram_free * 0.80))
+    safe_budget = min(memory_budget, fs_budget) if memory_budget > 0 and fs_budget > 0 else 0
+    total = per_workspace * (count + 1)  # candidates + later integration workspace
+
+    if requested == "disk":
+        return TeamWorkspacePlan("disk-isolated", count, project_bytes, per_workspace, safe_budget, total, "disk mode requested")
+    if ram_root is None or safe_budget <= 0:
+        return TeamWorkspacePlan("disk-isolated", count, project_bytes, per_workspace, safe_budget, total, "safe RAM budget unavailable")
+    if total > safe_budget:
+        return TeamWorkspacePlan(
+            "disk-isolated", count, project_bytes, per_workspace, safe_budget, total,
+            f"team RAM need {total} exceeds safe global budget {safe_budget}",
+        )
+    return TeamWorkspacePlan("ram", count, project_bytes, per_workspace, safe_budget, total)
+
+
+def create_isolated_team_workspace(
+    root: str | Path, backend_mode: str, *, checkpoint_id: str | None = None,
+) -> WorkspaceBackend:
+    if backend_mode == "ram":
+        backend = create_workspace_backend(root, "ram", checkpoint_id=checkpoint_id)
+        if isinstance(backend, RamWorkspace) and backend.info.mode == "ram":
+            return backend
+        # A concurrent team must never fall through to direct DiskWorkspace.
+        return IsolatedDiskWorkspace(root, requested_mode="ram", checkpoint_id=checkpoint_id)
+    if backend_mode == "disk-isolated":
+        return IsolatedDiskWorkspace(root, requested_mode="disk", checkpoint_id=checkpoint_id)
+    raise ValueError(f"unsupported team workspace mode: {backend_mode}")
 
 
 def create_workspace_backend(
