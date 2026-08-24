@@ -302,7 +302,8 @@ def evaluate_candidate(candidate: CandidateResult) -> dict[str, Any]:
     diff = _git_diff(root)
     return {
         "score": score, "delta": delta, "checks": checks, "diff": diff,
-        "candidate_id": blind_candidate_id(diff),
+        "candidate_id": blind_candidate_id(),
+        "content_fingerprint": content_fingerprint(diff),
         "verification_passed": verification_passed(results),
     }
 
@@ -346,11 +347,8 @@ def _attach_blind_candidate_snapshots(integration: RamWorkspace, candidates: lis
     ordered = sorted(candidates, key=lambda item: (str(item.evaluation.get("candidate_id") or ""), item.slot))
     for ordinal, candidate in enumerate(ordered, start=1):
         diff = str(candidate.evaluation.get("diff") or "")
-        fingerprint = content_fingerprint(diff)
-        content_id = str(candidate.evaluation.get("candidate_id") or blind_candidate_id(diff))
-        # content_id intentionally remains model/slot blind. snapshot_id only prevents
-        # filesystem collisions when multiple candidates have identical content.
-        snapshot_id = f"{content_id}-{ordinal:02d}"
+        fingerprint = str(candidate.evaluation.get("content_fingerprint") or content_fingerprint(diff))
+        snapshot_id = str(candidate.evaluation.get("candidate_id") or blind_candidate_id())
         duplicate_of = seen_fingerprints.get(fingerprint)
         if duplicate_of is None:
             seen_fingerprints[fingerprint] = snapshot_id
@@ -366,7 +364,6 @@ def _attach_blind_candidate_snapshots(integration: RamWorkspace, candidates: lis
         )
         evidence.append({
             "candidate_id": snapshot_id,
-            "content_id": content_id,
             "content_fingerprint": fingerprint,
             "duplicate_of": duplicate_of,
             "score": int(candidate.evaluation.get("score") or 0),

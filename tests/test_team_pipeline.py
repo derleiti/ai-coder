@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from aicoder.team_pipeline import (
-    STAGE_ORDER, StageLedger, TeamStage, blind_candidate_id, objective_rank_key,
+    STAGE_ORDER, StageLedger, TeamStage, blind_candidate_id, content_fingerprint, objective_rank_key,
     project_verification_plan,
 )
 
@@ -26,9 +26,13 @@ class StageGateTests(unittest.TestCase):
 
 
 class BlindRankingTests(unittest.TestCase):
-    def test_candidate_id_depends_on_content_not_model_or_slot(self):
-        self.assertEqual(blind_candidate_id("same diff"), blind_candidate_id("same diff"))
-        self.assertNotEqual(blind_candidate_id("diff a"), blind_candidate_id("diff b"))
+    def test_candidate_run_ids_are_random_and_content_fingerprint_is_separate(self):
+        first = blind_candidate_id("same diff")
+        second = blind_candidate_id("same diff")
+        self.assertNotEqual(first, second)
+        self.assertTrue(first.startswith("cand-"))
+        self.assertEqual(content_fingerprint("same diff"), content_fingerprint("same diff"))
+        self.assertNotEqual(content_fingerprint("diff a"), content_fingerprint("diff b"))
 
     def test_objective_ranking_ignores_model_identity(self):
         base = {

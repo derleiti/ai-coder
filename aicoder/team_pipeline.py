@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import subprocess
 import time
+import uuid
 from typing import Any, Iterable
 
 
@@ -162,8 +163,14 @@ def content_fingerprint(diff_text: str) -> str:
     return hashlib.sha256(str(diff_text).encode("utf-8", errors="replace")).hexdigest()
 
 
-def blind_candidate_id(diff_text: str) -> str:
-    return "cand-" + content_fingerprint(diff_text)[:10]
+def blind_candidate_id(diff_text: str = "") -> str:
+    """Return a random model-neutral candidate run id.
+
+    Content identity is tracked separately via ``content_fingerprint`` so two
+    identical or empty diffs never collide at the filesystem/logging layer.
+    """
+    token = hashlib.sha256(uuid.uuid4().bytes).hexdigest()[:12]
+    return "cand-" + token
 
 
 def objective_rank_key(evaluation: dict[str, Any]) -> tuple:
