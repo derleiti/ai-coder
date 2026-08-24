@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, subprocess
+import os, re, subprocess
 from pathlib import Path
 from typing import Any, Dict
 
@@ -21,6 +21,34 @@ def activate_workspace(path: str | Path | None = None) -> Path:
         raise ValueError(f"workspace is not an existing directory: {root}")
     os.environ[ACTIVE_WORKSPACE_ENV] = str(root)
     return root
+
+
+_TASK_WORKSPACE_RE = re.compile(
+    r"^\s*(?:workspace(?:[-_ ]?projekt)?|project|projekt)\s*:\s*(?P<path>.+?)\s*$",
+    re.IGNORECASE,
+)
+
+
+def workspace_from_task(task: str, configured: str | Path | None = None) -> Path:
+    """Resolve an explicit user-declared project workspace before global settings.
+
+    Supported first-class labels include ``Workspace-Projekt:``, ``Workspace:``,
+    ``Project:`` and ``Projekt:``. Only an existing local directory is accepted.
+    If no explicit declaration is present, normal active/configured workspace
+    resolution is used.
+    """
+    for raw_line in str(task or "").splitlines():
+        match = _TASK_WORKSPACE_RE.match(raw_line)
+        if not match:
+            continue
+        raw = match.group("path").strip().strip("`\"'")
+        if not raw:
+            continue
+        candidate = Path(raw).expanduser().resolve(strict=False)
+        if not candidate.exists() or not candidate.is_dir():
+            raise ValueError(f"declared workspace is not an existing directory: {candidate}")
+        return candidate
+    return active_workspace(str(configured) if configured is not None else None)
 
 
 def path_within_workspace(value: str | Path, root: str | Path | None = None) -> tuple[Path, bool]:

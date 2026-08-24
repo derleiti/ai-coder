@@ -27,7 +27,7 @@ from ..privileges import (
     PrivilegeBroker, assess_execution, format_request,
 )
 from ..session_state import DEFAULT_RUNTIME_MODE, get_state
-from ..workspace import active_workspace
+from ..workspace import active_workspace, workspace_from_task
 from ..workspace_backend import open_workspace_for_run, preserve_workspace_for_resume
 from ..client import TriForceClient
 from .. import chat_history
@@ -250,7 +250,7 @@ class _AgentWorker(QThread):
                 )
 
         resume_requested = persistent_plan and is_short_confirmation(initial_prompt)
-        source_workspace = str(active_workspace(state.get("workspace_root")))
+        source_workspace = str(workspace_from_task(initial_prompt, state.get("workspace_root")))
         workspace_mode = str(state.get("workspace_mode", "auto") or "auto")
         workspace_backend = open_workspace_for_run(
             source_workspace, workspace_mode, resume=resume_requested, resume_plan_id=None,

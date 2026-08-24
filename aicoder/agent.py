@@ -20,7 +20,7 @@ from .privileges import (
     PrivilegeBroker, assess_execution, format_request,
 )
 from .session_state import DEFAULT_RUNTIME_MODE, get_state
-from .workspace import active_workspace
+from .workspace import active_workspace, workspace_from_task
 from .workspace_backend import open_workspace_for_run, preserve_workspace_for_resume
 from .ui import (
     C,
@@ -358,7 +358,7 @@ def run_agent(
         session = load_session()
         request_timeout = int(state.get("request_timeout", 300))
         client = TriForceClient(session.base_url, token=session.token, timeout=request_timeout)
-        source_workspace = str(active_workspace(state.get("workspace_root")))
+        source_workspace = str(workspace_from_task(initial_prompt, state.get("workspace_root")))
         model_client, _ = native_model_transport_from_env(client, default_model=model or state.get("selected_model"))
 
         def team_event(kind: str, payload: dict) -> None:

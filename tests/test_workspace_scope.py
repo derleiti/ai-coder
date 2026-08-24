@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 from aicoder import cli
 from aicoder.agent import _cli_approval, _headless_approval
 from aicoder.executor import run_tool
-from aicoder.workspace import ACTIVE_WORKSPACE_ENV, activate_workspace, active_workspace
+from aicoder.workspace import ACTIVE_WORKSPACE_ENV, activate_workspace, active_workspace, workspace_from_task
 
 
 class ActiveWorkspaceTests(unittest.TestCase):
@@ -26,6 +26,22 @@ class ActiveWorkspaceTests(unittest.TestCase):
                 self.assertEqual(active_workspace(str(persisted)), persisted.resolve())
                 activate_workspace(launched)
                 self.assertEqual(active_workspace(str(persisted)), launched.resolve())
+
+    def test_explicit_prompt_workspace_overrides_persisted_parent(self):
+        with tempfile.TemporaryDirectory() as temp:
+            parent = Path(temp) / "workspace"
+            project = parent / "project-a"
+            project.mkdir(parents=True)
+            prompt = f"Workspace-Projekt: {project}\n\nOptimize this project."
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop(ACTIVE_WORKSPACE_ENV, None)
+                self.assertEqual(workspace_from_task(prompt, parent), project.resolve())
+
+    def test_declared_missing_workspace_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            missing = Path(temp) / "missing"
+            with self.assertRaises(ValueError):
+                workspace_from_task(f"Workspace: {missing}", temp)
 
     def test_workspace_command_accepts_non_git_directory_and_persists_exact_root(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -227,26 +227,29 @@ def _run_candidate(
     tools: list[dict], stop_requested: StopFn | None,
 ) -> CandidateResult:
     backend = create_isolated_team_workspace(source_workspace, backend_mode)
-    backend.prepare()
-    if not isinstance(backend, RamWorkspace):
+    try:
+        backend.prepare()
+        if not isinstance(backend, RamWorkspace):
+            raise WorkspaceError("parallel candidate runtime requires a transactional isolated workspace")
+        system = build_system_prompt(tools, str(backend.info.execution_root)).rstrip() + "\n\n" + CODER_SYSTEM_TEMPLATE.format(slot=slot, strategy=strategy)
+        started = time.monotonic()
+        runtime = NativeLightRuntime(
+            client=client, model_client=model_client,
+            initial_prompt=_candidate_prompt(task, plan, coordinator, strategy),
+            model=model, fallback_model=None, workspace_root=str(backend.info.execution_root),
+            plan_workspace_root=source_workspace, protected_workspace_root=source_workspace,
+            tools=tools, system_prompt=system, load_tools_on_start=True,
+            quick_chat=False, persistent_plan=False, approval_fn=_candidate_approval,
+            max_iterations=18, max_output_tokens=12000, stop_requested=stop_requested,
+        )
+        run = runtime.run()
+        return CandidateResult(
+            slot=slot, model=model, strategy=strategy, workspace=backend, run=run,
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+        )
+    except Exception:
         backend.abort()
-        raise WorkspaceError("parallel candidate runtime requires a transactional isolated workspace")
-    system = build_system_prompt(tools, str(backend.info.execution_root)).rstrip() + "\n\n" + CODER_SYSTEM_TEMPLATE.format(slot=slot, strategy=strategy)
-    started = time.monotonic()
-    runtime = NativeLightRuntime(
-        client=client, model_client=model_client,
-        initial_prompt=_candidate_prompt(task, plan, coordinator, strategy),
-        model=model, fallback_model=None, workspace_root=str(backend.info.execution_root),
-        plan_workspace_root=source_workspace, protected_workspace_root=source_workspace,
-        tools=tools, system_prompt=system, load_tools_on_start=True,
-        quick_chat=False, persistent_plan=False, approval_fn=_candidate_approval,
-        max_iterations=18, max_output_tokens=12000, stop_requested=stop_requested,
-    )
-    run = runtime.run()
-    return CandidateResult(
-        slot=slot, model=model, strategy=strategy, workspace=backend, run=run,
-        elapsed_ms=int((time.monotonic() - started) * 1000),
-    )
+        raise
 
 
 def _git_diff(root: Path) -> str:
