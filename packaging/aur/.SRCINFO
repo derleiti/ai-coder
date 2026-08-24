@@ -1,13 +1,13 @@
 pkgbase = aicoder
 	pkgdesc = Agentic coding workstation for AILinux/TriForce with GUI, MCP registry and local OS tools
-	pkgver = 0.9.9
+	pkgver = 1.0.0
 	pkgrel = 1
 	url = https://github.com/derleiti/ai-coder
 	arch = x86_64
 	license = MIT
 	depends = glibc
 	optdepends = git: workspace support
-	source = aicoder-0.9.9::https://github.com/derleiti/ai-coder/releases/download/v0.9.9/aicoder-0.9.9-x86_64-linux
+	source = aicoder::https://github.com/derleiti/ai-coder/releases/download/v1.0.0/aicoder
 	sha256sums = 32c69a0ea3a23b33c2588caf2e058c1f1745d11b788875e47be79cf1095d279c
 
 pkgname = aicoder
