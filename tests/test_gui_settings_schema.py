@@ -61,6 +61,10 @@ class GuiSettingsSchemaTests(unittest.TestCase):
         self.assertEqual(widget.timeout_spin.minimum(), settings.REGISTRY["request_timeout"].minimum)
         self.assertEqual(widget.timeout_spin.maximum(), settings.REGISTRY["request_timeout"].maximum)
         self.assertEqual(widget.timeout_spin.toolTip(), settings.REGISTRY["request_timeout"].description)
+        self.assertEqual(widget.team_brainstorm_spin.minimum(), 1)
+        self.assertEqual(widget.team_brainstorm_spin.maximum(), 5)
+        self.assertEqual(widget.team_brainstorm_spin.value(), settings.REGISTRY["team_brainstorm_rounds"].default)
+        self.assertEqual(widget.team_brainstorm_spin.toolTip(), settings.REGISTRY["team_brainstorm_rounds"].description)
 
     def test_initial_population_does_not_write_via_change_signals(self):
         with (
@@ -82,6 +86,7 @@ class GuiSettingsSchemaTests(unittest.TestCase):
             runtime_mode="classic",
             native_openrouter_tool_calling=True,
             team_runtime_mode="on",
+            team_brainstorm_rounds=5,
             team_coder_model_1="provider/new-model",
         )
         widget._refresh_external_settings()
@@ -92,7 +97,44 @@ class GuiSettingsSchemaTests(unittest.TestCase):
         self.assertEqual(widget.approval_mode_combo.currentData(), "autopilot")
         self.assertEqual(widget._schema_widgets["runtime_mode"].currentData(), "classic")
         self.assertEqual(widget.team_runtime_combo.currentData(), "on")
+        self.assertEqual(widget.team_brainstorm_spin.value(), 5)
         self.assertEqual(widget._team_model_combos["team_coder_model_1"].currentText(), "provider/new-model")
+
+    def test_reset_all_settings_restores_defaults_and_refreshes_ui(self):
+        widget = self.make_widget()
+        self.store.update(
+            selected_model="provider/custom",
+            request_timeout=240,
+            team_runtime_mode="on",
+            team_brainstorm_rounds=5,
+            approval_mode="autopilot",
+        )
+        widget._refresh_external_settings()
+        with patch.object(
+            settings_widget.QMessageBox, "question",
+            return_value=settings_widget.QMessageBox.StandardButton.Yes,
+        ):
+            widget._reset_all_settings()
+        state = self.store.load()
+        self.assertEqual({k: state[k] for k in settings.DEFAULTS}, settings.DEFAULTS)
+        self.assertEqual(widget.timeout_spin.value(), settings.DEFAULTS["request_timeout"])
+        self.assertEqual(widget.team_runtime_combo.currentData(), settings.DEFAULTS["team_runtime_mode"])
+        self.assertEqual(widget.team_brainstorm_spin.value(), settings.DEFAULTS["team_brainstorm_rounds"])
+        self.assertEqual(widget.approval_mode_combo.currentData(), settings.DEFAULTS["approval_mode"])
+        self.assertEqual(widget.model_status.text(), "All settings reset to defaults.")
+
+    def test_reset_all_settings_cancel_keeps_current_values(self):
+        widget = self.make_widget()
+        self.store.update(request_timeout=240, team_brainstorm_rounds=5)
+        widget._refresh_external_settings()
+        with patch.object(
+            settings_widget.QMessageBox, "question",
+            return_value=settings_widget.QMessageBox.StandardButton.No,
+        ):
+            widget._reset_all_settings()
+        state = self.store.load()
+        self.assertEqual(state["request_timeout"], 240)
+        self.assertEqual(state["team_brainstorm_rounds"], 5)
 
     def test_unhandled_settings_are_schema_generated_and_saved_through_store(self):
         widget = self.make_widget()

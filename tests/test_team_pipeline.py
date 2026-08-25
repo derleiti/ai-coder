@@ -6,7 +6,7 @@ from pathlib import Path
 
 from aicoder.team_pipeline import (
     STAGE_ORDER, StageLedger, TeamStage, blind_candidate_id, content_fingerprint, objective_rank_key,
-    project_verification_plan,
+    project_verification_plan, execute_verification_plan,
 )
 
 
@@ -84,6 +84,18 @@ class ProjectPlanTests(unittest.TestCase):
             names = [item.name for item in plan]
             self.assertIn("python-compile", names)
             self.assertIn("python-tests", names)
+
+    def test_compile_gate_ignores_internal_candidate_snapshots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "pyproject.toml").write_text('[project]\nname="x"\nversion="0.1"\n', encoding="utf-8")
+            (root / "good.py").write_text('VALUE = 1\n', encoding="utf-8")
+            rejected = root / ".aicoder-team" / "candidates" / "rejected"
+            rejected.mkdir(parents=True)
+            (rejected / "bad.py").write_text('def broken(:\n', encoding="utf-8")
+            compile_command = next(item for item in project_verification_plan(root) if item.name == "python-compile")
+            result = execute_verification_plan(root, [compile_command])[0]
+            self.assertTrue(result.ok, result.output)
 
 
 if __name__ == "__main__":

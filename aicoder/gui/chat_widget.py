@@ -15,7 +15,7 @@ except ImportError:
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
     QTextEdit, QPlainTextEdit, QPushButton, QLabel, QMessageBox,
-    QMenu, QInputDialog,
+    QMenu, QInputDialog, QWidgetAction,
 )
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, QMetaObject, Q_ARG, QMimeData, QUrl
 from PyQt6.QtGui import (
@@ -148,7 +148,7 @@ class _AgentWorker(QThread):
                 route = configured if configured == effective else f"{configured} → {effective}"
                 detail = f"effective={route}"
                 detail += f" · transport={payload.get('transport') or 'default'}"
-                self.msg.emit("system", "Run route", detail)
+                self.msg.emit("runtime", "Run route", detail)
                 if bool(payload.get("resumed")):
                     self.msg.emit(
                         "system",
@@ -164,7 +164,7 @@ class _AgentWorker(QThread):
                     text = f"Slow filesystem operation: {payload.get('tool') or 'I/O'} {elapsed:.1f}s"
                 else:
                     text = str(payload.get("message") or "Performance bottleneck detected")
-                self.msg.emit("system", text, "performance")
+                self.msg.emit("runtime", text, "performance")
             elif kind == "performance_summary":
                 wall = int(payload.get("wall_ms") or 0) / 1000.0
                 model_s = int(payload.get("model_ms") or 0) / 1000.0
@@ -182,24 +182,33 @@ class _AgentWorker(QThread):
                     "AICoder verwendet weiterhin textbasiertes Tool-Calling; "
                     "native Provider-Toolschemas werden nicht gesendet."
                 )
-                self.msg.emit("system", _msg, runtime_label)
+                self.msg.emit("runtime", _msg, runtime_label)
             elif kind == "plan":
                 plan = payload.get("plan")
                 plan_id = getattr(plan, "id", "")
                 action = str(payload.get("action") or "plan")
                 if plan_id:
                     active_plan_id = str(plan_id)
-                    self.msg.emit("system", f"Persistent plan {action}: {plan_id}", runtime_label)
+                    self.msg.emit("runtime", f"Persistent plan {action}: {plan_id}", runtime_label)
             elif kind == "model_start":
                 phase = str(payload.get("phase") or "planning")
                 model_name = str(payload.get("model") or self.model or "backend")
                 self.activity.emit(f"Waiting for model · {model_name} · {phase} · idle timeout {int(payload.get('timeout') or 0)}s")
+            elif kind == "runtime_status":
+                category = str(payload.get("category") or "run").upper()
+                status = str(payload.get("status") or "info")
+                phase = str(payload.get("phase") or "runtime")
+                mode = str(payload.get("runtime_mode") or runtime_label)
+                step = int(payload.get("iteration") or 0)
+                title = f"{category} · {status}"
+                meta = f"{mode} · {phase}" + (f" · step {step}" if step else "")
+                self.msg.emit("runtime", str(payload.get("message") or ""), f"{title} · {meta}")
             elif kind == "model_response":
                 requested = str(payload.get("requested") or "default")
                 used = str(payload.get("model") or requested)
                 route = used if used == requested else f"{requested} → {used}"
                 telemetry = payload.get("transport_telemetry") if isinstance(payload.get("transport_telemetry"), dict) else {}
-                meta = route
+                meta = route + " · tok/s n/a"
                 request_id = str(payload.get("request_id") or telemetry.get("request_id") or "")
                 if request_id:
                     meta += f" · req {request_id[-8:]}"
@@ -209,8 +218,11 @@ class _AgentWorker(QThread):
                         f" · {int(telemetry.get('chunks') or 0)} chunks"
                         f" · max gap {float(telemetry.get('max_rx_gap_s') or 0.0):.1f}s"
                     )
+                if payload.get("usage_available"):
+                    meta += (f" · in/out {int(payload.get('input_tokens') or 0)}/{int(payload.get('output_tokens') or 0)}"
+                             f" · {float(payload.get('tokens_per_second') or 0.0):.1f} tok/s")
                 self.msg.emit(
-                    "system", f"Model response in {float(payload.get('elapsed_ms') or 0) / 1000.0:.1f}s", meta
+                    "runtime", f"Model response in {float(payload.get('elapsed_ms') or 0) / 1000.0:.1f}s", meta
                 )
             elif kind == "thought":
                 self.msg.emit("thought", str(payload.get("text") or ""), f"step {payload.get('iteration', '?')}")
@@ -263,7 +275,7 @@ class _AgentWorker(QThread):
                 workspace_detail += " · restored"
         elif info.fallback_reason:
             workspace_detail += f" · fallback: {info.fallback_reason}"
-        self.msg.emit("system", f"Execution workspace: {workspace_detail}", runtime_label)
+        self.msg.emit("runtime", f"Execution workspace: {workspace_detail}", runtime_label)
         runtime = NativeLightRuntime(
             client=self.client,
             initial_prompt=initial_prompt,
@@ -302,13 +314,18 @@ class _AgentWorker(QThread):
             return
         self.finished.emit(result.response, result.model)
 
-    def _run_team_impl(self, initial_prompt: str):
+    def _run_team_impl(self, initial_prompt: str, resume_checkpoint: dict | None = None):
         from ..model_transport import native_model_transport_from_env
         from ..team_orchestrator import run_team
         from ..team_runtime import config_from_state
 
         state = get_state()
-        source_workspace = str(workspace_from_task(initial_prompt, state.get("workspace_root")))
+        if resume_checkpoint is not None:
+            source_workspace = str(resume_checkpoint.get("source_workspace") or active_workspace(state.get("workspace_root")))
+            team_task = str(resume_checkpoint.get("task") or initial_prompt)
+        else:
+            source_workspace = str(workspace_from_task(initial_prompt, state.get("workspace_root")))
+            team_task = initial_prompt
         config = config_from_state(state)
         model_client, _ = native_model_transport_from_env(self.client, default_model=self.model or None)
 
@@ -320,25 +337,64 @@ class _AgentWorker(QThread):
                     f"Team runtime started · {payload.get('research', 0)} research · {payload.get('coders', 0)} coders",
                     "RAM candidates",
                 )
+            elif kind == "team_resume":
+                self.activity.emit(f"Team resume · {payload.get('stage') or '?'}")
+                self.msg.emit("runtime", f"Resuming team pipeline at {payload.get('stage') or '?'}", str(payload.get("source_workspace") or ""))
             elif kind == "team_pipeline":
                 stage = str(payload.get("stage") or "stage")
                 status = str(payload.get("status") or "?")
                 self.activity.emit(f"Team · {stage} · {status}")
                 if status == "started":
-                    self.msg.emit("system", f"Pipeline · {stage}", "stage")
+                    self.msg.emit("runtime", f"Pipeline · {stage}", "stage")
             elif kind == "team_workspace_plan":
                 mode = str(payload.get("backend_mode") or "?")
                 count = int(payload.get("candidate_count") or 0)
                 reason = str(payload.get("reason") or "").strip()
                 detail = f"{count} Kandidaten · {mode}" + (f" · {reason}" if reason else "")
-                self.msg.emit("system", "Workspace-Plan", detail)
+                self.msg.emit("runtime", "Workspace-Plan", detail)
             elif kind == "team_stage":
                 role = str(payload.get("role") or "stage")
                 status = str(payload.get("status") or "?")
                 model = str(payload.get("model") or "?")
                 elapsed = int(payload.get("elapsed_ms") or 0) / 1000.0
+                telemetry = payload.get("telemetry") if isinstance(payload.get("telemetry"), dict) else {}
+                meta = model + " · tok/s n/a"
+                if telemetry.get("usage_available"):
+                    meta += f" · in/out {int(telemetry.get('input_tokens') or 0)}/{int(telemetry.get('output_tokens') or 0)} · {float(telemetry.get('tokens_per_second') or 0.0):.1f} tok/s"
+                if payload.get("error"):
+                    meta += f" · ERROR {payload.get('error')}"
                 self.activity.emit(f"Team · {role} · {status}")
-                self.msg.emit("system", f"{role} · {status} · {elapsed:.1f}s", model)
+                self.msg.emit("runtime", f"{role} · {status} · {elapsed:.1f}s", meta)
+            elif kind == "team_worker_event":
+                role = str(payload.get("role") or "worker")
+                event = str(payload.get("event") or "?")
+                if event == "runtime_status":
+                    category = str(payload.get("category") or "run").upper()
+                    status = str(payload.get("status") or "info")
+                    self.msg.emit(
+                        "runtime", str(payload.get("message") or ""),
+                        f"{role} · {category} · {status} · {payload.get('phase') or 'runtime'}",
+                    )
+                elif event == "model_response":
+                    rate = float(payload.get("tokens_per_second") or 0.0)
+                    meta = f"{payload.get('model') or '?'} · {rate:.1f} tok/s" if payload.get("usage_available") else f"{payload.get('model') or '?'} · tok/s n/a"
+                    self.msg.emit("runtime", f"{role} · model response · {int(payload.get('elapsed_ms') or 0)/1000.0:.1f}s", meta)
+                elif event == "thought":
+                    text = str(payload.get("text") or "").strip()
+                    if text:
+                        self.msg.emit("thought", text[:1600], role)
+                elif event == "final":
+                    text = str(payload.get("response") or "").strip()
+                    if text:
+                        self.msg.emit("model", text[:6000], f"{role} · final")
+                elif event == "tool_result" and payload.get("is_error"):
+                    self.msg.emit("runtime", f"{role} · tool error · {payload.get('name')}", str(payload.get("result") or "")[-1000:])
+                elif event in {"error", "paused"}:
+                    self.msg.emit("runtime", f"{role} · {event}", str(payload.get("message") or payload.get("reason") or ""))
+            elif kind == "team_model_output":
+                text = str(payload.get("text") or "").strip()
+                if text:
+                    self.msg.emit("model", text[:6000], f"{payload.get('role') or 'planner'} · {payload.get('model') or '?'}")
             elif kind == "team_candidate":
                 cid = str(payload.get("candidate_id") or "candidate")
                 self.msg.emit(
@@ -346,6 +402,11 @@ class _AgentWorker(QThread):
                     f"{cid} · {payload.get('status')} · score {payload.get('score')}",
                     "anonymized candidate",
                 )
+            elif kind == "team_verification":
+                state = "OK" if payload.get("ok") else "FAIL"
+                self.msg.emit("runtime", f"Verify · {payload.get('name')} · {state}", f"{int(payload.get('elapsed_ms') or 0)/1000.0:.2f}s · exit {payload.get('exit_code')}")
+            elif kind == "team_error":
+                self.msg.emit("runtime", f"Team error · {payload.get('stage')}", str(payload.get("error") or ""))
             elif kind == "team_complete":
                 self.msg.emit(
                     "system",
@@ -354,9 +415,10 @@ class _AgentWorker(QThread):
                 )
 
         result = run_team(
-            task=initial_prompt, state=state, config=config, client=self.client,
+            task=team_task, state=state, config=config, client=self.client,
             model_client=model_client, source_workspace=source_workspace,
             event_fn=on_team_event, stop_requested=lambda: self._stopped,
+            resume_checkpoint=resume_checkpoint,
         )
         if result.status != "completed":
             self.error.emit(result.error or "Team runtime failed")
@@ -370,6 +432,13 @@ class _AgentWorker(QThread):
         messages = list(self.messages)
         latest = next((str(m.get("content") or "") for m in reversed(messages) if m.get("role") == "user"), "")
         from ..team_runtime import should_use_team
+        from ..team_orchestrator import load_latest_team_checkpoint
+        team_checkpoint = None
+        if latest and is_short_confirmation(latest):
+            team_checkpoint = load_latest_team_checkpoint(str(active_workspace(state.get("workspace_root"))))
+        if team_checkpoint is not None:
+            self._run_team_impl(latest, team_checkpoint)
+            return
         if latest and should_use_team(latest, str(state.get("team_runtime_mode") or "off")) and not is_short_confirmation(latest):
             self._run_team_impl(latest)
             return
@@ -475,6 +544,13 @@ class ChatWidget(QWidget):
                 action.setData(s["id"])
         menu.addSeparator()
         new_action = menu.addAction("➕ Neue Session")
+        menu.addSeparator()
+        clear_widget_action = QWidgetAction(menu)
+        clear_btn = QPushButton("Clear history")
+        clear_btn.setStyleSheet("QPushButton { color:#ff5c5c; background:transparent; border:0; text-align:left; padding:6px 12px; font-weight:600; } QPushButton:hover { background:#3a1f26; }")
+        clear_widget_action.setDefaultWidget(clear_btn)
+        menu.addAction(clear_widget_action)
+        clear_btn.clicked.connect(lambda: (menu.close(), self._clear_all_history()))
         chosen = menu.exec(self.history_btn.mapToGlobal(self.history_btn.rect().bottomLeft()))
         if chosen == new_action:
             self._new_session()
@@ -485,18 +561,32 @@ class ChatWidget(QWidget):
         self._clear_chat()
         self._session_id = None
 
+    def _clear_all_history(self):
+        answer = QMessageBox.question(
+            self, "Clear history",
+            "Delete all saved chat sessions? This cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        chat_history.clear_history()
+        self._session_id = None
+        self._clear_chat()
+        self._update_status_idle("History cleared")
+
     def _load_session(self, session_id: str):
         """Restore a previous chat session."""
         self.log.clear()
+        self._reset_runtime_panel()
         self._messages = []
         self._session_id = session_id
         msgs = chat_history.load_messages(session_id)
         for m in msgs:
             role = m["role"]
-            if role == "system":
-                continue
             self._append_msg(role, m["content"], m.get("meta", ""))
-            self._messages.append({"role": role, "content": m["content"]})
+            if role in {"user", "assistant"}:
+                self._messages.append({"role": role, "content": m["content"]})
         self._update_status_idle("Session geladen")
 
     def _build_ui(self):
@@ -509,6 +599,29 @@ class ChatWidget(QWidget):
         self.log.setObjectName("ChatLog")
         self.log.setReadOnly(True)
         layout.addWidget(self.log, stretch=1)
+
+        # Compact runtime console: keep high-frequency orchestration noise out of
+        # the conversational transcript so model reasoning remains readable.
+        runtime_head = QHBoxLayout()
+        self.runtime_summary = QLabel("Runtime · success 0 · errors 0")
+        self.runtime_summary.setObjectName("Caption")
+        runtime_head.addWidget(self.runtime_summary, stretch=1)
+        self.runtime_errors_btn = QPushButton("Show runtime errors")
+        self.runtime_errors_btn.setCheckable(True)
+        self.runtime_errors_btn.setFixedHeight(24)
+        self.runtime_errors_btn.toggled.connect(self._refresh_runtime_panel)
+        runtime_head.addWidget(self.runtime_errors_btn)
+        layout.addLayout(runtime_head)
+
+        self.runtime_log = QPlainTextEdit()
+        self.runtime_log.setObjectName("RuntimeLog")
+        self.runtime_log.setReadOnly(True)
+        self.runtime_log.setMaximumBlockCount(200)
+        self.runtime_log.setFixedHeight(78)  # roughly four compact lines
+        layout.addWidget(self.runtime_log)
+        self._runtime_entries = []
+        self._runtime_success_count = 0
+        self._runtime_error_count = 0
 
         # Status-Zeile (erweitert: User, Tier, Workspace, Tools)
         self.status = QLabel("Ready.")
@@ -566,15 +679,17 @@ class ChatWidget(QWidget):
         colors = {
             "user": ("#00d4ff", "You"),
             "assistant": ("#00ff88", "AI"),
+            "model": ("#d16dff", "Model"),
             "thought": ("#888", "Thought"),
             "tool": ("#ff9800", "Tool"),
             "tool_result": ("#aaa", "Result"),
             "error": ("#ff6b6b", "Error"),
+            "runtime": ("#7dd3fc", "Runtime"),
             "system": ("#666", "System"),
         }
         color, label = colors.get(role, ("#ccc", role))
         meta_html = f' <span style="color:#666;">({html.escape(meta)})</span>' if meta else ""
-        if role in ("assistant", "thought") and _HAS_MD:
+        if role in ("assistant", "model", "thought") and _HAS_MD:
             body = _md.markdown(text, extensions=["fenced_code", "nl2br", "tables"])
             # Style code blocks
             body = body.replace(
@@ -589,11 +704,21 @@ class ChatWidget(QWidget):
             content_html = f'<div style="color:#e0e0e0;">{body}</div>'
         else:
             esc = html.escape(text)
-            content_html = f'<span style="color:#e0e0e0; white-space:pre-wrap;">{esc}</span>'
+            if role == "runtime":
+                content_html = (
+                    '<div style="color:#dbeafe;background:#111827;border-left:3px solid #38bdf8;'
+                    'padding:6px 9px;margin-top:3px;font-size:12px;line-height:1.35;">' + esc + '</div>'
+                )
+            elif role == "error":
+                content_html = f'<span style="color:#fecaca;font-size:13px;white-space:pre-wrap;">{esc}</span>'
+            else:
+                content_html = f'<span style="color:#e0e0e0; white-space:pre-wrap;">{esc}</span>'
+        label_size = "13px" if role in {"runtime", "error", "assistant"} else "12px"
+        margin = "7px 0" if role in {"runtime", "error"} else "4px 0"
         block = (
-            f'<div style="margin:4px 0;">'
-            f'<span style="color:#666;">[{ts}]</span> '
-            f'<span style="color:{color};font-weight:bold;">{label}</span>{meta_html}<br>'
+            f'<div style="margin:{margin};">'
+            f'<span style="color:#666;font-size:10px;">[{ts}]</span> '
+            f'<span style="color:{color};font-weight:bold;font-size:{label_size};">{label}</span>{meta_html}<br>'
             f'{content_html}'
             f'</div><hr style="border-color:#222;">'
         )
@@ -654,8 +779,19 @@ class ChatWidget(QWidget):
     def _stop_activity(self):
         self._activity_timer.stop()
 
+    def _reset_runtime_panel(self):
+        if not hasattr(self, "runtime_log"):
+            return
+        self._runtime_entries = []
+        self._runtime_success_count = 0
+        self._runtime_error_count = 0
+        self.runtime_errors_btn.setChecked(False)
+        self.runtime_log.clear()
+        self._refresh_runtime_panel()
+
     def _clear_chat(self):
         self.log.clear()
+        self._reset_runtime_panel()
         self._tools = None
         self._system = None
         self._messages = []
@@ -864,8 +1000,50 @@ class ChatWidget(QWidget):
         )
         self._worker.start()
 
+    def _runtime_severity(self, text: str, meta: str = "", force_error: bool = False) -> str:
+        value = f"{meta} {text}".lower()
+        if force_error or any(token in value for token in ("crashed", "exception", "timeout", "exhausted", "runtime failed", "team error")):
+            return "error"
+        if any(token in value for token in ("blocked", "aborted by user", "path does not exist", "not enabled for this run", "paused")):
+            return "warning"
+        if any(token in value for token in ("success", "completed", " complete", "allowed", "satisfied", " ok", "done", "response in", "exit 0")):
+            return "success"
+        return "running"
+
+    def _append_runtime(self, text: str, meta: str = "", force_error: bool = False):
+        ts = datetime.now().strftime("%H:%M:%S")
+        severity = self._runtime_severity(text, meta, force_error)
+        if severity == "error":
+            self._runtime_error_count += 1
+        elif severity == "success":
+            self._runtime_success_count += 1
+        prefix = {"error": "ERR", "warning": "WARN", "success": "OK ", "running": "RUN"}[severity]
+        detail = f" [{meta}]" if meta else ""
+        self._runtime_entries.append((severity, f"{ts} {prefix}{detail} {text}".strip()))
+        self._runtime_entries = self._runtime_entries[-200:]
+        self._refresh_runtime_panel()
+
+    def _refresh_runtime_panel(self, *_args):
+        errors_only = bool(getattr(self, "runtime_errors_btn", None) and self.runtime_errors_btn.isChecked())
+        entries = [line for severity, line in self._runtime_entries if (severity == "error" or not errors_only)]
+        self.runtime_log.setPlainText("\n".join(entries[-4:]))
+        cursor = self.runtime_log.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.runtime_log.setTextCursor(cursor)
+        self.runtime_summary.setText(
+            f"Runtime · success {self._runtime_success_count} · errors {self._runtime_error_count}"
+        )
+        self.runtime_errors_btn.setText("Show all runtime" if errors_only else "Show runtime errors")
+
     def _on_agent_msg(self, role: str, text: str, meta: str):
+        if role in {"runtime", "tool", "tool_result"}:
+            self._append_runtime(text, meta)
+            return
+        if role == "error":
+            self._append_runtime(text, meta, force_error=True)
         self._append_msg(role, text, meta)
+        if self._session_id and role in {"system", "model", "thought", "error"}:
+            chat_history.save_message(self._session_id, role, text, meta)
 
     def _on_response(self, text: str, model_used: str):
         self._stop_activity()

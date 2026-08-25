@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import os
 import subprocess
 import tempfile
@@ -54,6 +55,34 @@ class RamWorkspaceTests(unittest.TestCase):
                 self.assertEqual(backend.info.source_root, project.resolve())
             finally:
                 backend.abort()
+
+    def test_ram_workspace_excludes_generated_dependencies_and_language_caches(self):
+        with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as ram:
+            root = Path(temp)
+            (root / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+            generated_dirs = (
+                ".venv", "node_modules", "target", ".gradle", "obj",
+                "dist", "build", "coverage", ".cache", "vendor", "DerivedData",
+            )
+            for name in generated_dirs:
+                path = root / name
+                path.mkdir(parents=True)
+                (path / "generated.bin").write_bytes(b"x" * 64 * 1024)
+            for name in ("module.pyc", "native.o", "debug.log", "scratch.tmp", ".DS_Store"):
+                (root / name).write_bytes(b"generated")
+
+            backend = RamWorkspace(root, ram_root=ram)
+            execution = backend.prepare()
+            try:
+                self.assertTrue((execution / "app.py").is_file())
+                for name in generated_dirs:
+                    self.assertFalse((execution / name).exists(), name)
+                for name in ("module.pyc", "native.o", "debug.log", "scratch.tmp", ".DS_Store"):
+                    self.assertFalse((execution / name).exists(), name)
+                self.assertLess(backend.info.estimated_bytes, 64 * 1024)
+            finally:
+                backend.abort()
+
 
     def test_ram_workspace_is_isolated_until_verified_finalize(self):
         with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as ram:
@@ -141,6 +170,17 @@ class RamWorkspaceTests(unittest.TestCase):
             self.assertEqual(subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip(), source_head)
             backend.abort()
 
+    def test_ram_workspace_finalizer_removes_orphan_execution_tree(self):
+        with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as ram:
+            root = Path(temp)
+            (root / "x.txt").write_text("x", encoding="utf-8")
+            backend = RamWorkspace(root, ram_root=ram)
+            execution = backend.prepare()
+            self.assertTrue(execution.exists())
+            del backend
+            gc.collect()
+            self.assertFalse(execution.exists())
+
     def test_auto_falls_back_to_disk_when_safe_budget_is_too_small(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -186,3 +226,20 @@ class TeamWorkspaceBudgetTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class WorkspaceNativeDiffTests(unittest.TestCase):
+    def test_ram_delta_diff_does_not_require_git_metadata(self):
+        with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as ram:
+            source = Path(temp)
+            (source / "one.txt").write_text("old\n", encoding="utf-8")
+            backend = RamWorkspace(source, ram_root=ram)
+            root = backend.prepare()
+            try:
+                (root / "one.txt").write_text("new\n", encoding="utf-8")
+                (root / "two.txt").write_text("added\n", encoding="utf-8")
+                diff = backend.delta_diff()
+                self.assertIn("-old", diff)
+                self.assertIn("+new", diff)
+                self.assertIn("two.txt", diff)
+            finally:
+                backend.abort()

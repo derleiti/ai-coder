@@ -37,6 +37,38 @@ class ActiveWorkspaceTests(unittest.TestCase):
                 os.environ.pop(ACTIVE_WORKSPACE_ENV, None)
                 self.assertEqual(workspace_from_task(prompt, parent), project.resolve())
 
+    def test_inline_sentence_after_absolute_workspace_is_not_part_of_path(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            project = root / "aicoder-experimental"
+            project.mkdir(parents=True)
+            prompt = f"Workspace-Projekt: {project}. Work only in this project."
+            self.assertEqual(workspace_from_task(prompt, root), project.resolve())
+
+    def test_inline_sentence_after_relative_workspace_is_not_part_of_path(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            project = root / "aicoder-experimental"
+            project.mkdir(parents=True)
+            prompt = "Workspace-Projekt: aicoder-experimental; optimize only this project."
+            self.assertEqual(workspace_from_task(prompt, root), project.resolve())
+
+    def test_existing_workspace_with_sentence_like_punctuation_wins_as_complete_path(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            project = root / "release. candidate"
+            project.mkdir(parents=True)
+            prompt = f"Workspace: {project}"
+            self.assertEqual(workspace_from_task(prompt, root), project.resolve())
+
+    def test_english_workspace_project_label_resolves_relative_project(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            project = root / "aicoder-experimental"
+            project.mkdir(parents=True)
+            prompt = "Workspace project: aicoder-experimental\n\nOptimize this project."
+            self.assertEqual(workspace_from_task(prompt, root), project.resolve())
+
     def test_relative_declared_workspace_resolves_inside_configured_project_container(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "workspace"

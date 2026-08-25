@@ -273,7 +273,7 @@ class SettingsWidget(QWidget):
         self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.password_edit.setPlaceholderText("Password")
         login_form.addRow("Base URL:", self.base_url_edit)
-        login_form.addRow("E-Mail:", self.email_edit)
+        login_form.addRow("Email:", self.email_edit)
         login_form.addRow("Password:", self.password_edit)
 
         btn_row = QHBoxLayout()
@@ -291,7 +291,7 @@ class SettingsWidget(QWidget):
         layout.addWidget(login_group)
 
         # --- Model Group ---
-        model_group = QGroupBox("Modell-Konfiguration")
+        model_group = QGroupBox("Model configuration")
         model_form = QFormLayout()
         model_form.setHorizontalSpacing(14)
         model_form.setVerticalSpacing(9)
@@ -300,32 +300,32 @@ class SettingsWidget(QWidget):
         self.model_combo = QComboBox()
         self.model_combo.setEditable(True)
         self.model_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        self.model_combo.lineEdit().setPlaceholderText("Modell auswählen oder ID eingeben...")
+        self.model_combo.lineEdit().setPlaceholderText("Select a model or enter an ID...")
         self.model_combo.setMinimumWidth(500)
         self.model_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
         # Refresh button
-        refresh_btn = QPushButton("Modelle laden")
+        refresh_btn = QPushButton("Load models")
         refresh_btn.clicked.connect(self._load_models)
 
         self.model_status = QLabel("")
         self.model_status.setStyleSheet("color: #888; font-size: 11px;")
 
-        model_form.addRow("Basismodell:", self.model_combo)
+        model_form.addRow("Base model:", self.model_combo)
 
         timeout_spec = settings_core.REGISTRY["request_timeout"]
         self.timeout_spin = QSpinBox()
         self.timeout_spin.setRange(int(timeout_spec.minimum or 0), int(timeout_spec.maximum or 2_147_483_647))
         self.timeout_spin.setSuffix(" s")
         self.timeout_spin.setToolTip(timeout_spec.description)
-        model_form.addRow("Request-Timeout:", self.timeout_spin)
+        model_form.addRow("Idle watchdog:", self.timeout_spin)
 
         # Buttons row
         model_btn_row = QHBoxLayout()
-        save_btn = QPushButton("Basismodell speichern")
+        save_btn = QPushButton("Save base model")
         save_btn.clicked.connect(self._save_model_config)
-        self.probe_btn = QPushButton("Modell testen")
-        self.probe_btn.setToolTip("Kleine Direktanfrage; misst die reale End-to-End-Latenz dieses Modells")
+        self.probe_btn = QPushButton("Test model")
+        self.probe_btn.setToolTip("Small direct request that measures real end-to-end model latency")
         self.probe_btn.clicked.connect(self._test_model)
         model_btn_row.addWidget(refresh_btn)
         model_btn_row.addWidget(save_btn)
@@ -338,35 +338,42 @@ class SettingsWidget(QWidget):
         layout.addWidget(model_group)
 
         # --- Agent Team Group ---
-        team_group = QGroupBox("Agent-Team · RAM Multi-Agent Runtime")
+        team_group = QGroupBox("Agent Team · RAM Multi-Agent Runtime")
         team_form = QFormLayout()
         team_form.setHorizontalSpacing(14)
         team_form.setVerticalSpacing(7)
 
         self.team_runtime_combo = QComboBox()
         team_mode_labels = {
-            "off": "Aus — normaler Einzelagent",
-            "auto": "Auto — Team nur für größere Coding-Aufgaben",
-            "on": "An — Team bevorzugen",
+            "off": "Off — normal single agent",
+            "auto": "Auto — team for substantive coding tasks",
+            "on": "On — prefer team runtime",
         }
         for value in settings_core.REGISTRY["team_runtime_mode"].choice_list():
             self.team_runtime_combo.addItem(team_mode_labels.get(value, value), value)
         self.team_runtime_combo.setToolTip(settings_core.REGISTRY["team_runtime_mode"].description)
-        team_form.addRow("Team-Runtime:", self.team_runtime_combo)
+        team_form.addRow("Team runtime:", self.team_runtime_combo)
+
+        brainstorm_spec = settings_core.REGISTRY["team_brainstorm_rounds"]
+        self.team_brainstorm_spin = QSpinBox()
+        self.team_brainstorm_spin.setRange(int(brainstorm_spec.minimum or 1), int(brainstorm_spec.maximum or 5))
+        self.team_brainstorm_spin.setSuffix(" rounds")
+        self.team_brainstorm_spin.setToolTip(brainstorm_spec.description)
+        team_form.addRow("Brainstorm rounds:", self.team_brainstorm_spin)
 
         team_labels = [
-            ("team_research_model_1", "Recherche 1 · Primärquellen / aktuelle Docs"),
-            ("team_research_model_2", "Recherche 2 · Best Practices / bewährte Architektur"),
-            ("team_research_model_3", "Recherche 3 · Sicherheit / Zuverlässigkeit"),
-            ("team_research_model_4", "Recherche 4 · Alternativen / ähnliche Systeme"),
-            ("team_planner_model", "Planer · gemeinsamer Implementierungsplan"),
-            ("team_coordinator_model", "Koordinator · Planprüfung / Laufsteuerung"),
-            ("team_coder_model_1", "Coder 1 · konservativ / minimal"),
-            ("team_coder_model_2", "Coder 2 · Architektur-first"),
-            ("team_coder_model_3", "Coder 3 · Performance / Effizienz"),
-            ("team_coder_model_4", "Coder 4 · Robustheit / Sicherheit"),
-            ("team_merge_model", "Merge · Integration der besten Kandidaten"),
-            ("team_test_planner_model", "Test-Planer · Verifikationsplan"),
+            ("team_research_model_1", "Research 1 · Primary sources / current docs"),
+            ("team_research_model_2", "Research 2 · Best practices / proven architecture"),
+            ("team_research_model_3", "Research 3 · Security / reliability"),
+            ("team_research_model_4", "Research 4 · Alternatives / comparable systems"),
+            ("team_planner_model", "Planner · shared implementation plan"),
+            ("team_coordinator_model", "Coordinator · plan review / run coordination"),
+            ("team_coder_model_1", "Coder 1 · conservative / minimal"),
+            ("team_coder_model_2", "Coder 2 · architecture-first"),
+            ("team_coder_model_3", "Coder 3 · performance / efficiency"),
+            ("team_coder_model_4", "Coder 4 · robustness / security"),
+            ("team_merge_model", "Merge · integrate the best candidates"),
+            ("team_test_planner_model", "Test planner · verification plan"),
         ]
         for key, label in team_labels:
             combo = QComboBox()
@@ -381,19 +388,19 @@ class SettingsWidget(QWidget):
             self._team_model_combos[key] = combo
 
         note = QLabel(
-            "Leere/off Slots werden übersprungen. @primary verwendet das Basismodell. "
-            "Dasselbe Modell darf beliebig oft eingesetzt werden. Recherche läuft read-only; "
-            "Coder arbeiten in getrennten RAM-Workspaces. Bewertung erfolgt zuerst durch Tests und Messdaten."
+            "Empty/off slots are skipped. @primary uses the base model. "
+            "The same model may be reused in multiple roles. Research is read-only; "
+            "coders work in isolated RAM workspaces. Tests and measurements take priority in evaluation."
         )
         note.setWordWrap(True)
         note.setStyleSheet("color: #888; font-size: 11px;")
         team_form.addRow(note)
 
-        team_save = QPushButton("Agent-Team speichern")
+        team_save = QPushButton("Save agent team")
         team_save.clicked.connect(self._save_team_config)
-        self.team_probe_btn = QPushButton("Team-KIs prüfen")
+        self.team_probe_btn = QPushButton("Test team models")
         self.team_probe_btn.setToolTip(
-            "Prüft jedes konfigurierte eindeutige Team-Modell mit einem echten Native-Light file_read-Roundtrip."
+            "Tests every distinct configured team model with a real Native-Light file_read roundtrip."
         )
         self.team_probe_btn.clicked.connect(self._test_team_models)
         self.team_status = QLabel("")
@@ -408,20 +415,20 @@ class SettingsWidget(QWidget):
         layout.addWidget(team_group)
 
         # --- Permission Group ---
-        permission_group = QGroupBox("Berechtigungen und Autopilot")
+        permission_group = QGroupBox("Permissions and autopilot")
         permission_form = QFormLayout()
         approval_spec = settings_core.REGISTRY["approval_mode"]
         approval_labels = {
-            "ask": "Manuell — jede Änderung bestätigen",
-            "autopilot": "Autopilot — sichere Änderungen automatisch freigeben",
-            "all": "Workspace-Auto — normale Änderungen automatisch freigeben",
+            "ask": "Manual — confirm every change",
+            "autopilot": "Autopilot — automatically approve safe changes",
+            "all": "Workspace auto — automatically approve normal changes",
         }
         self.approval_mode_combo = QComboBox()
         for value in approval_spec.choice_list():
             self.approval_mode_combo.addItem(approval_labels.get(value, value), value)
         self.approval_mode_combo.setMinimumWidth(420)
         self.approval_mode_combo.setToolTip(approval_spec.description)
-        save_permissions_btn = QPushButton("Berechtigungen speichern")
+        save_permissions_btn = QPushButton("Save permissions")
         save_permissions_btn.clicked.connect(self._save_permission_config)
         self.permission_status = QLabel("Aktueller Modus wird aus state.json geladen")
         self.permission_status.setStyleSheet("color: #888; font-size: 11px;")
@@ -505,7 +512,7 @@ class SettingsWidget(QWidget):
             if key not in handled and not key.startswith("team_") and not spec.sensitive
         ]
         if additional:
-            schema_group = QGroupBox("Weitere Einstellungen")
+            schema_group = QGroupBox("Additional settings")
             schema_form = QFormLayout()
             schema_form.setHorizontalSpacing(14)
             schema_form.setVerticalSpacing(9)
@@ -515,7 +522,7 @@ class SettingsWidget(QWidget):
                 label = f"{spec.key}{' ⚠' if spec.security_impact else ''}:"
                 schema_form.addRow(label, widget)
                 self._schema_widgets[spec.key] = widget
-            schema_save = QPushButton("Weitere Einstellungen speichern")
+            schema_save = QPushButton("Save additional settings")
             schema_save.clicked.connect(self._save_schema_settings)
             self.schema_status = QLabel("")
             self.schema_status.setStyleSheet("color: #888; font-size: 11px;")
@@ -526,6 +533,18 @@ class SettingsWidget(QWidget):
             schema_form.addRow(schema_row)
             schema_group.setLayout(schema_form)
             layout.addWidget(schema_group)
+
+        reset_group = QGroupBox("Reset settings")
+        reset_layout = QHBoxLayout()
+        reset_note = QLabel("Restore all AICoder settings to their built-in defaults. Login/session credentials are not changed.")
+        reset_note.setWordWrap(True)
+        self.reset_all_settings_btn = QPushButton("Reset all settings")
+        self.reset_all_settings_btn.setStyleSheet("color: #ff6b6b;")
+        self.reset_all_settings_btn.clicked.connect(self._reset_all_settings)
+        reset_layout.addWidget(reset_note, 1)
+        reset_layout.addWidget(self.reset_all_settings_btn)
+        reset_group.setLayout(reset_layout)
+        layout.addWidget(reset_group)
 
 
     def _create_schema_widget(self, spec):
@@ -580,6 +599,22 @@ class SettingsWidget(QWidget):
                 widget.setText(",".join(str(item) for item in value))
         else:
             widget.setText("" if value is None else str(value))
+
+    def _reset_all_settings(self):
+        reply = QMessageBox.question(
+            self,
+            "Reset all settings",
+            "Reset every AICoder setting to its built-in default?\n\nYour login/session credentials will be kept.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        state = settings_core.STORE.reset_all()
+        self._apply_state_to_widgets(state, emit_changes=True)
+        self.model_status.setText("All settings reset to defaults.")
+        self.model_status.setStyleSheet("color: #00ff88; font-size: 11px;")
+
 
     def _save_schema_settings(self):
         if self._loading_settings:
@@ -649,6 +684,7 @@ class SettingsWidget(QWidget):
             team_idx = self.team_runtime_combo.findData(state.get("team_runtime_mode", settings_core.REGISTRY["team_runtime_mode"].default))
             if team_idx >= 0:
                 self.team_runtime_combo.setCurrentIndex(team_idx)
+            self.team_brainstorm_spin.setValue(int(state.get("team_brainstorm_rounds", settings_core.REGISTRY["team_brainstorm_rounds"].default)))
             for key, combo in self._team_model_combos.items():
                 value = str(state.get(key, settings_core.REGISTRY[key].default) or "")
                 combo.setCurrentText(value or "off")
@@ -704,7 +740,7 @@ class SettingsWidget(QWidget):
             self.model_status.setStyleSheet("color: #ff6b6b; font-size: 11px;")
             return
 
-        self.model_status.setText("Modelle werden geladen...")
+        self.model_status.setText("Loading models...")
         self.model_status.setStyleSheet("color: #00d4ff; font-size: 11px;")
 
         self._loader = _ModelLoader(client)
@@ -741,7 +777,7 @@ class SettingsWidget(QWidget):
         if cur_model:
             self.model_combo.setCurrentText(cur_model)
 
-        self.model_status.setText(f"{len(models)} Modelle ({tier})")
+        self.model_status.setText(f"{len(models)} models ({tier})")
         self.model_status.setStyleSheet("color: #00ff88; font-size: 11px;")
         self.models_loaded.emit(self._models)
 
@@ -888,22 +924,22 @@ class SettingsWidget(QWidget):
             if value and value not in models:
                 models.append(value)
         if not models:
-            self.team_status.setText("Keine aktiven Team-Modelle zum Prüfen.")
+            self.team_status.setText("No active team models to test.")
             self.team_status.setStyleSheet("color: #ffb020; font-size: 11px;")
             return
         if str(state.get("runtime_mode") or "native-light") != "native-light":
-            self.team_status.setText("Team-Test benötigt Runtime native-light.")
+            self.team_status.setText("Team test requires the native-light runtime.")
             self.team_status.setStyleSheet("color: #ff6b6b; font-size: 11px;")
             return
         try:
             session = load_session()
         except Exception as exc:
-            self.team_status.setText(f"Team-Test nicht verfügbar: {exc}")
+            self.team_status.setText(f"Team test unavailable: {exc}")
             self.team_status.setStyleSheet("color: #ff6b6b; font-size: 11px;")
             return
         timeout = max(10, min(60, int(self.timeout_spin.value())))
         self.team_probe_btn.setEnabled(False)
-        self.team_status.setText(f"Prüfe {len(models)} Team-KI(s) · Native-Light Tool-Roundtrip …")
+        self.team_status.setText(f"Testing {len(models)} team model(s) · Native-Light tool roundtrip …")
         self.team_status.setStyleSheet("color: #00d4ff; font-size: 11px;")
         self._team_probe = _TeamModelProbe(
             session.base_url, session.token, models, timeout,
@@ -931,13 +967,16 @@ class SettingsWidget(QWidget):
             if row.get("error"):
                 detail += f" · {str(row.get('error'))[:180]}"
             lines.append(detail)
-        QMessageBox.information(self, "Team-KIs prüfen", "\n".join(lines))
+        QMessageBox.information(self, "Test team models", "\n".join(lines))
 
 
     def _save_team_config(self):
         if self._loading_settings:
             return
-        proposed = {"team_runtime_mode": self.team_runtime_combo.currentData() or "auto"}
+        proposed = {
+            "team_runtime_mode": self.team_runtime_combo.currentData() or "auto",
+            "team_brainstorm_rounds": self.team_brainstorm_spin.value(),
+        }
         for key, combo in self._team_model_combos.items():
             text = combo.currentText().strip()
             proposed[key] = "" if text.lower() in {"off", "none", "disabled"} else text
@@ -947,15 +986,15 @@ class SettingsWidget(QWidget):
             config = config_from_state(get_state())
             errors = config.validate()
         except settings_core.SettingsError as exc:
-            self.team_status.setText(f"Ungültige Einstellung: {exc}")
+            self.team_status.setText(f"Invalid setting: {exc}")
             self.team_status.setStyleSheet("color: #ff6b6b; font-size: 11px;")
             return
         if errors:
-            self.team_status.setText("Gespeichert mit Hinweis · " + "; ".join(errors))
+            self.team_status.setText("Saved with warning · " + "; ".join(errors))
             self.team_status.setStyleSheet("color: #ffb020; font-size: 11px;")
         else:
             self.team_status.setText(
-                f"Gespeichert · {len(config.research)} Recherche · {len(config.coders)} Coder · {config.active_count} Rollen"
+                f"Saved · {len(config.research)} research · {len(config.coders)} coders · {config.active_count} roles"
             )
             self.team_status.setStyleSheet("color: #00ff88; font-size: 11px;")
         self._settings_snapshot = self._state_signature(get_state())
@@ -1019,7 +1058,7 @@ class SettingsWidget(QWidget):
         model = self.model_combo.currentText().strip()
         set_model(model)
         set_request_timeout(self.timeout_spin.value())
-        self.model_status.setText("Gespeichert.")
+        self.model_status.setText("Saved.")
         self.model_status.setStyleSheet("color: #00ff88; font-size: 11px;")
         self._settings_snapshot = self._state_signature(get_state())
         self.selection_changed.emit(model)

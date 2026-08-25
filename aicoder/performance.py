@@ -22,6 +22,32 @@ def _ms(seconds: float) -> int:
     return max(0, int(round(float(seconds) * 1000.0)))
 
 
+def _int_value(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def model_usage_metrics(result: Any, elapsed_ms: int | float = 0) -> dict[str, Any]:
+    """Normalize provider token-usage metadata without inspecting response text."""
+    data = result if isinstance(result, dict) else {}
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    gemini = data.get("usageMetadata") if isinstance(data.get("usageMetadata"), dict) else {}
+    input_tokens = _int_value(usage.get("prompt_tokens") or usage.get("input_tokens") or gemini.get("promptTokenCount") or gemini.get("inputTokenCount"))
+    output_tokens = _int_value(usage.get("completion_tokens") or usage.get("output_tokens") or gemini.get("candidatesTokenCount") or gemini.get("outputTokenCount"))
+    total_tokens = _int_value(usage.get("total_tokens") or gemini.get("totalTokenCount"))
+    if not total_tokens and (input_tokens or output_tokens):
+        total_tokens = input_tokens + output_tokens
+    elapsed = max(0, _int_value(elapsed_ms))
+    tokens_per_second = round(output_tokens / (elapsed / 1000.0), 2) if output_tokens and elapsed > 0 else 0.0
+    return {
+        "input_tokens": input_tokens, "output_tokens": output_tokens,
+        "total_tokens": total_tokens, "tokens_per_second": tokens_per_second,
+        "usage_available": bool(input_tokens or output_tokens or total_tokens),
+    }
+
+
 @dataclass
 class RuntimePerformance:
     """Aggregate timing for one agent run.
@@ -37,6 +63,11 @@ class RuntimePerformance:
     filesystem_ms: int = 0
     build_test_ms: int = 0
     model_requests: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    tokenized_model_requests: int = 0
+    tokenized_model_ms: int = 0
     tool_calls: int = 0
     filesystem_calls: int = 0
     tool_errors: int = 0
@@ -44,11 +75,20 @@ class RuntimePerformance:
     slowest_tool_ms: int = 0
     slowest_tool: str = ""
 
-    def record_model(self, elapsed_ms: int | float) -> None:
+    def record_model(
+        self, elapsed_ms: int | float, *, input_tokens: int = 0,
+        output_tokens: int = 0, total_tokens: int = 0,
+    ) -> None:
         elapsed = max(0, int(round(float(elapsed_ms or 0))))
         self.model_ms += elapsed
         self.model_requests += 1
         self.slowest_model_ms = max(self.slowest_model_ms, elapsed)
+        self.input_tokens += max(0, int(input_tokens or 0))
+        self.output_tokens += max(0, int(output_tokens or 0))
+        self.total_tokens += max(0, int(total_tokens or 0))
+        if input_tokens or output_tokens or total_tokens:
+            self.tokenized_model_requests += 1
+            self.tokenized_model_ms += elapsed
 
     def record_tool(self, name: str, elapsed_s: float, *, is_error: bool = False) -> None:
         elapsed = _ms(elapsed_s)
@@ -74,6 +114,7 @@ class RuntimePerformance:
         tool_share = (self.tool_ms / wall_ms) if wall_ms else 0.0
         io_share = (self.filesystem_ms / wall_ms) if wall_ms else 0.0
         average_model_ms = int(self.model_ms / self.model_requests) if self.model_requests else 0
+        output_tokens_per_second = round(self.output_tokens / (self.tokenized_model_ms / 1000.0), 2) if self.output_tokens and self.tokenized_model_ms else 0.0
 
         bottleneck = "orchestration"
         dominant_ms = orchestration_ms
@@ -112,6 +153,12 @@ class RuntimePerformance:
             "build_test_ms": self.build_test_ms,
             "orchestration_ms": orchestration_ms,
             "model_requests": self.model_requests,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "total_tokens": self.total_tokens,
+            "tokenized_model_requests": self.tokenized_model_requests,
+            "tokenized_model_ms": self.tokenized_model_ms,
+            "output_tokens_per_second": output_tokens_per_second,
             "tool_calls": self.tool_calls,
             "filesystem_calls": self.filesystem_calls,
             "tool_errors": self.tool_errors,

@@ -45,6 +45,22 @@ class RegistrySchemaTests(unittest.TestCase):
         self.assertEqual(first, sorted(first, key=lambda k: (settings.REGISTRY[k].group, k)))
 
 
+class BrainstormSettingTests(unittest.TestCase):
+    def test_brainstorm_rounds_are_bounded(self):
+        self.assertEqual(settings.coerce("team_brainstorm_rounds", "2"), 2)
+        self.assertEqual(settings.REGISTRY["team_brainstorm_rounds"].default, 2)
+        for bad in (0, 6):
+            with self.subTest(bad=bad), self.assertRaises(SettingsError):
+                settings.coerce("team_brainstorm_rounds", bad)
+
+    def test_legacy_brainstorm_minutes_migrate_to_rounds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            path.write_text(json.dumps({"team_brainstorm_minutes": 4}), encoding="utf-8")
+            store = SettingsStore(lambda: path)
+            self.assertEqual(store.load()["team_brainstorm_rounds"], 4)
+
+
 class CoercionTests(unittest.TestCase):
     def test_enum_rejects_unknown_value_and_names_the_allowed_ones(self):
         with self.assertRaises(SettingsError) as ctx:

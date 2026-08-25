@@ -15,6 +15,7 @@ from typing import Any, Iterable
 class TeamStage(str, Enum):
     PLAN_RESEARCH = "plan_research"
     RESEARCH = "research"
+    BRAINSTORM = "brainstorm"
     PLAN_CODE = "plan_code"
     CODE = "code"
     MERGE_PLAN = "merge_plan"
@@ -81,7 +82,7 @@ def project_verification_plan(root: str | Path) -> list[VerificationCommand]:
     commands: list[VerificationCommand] = []
 
     if (root / "pyproject.toml").exists() or (root / "setup.py").exists() or (root / "setup.cfg").exists():
-        commands.append(VerificationCommand("python-compile", ("python3", "-m", "compileall", "-q", "."), 120))
+        commands.append(VerificationCommand("python-compile", ("python3", "-m", "compileall", "-q", "-x", r"(^|/)(\.aicoder-team|\.venv)(/|$)", "."), 120))
         if (root / "tests").is_dir():
             pyproject_text = ""
             if (root / "pyproject.toml").exists():

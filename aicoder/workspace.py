@@ -24,7 +24,7 @@ def activate_workspace(path: str | Path | None = None) -> Path:
 
 
 _TASK_WORKSPACE_RE = re.compile(
-    r"^\s*(?:workspace(?:[-_ ]?projekt)?|project|projekt)\s*:\s*(?P<path>.+?)\s*$",
+    r"^\s*(?:workspace(?:[-_ ]?(?:project|projekt))?|project|projekt)\s*:\s*(?P<path>.+?)\s*$",
     re.IGNORECASE,
 )
 
@@ -41,24 +41,50 @@ def workspace_from_task(task: str, configured: str | Path | None = None) -> Path
         match = _TASK_WORKSPACE_RE.match(raw_line)
         if not match:
             continue
-        raw = match.group("path").strip().strip("`\"'")
+        raw = match.group("path").strip()
         if not raw:
             continue
-        requested = Path(raw).expanduser()
-        if requested.is_absolute():
-            candidate = requested.resolve(strict=False)
-        else:
-            base = Path(configured).expanduser().resolve(strict=False) if configured is not None else active_workspace()
+
+        base = (
+            Path(configured).expanduser().resolve(strict=False)
+            if configured is not None
+            else active_workspace()
+        )
+
+        def resolve_declared(value: str) -> Path:
+            cleaned = value.strip().strip("`\"" + chr(39))
+            requested = Path(cleaned).expanduser()
+            if requested.is_absolute():
+                return requested.resolve(strict=False)
             candidate = (base / requested).resolve(strict=False)
             try:
                 candidate.relative_to(base)
             except ValueError as exc:
-                raise ValueError(f"relative workspace must stay inside configured workspace root: {candidate}") from exc
-        if not candidate.exists() or not candidate.is_dir():
-            raise ValueError(f"declared workspace is not an existing directory: {candidate}")
-        return candidate
-    return active_workspace(str(configured) if configured is not None else None)
+                raise ValueError(
+                    f"relative workspace must stay inside configured workspace root: {candidate}"
+                ) from exc
+            return candidate
 
+        candidate = resolve_declared(raw)
+        if candidate.exists() and candidate.is_dir():
+            return candidate
+
+        # Direct CLI prompts may put prose after the declaration on the same
+        # line. Prefer the complete value first so real paths containing spaces
+        # or punctuation keep working; only then accept a clear sentence
+        # separator as the end of the workspace declaration.
+        for separator in (". ", "; "):
+            if separator not in raw:
+                continue
+            prefix = raw.split(separator, 1)[0].strip()
+            if not prefix:
+                continue
+            shortened = resolve_declared(prefix)
+            if shortened.exists() and shortened.is_dir():
+                return shortened
+
+        raise ValueError(f"declared workspace is not an existing directory: {candidate}")
+    return active_workspace(str(configured) if configured is not None else None)
 
 def path_within_workspace(value: str | Path, root: str | Path | None = None) -> tuple[Path, bool]:
     workspace = (Path(root).expanduser().resolve(strict=False) if root is not None else active_workspace())

@@ -10,6 +10,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 import hashlib
+import fnmatch
+import difflib
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -20,13 +22,35 @@ import tarfile
 import tempfile
 from typing import Any, Iterable
 import uuid
+import weakref
 
 from .config import CONFIG_DIR
 
 WORKSPACE_MODES = frozenset({"auto", "ram", "disk"})
 _MANIFEST_FILE = ".aicoder-checkpoint.json"
 _INTERNAL_NAMES = frozenset({_MANIFEST_FILE, ".aicoder-team"})
-_TRANSIENT_DIRS = frozenset({"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".nox"})
+_TRANSIENT_DIRS = frozenset({
+    # Python
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".nox",
+    ".venv", "venv", "env", ".eggs",
+    # JavaScript / TypeScript / frontend
+    "node_modules", ".npm", ".yarn", ".pnpm-store", ".turbo", ".next", ".nuxt",
+    ".parcel-cache", ".vite", ".svelte-kit",
+    # Rust / Go / JVM / .NET / native builds
+    "target", ".gradle", ".dart_tool", ".pub-cache", ".build",
+    "cmake-build-debug", "cmake-build-release", "CMakeFiles",
+    "obj",
+    # Generic dependency/build/cache outputs
+    "dist", "build", "out", "coverage", ".coverage", ".cache", ".sass-cache",
+    "vendor", "Pods", "DerivedData",
+})
+_TRANSIENT_NAME_PATTERNS = (
+    "*.pyc", "*.pyo", "*.pyd", "*.egg-info", "*.egg",
+    "*.class", "*.jar.tmp", "*.o", "*.obj", "*.a", "*.lib",
+    "*.so", "*.dylib", "*.dll", "*.exe.tmp", "*.beam",
+    "*.profraw", "*.profdata", "*.gcda", "*.gcno", "*.coverage",
+    "*.tmp", "*.temp", "*.swp", "*.swo", "*~", "*.log", ".DS_Store",
+)
 _MIN_RAM_RESERVE = 512 * 1024 * 1024
 _RAM_OVERHEAD = 64 * 1024 * 1024
 
@@ -223,7 +247,10 @@ def _iter_tree(root: Path, *, include_git: bool = False) -> Iterable[tuple[Path,
         for entry in entries:
             rel = Path(entry.path).relative_to(root).as_posix()
             top = rel.split("/", 1)[0]
-            if (not include_git and top == ".git") or top in _INTERNAL_NAMES or entry.name in _TRANSIENT_DIRS:
+            transient_name = entry.name in _TRANSIENT_DIRS or any(
+                fnmatch.fnmatch(entry.name, pattern) for pattern in _TRANSIENT_NAME_PATTERNS
+            )
+            if (not include_git and top == ".git") or top in _INTERNAL_NAMES or transient_name:
                 continue
             path = Path(entry.path)
             yield path, rel
@@ -308,7 +335,7 @@ def _copy_working_tree(source: Path, destination: Path, *, git_workspace: bool) 
             raise WorkspaceError(f"RAM Git isolation failed: {proc.stderr.strip() or proc.stdout.strip()}")
         shutil.copytree(
             source, destination, dirs_exist_ok=True, symlinks=True,
-            ignore=shutil.ignore_patterns(".git"),
+            ignore=shutil.ignore_patterns(".git", *_TRANSIENT_DIRS, *_TRANSIENT_NAME_PATTERNS),
         )
         # Populate the private index from HEAD without touching copied files.
         subprocess.run(
@@ -316,7 +343,7 @@ def _copy_working_tree(source: Path, destination: Path, *, git_workspace: bool) 
             capture_output=True, text=True, timeout=30, check=False,
         )
         return
-    shutil.copytree(source, destination, dirs_exist_ok=True, symlinks=True)
+    shutil.copytree(source, destination, dirs_exist_ok=True, symlinks=True, ignore=shutil.ignore_patterns(*_TRANSIENT_DIRS, *_TRANSIENT_NAME_PATTERNS))
 
 
 def _safe_plan_id(value: str) -> str:
@@ -380,6 +407,9 @@ class RamWorkspace(WorkspaceBackend):
         self._prepared = False
         self._closed = False
         self._restored_checkpoint = False
+        # Last-resort cleanup: unexpected exceptions must not strand tmpfs workspaces.
+        # The finalizer owns only this workspace path, so concurrent runs remain isolated.
+        self._cleanup_finalizer = weakref.finalize(self, shutil.rmtree, execution, True)
         self._info = WorkspaceInfo(
             mode="ram", requested_mode=requested_mode,
             source_root=source, execution_root=execution,
@@ -415,6 +445,53 @@ class RamWorkspace(WorkspaceBackend):
             "deleted_count": len(deleted),
             "current_entries": len(current),
         }
+
+    def delta_diff(self, *, max_chars: int = 100_000) -> str:
+        """Return a deterministic source-vs-RAM diff without requiring Git metadata."""
+        _current, changed, deleted = self._delta()
+        affected = set(changed) | set(deleted)
+        self._assert_source_unchanged(affected)
+        chunks: list[str] = []
+        limit = max(1000, int(max_chars))
+
+        def text_lines(path: Path) -> list[str] | None:
+            try:
+                if not path.is_file() or path.is_symlink() or path.stat().st_size > 500_000:
+                    return None
+                raw = path.read_bytes()
+                if b"\x00" in raw:
+                    return None
+                return raw.decode("utf-8").splitlines(keepends=True)
+            except (OSError, UnicodeDecodeError):
+                return None
+
+        for rel in sorted(affected):
+            before = self._source / rel
+            after = self._execution / rel
+            before_lines = text_lines(before) if rel in self._baseline else []
+            after_lines = text_lines(after) if after.exists() or after.is_symlink() else []
+            if before_lines is not None and after_lines is not None:
+                chunk = "".join(difflib.unified_diff(
+                    before_lines, after_lines,
+                    fromfile=(f"a/{rel}" if rel in self._baseline else "/dev/null"),
+                    tofile=(f"b/{rel}" if rel not in deleted else "/dev/null"),
+                ))
+            else:
+                old = self._baseline.get(rel)
+                new = _fingerprint(after)
+                chunk = (
+                    f"--- a/{rel}\n+++ b/{rel}\n"
+                    f"@@ binary-or-nontext @@ old={old.as_dict() if old else None} "
+                    f"new={new.as_dict() if new else None}\n"
+                )
+            if chunk:
+                chunks.append(chunk)
+            if sum(len(item) for item in chunks) >= limit:
+                break
+        text = "".join(chunks)
+        if len(text) > limit:
+            text = text[:limit] + "\n... [workspace diff truncated]\n"
+        return text
 
     def seed_from(self, other_root: str | Path) -> None:
         """Replace RAM working-tree content from another candidate, keeping private .git metadata."""
@@ -678,7 +755,10 @@ class RamWorkspace(WorkspaceBackend):
         if self._closed:
             return
         self._closed = True
-        shutil.rmtree(self._execution, ignore_errors=True)
+        if self._cleanup_finalizer.alive:
+            self._cleanup_finalizer()
+        else:
+            shutil.rmtree(self._execution, ignore_errors=True)
 
 
 class IsolatedDiskWorkspace(RamWorkspace):

@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from aicoder.performance import RuntimePerformance
+from aicoder.performance import RuntimePerformance, model_usage_metrics
 
 
 class RuntimePerformanceTests(unittest.TestCase):
@@ -38,6 +38,28 @@ class RuntimePerformanceTests(unittest.TestCase):
         snapshot = metrics.snapshot(now=1.0)
         kinds = {item["kind"] for item in snapshot["warnings"]}
         self.assertIn("tool_errors", kinds)
+
+    def test_openai_usage_reports_effective_output_tokens_per_second(self):
+        usage = model_usage_metrics({"usage": {"prompt_tokens": 1000, "completion_tokens": 250, "total_tokens": 1250}}, 2000)
+        self.assertEqual(usage["input_tokens"], 1000)
+        self.assertEqual(usage["output_tokens"], 250)
+        self.assertEqual(usage["total_tokens"], 1250)
+        self.assertEqual(usage["tokens_per_second"], 125.0)
+
+    def test_gemini_usage_is_normalized(self):
+        usage = model_usage_metrics({"usageMetadata": {"promptTokenCount": 40, "candidatesTokenCount": 10, "totalTokenCount": 50}}, 500)
+        self.assertEqual(usage["input_tokens"], 40)
+        self.assertEqual(usage["output_tokens"], 10)
+        self.assertEqual(usage["tokens_per_second"], 20.0)
+
+    def test_aggregate_throughput_uses_only_requests_with_usage(self):
+        metrics = RuntimePerformance(started_at=0.0)
+        metrics.record_model(2000, input_tokens=100, output_tokens=200, total_tokens=300)
+        metrics.record_model(8000)
+        snapshot = metrics.snapshot(now=10.0)
+        self.assertEqual(snapshot["tokenized_model_requests"], 1)
+        self.assertEqual(snapshot["tokenized_model_ms"], 2000)
+        self.assertEqual(snapshot["output_tokens_per_second"], 100.0)
 
 
 if __name__ == "__main__":

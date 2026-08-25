@@ -763,6 +763,36 @@ _OBFUSCATION_PATTERNS = [
     "perl -e", "ruby -e", "bash -c", "sh -c", "zsh -c",
 ]
 
+def _has_unquoted_pipe(command: str) -> bool:
+    """Return True only for shell pipes outside balanced quotes.
+
+    Regex arguments such as ``'(^|/)(foo|bar)'`` are data, not shell pipelines.
+    Malformed/unclosed quoting stays conservative when a pipe was encountered.
+    """
+    quote = None
+    escaped = False
+    quoted_pipe = False
+    for char in str(command or ""):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and quote != "'":
+            escaped = True
+            continue
+        if quote is not None:
+            if char == quote:
+                quote = None
+            elif char == "|":
+                quoted_pipe = True
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            continue
+        if char == "|":
+            return True
+    return bool(quote is not None and quoted_pipe)
+
+
 def is_destructive(cmd: str) -> bool:
     """Check if a command matches known destructive or obfuscation patterns."""
     cmd_lower = cmd.lower().strip()
@@ -770,7 +800,7 @@ def is_destructive(cmd: str) -> bool:
         return True
     if any(pat in cmd_lower for pat in _OBFUSCATION_PATTERNS):
         return True
-    if "|" in cmd_lower and any(sh in cmd_lower for sh in ("bash", "sh", "python", "perl", "ruby")):
+    if _has_unquoted_pipe(cmd) and any(sh in cmd_lower for sh in ("bash", "sh", "python", "perl", "ruby")):
         return True
     return False
 
@@ -1674,8 +1704,16 @@ def run_git_read(args: dict) -> Tuple[str, bool]:
     if action not in {"status", "diff", "log", "show", "branch"}:
         return "git error: only status, diff, log, show, and branch are allowed", True
     raw_args = args.get("args") or []
+    if isinstance(raw_args, str):
+        # Provider/model compatibility: some otherwise-correct tool calls encode
+        # CLI-style git arguments as one string. Canonicalize this unambiguous
+        # read-only form before applying the same deny rules below.
+        try:
+            raw_args = shlex.split(raw_args)
+        except ValueError as exc:
+            return f"git error: invalid args string: {exc}", True
     if not isinstance(raw_args, list) or not all(isinstance(item, str) for item in raw_args):
-        return "git error: args must be a string array", True
+        return "git error: args must be a string array or shell-style string", True
     denied = ("--output", "--exec", "--upload-pack", "--receive-pack", "-d", "-D", "-m", "-M")
     if any(item in denied or item.startswith("--output=") for item in raw_args):
         return "git error: mutating or output-writing argument rejected", True
