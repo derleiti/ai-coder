@@ -498,8 +498,9 @@ def _call_advisor(
 
         recovery_attempt += 1
         if envelope_failure:
-            delay_s = 2.0
-            label = "incomplete provider envelope fresh-session recovery"
+            envelope_delays = (2.0, 4.0, 8.0, 15.0, 30.0)
+            delay_s = envelope_delays[min(recovery_attempt - 1, len(envelope_delays) - 1)]
+            label = "degraded provider envelope fresh-session recovery"
         else:
             # Back off enough to survive long provider/network outages without
             # hammering the upstream. The cap keeps recovery responsive.
@@ -511,6 +512,13 @@ def _call_advisor(
             message=(f"{label} {delay_s:.0f}s before advisor retry "
                      f"{recovery_attempt}/unlimited: {reason[:500]}"),
         )
+        if recovery_attempt % 10 == 0:
+            _emit(
+                event_fn, "team_worker_event", role=role, event="runtime_status",
+                category="recovery", status="warning", phase="advisor_retry",
+                message=(f"advisor recovery is still failing after {recovery_attempt} attempts; "
+                         "automatic recovery remains unlimited. Provider appears degraded."),
+            )
         if not _interruptible_recovery_sleep(delay_s, stop_requested):
             return AgentStageResult(
                 role, model, "failed", "", int((time.monotonic() - started) * 1000),

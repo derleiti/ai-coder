@@ -514,6 +514,26 @@ class TeamWorkerAutoResumeTests(unittest.TestCase):
         self.assertIn("Automatic runtime resume 1/unlimited", calls[3])
         self.assertIn("Automatic runtime resume 2/unlimited", calls[4])
 
+    def test_advisor_incomplete_envelope_uses_progressive_backoff_and_warns(self):
+        from aicoder.team_orchestrator import _call_advisor
+        from aicoder.client import ClientError
+        model_client = MagicMock()
+        model_client.chat.side_effect = [
+            ClientError("Transient incomplete chat response: no recognized assistant response envelope; keys=['_transport_telemetry']")
+            for _ in range(10)
+        ] + [{"response": "ok", "model": "test/model"}]
+        events = []
+        with patch("aicoder.team_orchestrator._interruptible_recovery_sleep", return_value=True) as sleeper:
+            result = _call_advisor(
+                model_client, model="test/model", system="sys", prompt="task",
+                event_fn=lambda kind, payload: events.append((kind, payload)),
+                role="plan_research", stop_requested=lambda: False,
+            )
+        self.assertEqual(result.status, "completed")
+        self.assertEqual([call.args[0] for call in sleeper.call_args_list[:5]], [2.0, 4.0, 8.0, 15.0, 30.0])
+        self.assertEqual(sleeper.call_args_list[9].args[0], 30.0)
+        self.assertTrue(any(payload.get("status") == "warning" and "10 attempts" in payload.get("message", "") for kind, payload in events if kind == "team_worker_event"))
+
     def test_user_stop_never_auto_resumes(self):
         calls = []
         paused = AgentRunResult(
