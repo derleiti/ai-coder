@@ -758,7 +758,7 @@ def _run_candidate(
     *, client, model_client: ModelTransport, source_workspace: str, backend_mode: str,
     slot: int, model: str, strategy: str, task: str, plan: str, coordinator: str,
     tools: list[dict], stop_requested: StopFn | None, request_timeout: int = 300,
-    stage_handoff: str = "",
+    stage_handoff: str = "", liveness_timeout_s: int = 1200,
     event_fn: EventFn | None = None,
 ) -> CandidateResult:
     backend = create_isolated_team_workspace(source_workspace, backend_mode)
@@ -768,7 +768,14 @@ def _run_candidate(
             raise WorkspaceError("parallel candidate runtime requires a transactional isolated workspace")
         system = build_system_prompt(tools, str(backend.info.execution_root)).rstrip() + "\n\n" + CODER_SYSTEM_TEMPLATE.format(slot=slot, strategy=strategy)
         started = time.monotonic()
+        liveness_timeout_s = max(60, int(liveness_timeout_s))
+        liveness_deadline = started + liveness_timeout_s
         worker_role = f"coder:{slot}"
+
+        def candidate_stop_requested() -> bool:
+            if stop_requested and stop_requested():
+                return True
+            return time.monotonic() >= liveness_deadline
         # Avoid a four-request burst against one upstream/provider at the exact
         # same instant.  Keep the stagger short so healthy parallelism remains.
         startup_delay_s = min(15.0, max(0.0, (slot - 1) * 5.0))
@@ -790,14 +797,28 @@ def _run_candidate(
                 plan_workspace_root=source_workspace, protected_workspace_root=source_workspace,
                 tools=tools, system_prompt=system, load_tools_on_start=True,
                 quick_chat=False, persistent_plan=False, approval_fn=_candidate_approval,
-                max_iterations=18, max_output_tokens=12000, stop_requested=stop_requested,
+                max_iterations=18, max_output_tokens=12000, stop_requested=candidate_stop_requested,
                 base_timeout=request_timeout, event_fn=forward, conversation=conversation,
             )
             return runtime.run()
 
         run = _run_worker_with_auto_resume(
-            run_once, role=worker_role, event_fn=event_fn, stop_requested=stop_requested,
+            run_once, role=worker_role, event_fn=event_fn, stop_requested=candidate_stop_requested,
         )
+        deadline_reached = time.monotonic() >= liveness_deadline
+        user_stopped = bool(stop_requested and stop_requested())
+        if deadline_reached and not user_stopped and run.status != "completed":
+            reason = (
+                f"candidate liveness timeout after {liveness_timeout_s}s without terminal completion; "
+                "candidate was dropped so it cannot block the team stage"
+            )
+            run.status = "failed"
+            run.response = reason
+            run.error = reason
+            _emit(
+                event_fn, "team_worker_event", role=worker_role, event="runtime_status",
+                category="liveness", status="failed", phase="candidate_timeout", message=reason,
+            )
         elapsed_ms = int((time.monotonic() - started) * 1000)
         audit.log_tool(tool_name="team_candidate_result", arguments={"slot": slot, "strategy": strategy}, result=f"status={run.status}; iterations={run.iterations}; error={str(run.error or chr(45))[:1200]}; response_present={bool(str(run.response or chr(32)).strip())}", duration_s=elapsed_ms / 1000.0, is_error=run.status != "completed", model=model, iteration=run.iterations)
         return CandidateResult(
@@ -841,11 +862,36 @@ def _run_check(root: Path, command: list[str], timeout: int = 90) -> dict[str, A
         return {"ok": False, "exit_code": -1, "elapsed_ms": int((time.monotonic()-started)*1000), "output": str(exc)}
 
 
+_PROJECT_MARKERS = (
+    "pyproject.toml", "setup.py", "setup.cfg", "package.json", "Cargo.toml",
+    "go.mod", "CMakeLists.txt", "Makefile",
+)
+
+def _verification_root_for_delta(root: str | Path, delta: dict[str, Any]) -> Path:
+    """Choose the actual changed project when a team workspace contains multiple repos."""
+    root_path = Path(root)
+    if (root_path / ".git").exists() or any((root_path / marker).exists() for marker in _PROJECT_MARKERS):
+        return root_path
+    paths = [str(item) for item in (delta.get("changed") or []) + (delta.get("deleted") or []) if str(item)]
+    top_levels = {Path(item).parts[0] for item in paths if Path(item).parts}
+    project_children = []
+    for name in sorted(top_levels):
+        child = root_path / name
+        if child.is_dir() and ((child / ".git").exists() or any((child / marker).exists() for marker in _PROJECT_MARKERS)):
+            project_children.append(child)
+    if len(project_children) == 1:
+        return project_children[0]
+    return root_path
+
+def _candidate_is_mergeable(candidate: CandidateResult) -> bool:
+    return candidate.run.status == "completed" and bool(candidate.evaluation.get("verification_passed"))
+
 def evaluate_candidate(candidate: CandidateResult) -> dict[str, Any]:
     root = Path(candidate.workspace.info.execution_root)
     delta = candidate.workspace.delta_summary() if isinstance(candidate.workspace, RamWorkspace) else {}
-    plan = project_verification_plan(root)
-    results = execute_verification_plan(root, plan)
+    verification_root = _verification_root_for_delta(root, delta)
+    plan = project_verification_plan(verification_root)
+    results = execute_verification_plan(verification_root, plan)
     checks = {row.name: row.as_dict() for row in results}
     passed = sum(1 for row in results if row.ok and row.required)
     failed = sum(1 for row in results if (not row.ok) and row.required)
@@ -1119,6 +1165,10 @@ def run_team(
         request_timeout = max(10, min(300, int(state.get("request_timeout") or 300)))
     except (TypeError, ValueError):
         request_timeout = 300
+    try:
+        candidate_liveness_timeout_s = max(60, min(7200, int(state.get("team_candidate_liveness_timeout_seconds") or 1200)))
+    except (TypeError, ValueError):
+        candidate_liveness_timeout_s = 1200
 
     started = time.monotonic()
     run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
@@ -1301,6 +1351,7 @@ def run_team(
                 strategy=slot.strategy, task=task, plan=code_plan.response, coordinator="",
                 tools=coder_tools, stop_requested=stop_requested, request_timeout=request_timeout, event_fn=event_fn,
                 stage_handoff=_render_stage_handoff(source_workspace, TeamStage.PLAN_CODE),
+                liveness_timeout_s=candidate_liveness_timeout_s,
             ): slot for slot in config.coders
         }
         for future in as_completed(futures):
@@ -1318,10 +1369,13 @@ def run_team(
             except Exception as exc:
                 _emit(event_fn, "team_candidate", candidate_id="failed", status="failed", score=-999,
                       error=f"{type(exc).__name__}: {exc}")
-    viable = [candidate for candidate in candidates if candidate.run.status == "completed"]
+    viable = [candidate for candidate in candidates if _candidate_is_mergeable(candidate)]
     if not viable:
         for c in candidates: c.workspace.abort()
-        return TeamRunResult("failed", "", "", stages, candidates, {"ledger": ledger.as_dict()}, "no coding candidate completed")
+        return TeamRunResult(
+            "failed", "", "", stages, candidates, {"ledger": ledger.as_dict()},
+            "no verified coding candidate completed; merge was skipped",
+        )
     winner = max(viable, key=lambda item: objective_rank_key(item.evaluation))
     _stage_complete(ledger, TeamStage.CODE, event_fn)
     _save_stage_handoff(source_workspace, TeamStage.CODE, {
@@ -1350,7 +1404,8 @@ def run_team(
         fallback_reason=integration.info.fallback_reason,
     )
     integration.seed_from(winner.workspace.info.execution_root)
-    blind_evidence = _attach_blind_candidate_snapshots(integration, candidates)
+    # Never expose failed/unverified candidate code to the merge model.
+    blind_evidence = _attach_blind_candidate_snapshots(integration, viable)
     winner_id = str(winner.evaluation.get("candidate_id"))
 
     # 5) merge_plan — blind to model/provider/slot identity.
@@ -1432,8 +1487,10 @@ def run_team(
     })
 
     # 7) plan_tests — model may explain/extend intent, deterministic commands remain authoritative.
+    merged_delta = integration.delta_summary()
     _stage_start(ledger, TeamStage.PLAN_TESTS, event_fn)
-    deterministic_plan = project_verification_plan(integration.info.execution_root)
+    verification_root = _verification_root_for_delta(integration.info.execution_root, merged_delta)
+    deterministic_plan = project_verification_plan(verification_root)
     test_plan_text = json.dumps([
         {"name": item.name, "argv": list(item.argv), "timeout": item.timeout, "required": item.required}
         for item in deterministic_plan
@@ -1463,7 +1520,7 @@ def run_team(
 
     # 8) tests_function_ok — one focused debug attempt may repair a failed final gate.
     _stage_start(ledger, TeamStage.TESTS_FUNCTION_OK, event_fn)
-    verification_results = execute_verification_plan(integration.info.execution_root, deterministic_plan)
+    verification_results = execute_verification_plan(verification_root, deterministic_plan)
     initial_verification_payload = _verification_payload(verification_results)
     verification_payload = initial_verification_payload
     integration.write_candidate_artifact(
@@ -1515,7 +1572,7 @@ def run_team(
 
         # Always rerun the complete deterministic plan. Model self-assessment is
         # advisory; executable evidence alone decides whether disk write is opened.
-        verification_results = execute_verification_plan(integration.info.execution_root, deterministic_plan)
+        verification_results = execute_verification_plan(verification_root, deterministic_plan)
         verification_payload = _verification_payload(verification_results)
         for item in verification_results:
             _emit(event_fn, "team_verification", phase="after_debug", name=item.name, ok=item.ok,

@@ -42,7 +42,7 @@ _TRANSIENT_DIRS = frozenset({
     "obj",
     # Generic dependency/build/cache outputs
     "dist", "build", "out", "coverage", ".coverage", ".cache", ".sass-cache",
-    "vendor", "Pods", "DerivedData", ".backup",
+    "vendor", "Pods", "DerivedData", ".backup", ".benchmarks",
 })
 _TRANSIENT_NAME_PATTERNS = (
     "*.pyc", "*.pyo", "*.pyd", "*.egg-info", "*.egg",

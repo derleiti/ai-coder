@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from aicoder.agent_runtime import AgentRunResult, auto_resumable_pause, auto_resume_limit
-from aicoder.team_orchestrator import AgentStageResult, CandidateResult, _anonymized_brainstorm_round, _brainstorm_rounds, _build_brainstorm_prompt, _RESEARCH_TOOL_NAMES, _brainstorm_participants, _merge_completion_contradiction, _run_worker_with_auto_resume, _worker_event_forwarder, _call_advisor, _save_stage_handoff, _load_stage_handoff, _render_stage_handoff, _team_handoff_dir, _create_run_backup, _preserve_failed_workspace, clear_team_checkpoint, run_team
+from aicoder.team_orchestrator import AgentStageResult, CandidateResult, _anonymized_brainstorm_round, _brainstorm_rounds, _build_brainstorm_prompt, _RESEARCH_TOOL_NAMES, _brainstorm_participants, _merge_completion_contradiction, _run_worker_with_auto_resume, _run_candidate, _candidate_is_mergeable, _verification_root_for_delta, _worker_event_forwarder, _call_advisor, _save_stage_handoff, _load_stage_handoff, _render_stage_handoff, _team_handoff_dir, _create_run_backup, _preserve_failed_workspace, clear_team_checkpoint, run_team
 from aicoder.team_runtime import BRAINSTORM_SYSTEM_PROMPT, PLANNER_SYSTEM_PROMPT, CODER_SYSTEM_TEMPLATE, config_from_state
 from aicoder.team_pipeline import TeamStage, VerificationResult
 from aicoder.workspace_backend import RamWorkspace
@@ -73,6 +73,29 @@ class TeamStageHandoffTests(unittest.TestCase):
                 self.assertTrue(handoff_dir.is_dir())
                 clear_team_checkpoint(str(source))
                 self.assertFalse(handoff_dir.exists())
+
+
+
+class TeamCandidateGateTests(unittest.TestCase):
+    def test_mergeable_requires_completed_and_verified(self):
+        completed = _result("DONE")
+        candidate = CandidateResult(1, "test/model", "minimal", MagicMock(), completed)
+        candidate.evaluation = {"verification_passed": False}
+        self.assertFalse(_candidate_is_mergeable(candidate))
+        candidate.evaluation["verification_passed"] = True
+        self.assertTrue(_candidate_is_mergeable(candidate))
+        candidate.run.status = "paused"
+        self.assertFalse(_candidate_is_mergeable(candidate))
+
+    def test_verification_root_selects_changed_nested_project(self):
+        with tempfile.TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            project = root / "aicoder-experimental"
+            project.mkdir()
+            (project / "pyproject.toml").write_text('[project]\nname="demo"\nversion="0.1"\n', encoding="utf-8")
+            (root / ".benchmarks").mkdir()
+            delta = {"changed": [".benchmarks", "aicoder-experimental/aicoder/app.py"], "deleted": []}
+            self.assertEqual(_verification_root_for_delta(root, delta), project)
 
 class TeamResearchToolPolicyTests(unittest.TestCase):
     def test_research_workers_have_safe_diagnostic_tools(self):
@@ -355,12 +378,13 @@ class TeamWorkerAutoResumeTests(unittest.TestCase):
         def run_once(prompt, conversation):
             calls.append((prompt, conversation))
             return completed if len(calls) == 7 else paused
-        with patch("aicoder.team_orchestrator.time.sleep") as sleep_mock:
+        delays = []
+        with patch("aicoder.team_orchestrator._interruptible_recovery_sleep", side_effect=lambda delay, _stop: delays.append(delay) or True):
             result = _run_worker_with_auto_resume(
                 run_once, role="coder:2", event_fn=None, stop_requested=lambda: False,
             )
         self.assertEqual(result.status, "completed")
-        self.assertEqual([call.args[0] for call in sleep_mock.call_args_list], [2.0, 4.0, 8.0, 15.0, 30.0, 30.0])
+        self.assertEqual(delays, [2.0, 4.0, 8.0, 15.0, 30.0, 30.0])
 
     def test_recovery_warns_every_ten_attempts_without_stopping(self):
         reason = "Agent paused because the model returned no usable final response after a final-response repair request."
@@ -487,8 +511,8 @@ class TeamWorkerAutoResumeTests(unittest.TestCase):
         self.assertEqual(len(calls), 5)
         self.assertIn("Automatic continuation slice 1/6", calls[1])
         self.assertIn("Automatic continuation slice 2/6", calls[2])
-        self.assertIn("Automatic runtime resume 1/3", calls[3])
-        self.assertIn("Automatic runtime resume 2/3", calls[4])
+        self.assertIn("Automatic runtime resume 1/unlimited", calls[3])
+        self.assertIn("Automatic runtime resume 2/unlimited", calls[4])
 
     def test_user_stop_never_auto_resumes(self):
         calls = []
