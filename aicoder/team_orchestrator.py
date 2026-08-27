@@ -365,23 +365,23 @@ def _run_worker_with_auto_resume(
         reason = result.response or result.error
         slice_mode = "continuation" if "safety pause after an unusually long run" in reason.lower() else "recovery"
         envelope_failure = slice_mode == "recovery" and _is_incomplete_envelope_reason(reason)
-        transient_failure = slice_mode == "recovery" and _is_transient_model_failure(reason)
-        # External model/provider/network failures are availability problems, not
-        # task failures. Keep the worker alive until recovery or explicit stop.
-        limit = None if transient_failure else auto_resume_limit(reason)
+        # Recovery slices are availability/progress recovery, not terminal task
+        # failures. Keep every recovery class alive until success or explicit stop.
+        # Safety continuations remain a separate bounded mechanism.
+        limit = None if slice_mode == "recovery" else auto_resume_limit(reason)
         if limit is not None and attempts[slice_mode] >= limit:
             break
         attempts[slice_mode] += 1
         attempt = attempts[slice_mode]
         if slice_mode == "recovery" and "transient model/backend failure" in reason.lower():
             if envelope_failure:
-                # An incomplete envelope means the provider conversation itself is unusable.
-                # Start a fresh session indefinitely; a long cooldown only makes degraded
-                # providers less likely to ever finish a team run. Keep a tiny interruptible
-                # delay to avoid a hot retry loop while preserving user-stop responsiveness.
-                delay_s = 2.0
+                # Repeated telemetry-only envelopes indicate provider degradation rather than
+                # useful model progress. Keep recovery unlimited, but stop hammering the same
+                # upstream endpoint every two seconds. Each retry still starts a fresh chat.
+                envelope_delays = (2.0, 4.0, 8.0, 15.0, 30.0)
+                delay_s = envelope_delays[min(attempt - 1, len(envelope_delays) - 1)]
                 status = "backoff"
-                label = "incomplete provider envelope fresh-session recovery"
+                label = "degraded provider envelope fresh-session recovery"
             else:
                 delay_s = min(30.0, float(2 ** min(attempt - 1, 5)))
                 delay_s += (sum(ord(ch) for ch in role) % 5) * 0.17
@@ -399,6 +399,13 @@ def _run_worker_with_auto_resume(
             category="recovery", status="resuming", phase="auto_resume",
             message=f"automatic {slice_mode} {attempt}/{limit if limit is not None else 'unlimited'}: {reason[:1000]}",
         )
+        if slice_mode == "recovery" and attempt % 10 == 0:
+            _emit(
+                event_fn, "team_worker_event", role=role, event="runtime_status",
+                category="recovery", status="warning", phase="auto_resume",
+                message=(f"recovery is still failing after {attempt} attempts; automatic recovery remains unlimited. "
+                         "Provider is degraded; stop the run manually if you do not want to continue."),
+            )
         if slice_mode == "recovery" and _is_incomplete_envelope_reason(reason):
             handoff = _fresh_recovery_handoff(result, reason, attempt, limit)
             _emit(
@@ -415,9 +422,9 @@ def _run_worker_with_auto_resume(
     if result.status == "paused" and auto_resumable_pause(result.response or result.error):
         reason = result.response or result.error
         slice_mode = "continuation" if "safety pause after an unusually long run" in reason.lower() else "recovery"
-        if _is_transient_model_failure(reason) and not (stop_requested and stop_requested()):
-            # Reaching here for a transient failure means the loop was interrupted
-            # externally; transient recovery itself has no exhaustion budget.
+        if slice_mode == "recovery" and not (stop_requested and stop_requested()):
+            # Recovery has no exhaustion budget. Reaching this branch means the
+            # loop was interrupted externally rather than exhausting retries.
             return result
         limit = auto_resume_limit(reason)
         _emit(

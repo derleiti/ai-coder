@@ -354,23 +354,42 @@ def _run_native_light_agent(
     while result.status == "paused" and auto_resumable_pause(result.response or result.error):
         reason = result.response or result.error
         slice_mode = "continuation" if "safety pause after an unusually long run" in reason.lower() else "recovery"
-        limit = auto_resume_limit(reason)
-        if auto_resume_attempts[slice_mode] >= limit:
+        limit = auto_resume_limit(reason) if slice_mode == "continuation" else None
+        if limit is not None and auto_resume_attempts[slice_mode] >= limit:
             break
         auto_resume_attempts[slice_mode] += 1
         auto_resume_attempt = auto_resume_attempts[slice_mode]
+        limit_label = str(limit) if limit is not None else "unlimited"
+        if slice_mode == "recovery" and (
+            "transient incomplete chat response" in reason.lower()
+            or "no recognized assistant response envelope" in reason.lower()
+        ):
+            delay_s = min(30.0, (2.0, 4.0, 8.0, 15.0, 30.0)[min(auto_resume_attempt - 1, 4)])
+            on_event("runtime_status", {
+                "category": "recovery", "status": "backoff", "phase": "auto_resume",
+                "runtime_mode": runtime_label,
+                "message": f"degraded provider envelope; waiting {delay_s:.0f}s before recovery {auto_resume_attempt}/{limit_label}",
+            })
+            time.sleep(delay_s)
         on_event("runtime_status", {
             "category": "recovery", "status": "resuming", "phase": "auto_resume",
             "runtime_mode": runtime_label,
-            "message": f"automatic {slice_mode} {auto_resume_attempt}/{limit}: {reason[:1000]}",
+            "message": f"automatic {slice_mode} {auto_resume_attempt}/{limit_label}: {reason[:1000]}",
         })
+        if slice_mode == "recovery" and auto_resume_attempt % 10 == 0:
+            on_event("runtime_status", {
+                "category": "recovery", "status": "warning", "phase": "auto_resume",
+                "runtime_mode": runtime_label,
+                "message": (f"recovery is still failing after {auto_resume_attempt} attempts; "
+                            "automatic recovery remains unlimited. Stop the run manually if you do not want to continue."),
+            })
         if persistent_plan and result.plan_id:
             next_prompt = "continue"
             next_conversation = conversation
             next_resume = True
             next_plan_id = result.plan_id
         else:
-            next_prompt = auto_resume_prompt(reason, auto_resume_attempt, limit)
+            next_prompt = auto_resume_prompt(reason, auto_resume_attempt, limit, unlimited=limit is None)
             next_conversation = continuation_messages(result)
             next_resume = False
             next_plan_id = None
@@ -382,13 +401,14 @@ def _run_native_light_agent(
     if result.status == "paused" and auto_resumable_pause(result.response or result.error):
         reason = result.response or result.error
         slice_mode = "continuation" if "safety pause after an unusually long run" in reason.lower() else "recovery"
-        limit = auto_resume_limit(reason)
-        on_event("runtime_status", {
-            "category": "recovery", "status": "failed", "phase": "auto_resume",
-            "runtime_mode": runtime_label,
-            "message": (f"automatic {slice_mode} budget exhausted after {auto_resume_attempts[slice_mode]}/{limit} attempt(s); "
-                        f"continuations={auto_resume_attempts['continuation']}, recoveries={auto_resume_attempts['recovery']}"),
-        })
+        if slice_mode == "continuation":
+            limit = auto_resume_limit(reason)
+            on_event("runtime_status", {
+                "category": "recovery", "status": "failed", "phase": "auto_resume",
+                "runtime_mode": runtime_label,
+                "message": (f"automatic {slice_mode} budget exhausted after {auto_resume_attempts[slice_mode]}/{limit} attempt(s); "
+                            f"continuations={auto_resume_attempts['continuation']}, recoveries={auto_resume_attempts['recovery']}"),
+            })
     if result.status != "completed":
         preserve_workspace_for_resume(workspace_backend, result.plan_id or None)
     stop_model_heartbeat()

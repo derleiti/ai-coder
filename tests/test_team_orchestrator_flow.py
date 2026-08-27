@@ -343,6 +343,48 @@ class TeamWorkerAutoResumeTests(unittest.TestCase):
         self.assertIn("FRESH RECOVERY CHAT 7/unlimited", calls[-1][0])
         self.assertIsNone(calls[-1][1])
 
+    def test_incomplete_envelope_recovery_uses_progressive_backoff(self):
+        reason = "Transient model/backend failure after request retries were exhausted: Transient incomplete chat response: no recognized assistant response envelope; keys=[_transport_telemetry]"
+        paused = AgentRunResult(
+            status="paused", response=reason, model="test/model", messages=[], tools=[], system_prompt="sys",
+        )
+        completed = AgentRunResult(
+            status="completed", response="DONE: recovered", model="test/model", messages=[], tools=[], system_prompt="sys",
+        )
+        calls = []
+        def run_once(prompt, conversation):
+            calls.append((prompt, conversation))
+            return completed if len(calls) == 7 else paused
+        with patch("aicoder.team_orchestrator.time.sleep") as sleep_mock:
+            result = _run_worker_with_auto_resume(
+                run_once, role="coder:2", event_fn=None, stop_requested=lambda: False,
+            )
+        self.assertEqual(result.status, "completed")
+        self.assertEqual([call.args[0] for call in sleep_mock.call_args_list], [2.0, 4.0, 8.0, 15.0, 30.0, 30.0])
+
+    def test_recovery_warns_every_ten_attempts_without_stopping(self):
+        reason = "Agent paused because the model returned no usable final response after a final-response repair request."
+        paused = AgentRunResult(
+            status="paused", response=reason, model="test/model", messages=[], tools=[], system_prompt="sys",
+        )
+        completed = AgentRunResult(
+            status="completed", response="DONE: recovered", model="test/model", messages=[], tools=[], system_prompt="sys",
+        )
+        calls = []
+        events = []
+        def run_once(prompt, conversation):
+            calls.append((prompt, conversation))
+            return completed if len(calls) == 12 else paused
+        result = _run_worker_with_auto_resume(
+            run_once, role="coder:4",
+            event_fn=lambda kind, payload: events.append((kind, payload)),
+            stop_requested=lambda: False,
+        )
+        self.assertEqual(result.status, "completed")
+        self.assertIn("Automatic runtime resume 10/unlimited", calls[10][0])
+        warnings = [payload for kind, payload in events if kind == "team_worker_event" and payload.get("status") == "warning"]
+        self.assertTrue(any("after 10 attempts" in payload.get("message", "") for payload in warnings))
+
     def test_fresh_recovery_handoff_preserves_text_and_tool_calls(self):
         reason = "Transient model/backend failure after request retries were exhausted: Transient incomplete chat response: no recognized assistant response envelope; keys=[_transport_telemetry]"
         paused = AgentRunResult(
