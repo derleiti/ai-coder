@@ -812,7 +812,8 @@ def _run_candidate(
                 plan_workspace_root=source_workspace, protected_workspace_root=source_workspace,
                 tools=tools, system_prompt=system, load_tools_on_start=True,
                 quick_chat=False, persistent_plan=False, approval_fn=_candidate_approval,
-                max_iterations=CODER_MAX_ITERATIONS, max_output_tokens=12000, stop_requested=candidate_stop_requested,
+                max_iterations=CODER_MAX_ITERATIONS, require_test_verification=True,
+                max_output_tokens=12000, stop_requested=candidate_stop_requested,
                 base_timeout=request_timeout, event_fn=forward, conversation=conversation,
             )
             return runtime.run()

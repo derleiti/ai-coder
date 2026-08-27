@@ -351,6 +351,7 @@ class NativeLightRuntime:
     max_output_tokens: int = 16384
     tools_unavailable_reason: str = ""
     max_iterations: int | None = MAX_ITERATIONS
+    require_test_verification: bool = False
     progressive_tool_disclosure: bool = True
     native_openrouter_tool_calling: bool = False
     tool_budget: int = DEFAULT_TOOL_BUDGET
@@ -870,6 +871,7 @@ class NativeLightRuntime:
         tool_was_called = False
         tool_nudge_sent = False
         mutation_seen, verification_seen = plan.progress_flags() if resumed and plan else (False, False)
+        test_verification_seen = False
         verification_nudge_sent = False
         fresh_inspection_after_resume = not resumed
         starting_plan_iteration = plan.iteration if plan is not None else 0
@@ -1143,10 +1145,11 @@ class NativeLightRuntime:
                         fallback_used=fallback_used, plan_id=plan.id if plan else "",
                     )
 
-                if mutation_seen and not verification_seen:
+                verification_ready = verification_seen and (not self.require_test_verification or test_verification_seen)
+                if mutation_seen and not verification_ready:
                     messages.append({"role": "assistant", "content": response})
                     if not verification_nudge_sent:
-                        current_input = _VERIFICATION_REQUIRED_PROMPT
+                        current_input = (_VERIFICATION_REQUIRED_PROMPT + (" Run the relevant test suite with the test tool; lint or an older test result is not sufficient." if self.require_test_verification else ""))
                         verification_nudge_sent = True
                         self._emit(
                             "runtime_status", category="verify", status="required", phase="post_change",
@@ -1562,10 +1565,28 @@ class NativeLightRuntime:
                         iterations=i + 1, latency_ms=total_latency,
                         fallback_used=fallback_used, plan_id=plan.id if plan else "",
                     )
+                previous_mutation_seen = mutation_seen
                 mutation_seen, verified_now = self._record_tool_progress(
                     plan, name, args, tool_result, is_error, mutation_seen,
                 )
-                verification_seen = verification_seen or verified_now
+                mutation_effect = (
+                    not is_error
+                    and _has_mutation_effect(name, args)
+                    and not _is_behavior_verification_call(name, args)
+                )
+                if mutation_effect:
+                    verification_seen = verified_now
+                    test_verification_seen = False
+                    verification_nudge_sent = False
+                else:
+                    verification_seen = verification_seen or verified_now
+                if not is_error and name == "test" and verified_now and previous_mutation_seen:
+                    test_verification_seen = True
+                if is_error and name == "test":
+                    tool_results.append(
+                        "TEST FAILED. Diagnose the failure and change the implementation or its regression test before rerunning the same test. "
+                        "Do not loop on an unchanged failing test command."
+                    )
                 if not is_error and assess_execution(name, args, destructive=False).mutation:
                     batch_mutation = True
                 batch_verification = batch_verification or verified_now
@@ -1719,9 +1740,12 @@ class NativeLightRuntime:
             self._save_journal(plan, messages, tool_batches=journal_batches)
 
             if response.strip().upper().startswith("DONE:"):
-                if mutation_seen and not verification_seen:
+                verification_ready = verification_seen and (not self.require_test_verification or test_verification_seen)
+                if mutation_seen and not verification_ready:
                     if not verification_nudge_sent:
                         current_input += "\n\n" + _VERIFICATION_REQUIRED_PROMPT
+                        if self.require_test_verification:
+                            current_input += " Run the relevant test suite with the test tool; lint or an older test result is not sufficient."
                         verification_nudge_sent = True
                         self._emit(
                             "runtime_status", category="verify", status="required", phase="post_change",

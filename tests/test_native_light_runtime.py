@@ -806,6 +806,72 @@ class RuntimeEventPayloadRegressionTests(unittest.TestCase):
         self.assertEqual(events[0][1]["kind"], "model_latency")
 
 
+class CandidateTestCorrectionLoopTests(unittest.TestCase):
+    def test_successful_test_becomes_stale_after_later_mutation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp)
+            client = MagicMock()
+            client.timeout = 30
+            client.chat.side_effect = [
+                {"response": '<tool_call>{"name":"file_edit","arguments":{"path":"x.py","operation":"write","content":"x=1"}}</tool_call>', "model": "test/model"},
+                {"response": '<tool_call>{"name":"test","arguments":{"command":"python3 -m unittest"}}</tool_call>', "model": "test/model"},
+                {"response": '<tool_call>{"name":"file_edit","arguments":{"path":"x.py","operation":"write","content":"x=2"}}</tool_call>', "model": "test/model"},
+                {"response": "DONE: stale test must not count", "model": "test/model"},
+                {"response": '<tool_call>{"name":"test","arguments":{"command":"python3 -m unittest"}}</tool_call>', "model": "test/model"},
+                {"response": "DONE: retested after latest mutation", "model": "test/model"},
+            ]
+            runtime = NativeLightRuntime(
+                client=client, initial_prompt="Fix and test x.py", model="test/model",
+                fallback_model=None, workspace_root=str(workspace),
+                tools=[LOCAL_FILE_EDIT_SCHEMA, LOCAL_TEST_SCHEMA], load_tools_on_start=True,
+                approval_fn=lambda _name, _args: True, persistent_plan=False,
+                require_test_verification=True, base_timeout=30,
+            )
+            with patch("aicoder.agent_runtime.run_tool", return_value=("passed", False)) as run_tool:
+                result = runtime.run()
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(result.response, "DONE: retested after latest mutation")
+            self.assertEqual(run_tool.call_count, 4)
+            self.assertTrue(any(
+                "older test result is not sufficient" in str(message.get("content", ""))
+                for message in result.messages
+            ))
+
+    def test_failed_test_can_be_repaired_then_retested(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp)
+            client = MagicMock()
+            client.timeout = 30
+            client.chat.side_effect = [
+                {"response": '<tool_call>{"name":"file_edit","arguments":{"path":"x.py","operation":"write","content":"broken"}}</tool_call>', "model": "test/model"},
+                {"response": '<tool_call>{"name":"test","arguments":{"command":"python3 -m unittest"}}</tool_call>', "model": "test/model"},
+                {"response": '<tool_call>{"name":"file_edit","arguments":{"path":"x.py","operation":"write","content":"fixed"}}</tool_call>', "model": "test/model"},
+                {"response": '<tool_call>{"name":"test","arguments":{"command":"python3 -m unittest"}}</tool_call>', "model": "test/model"},
+                {"response": "DONE: fixed after failing test", "model": "test/model"},
+            ]
+            runtime = NativeLightRuntime(
+                client=client, initial_prompt="Fix and test x.py", model="test/model",
+                fallback_model=None, workspace_root=str(workspace),
+                tools=[LOCAL_FILE_EDIT_SCHEMA, LOCAL_TEST_SCHEMA], load_tools_on_start=True,
+                approval_fn=lambda _name, _args: True, persistent_plan=False,
+                require_test_verification=True, base_timeout=30,
+            )
+            outcomes = iter([
+                ("updated", False),
+                ("1 failed", True),
+                ("updated", False),
+                ("1 passed", False),
+            ])
+            with patch("aicoder.agent_runtime.run_tool", side_effect=lambda *_a, **_k: next(outcomes)) as run_tool:
+                result = runtime.run()
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(result.response, "DONE: fixed after failing test")
+            self.assertEqual(run_tool.call_count, 4)
+            self.assertTrue(any(
+                "TEST FAILED" in str(message.get("content", ""))
+                for message in result.messages
+            ))
+
 if __name__ == "__main__":
     unittest.main()
 
