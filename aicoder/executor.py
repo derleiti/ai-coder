@@ -365,6 +365,11 @@ LOCAL_SHELL_SCHEMA = {
 
 LOCAL_BINARY_EXEC_SCHEMA = {
     "name": "binary_exec",
+    "x-aicoder-contract": [
+        "arguments must be a JSON array of strings, never one shell command string",
+        "work_dir is the working directory; do not duplicate that directory in relative argument paths",
+        "use shell/task_runner only when shell composition is genuinely required",
+    ],
     "description": (
         "Execute one LOCAL program with structured arguments and no shell parsing. "
         "Prefer this for Python programs, test binaries, compilers and other direct executables."
@@ -498,6 +503,11 @@ LOCAL_FILE_TREE_SCHEMA = {
 
 LOCAL_CODE_READ_SCHEMA = {
     "name": "code_read",
+    "x-aicoder-contract": [
+        "start_line and end_line are inclusive and 1-based",
+        "omit line bounds to read the whole bounded file",
+        "if runtime reports EOF/line count, correct the range instead of repeating the same read",
+    ],
     "description": "Read code/text on the LOCAL AICoder host. TriForce is never a code execution target.",
     "inputSchema": {
         "type": "object",
@@ -528,6 +538,11 @@ LOCAL_CODE_TREE_SCHEMA = {
 
 LOCAL_CODE_SEARCH_SCHEMA = {
     "name": "code_search",
+    "x-aicoder-contract": [
+        "query is literal text unless regex=true",
+        "path scopes the search relative to root when root is supplied",
+        "after repeated no-match results change the query/evidence source instead of repeating it",
+    ],
     "description": "Recursively search project files on the LOCAL AICoder host. TriForce is never a code execution target.",
     "inputSchema": {
         "type": "object",
@@ -561,6 +576,11 @@ LOCAL_CODE_GREP_SCHEMA = {
 
 LOCAL_GIT_SCHEMA = {
     "name": "git",
+    "x-aicoder-contract": [
+        "read-only actions only: status, diff, log, show, branch",
+        "args is a JSON array of git arguments, not a shell command",
+        "cwd is already the repository directory; do not duplicate it in args",
+    ],
     "description": "Read-only Git inspection. Outside-workspace cwd requires explicit one-time local scope approval.",
     "inputSchema": {
         "type": "object",
@@ -588,6 +608,13 @@ LOCAL_LINT_SCHEMA = {
 
 LOCAL_TEST_SCHEMA = {
     "name": "test",
+    "x-aicoder-contract": [
+        "use supported test-framework commands such as pytest or python -m unittest",
+        "cwd is already the project working directory; test paths are relative to cwd unless absolute",
+        "do not prefix a relative test path with the project directory name again when cwd is that project",
+        "a failed test requires a corrective code/test change before repeating the same test",
+        "zero tests collected is not successful behavior verification",
+    ],
     "description": "Run LOCAL tests. Use pytest, python -m unittest, npm test, make test.",
     "inputSchema": {
         "type": "object",
@@ -666,8 +693,8 @@ You are ai-coder — an autonomous AILinux operator agent for coding, DevOps, sy
 
 ## INIT — Only when needed:
 - Simple greeting/chat: respond directly. NO tool calls needed.
-- Coding task or complex question: memory_search first, then act.
-- Time-sensitive/version question: search first, never guess.
+- Coding task or complex question: if memory_search is active and prior project context is useful, use it first; otherwise inspect with the active tools and act.
+- Time-sensitive/version question: use an active search/research tool first; if none is active, report that evidence gap instead of guessing.
 - Do NOT run health/status/init/current_time for basic conversation.
 
 ## Tool Model:
@@ -677,18 +704,30 @@ You are ai-coder — an autonomous AILinux operator agent for coding, DevOps, sy
 - subagent_run delegates focused work. analyze/review/plan are advisory; debug/task may use the active parent tool subset.
 - MCP tools expose user-facing TriForce backend SERVICES under authenticated RBAC. TriForce itself is never an operator target: do not inspect or modify its host, repository, processes, services, containers, or federation nodes.
 
+## RUNTIME EXECUTION CONTRACT — follow literally:
+1. The model proposes tool calls; AICoder owns execution, approvals, workspace enforcement, retries, result correlation and recovery. Never pretend that you executed a tool yourself.
+2. To use a capability, CALL the exact active tool. Do not ask the user for tool permission in prose first. The host approval broker decides whether confirmation is required and, when needed, the UI/CLI asks the user.
+3. NEVER claim that the user approved, denied, rejected, or failed to approve an operation unless the runtime/tool result explicitly reports that decision. No approval dialog is NOT evidence of denial: the operation may be read-only, automatically allowed by configured host policy, or running inside an isolated autonomous candidate policy.
+4. If the runtime reports blocked/denied/rejected, treat that exact result as authoritative. Do not repeat the same blocked operation unchanged and do not invent a different reason. If no denial result exists, do not describe the step as denied.
+5. Use ONLY tools listed under ## Tools. A workflow name mentioned elsewhere is not proof that the tool is active. If a preferred tool is absent, choose an available equivalent or report the concrete capability gap.
+6. Tool arguments are a strict API contract. Required fields are marked with *. Use canonical field names, enum values and types shown below. Do not invent aliases even if AICoder can normalize some common model variants.
+7. Tool results are authoritative runtime evidence. After an error, read the error literally, correct arguments/path/query/range or change approach, then issue a NEW call. Never repeat an identical failing or already-successful call merely to make progress.
+8. A successful mutation makes earlier behavior verification stale. After the final behavior-changing mutation, run the appropriate test/reproducer. A failed test requires diagnosis and a justified code/test correction before rerunning the same test.
+9. Do not announce provider fallback, retries, recovery, workspace persistence, merge, approval, or atomic write success unless the runtime explicitly reports it. These are host-owned state transitions.
+10. Finish only when the requested work is actually complete and required verification is fresh. If blocked, identify the exact runtime/tool blocker instead of fabricating a user decision.
+
 ## When to use which:
-- LOCAL READ/ANALYZE: file_read, file_tree, code_grep, code_read, code_search, code_tree on the AICoder machine. code_* accepts an optional project root plus target=auto|local|remote; auto defaults to the local AICoder host, while remote explicitly executes through TriForce.
+- LOCAL READ/ANALYZE: when listed as active, file_read, file_tree, code_grep, code_read, code_search and code_tree operate on the AICoder machine. code_* accepts an optional project root plus target=auto|local|remote; auto defaults to the local AICoder host, while remote explicitly executes through TriForce.
 - MCP schema origin does not imply remote execution. AICoder dispatches workspace/code tools locally; backend-only tools remain remote.
-- CREATE DIRECTORIES: use directory_create. Never use file_edit on a directory path.
-- WRITE/MODIFY FILES: use file_edit with path + operation + typed content fields.
-- BACKEND CONNECTIVITY: health (READ-ONLY)
-- SKILLS: when a catalogued skill matches the task, call skill_read(name) before acting.
-- SUBAGENTS: use subagent_run for bounded analysis/review/planning or focused debug/task work.
+- CREATE DIRECTORIES: when directory_create is active, use it for directories. Never use file_edit on a directory path.
+- WRITE/MODIFY FILES: when file_edit is active, use it with path + operation + the operation-specific typed content fields.
+- BACKEND CONNECTIVITY: when health is active, health is read-only
+- SKILLS: when skill_read is active and a catalogued skill matches the task, call skill_read(name) before acting.
+- SUBAGENTS: when subagent_run is active, use it for bounded analysis/review/planning or focused debug/task work.
   Tool-capable subagents inherit only the active parent tools, cannot recurse into subagent_run, and remain subject to the same approvals and workspace policy.
-- SEARCH: memory_search (first!) → search → crawl
-- MODELS: models, specialist (info only)
-- STUCK >2 rounds: Stop guessing. Use memory_search, then search, then ask user.
+- SEARCH: use active research tools in this preference order when present: memory_search → search → crawl; skip names not listed under ## Tools
+- MODELS: when active, models and specialist are informational/advisory capabilities
+- STUCK >2 rounds: stop guessing; use a different ACTIVE evidence tool/query if available, otherwise report the concrete blocker or ask one focused question.
 
 ## SECURITY MODEL:
 - MCP read tools provide coding, documentation, search, memory, and model information.
@@ -918,20 +957,57 @@ def load_tools(client: TriForceClient, force_refresh: bool = False) -> list[dict
     return copy.deepcopy(result)
 
 
+def _compact_schema_type(spec: dict) -> str:
+    kind = str(spec.get("type") or "any")
+    if kind == "array":
+        items = spec.get("items") if isinstance(spec.get("items"), dict) else {}
+        kind = f"array[{items.get('type') or 'any'}]"
+    enum = spec.get("enum")
+    if isinstance(enum, list) and enum:
+        values = "|".join(str(item) for item in enum[:16])
+        if len(enum) > 16:
+            values += "|..."
+        kind += f" enum[{values}]"
+    minimum = spec.get("minimum")
+    maximum = spec.get("maximum")
+    if minimum is not None or maximum is not None:
+        kind += f" range[{minimum if minimum is not None else '-inf'}..{maximum if maximum is not None else 'inf'}]"
+    return kind
+
+
+def _compact_tool_arg(name: str, spec: dict, required: set[str]) -> str:
+    marker = "*" if name in required else ""
+    detail = _compact_schema_type(spec)
+    desc = " ".join(str(spec.get("description") or "").split())[:110]
+    return f"{name}{marker}:{detail}" + (f" — {desc}" if desc else "")
+
+
 def build_tool_desc(tools: list[dict]) -> str:
-    """Build a compact text-tool contract for models without native schema enforcement."""
+    """Build a schema-derived text contract for models without reliable native schema use."""
     out = []
-    for t in sorted(tools, key=lambda x: x["name"]):
-        props = list(t.get("inputSchema",{}).get("properties",{}).keys())
-        req = t.get("inputSchema",{}).get("required",[])
-        sig = ", ".join(f"{p}*" if p in req else p for p in props)
-        desc = (t.get("description","") or "")[:160].replace("\n"," ")
-        line = f"- {t['name']}({sig}): {desc}"
+    for t in sorted(tools, key=lambda x: str(x.get("name") or "")):
+        name = str(t.get("name") or "").strip()
+        if not name:
+            continue
+        schema = t.get("inputSchema") if isinstance(t.get("inputSchema"), dict) else {}
+        props = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+        required = {str(item) for item in (schema.get("required") or [])}
+        args = "; ".join(
+            _compact_tool_arg(str(arg_name), arg_spec if isinstance(arg_spec, dict) else {}, required)
+            for arg_name, arg_spec in props.items()
+        )
+        short_sig = ", ".join(
+            f"{arg_name}*" if str(arg_name) in required else str(arg_name)
+            for arg_name in props
+        )
+        desc = " ".join(str(t.get("description") or "").split())[:220]
+        schema_detail = f" [schema: {args}]" if args else ""
+        line = f"- {name}({short_sig}){schema_detail}: {desc}"
         contract = t.get("x-aicoder-contract")
         if isinstance(contract, list):
-            rules = [str(item).strip() for item in contract if str(item).strip()]
+            rules = [" ".join(str(item).split()) for item in contract if str(item).strip()]
             if rules:
-                line += " | contract: " + "; ".join(rules[:6])
+                line += "\n  contract: " + "; ".join(rules[:8])
         out.append(line)
     return "\n".join(out)
 
