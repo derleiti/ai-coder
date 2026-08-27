@@ -113,6 +113,35 @@ class SyntaxGuardTests(unittest.TestCase):
         self.assertFalse(is_error, result)
         self.assertIn("return a - b", target.read_text(encoding="utf-8"))
 
+    def test_replace_accepts_content_as_unambiguous_new_text_alias(self):
+        target = self.root / "ok.py"
+        target.write_text(VALID, encoding="utf-8")
+        result, is_error = self._edit(
+            path="ok.py", operation="replace",
+            old_text="return a + b", content="return a - b",
+        )
+        self.assertFalse(is_error, result)
+        self.assertIn("return a - b", target.read_text(encoding="utf-8"))
+
+    def test_replace_accepts_search_and_replacement_text_aliases(self):
+        target = self.root / "ok.py"
+        target.write_text(VALID, encoding="utf-8")
+        result, is_error = self._edit(
+            path="ok.py", operation="replace",
+            search="return a + b", replacement_text="return a - b",
+        )
+        self.assertFalse(is_error, result)
+        self.assertIn("return a - b", target.read_text(encoding="utf-8"))
+
+    def test_invalid_replace_returns_actionable_contract_error(self):
+        target = self.root / "ok.py"
+        target.write_text(VALID, encoding="utf-8")
+        result, is_error = self._edit(path="ok.py", operation="replace")
+        self.assertTrue(is_error)
+        self.assertIn("old_text", result)
+        self.assertIn("new_text", result)
+        self.assertIn("Do not repeat", result)
+
     def test_error_message_names_the_line(self):
         result, _ = self._edit(path="x.py", operation="create", content=TRUNCATED)
         self.assertIn("line 2", result)

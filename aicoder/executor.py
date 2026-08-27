@@ -446,6 +446,12 @@ LOCAL_FILE_EDIT_SCHEMA = {
         "UTF-8 FILE (not a directory). To create a folder/directory, use directory_create. "
         "Paths outside the active workspace trigger explicit one-time local scope approval."
     ),
+    "x-aicoder-contract": [
+        "create/write/append: use content",
+        "replace: use old_text + new_text; do not use content as the canonical replacement field",
+        "replace old_text must match exactly once",
+        "common model aliases are normalized when unambiguous",
+    ],
     "inputSchema": {
         "type": "object",
         "properties": {
@@ -913,14 +919,20 @@ def load_tools(client: TriForceClient, force_refresh: bool = False) -> list[dict
 
 
 def build_tool_desc(tools: list[dict]) -> str:
-    """Build tool description string for system prompt."""
+    """Build a compact text-tool contract for models without native schema enforcement."""
     out = []
     for t in sorted(tools, key=lambda x: x["name"]):
         props = list(t.get("inputSchema",{}).get("properties",{}).keys())
         req = t.get("inputSchema",{}).get("required",[])
         sig = ", ".join(f"{p}*" if p in req else p for p in props)
-        desc = (t.get("description","") or "")[:100].replace("\n"," ")
-        out.append(f"- {t['name']}({sig}): {desc}")
+        desc = (t.get("description","") or "")[:160].replace("\n"," ")
+        line = f"- {t['name']}({sig}): {desc}"
+        contract = t.get("x-aicoder-contract")
+        if isinstance(contract, list):
+            rules = [str(item).strip() for item in contract if str(item).strip()]
+            if rules:
+                line += " | contract: " + "; ".join(rules[:6])
+        out.append(line)
     return "\n".join(out)
 
 
@@ -1448,17 +1460,41 @@ def _rejects_broken_python(
 
 
 def _normalize_file_edit_args(args: dict) -> dict:
-    """Accept common provider/model aliases while keeping one canonical API internally."""
+    """Normalize unambiguous model/provider aliases to the canonical file_edit contract."""
     normalized = dict(args)
     if str(normalized.get("operation") or "").lower() == "replace":
-        if "old_text" not in normalized and isinstance(normalized.get("find"), str):
-            normalized["old_text"] = normalized["find"]
+        if "old_text" not in normalized:
+            for alias in ("find", "search", "search_text"):
+                if isinstance(normalized.get(alias), str):
+                    normalized["old_text"] = normalized[alias]
+                    break
         if "new_text" not in normalized:
-            for alias in ("replace", "replacement"):
+            for alias in ("replace", "replacement", "replacement_text", "content"):
                 if isinstance(normalized.get(alias), str):
                     normalized["new_text"] = normalized[alias]
                     break
     return normalized
+
+
+def _file_edit_contract_error(args: dict) -> str:
+    operation = str(args.get("operation") or "").lower()
+    if operation == "replace":
+        missing = []
+        old = args.get("old_text")
+        new = args.get("new_text")
+        if not isinstance(old, str) or not old:
+            missing.append("old_text")
+        if not isinstance(new, str):
+            missing.append("new_text")
+        supplied = ", ".join(sorted(str(key) for key in args if not str(key).startswith("_"))) or "none"
+        return (
+            "file_edit error: invalid replace arguments. Required: path, operation='replace', "
+            "non-empty old_text, and string new_text. "
+            f"Missing/invalid: {', '.join(missing) or 'unknown'}. Supplied fields: {supplied}. "
+            "Use content only for create/write/append; for replace use new_text. "
+            "Do not repeat the same invalid call unchanged."
+        )
+    return "file_edit error: invalid arguments"
 
 
 def run_file_edit(args: dict) -> Tuple[str, bool]:
@@ -1497,7 +1533,7 @@ def run_file_edit(args: dict) -> Tuple[str, bool]:
             old = args.get("old_text")
             new = args.get("new_text")
             if not isinstance(old, str) or not old or not isinstance(new, str):
-                return "file_edit error: replace requires non-empty old_text and string new_text", True
+                return _file_edit_contract_error(args), True
             original = previous or ""
             count = original.count(old)
             if count != 1:
