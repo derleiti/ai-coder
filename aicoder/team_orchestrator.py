@@ -34,7 +34,7 @@ from .team_runtime import (
 )
 from .team_pipeline import (
     StageLedger, TeamStage, blind_candidate_id, content_fingerprint, execute_verification_plan,
-    objective_rank_key, project_verification_plan, verification_passed,
+    objective_rank_key, project_verification_plan, test_change_evidence, verification_passed,
 )
 from .workspace_backend import (
     RamWorkspace, WorkspaceBackend, WorkspaceError, create_isolated_team_workspace,
@@ -675,6 +675,9 @@ def evaluate_candidate(candidate: CandidateResult) -> dict[str, Any]:
     score = (40 if candidate.run.status == "completed" else 0) + passed * 25 - failed * 60
     if delta.get("changed_count", 0) or delta.get("deleted_count", 0):
         score += 10
+    test_evidence = test_change_evidence(delta)
+    if test_evidence["behavior_change"] and not test_evidence["tests_changed"]:
+        score -= 35
     if candidate.run.error:
         score -= 20
     diff = candidate.workspace.delta_diff() if isinstance(candidate.workspace, RamWorkspace) else _git_diff(root)
@@ -683,6 +686,7 @@ def evaluate_candidate(candidate: CandidateResult) -> dict[str, Any]:
         "candidate_id": blind_candidate_id(),
         "content_fingerprint": content_fingerprint(diff),
         "verification_passed": verification_passed(results),
+        "test_change_evidence": test_evidence,
     }
 
 
@@ -1040,7 +1044,11 @@ def run_team(
         result_model = winner.run.model
     _stage_complete(ledger, TeamStage.MERGE, event_fn)
 
-    # 7) plan_tests — model may explain/extend intent, deterministic commands remain authoritative.
+    # Tests are implementation artifacts: behavior/source changes must carry test-file evidence.
+    merged_delta = integration.delta_summary()
+    merged_test_evidence = test_change_evidence(merged_delta)
+
+    # 7) plan_tests — model reviews coverage intent; deterministic commands remain authoritative.
     _stage_start(ledger, TeamStage.PLAN_TESTS, event_fn)
     deterministic_plan = project_verification_plan(integration.info.execution_root)
     test_plan_text = json.dumps([
@@ -1052,6 +1060,7 @@ def run_team(
             model_client, model=config.test_planner_model, system=TEST_PLANNER_SYSTEM_PROMPT,
             prompt=(f"[USER_TASK]\n{task}\n\n[SHARED_IMPLEMENTATION_CONTRACT]\n{code_plan.response}\n\n"
                     f"[BLIND_MERGE_CONTRACT]\n{merge_plan.response}\n\n"
+                    f"[MERGED_CHANGE_TEST_EVIDENCE_AUTHORITATIVE]\n{json.dumps(merged_test_evidence, ensure_ascii=False, indent=2)}\n\n"
                     f"[DETERMINISTIC_REPOSITORY_CHECKS_AUTHORITATIVE]\n{test_plan_text}"),
             max_tokens=5000, event_fn=event_fn, role="plan_tests", stop_requested=stop_requested,
         )
@@ -1063,6 +1072,13 @@ def run_team(
     else:
         stages.append(AgentStageResult("plan_tests", "deterministic", "completed", test_plan_text, 0))
     _stage_complete(ledger, TeamStage.PLAN_TESTS, event_fn)
+    if not merged_test_evidence["coverage_evidence_ok"]:
+        integration.abort(); [c.workspace.abort() for c in candidates]
+        return TeamRunResult(
+            "failed", "", result_model, stages, candidates,
+            {"ledger": ledger.as_dict(), "test_change_evidence": merged_test_evidence},
+            "test coverage evidence gate failed: source/behavior changes were merged without adding or updating tests",
+        )
 
     # 8) tests_function_ok — only executable evidence can open the disk-write gate.
     _stage_start(ledger, TeamStage.TESTS_FUNCTION_OK, event_fn)

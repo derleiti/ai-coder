@@ -6,7 +6,7 @@ from pathlib import Path
 
 from aicoder.team_pipeline import (
     STAGE_ORDER, StageLedger, TeamStage, blind_candidate_id, content_fingerprint, objective_rank_key,
-    project_verification_plan, execute_verification_plan,
+    project_verification_plan, execute_verification_plan, test_change_evidence,
 )
 
 
@@ -72,6 +72,28 @@ class ResearchEvidenceBiasTests(unittest.TestCase):
         )
         prompt = _build_planner_prompt("task", "repo", [report])
         self.assertIn("unverified-or-local-only", prompt)
+
+
+class TestChangeEvidenceTests(unittest.TestCase):
+    def test_source_change_without_test_change_fails_evidence(self):
+        evidence = test_change_evidence({"changed": ["aicoder/runtime.py"], "deleted": []})
+        self.assertTrue(evidence["behavior_change"])
+        self.assertFalse(evidence["tests_changed"])
+        self.assertFalse(evidence["coverage_evidence_ok"])
+
+    def test_source_change_with_regression_test_passes_evidence(self):
+        evidence = test_change_evidence({
+            "changed": ["aicoder/runtime.py", "tests/test_runtime.py"],
+            "deleted": [],
+        })
+        self.assertTrue(evidence["behavior_change"])
+        self.assertTrue(evidence["tests_changed"])
+        self.assertTrue(evidence["coverage_evidence_ok"])
+
+    def test_docs_only_change_does_not_require_test_edit(self):
+        evidence = test_change_evidence({"changed": ["README.md"], "deleted": []})
+        self.assertFalse(evidence["behavior_change"])
+        self.assertTrue(evidence["coverage_evidence_ok"])
 
 
 class ProjectPlanTests(unittest.TestCase):

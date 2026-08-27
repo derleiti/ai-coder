@@ -101,6 +101,32 @@ class RamWorkspaceTests(unittest.TestCase):
             self.assertEqual((root / "created.txt").read_text(), "created\n")
             self.assertFalse(execution.exists())
 
+    def test_finalize_creates_full_project_backup_with_manifest(self):
+        with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as ram:
+            root = Path(temp)
+            (root / "app.py").write_text("old\n", encoding="utf-8")
+            (root / "keep.txt").write_text("keep\n", encoding="utf-8")
+            (root / ".git").mkdir()
+            (root / ".git" / "config").write_text("private\n", encoding="utf-8")
+            backend = RamWorkspace(root, ram_root=ram)
+            execution = backend.prepare()
+            (execution / "app.py").write_text("new\n", encoding="utf-8")
+            (execution / "created.txt").write_text("created\n", encoding="utf-8")
+
+            backend.finalize(verified=True)
+
+            backups = [p for p in (root / ".backup").iterdir() if p.is_dir()]
+            self.assertEqual(len(backups), 1)
+            backup = backups[0]
+            self.assertEqual((backup / "project" / "app.py").read_text(), "old\n")
+            self.assertEqual((backup / "project" / "keep.txt").read_text(), "keep\n")
+            self.assertFalse((backup / "project" / ".git").exists())
+            self.assertFalse((backup / "project" / ".backup").exists())
+            manifest = __import__("json").loads((backup / "manifest.json").read_text())
+            self.assertEqual(manifest["status"], "completed")
+            self.assertIn("app.py", manifest["modified"])
+            self.assertIn("created.txt", manifest["created"])
+
     def test_ram_workspace_deletion_is_committed(self):
         with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as ram:
             root = Path(temp)

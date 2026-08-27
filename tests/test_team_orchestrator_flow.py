@@ -308,6 +308,11 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
                 backend.prepare()
                 slot = kwargs["slot"]
                 (backend.info.execution_root / "app.py").write_text(f"value = {slot}\n", encoding="utf-8")
+                (backend.info.execution_root / "tests" / "test_app.py").write_text(
+                    "import unittest\nimport app\nclass T(unittest.TestCase):\n"
+                    f"    def test_value(self): self.assertEqual(app.value, {slot})\n",
+                    encoding="utf-8",
+                )
                 item = CandidateResult(slot, kwargs["model"], kwargs["strategy"], backend, _result(f"DONE: candidate {slot}"))
                 candidates.append(item)
                 return item

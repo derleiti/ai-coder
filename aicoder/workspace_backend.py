@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
+from datetime import datetime
 import hashlib
 import fnmatch
 import difflib
@@ -28,7 +29,8 @@ from .config import CONFIG_DIR
 
 WORKSPACE_MODES = frozenset({"auto", "ram", "disk"})
 _MANIFEST_FILE = ".aicoder-checkpoint.json"
-_INTERNAL_NAMES = frozenset({_MANIFEST_FILE, ".aicoder-team"})
+_BACKUP_DIR = ".backup"
+_INTERNAL_NAMES = frozenset({_MANIFEST_FILE, ".aicoder-team", _BACKUP_DIR})
 _TRANSIENT_DIRS = frozenset({
     # Python
     "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".nox",
@@ -611,6 +613,83 @@ class RamWorkspace(WorkspaceBackend):
                 except (OSError, TypeError):
                     shutil.copy2(source, target, follow_symlinks=False)
 
+    def _create_persistent_project_backup(
+        self,
+        *,
+        changed: set[str],
+        deleted: set[str],
+        current: dict[str, _Entry],
+    ) -> dict[str, Any]:
+        """Snapshot the complete pre-write project tree into .backup/<run_id>."""
+        now = datetime.now().astimezone()
+        run_id = f"{now.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+        backup_root = self._source / _BACKUP_DIR
+        final = backup_root / run_id
+        temp = backup_root / f".tmp-{run_id}-{uuid.uuid4().hex[:8]}"
+        snapshot = temp / "project"
+        snapshot.mkdir(parents=True, exist_ok=False)
+
+        try:
+            for source, rel in sorted(
+                _iter_tree(self._source, include_git=False),
+                key=lambda item: (item[1].count("/"), item[1]),
+            ):
+                entry = _fingerprint(source)
+                if entry is None:
+                    continue
+                target = snapshot / rel
+                if entry.kind == "dir":
+                    target.mkdir(parents=True, exist_ok=True)
+                    try:
+                        os.chmod(target, entry.mode)
+                    except OSError:
+                        pass
+                elif entry.kind == "symlink":
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    os.symlink(os.readlink(source), target)
+                elif entry.kind == "file":
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        os.link(source, target, follow_symlinks=False)
+                    except (OSError, TypeError):
+                        shutil.copy2(source, target, follow_symlinks=False)
+
+            created = sorted(rel for rel in changed if rel not in self._baseline and rel in current)
+            modified = sorted(rel for rel in changed if rel in self._baseline and rel in current)
+            manifest = {
+                "schema": 1,
+                "run_id": run_id,
+                "created_at": now.isoformat(),
+                "source": str(self._source),
+                "snapshot": "project",
+                "status": "prepared",
+                "modified": modified,
+                "created": created,
+                "deleted": sorted(deleted),
+                "excluded": [".git", _BACKUP_DIR, *sorted(_TRANSIENT_DIRS)],
+            }
+            (temp / "manifest.json").write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temp, final)
+            return {"run_id": run_id, "path": str(final), "manifest": manifest}
+        except Exception:
+            shutil.rmtree(temp, ignore_errors=True)
+            raise
+
+    @staticmethod
+    def _update_persistent_backup_status(backup_info: dict[str, Any], status: str) -> None:
+        path = Path(str(backup_info.get("path") or ""))
+        manifest_path = path / "manifest.json"
+        manifest = dict(backup_info.get("manifest") or {})
+        manifest["status"] = status
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        backup_info["manifest"] = manifest
+
     def _rollback(self, affected: set[str], backup: Path) -> None:
         # Remove partial committed state first, deepest paths first.
         for rel in sorted(affected, key=lambda item: (item.count("/"), item), reverse=True):
@@ -633,6 +712,10 @@ class RamWorkspace(WorkspaceBackend):
             return
         self._assert_source_unchanged(affected)
 
+        persistent_backup = self._create_persistent_project_backup(
+            changed=changed, deleted=deleted, current=current,
+        )
+
         txn = self._source.parent / f".aicoder-txn-{uuid.uuid4().hex}"
         backup = txn / "backup"
         backup.mkdir(parents=True, exist_ok=False)
@@ -650,12 +733,15 @@ class RamWorkspace(WorkspaceBackend):
         except Exception as exc:
             try:
                 self._rollback(affected, backup)
+                self._update_persistent_backup_status(persistent_backup, "rolled_back")
             except Exception as rollback_exc:
                 raise WorkspaceError(
-                    f"RAM commit failed ({exc}); rollback also failed ({rollback_exc}). Backup kept at {txn}"
+                    f"RAM commit failed ({exc}); rollback also failed ({rollback_exc}). "
+                    f"Transaction backup kept at {txn}; persistent backup at {persistent_backup['path']}"
                 ) from exc
             raise WorkspaceError(f"RAM commit failed and was rolled back: {exc}") from exc
         else:
+            self._update_persistent_backup_status(persistent_backup, "completed")
             shutil.rmtree(txn, ignore_errors=True)
             if self._checkpoint_id:
                 self.clear_checkpoint(self._checkpoint_id)
