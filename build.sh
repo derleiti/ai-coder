@@ -56,6 +56,7 @@ if command -v dpkg-deb &>/dev/null; then
 
     cp -a packaging/debian/aicoder/. "$PKGROOT/"
     install -Dm755 dist/aicoder "$PKGROOT/usr/bin/aicoder"
+    install -Dm644 assets/aicoder.png "$PKGROOT/usr/share/icons/hicolor/128x128/apps/aicoder.png"
     sed "s/@VERSION@/${VERSION}/g" packaging/debian/aicoder/usr/share/man/man1/aicoder.1 \
         | gzip -9n > "$PKGROOT/usr/share/man/man1/aicoder.1.gz"
     rm -f "$PKGROOT/usr/share/man/man1/aicoder.1"

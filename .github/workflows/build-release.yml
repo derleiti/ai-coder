@@ -126,11 +126,12 @@ jobs:
           VERSION: ${{ needs.metadata.outputs.version }}
         run: |
           mkdir -p pkg/usr/bin pkg/DEBIAN
-          mkdir -p pkg/usr/share/applications pkg/usr/share/man/man1
+          mkdir -p pkg/usr/share/applications pkg/usr/share/man/man1 pkg/usr/share/icons/hicolor/128x128/apps
           cp dist/aicoder pkg/usr/bin/aicoder
           chmod 755 pkg/usr/bin/aicoder
           cp packaging/linux/ai-coder-gui.desktop pkg/usr/share/applications/
           cp packaging/linux/ai-coder.desktop pkg/usr/share/applications/
+          cp assets/aicoder.png pkg/usr/share/icons/hicolor/128x128/apps/aicoder.png
           cp packaging/debian/aicoder/usr/share/man/man1/aicoder.1.gz pkg/usr/share/man/man1/
           chmod 644 pkg/usr/share/man/man1/aicoder.1.gz
           SIZE=$(du -s pkg/usr | cut -f1)

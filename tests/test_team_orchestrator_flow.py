@@ -6,8 +6,9 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from aicoder.agent_runtime import AgentRunResult, auto_resumable_pause, auto_resume_limit
-from aicoder.team_orchestrator import AgentStageResult, CandidateResult, _anonymized_brainstorm_round, _brainstorm_rounds, _build_brainstorm_prompt, _RESEARCH_TOOL_NAMES, _brainstorm_participants, _merge_completion_contradiction, _run_worker_with_auto_resume, _worker_event_forwarder, _call_advisor, run_team
-from aicoder.team_runtime import config_from_state
+from aicoder.team_orchestrator import AgentStageResult, CandidateResult, _anonymized_brainstorm_round, _brainstorm_rounds, _build_brainstorm_prompt, _RESEARCH_TOOL_NAMES, _brainstorm_participants, _merge_completion_contradiction, _run_worker_with_auto_resume, _worker_event_forwarder, _call_advisor, _save_stage_handoff, _load_stage_handoff, _render_stage_handoff, _team_handoff_dir, _create_run_backup, _preserve_failed_workspace, clear_team_checkpoint, run_team
+from aicoder.team_runtime import BRAINSTORM_SYSTEM_PROMPT, PLANNER_SYSTEM_PROMPT, CODER_SYSTEM_TEMPLATE, config_from_state
+from aicoder.team_pipeline import TeamStage, VerificationResult
 from aicoder.workspace_backend import RamWorkspace
 
 
@@ -33,6 +34,45 @@ class FakeIntegrationRuntime:
         marker.write_text("final\n", encoding="utf-8")
         return _result("DONE: final", self.model)
 
+
+
+
+class TeamStageHandoffTests(unittest.TestCase):
+    def test_stage_handoff_round_trip_is_bounded_and_workspace_scoped(self):
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as checkpoint_dir:
+            source = Path(source_dir)
+            payload = {"task": "demo", "reports": [{"response": "x" * 20000}]}
+            with patch("aicoder.team_orchestrator._TEAM_CHECKPOINT_DIR", Path(checkpoint_dir)):
+                path = _save_stage_handoff(str(source), TeamStage.RESEARCH, payload)
+                self.assertTrue(path.is_file())
+                loaded = _load_stage_handoff(str(source), TeamStage.RESEARCH)
+                self.assertEqual(loaded["stage"], "research")
+                self.assertEqual(loaded["task"], "demo")
+                self.assertIn("bounded stage handoff", loaded["reports"][0]["response"])
+                rendered = _render_stage_handoff(str(source), TeamStage.RESEARCH)
+                self.assertIn('"stage": "research"', rendered)
+
+    def test_stage_prompts_require_independent_session_and_explicit_handoff(self):
+        for prompt in (BRAINSTORM_SYSTEM_PROMPT, PLANNER_SYSTEM_PROMPT, CODER_SYSTEM_TEMPLATE):
+            self.assertIn("STAGE CONTEXT ISOLATION", prompt)
+            self.assertIn("independent model session", prompt)
+            self.assertIn("[STAGE_HANDOFF]", prompt)
+        text = _build_brainstorm_prompt(
+            "Improve", "workspace=/tmp/repo", [], "reliability",
+            research_handoff='{"stage":"research","reports":["fact"]}',
+        )
+        self.assertIn("[STAGE_HANDOFF:RESEARCH]", text)
+        self.assertIn('"fact"', text)
+
+    def test_clear_checkpoint_removes_transient_stage_handoffs(self):
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as checkpoint_dir:
+            source = Path(source_dir)
+            with patch("aicoder.team_orchestrator._TEAM_CHECKPOINT_DIR", Path(checkpoint_dir)):
+                _save_stage_handoff(str(source), TeamStage.RESEARCH, {"task": "demo"})
+                handoff_dir = _team_handoff_dir(str(source))
+                self.assertTrue(handoff_dir.is_dir())
+                clear_team_checkpoint(str(source))
+                self.assertFalse(handoff_dir.exists())
 
 class TeamResearchToolPolicyTests(unittest.TestCase):
     def test_research_workers_have_safe_diagnostic_tools(self):
@@ -124,7 +164,7 @@ class TeamMergeCompletionGuardTests(unittest.TestCase):
 
 
 class TeamAdvisorRecoveryTests(unittest.TestCase):
-    def test_incomplete_envelope_retries_advisor_after_long_cooldown(self):
+    def test_incomplete_envelope_retries_advisor_with_short_unlimited_recovery(self):
         model_client = MagicMock()
         model_client.chat.side_effect = [
             RuntimeError("Transient incomplete chat response: no recognized assistant response envelope; keys=['_transport_telemetry']"),
@@ -137,7 +177,65 @@ class TeamAdvisorRecoveryTests(unittest.TestCase):
         self.assertEqual(result.status, "completed")
         self.assertEqual(result.response, "PLAN OK")
         self.assertEqual(model_client.chat.call_count, 2)
-        sleep_mock.assert_called_once_with(30.0)
+        self.assertEqual(sum(call.args[0] for call in sleep_mock.call_args_list), 2.0)
+
+    def test_empty_advisor_response_retries_until_valid_response(self):
+        model_client = MagicMock()
+        model_client.chat.side_effect = [
+            {"response": "", "model": "test/model"},
+            {"response": "PLAN OK", "model": "test/model"},
+        ]
+        with patch("aicoder.team_orchestrator.time.sleep") as sleep_mock:
+            result = _call_advisor(
+                model_client, model="test/model", system="system", prompt="task", max_tokens=64,
+                stop_requested=lambda: False,
+            )
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.response, "PLAN OK")
+        self.assertEqual(model_client.chat.call_count, 2)
+        self.assertEqual(sum(call.args[0] for call in sleep_mock.call_args_list), 1.0)
+
+    def test_transient_advisor_connection_failure_retries_beyond_old_budget(self):
+        model_client = MagicMock()
+        model_client.chat.side_effect = (
+            [RuntimeError("HTTP 503 Service Unavailable")] * 6
+            + [{"response": "RECOVERED", "model": "test/model"}]
+        )
+        with patch("aicoder.team_orchestrator.time.sleep"):
+            result = _call_advisor(
+                model_client, model="test/model", system="system", prompt="task", max_tokens=64,
+                stop_requested=lambda: False,
+            )
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.response, "RECOVERED")
+        self.assertEqual(model_client.chat.call_count, 7)
+
+    def test_nontransient_advisor_error_still_fails_without_retry(self):
+        model_client = MagicMock()
+        model_client.chat.side_effect = RuntimeError("invalid API key")
+        with patch("aicoder.team_orchestrator.time.sleep") as sleep_mock:
+            result = _call_advisor(
+                model_client, model="test/model", system="system", prompt="task", max_tokens=64,
+                stop_requested=lambda: False,
+            )
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(model_client.chat.call_count, 1)
+        sleep_mock.assert_not_called()
+
+    def test_advisor_transient_recovery_honors_user_stop(self):
+        model_client = MagicMock()
+        model_client.chat.side_effect = RuntimeError("connection refused")
+        stop_checks = {"count": 0}
+        def stopped():
+            stop_checks["count"] += 1
+            return stop_checks["count"] >= 3
+        with patch("aicoder.team_orchestrator.time.sleep"):
+            result = _call_advisor(
+                model_client, model="test/model", system="system", prompt="task", max_tokens=64,
+                stop_requested=stopped,
+            )
+        self.assertEqual(result.status, "failed")
+        self.assertIn("stopped by user", result.error)
 
 
 class TeamWorkerAutoResumeTests(unittest.TestCase):
@@ -164,16 +262,39 @@ class TeamWorkerAutoResumeTests(unittest.TestCase):
                 run_once, role="coder:1", event_fn=lambda kind, payload: events.append((kind, payload)),
                 stop_requested=lambda: False,
             )
-        sleep_mock.assert_called_once()
-        self.assertGreaterEqual(float(sleep_mock.call_args.args[0]), 1.0)
+        self.assertGreaterEqual(sum(call.args[0] for call in sleep_mock.call_args_list), 1.0)
         self.assertEqual(result.status, "completed")
         self.assertEqual(len(calls), 2)
         self.assertIsNone(calls[0][0])
-        self.assertIn("Automatic runtime resume 1/3", calls[1][0])
+        self.assertIn("Automatic runtime resume 1/unlimited", calls[1][0])
         self.assertEqual(calls[1][1], [{"role": "assistant", "content": "partial"}])
         self.assertTrue(any(kind == "team_worker_event" and payload.get("phase") == "auto_resume" for kind, payload in events))
 
-    def test_incomplete_envelope_gets_extended_recovery_budget_and_cooldown(self):
+    def test_generic_transient_worker_recovery_is_unlimited_and_preserves_context(self):
+        reason = "Transient model/backend failure after request retries were exhausted: connection reset"
+        paused = AgentRunResult(
+            status="paused", response=reason, model="test/model",
+            messages=[{"role": "system", "content": "sys"}, {"role": "assistant", "content": "work evidence"}],
+            tools=[], system_prompt="sys",
+        )
+        completed = AgentRunResult(
+            status="completed", response="DONE: recovered", model="test/model",
+            messages=[], tools=[], system_prompt="sys",
+        )
+        calls = []
+        def run_once(prompt, conversation):
+            calls.append((prompt, conversation))
+            return completed if len(calls) == 7 else paused
+        with patch("aicoder.team_orchestrator.time.sleep"):
+            result = _run_worker_with_auto_resume(
+                run_once, role="coder:2", event_fn=None, stop_requested=lambda: False,
+            )
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(len(calls), 7)
+        self.assertIn("Automatic runtime resume 6/unlimited", calls[-1][0])
+        self.assertEqual(calls[-1][1], [{"role": "assistant", "content": "work evidence"}])
+
+    def test_incomplete_envelope_uses_fresh_chat_without_recovery_budget(self):
         reason = "Transient model/backend failure after request retries were exhausted: Transient incomplete chat response: no recognized assistant response envelope; keys=['_transport_telemetry']"
         self.assertEqual(auto_resume_limit(reason), 5)
         calls = []
@@ -194,10 +315,88 @@ class TeamWorkerAutoResumeTests(unittest.TestCase):
                 run_once, role="coder:1", event_fn=None, stop_requested=lambda: False,
             )
         self.assertEqual(result.status, "completed")
-        sleep_mock.assert_called_once_with(30.0)
-        self.assertIn("FRESH RECOVERY CHAT 1/5", calls[1][0])
+        self.assertEqual(sum(call.args[0] for call in sleep_mock.call_args_list), 2.0)
+        self.assertIn("FRESH RECOVERY CHAT 1/unlimited", calls[1][0])
         self.assertIn("partial", calls[1][0])
         self.assertIsNone(calls[1][1], "incomplete-envelope recovery must start a fresh provider chat")
+
+    def test_incomplete_envelope_recovery_continues_beyond_five_fresh_sessions(self):
+        reason = "Transient model/backend failure after request retries were exhausted: Transient incomplete chat response: no recognized assistant response envelope; keys=[_transport_telemetry]"
+        paused = AgentRunResult(
+            status="paused", response=reason, model="test/model",
+            messages=[{"role": "assistant", "content": "preserved evidence"}], tools=[], system_prompt="sys",
+        )
+        completed = AgentRunResult(
+            status="completed", response="DONE: recovered after provider congestion", model="test/model",
+            messages=[], tools=[], system_prompt="sys",
+        )
+        calls = []
+        def run_once(prompt, conversation):
+            calls.append((prompt, conversation))
+            return completed if len(calls) == 8 else paused
+        with patch("aicoder.team_orchestrator.time.sleep"):
+            result = _run_worker_with_auto_resume(
+                run_once, role="coder:3", event_fn=None, stop_requested=lambda: False,
+            )
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(len(calls), 8)
+        self.assertIn("FRESH RECOVERY CHAT 7/unlimited", calls[-1][0])
+        self.assertIsNone(calls[-1][1])
+
+    def test_fresh_recovery_handoff_preserves_text_and_tool_calls(self):
+        reason = "Transient model/backend failure after request retries were exhausted: Transient incomplete chat response: no recognized assistant response envelope; keys=[_transport_telemetry]"
+        paused = AgentRunResult(
+            status="paused", response=reason, model="test/model",
+            messages=[
+                {"role": "system", "content": "sys"},
+                {
+                    "role": "assistant",
+                    "content": "I inspected the target before editing.",
+                    "tool_calls": [{"id": "call-1", "name": "file_read", "arguments": {"path": "a.py"}}],
+                },
+            ],
+            tools=[], system_prompt="sys",
+        )
+        completed = AgentRunResult(
+            status="completed", response="DONE: recovered", model="test/model",
+            messages=[], tools=[], system_prompt="sys",
+        )
+        calls = []
+        def run_once(prompt, conversation):
+            calls.append((prompt, conversation))
+            return paused if len(calls) == 1 else completed
+        with patch("aicoder.team_orchestrator.time.sleep"):
+            result = _run_worker_with_auto_resume(
+                run_once, role="coder:1", event_fn=None, stop_requested=lambda: False,
+            )
+        self.assertEqual(result.status, "completed")
+        handoff = calls[1][0]
+        self.assertIn("I inspected the target before editing.", handoff)
+        self.assertIn("call-1", handoff)
+        self.assertIn("file_read", handoff)
+
+    def test_worker_recovery_cooldown_honors_stop_request(self):
+        reason = "Transient model/backend failure after request retries were exhausted: Transient incomplete chat response: no recognized assistant response envelope; keys=[_transport_telemetry]"
+        paused = AgentRunResult(
+            status="paused", response=reason, model="test/model",
+            messages=[{"role": "system", "content": "sys"}], tools=[], system_prompt="sys",
+        )
+        calls = []
+        stop_checks = {"count": 0}
+        def run_once(prompt, conversation):
+            calls.append((prompt, conversation))
+            return paused
+        def stop_requested():
+            stop_checks["count"] += 1
+            return stop_checks["count"] >= 3
+        with patch("aicoder.team_orchestrator.time.monotonic", side_effect=[0.0, 0.0, 0.5]), \
+             patch("aicoder.team_orchestrator.time.sleep") as sleep_mock:
+            result = _run_worker_with_auto_resume(
+                run_once, role="coder:1", event_fn=None, stop_requested=stop_requested,
+            )
+        self.assertEqual(result.status, "paused")
+        self.assertEqual(len(calls), 1, "stop during cooldown must prevent a fresh model call")
+        sleep_mock.assert_called_once()
 
     def test_safety_pause_gets_continuation_budget_beyond_three_slices(self):
         calls = []
@@ -348,6 +547,142 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
             self.assertEqual((source / "app.py").read_text(encoding="utf-8"), "value = 2\n")
             self.assertEqual((source / "integrated.txt").read_text(encoding="utf-8"), "merged\n")
             self.assertFalse((source / ".aicoder-team").exists())
+
+
+class TeamVerificationRecoveryTests(unittest.TestCase):
+    @staticmethod
+    def _verification(ok: bool, output: str) -> list[VerificationResult]:
+        return [VerificationResult(
+            name="python-tests", argv=["python3", "-m", "pytest", "-q"], ok=ok,
+            exit_code=0 if ok else 1, elapsed_ms=3, output=output, required=True,
+        )]
+
+    def _run(self, workspace: Path, ram_dir: str, verification_side_effect):
+        source = workspace / "project"
+        source.mkdir()
+        (source / "app.py").write_text("value = 0\n", encoding="utf-8")
+        (source / "pyproject.toml").write_text(
+            "[project]\nname=\"demo\"\nversion=\"0.1.0\"\n", encoding="utf-8",
+        )
+        (source / "tests").mkdir()
+        (source / "tests" / "test_app.py").write_text(
+            "def test_value():\n    assert True\n", encoding="utf-8",
+        )
+        state = {
+            "selected_model": "test/model", "team_runtime_mode": "on",
+            "runtime_mode": "native-light", "workspace_mode": "ram",
+            "workspace_root": str(workspace),
+            "team_research_model_1": "test/model", "team_research_model_2": "",
+            "team_research_model_3": "", "team_research_model_4": "",
+            "team_planner_model": "test/model", "team_coordinator_model": "",
+            "team_coder_model_1": "test/model", "team_coder_model_2": "",
+            "team_coder_model_3": "", "team_coder_model_4": "",
+            "team_merge_model": "test/model", "team_test_planner_model": "test/model",
+            "team_brainstorm_rounds": 1,
+        }
+        config = config_from_state(state)
+
+        def researcher(**kwargs):
+            return AgentStageResult(
+                role=f"research:{kwargs['role']}", model=kwargs["model"], status="completed",
+                response="evidence", elapsed_ms=1,
+            )
+
+        def advisor(_model_client, *, model, system, prompt, max_tokens=0, **_kwargs):
+            return AgentStageResult("advisor", model, "completed", "shared plan", 1)
+
+        def candidate(**kwargs):
+            backend = RamWorkspace(source, ram_root=ram_dir)
+            backend.prepare()
+            (backend.info.execution_root / "app.py").write_text("value = 1\n", encoding="utf-8")
+            return CandidateResult(
+                kwargs["slot"], kwargs["model"], kwargs["strategy"], backend,
+                _result("DONE: candidate"),
+            )
+
+        def evaluate(item):
+            return {
+                "score": 90, "delta": item.workspace.delta_summary(),
+                "checks": {"python-tests": {"ok": True}}, "diff": "candidate",
+                "candidate_id": "cand-one", "content_fingerprint": "fp-one",
+                "verification_passed": True,
+            }
+
+        def create_backend(root, mode, **kwargs):
+            return RamWorkspace(root, ram_root=ram_dir)
+
+        FakeIntegrationRuntime.calls = 0
+        with (
+            patch("aicoder.team_orchestrator.load_tools", return_value=[]),
+            patch("aicoder.team_orchestrator._run_researcher", side_effect=researcher),
+            patch("aicoder.team_orchestrator._call_advisor", side_effect=advisor),
+            patch("aicoder.team_orchestrator._run_candidate", side_effect=candidate),
+            patch("aicoder.team_orchestrator.evaluate_candidate", side_effect=evaluate),
+            patch("aicoder.team_orchestrator.create_isolated_team_workspace", side_effect=create_backend),
+            patch("aicoder.team_orchestrator.NativeLightRuntime", FakeIntegrationRuntime),
+            patch("aicoder.team_orchestrator.execute_verification_plan", side_effect=verification_side_effect) as verify,
+        ):
+            result = run_team(
+                task="Implement feature", state=state, config=config, client=MagicMock(),
+                model_client=MagicMock(), source_workspace=str(source),
+            )
+        return source, result, verify
+
+    def test_failed_gate_gets_one_debug_pass_then_full_reverification_and_write(self):
+        with tempfile.TemporaryDirectory() as workspace_dir, tempfile.TemporaryDirectory() as ram_dir:
+            workspace = Path(workspace_dir)
+            source, result, verify = self._run(
+                workspace, ram_dir,
+                [self._verification(False, "assertion failed"), self._verification(True, "518 passed")],
+            )
+            self.assertEqual(result.status, "completed", result.error)
+            self.assertEqual(verify.call_count, 2)
+            self.assertEqual(FakeIntegrationRuntime.calls, 2, "merge plus exactly one debug runtime")
+            self.assertTrue(any(stage.role == "debug_tests" for stage in result.stages))
+            self.assertEqual((source / "integrated.txt").read_text(encoding="utf-8"), "final\n")
+            backup = Path(result.performance["backup_path"])
+            self.assertTrue((backup / "manifest.json").is_file())
+            self.assertEqual((backup / "before" / "app.py").read_text(encoding="utf-8"), "value = 0\n")
+            self.assertIn("assertion failed", (backup / "initial-verification.json").read_text(encoding="utf-8"))
+            self.assertIn("518 passed", (backup / "verification.json").read_text(encoding="utf-8"))
+
+    def test_failed_gate_after_debug_preserves_repo_and_never_writes_source(self):
+        with tempfile.TemporaryDirectory() as workspace_dir, tempfile.TemporaryDirectory() as ram_dir:
+            workspace = Path(workspace_dir)
+            source, result, verify = self._run(
+                workspace, ram_dir,
+                [self._verification(False, "first failure"), self._verification(False, "still failing")],
+            )
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(verify.call_count, 2)
+            self.assertEqual(FakeIntegrationRuntime.calls, 2, "merge plus one and only one debug runtime")
+            failed = Path(result.performance["failed_workspace"])
+            self.assertEqual(failed.parent, workspace)
+            self.assertTrue(failed.name.startswith("test_fail_"))
+            self.assertEqual((failed / "integrated.txt").read_text(encoding="utf-8"), "final\n")
+            self.assertTrue((failed / ".aicoder-failure" / "run.json").is_file())
+            self.assertIn("still failing", (failed / ".aicoder-failure" / "final-verification.json").read_text(encoding="utf-8"))
+            self.assertEqual((source / "app.py").read_text(encoding="utf-8"), "value = 0\n")
+            self.assertFalse((source / "integrated.txt").exists())
+            self.assertFalse((source / ".backup").exists(), "failed runs must not create a success backup")
+
+    def test_backup_directory_is_excluded_from_future_ram_candidates(self):
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as ram_dir:
+            source = Path(source_dir)
+            (source / "app.py").write_text("before\n", encoding="utf-8")
+            backend = RamWorkspace(source, ram_root=ram_dir)
+            backend.prepare()
+            (backend.info.execution_root / "app.py").write_text("after\n", encoding="utf-8")
+            backup = _create_run_backup(
+                backend, run_id="run-test", verification=[{"name": "tests", "ok": True}], task="demo",
+            )
+            self.assertTrue(backup.is_dir())
+            second = RamWorkspace(source, ram_root=ram_dir)
+            second.prepare()
+            try:
+                self.assertFalse((second.info.execution_root / ".backup").exists())
+            finally:
+                second.abort(); backend.abort()
 
 
 if __name__ == "__main__":

@@ -96,12 +96,15 @@ def auto_resume_limit(reason: str) -> int:
     return MAX_AUTO_RESUMES
 
 
-def auto_resume_prompt(reason: str, attempt: int, limit: int | None = None) -> str:
+def auto_resume_prompt(
+    reason: str, attempt: int, limit: int | None = None, *, unlimited: bool = False,
+) -> str:
     active_limit = int(limit or auto_resume_limit(reason))
+    limit_label = "unlimited" if unlimited else str(active_limit)
     text = str(reason or "")
     if "safety pause after an unusually long run" in text.lower():
         return (
-            f"Automatic continuation slice {attempt}/{active_limit}. This is NOT a fresh analysis pass. "
+            f"Automatic continuation slice {attempt}/{limit_label}. This is NOT a fresh analysis pass. "
             "Continue from the preserved conversation and tool evidence. Do not restart architecture discovery, "
             "git-status loops, baseline tests, or reread unchanged files already present in context. "
             "Move the assigned task toward a terminal state now: implement the smallest evidence-backed change, "
@@ -110,7 +113,7 @@ def auto_resume_prompt(reason: str, attempt: int, limit: int | None = None) -> s
             f"Previous pause reason: {text[:1200]}"
         )
     return (
-        f"Automatic runtime resume {attempt}/{active_limit}. "
+        f"Automatic runtime resume {attempt}/{limit_label}. "
         "Continue the existing task from the preserved context. Do not repeat the same failed "
         "action unchanged. Inspect existing tool results, choose a different approach when needed, "
         "finish required verification, and continue until the assigned task is actually complete. "

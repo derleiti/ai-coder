@@ -49,7 +49,9 @@ class FailureTracker:
         elif "429" in lower or _HTTP_5XX_RE.search(text) or any(
             token in lower for token in (
                 "timed out", "timeout", "temporarily unavailable", "connection reset",
-                "transient incomplete chat response",
+                "connection refused", "connection aborted", "remote end closed connection",
+                "network is unreachable", "temporary failure in name resolution",
+                "name or service not known", "transient incomplete chat response",
             )
         ):
             category = "transient"
