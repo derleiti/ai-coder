@@ -805,7 +805,7 @@ def _run_candidate(
                 plan_workspace_root=source_workspace, protected_workspace_root=source_workspace,
                 tools=tools, system_prompt=system, load_tools_on_start=True,
                 quick_chat=False, persistent_plan=False, approval_fn=_candidate_approval,
-                max_iterations=18, max_output_tokens=12000, stop_requested=candidate_stop_requested,
+                max_iterations=None, max_output_tokens=12000, stop_requested=candidate_stop_requested,
                 base_timeout=request_timeout, event_fn=forward, conversation=conversation,
             )
             return runtime.run()
@@ -1351,7 +1351,7 @@ def run_team(
     )
     _emit(event_fn, "team_workspace_plan", **workspace_plan.as_dict())
     _stage_start(ledger, TeamStage.CODE, event_fn)
-    with ThreadPoolExecutor(max_workers=min(2, len(config.coders)), thread_name_prefix="aicoder-coder") as pool:
+    with ThreadPoolExecutor(max_workers=len(config.coders), thread_name_prefix="aicoder-coder") as pool:
         futures = {
             pool.submit(
                 _run_candidate, client=client, model_client=model_client, source_workspace=source_workspace,

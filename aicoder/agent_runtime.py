@@ -6,6 +6,7 @@ runtime events, so future skills/subagents can extend one loop instead of two.
 from __future__ import annotations
 
 import json
+import itertools
 import queue
 import re
 import threading
@@ -349,7 +350,7 @@ class NativeLightRuntime:
     base_timeout: int = 300
     max_output_tokens: int = 16384
     tools_unavailable_reason: str = ""
-    max_iterations: int = MAX_ITERATIONS
+    max_iterations: int | None = MAX_ITERATIONS
     progressive_tool_disclosure: bool = True
     native_openrouter_tool_calling: bool = False
     tool_budget: int = DEFAULT_TOOL_BUDGET
@@ -929,14 +930,15 @@ class NativeLightRuntime:
             ),
         )
 
-        iteration_limit = max(1, min(MAX_ITERATIONS, int(self.max_iterations or MAX_ITERATIONS)))
+        iteration_limit = None if self.max_iterations is None else max(1, min(MAX_ITERATIONS, int(self.max_iterations)))
         final_response_repair_sent = False
         completion_audit_sent = False
-        for i in range(iteration_limit):
+        iteration_source = itertools.count() if iteration_limit is None else range(iteration_limit)
+        for i in iteration_source:
             self._emit(
                 "runtime_status", category="run", status="active", phase="iteration",
                 runtime_mode=runtime_mode, iteration=i + 1,
-                message=f"iteration {i + 1}/{iteration_limit} started",
+                message=f"iteration {i + 1}/{'unlimited' if iteration_limit is None else iteration_limit} started",
             )
             if self._stopped():
                 reason = "Agent stopped by user"

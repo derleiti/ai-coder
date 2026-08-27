@@ -23,6 +23,8 @@ import tempfile
 from typing import Any, Iterable
 import uuid
 import weakref
+import atexit
+import threading
 
 from .config import CONFIG_DIR
 
@@ -53,6 +55,26 @@ _TRANSIENT_NAME_PATTERNS = (
 )
 _MIN_RAM_RESERVE = 512 * 1024 * 1024
 _RAM_OVERHEAD = 64 * 1024 * 1024
+
+_ACTIVE_VOLATILE_WORKSPACES: set[Path] = set()
+_ACTIVE_VOLATILE_LOCK = threading.RLock()
+
+def _register_volatile_workspace(path: Path) -> None:
+    with _ACTIVE_VOLATILE_LOCK:
+        _ACTIVE_VOLATILE_WORKSPACES.add(Path(path))
+
+def _unregister_volatile_workspace(path: Path) -> None:
+    with _ACTIVE_VOLATILE_LOCK:
+        _ACTIVE_VOLATILE_WORKSPACES.discard(Path(path))
+
+def cleanup_process_ram_workspaces() -> None:
+    with _ACTIVE_VOLATILE_LOCK:
+        paths = list(_ACTIVE_VOLATILE_WORKSPACES)
+        _ACTIVE_VOLATILE_WORKSPACES.clear()
+    for path in paths:
+        shutil.rmtree(path, ignore_errors=True)
+
+atexit.register(cleanup_process_ram_workspaces)
 
 
 class WorkspaceError(RuntimeError):
@@ -416,6 +438,7 @@ class RamWorkspace(WorkspaceBackend):
             volatile=True, transactional=True,
             estimated_bytes=int(estimated_bytes), safe_budget_bytes=int(safe_budget_bytes),
         )
+        _register_volatile_workspace(execution)
 
     @property
     def info(self) -> WorkspaceInfo:
@@ -755,6 +778,7 @@ class RamWorkspace(WorkspaceBackend):
         if self._closed:
             return
         self._closed = True
+        _unregister_volatile_workspace(self._execution)
         if self._cleanup_finalizer.alive:
             self._cleanup_finalizer()
         else:
@@ -779,6 +803,7 @@ class IsolatedDiskWorkspace(RamWorkspace):
             root, ram_root=disk_root, requested_mode=requested_mode,
             estimated_bytes=0, safe_budget_bytes=0, checkpoint_id=checkpoint_id,
         )
+        _unregister_volatile_workspace(self._execution)
         self._info = replace(
             self._info, mode="disk-isolated", volatile=True, transactional=True,
             fallback_reason="isolated disk candidate workspace",

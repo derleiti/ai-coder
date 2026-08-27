@@ -101,4 +101,6 @@ def run_gui() -> int:
     window.tray = tray
     window.show()
 
+    from ..workspace_backend import cleanup_process_ram_workspaces
+    app.aboutToQuit.connect(cleanup_process_ram_workspaces)
     return app.exec()
