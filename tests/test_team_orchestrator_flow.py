@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from aicoder.agent_runtime import AgentRunResult, auto_resumable_pause, auto_resume_limit
-from aicoder.team_orchestrator import _coder_pool_size, CODER_MAX_ITERATIONS, AgentStageResult, CandidateResult, _anonymized_brainstorm_round, _brainstorm_rounds, _build_brainstorm_prompt, _RESEARCH_TOOL_NAMES, _brainstorm_participants, _merge_completion_contradiction, _run_worker_with_auto_resume, _run_candidate, _candidate_is_mergeable, _verification_root_for_delta, _worker_event_forwarder, _call_advisor, _save_stage_handoff, _load_stage_handoff, _render_stage_handoff, _team_handoff_dir, _create_run_backup, _preserve_failed_workspace, clear_team_checkpoint, run_team
+from aicoder.team_orchestrator import _coder_pool_size, CODER_MAX_ITERATIONS, AgentStageResult, CandidateResult, _anonymized_brainstorm_round, _brainstorm_rounds, _build_brainstorm_prompt, _RESEARCH_TOOL_NAMES, _brainstorm_participants, _merge_completion_contradiction, _run_worker_with_auto_resume, _run_candidate, _candidate_is_mergeable, _verification_root_for_delta, _working_project_root, _worker_event_forwarder, _call_advisor, _save_stage_handoff, _load_stage_handoff, _render_stage_handoff, _team_handoff_dir, _create_run_backup, _preserve_failed_workspace, clear_team_checkpoint, run_team
 from aicoder.team_runtime import BRAINSTORM_SYSTEM_PROMPT, PLANNER_SYSTEM_PROMPT, CODER_SYSTEM_TEMPLATE, config_from_state
 from aicoder.team_pipeline import TeamStage, VerificationResult
 from aicoder.workspace_backend import RamWorkspace
@@ -784,3 +784,37 @@ class CoderSchedulingPolicyTests(unittest.TestCase):
     def test_all_configured_coders_receive_worker_capacity(self):
         self.assertEqual(_coder_pool_size(4), 4)
         self.assertIsNone(CODER_MAX_ITERATIONS)
+
+
+class WorkingProjectRootTests(unittest.TestCase):
+    def test_named_nested_project_is_used_for_team_working_set(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp)
+            project = workspace / "aicoder-experimental"
+            project.mkdir()
+            (project / "pyproject.toml").write_text("[project]\nname='aicoder'\n", encoding="utf-8")
+            unrelated = workspace / "triforce"
+            unrelated.mkdir()
+            (unrelated / "pyproject.toml").write_text("[project]\nname='triforce'\n", encoding="utf-8")
+            resolved = _working_project_root(workspace, "work on aicoder-experimental", "")
+            self.assertEqual(resolved, project.resolve())
+
+    def test_invalid_planner_root_cannot_escape_or_override_named_project(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp)
+            project = workspace / "aicoder-experimental"
+            project.mkdir()
+            (project / "pyproject.toml").write_text("[project]\nname='aicoder'\n", encoding="utf-8")
+            plan = "[AUTHORITATIVE_PROJECT_ROOT]\n/tmp/does-not-exist\n"
+            resolved = _working_project_root(workspace, "work on aicoder-experimental", plan)
+            self.assertEqual(resolved, project.resolve())
+
+    def test_ambiguous_multi_project_task_falls_back_to_workspace(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp)
+            for name in ("alpha", "beta"):
+                project = workspace / name
+                project.mkdir()
+                (project / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
+            resolved = _working_project_root(workspace, "update all projects", "")
+            self.assertEqual(resolved, workspace.resolve())

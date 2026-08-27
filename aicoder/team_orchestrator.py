@@ -883,6 +883,45 @@ _PROJECT_MARKERS = (
     "go.mod", "CMakeLists.txt", "Makefile",
 )
 
+def _looks_like_project(path: Path) -> bool:
+    return path.is_dir() and ((path / ".git").exists() or any((path / marker).exists() for marker in _PROJECT_MARKERS))
+
+def _working_project_root(source_workspace: str | Path, task: str, code_plan: str = "") -> Path:
+    """Resolve a validated single-project working root without trusting planner prose blindly."""
+    source = Path(source_workspace).expanduser().resolve(strict=True)
+    if _looks_like_project(source):
+        return source
+
+    candidates: list[Path] = []
+    lines = str(code_plan or "").splitlines()
+    for index, line in enumerate(lines):
+        if line.strip().upper() == "[AUTHORITATIVE_PROJECT_ROOT]" and index + 1 < len(lines):
+            raw = lines[index + 1].strip()
+            if raw:
+                candidates.append(Path(raw).expanduser())
+
+    task_text = str(task or "")
+    try:
+        children = [child for child in source.iterdir() if _looks_like_project(child)]
+    except OSError:
+        children = []
+    for child in children:
+        if child.name.lower() in task_text.lower():
+            candidates.append(child)
+
+    if len(children) == 1:
+        candidates.append(children[0])
+
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(source)
+        except (OSError, ValueError):
+            continue
+        if _looks_like_project(resolved):
+            return resolved
+    return source
+
 def _verification_root_for_delta(root: str | Path, delta: dict[str, Any]) -> Path:
     """Choose the actual changed project when a team workspace contains multiple repos."""
     root_path = Path(root)
@@ -1354,15 +1393,17 @@ def run_team(
         _save_team_checkpoint(source_workspace, {"stage": TeamStage.CODE.value, "task": task, "code_plan": code_plan.response, "model": code_plan.model, "created_at": time.time()})
 
     # 5) code — isolated parallel candidates with one fair global backing mode.
+    working_project_root = _working_project_root(source_workspace, task, code_plan.response)
     workspace_plan = team_workspace_plan(
-        source_workspace, len(config.coders), str(state.get("workspace_mode") or "auto")
+        working_project_root, len(config.coders), str(state.get("workspace_mode") or "auto")
     )
+    _emit(event_fn, "team_working_project", source_workspace=source_workspace, working_project_root=str(working_project_root))
     _emit(event_fn, "team_workspace_plan", **workspace_plan.as_dict())
     _stage_start(ledger, TeamStage.CODE, event_fn)
     with ThreadPoolExecutor(max_workers=_coder_pool_size(len(config.coders)), thread_name_prefix="aicoder-coder") as pool:
         futures = {
             pool.submit(
-                _run_candidate, client=client, model_client=model_client, source_workspace=source_workspace,
+                _run_candidate, client=client, model_client=model_client, source_workspace=str(working_project_root),
                 backend_mode=workspace_plan.backend_mode, slot=slot.slot, model=slot.model,
                 strategy=slot.strategy, task=task, plan=code_plan.response, coordinator="",
                 tools=coder_tools, stop_requested=stop_requested, request_timeout=request_timeout, event_fn=event_fn,
@@ -1409,7 +1450,7 @@ def run_team(
     })
 
     # Build fresh integration workspace and attach anonymized full snapshots.
-    integration = create_isolated_team_workspace(source_workspace, workspace_plan.backend_mode)
+    integration = create_isolated_team_workspace(str(working_project_root), workspace_plan.backend_mode)
     integration.prepare()
     if not isinstance(integration, RamWorkspace):
         for c in candidates: c.workspace.abort()
