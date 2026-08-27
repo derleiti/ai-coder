@@ -561,6 +561,9 @@ LOCAL_CODE_SEARCH_SCHEMA = {
 
 LOCAL_CODE_GREP_SCHEMA = {
     "name": "code_grep",
+    "x-aicoder-contract": [
+        "path is workspace-relative; do not prepend / to project paths such as aicoder or tests",
+    ],
     "description": "Regex-search LOCAL text files. Outside-workspace paths require explicit one-time local scope approval.",
     "inputSchema": {
         "type": "object",
@@ -577,15 +580,15 @@ LOCAL_CODE_GREP_SCHEMA = {
 LOCAL_GIT_SCHEMA = {
     "name": "git",
     "x-aicoder-contract": [
-        "read-only actions only: status, diff, log, show, branch",
+        "read-only actions only: status, diff, log, show, branch, blame; blame takes the file path in args",
         "args is a JSON array of git arguments, not a shell command",
-        "cwd is already the repository directory; do not duplicate it in args",
+        "cwd is already the repository directory; project file paths in args are relative to cwd and normally must not start with /",
     ],
     "description": "Read-only Git inspection. Outside-workspace cwd requires explicit one-time local scope approval.",
     "inputSchema": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["status", "diff", "log", "show", "branch"]},
+            "action": {"type": "string", "enum": ["status", "diff", "log", "show", "branch", "blame"]},
             "args": {"type": "array", "items": {"type": "string"}},
             "cwd": {"type": "string", "description": "Workspace-relative repository directory"},
         },
@@ -1422,7 +1425,41 @@ def _code_project_path(args: dict, default_path: str = ".") -> Path:
     else:
         root = workspace
     raw = Path(str(args.get("path") or default_path)).expanduser()
-    return (raw if raw.is_absolute() else root / raw).resolve(strict=False)
+    if raw.is_absolute():
+        absolute = raw.resolve(strict=False)
+        # Model compatibility: `/aicoder/x.py` is often an accidental leading slash
+        # for a workspace-relative `aicoder/x.py`. Only reinterpret it when the
+        # absolute path does not exist and the same relative path exists under the
+        # authoritative project root. Real absolute paths always keep their meaning.
+        relative_candidate = (root / str(raw).lstrip("/")).resolve(strict=False)
+        if not absolute.exists() and relative_candidate.exists() and _inside(relative_candidate, root):
+            return relative_candidate
+        return absolute
+    return (root / raw).resolve(strict=False)
+
+
+def _normalize_accidental_workspace_read_path(tool_name: str, args: dict) -> dict:
+    """Repair an obvious leading-slash model error for read-only workspace tools.
+
+    Preserve genuine absolute paths. Reinterpret only a nonexistent absolute path when
+    the exact same relative path exists inside the active workspace. This keeps scope
+    enforcement strict while making `/aicoder/x.py` compatible with `aicoder/x.py`.
+    """
+    if tool_name not in {"file_read", "file_tree", "code_grep"}:
+        return args
+    value = args.get("path")
+    if not isinstance(value, str) or not value.startswith("/"):
+        return args
+    absolute = Path(value).expanduser().resolve(strict=False)
+    if absolute.exists():
+        return args
+    root = _workspace_root().resolve(strict=False)
+    candidate = (root / value.lstrip("/")).resolve(strict=False)
+    if not candidate.exists() or not _inside(candidate, root):
+        return args
+    normalized = dict(args)
+    normalized["path"] = str(candidate)
+    return normalized
 
 
 def _workspace_escape_target(tool_name: str, args: dict) -> Path | None:
@@ -1820,8 +1857,9 @@ def run_code_grep(args: dict) -> Tuple[str, bool]:
 
 def run_git_read(args: dict) -> Tuple[str, bool]:
     action = str(args.get("action") or "").lower()
-    if action not in {"status", "diff", "log", "show", "branch"}:
-        return "git error: only status, diff, log, show, and branch are allowed", True
+    supported = {"status", "diff", "log", "show", "branch", "blame"}
+    if action not in supported:
+        return "git error: supported read-only actions are status, diff, log, show, branch, and blame", True
     raw_args = args.get("args") or []
     if isinstance(raw_args, str):
         # Provider/model compatibility: some otherwise-correct tool calls encode
@@ -1838,6 +1876,31 @@ def run_git_read(args: dict) -> Tuple[str, bool]:
         return "git error: mutating or output-writing argument rejected", True
     try:
         cwd = _workspace_path(args.get("cwd") or ".", allow_outside=bool(args.get("_workspace_escape_approved")))
+        # Tolerate a common model shape for blame: cwd points at the file and args
+        # is empty. Resolve the enclosing repository and supply the file path.
+        if action == "blame" and cwd.is_file() and not raw_args:
+            file_path = cwd
+            probe = file_path.parent
+            repo = None
+            for parent in (probe, *probe.parents):
+                if (parent / ".git").exists():
+                    repo = parent
+                    break
+            if repo is None:
+                return f"git error: no repository found for blame target: {file_path}", True
+            raw_args = [str(file_path.relative_to(repo))]
+            cwd = repo
+        # Normalize accidental leading slashes in Git pathspecs only when the
+        # absolute path is absent and the workspace-relative file really exists.
+        normalized_args: list[str] = []
+        for item in raw_args:
+            if item.startswith("/") and not Path(item).exists():
+                candidate = (cwd / item.lstrip("/")).resolve(strict=False)
+                if candidate.exists() and _inside(candidate, cwd):
+                    normalized_args.append(item.lstrip("/"))
+                    continue
+            normalized_args.append(item)
+        raw_args = normalized_args
         command = [
             "git", "--no-pager",
             "-c", "diff.external=",
@@ -1858,6 +1921,52 @@ def run_git_read(args: dict) -> Tuple[str, bool]:
         return output[:12000] or "(no output)", completed.returncode != 0
     except Exception as exc:
         return f"git error: {exc}", True
+
+
+def _disk_backed_project_environment(cwd: Path, argv: list[str]) -> tuple[list[str], dict[str, str]]:
+    """Reuse heavy dependency environments from the protected source tree read-only.
+
+    Transactional team workspaces intentionally exclude .venv/node_modules. For test/lint
+    execution, reuse their executables/dependencies from the protected persistent source
+    while keeping imports and cwd pointed at the isolated candidate. No dependency tree is
+    linked into the candidate and package-install commands are not introduced here.
+    """
+    env = dict(os.environ)
+    source = _protected_root()
+    candidate = _workspace_root().resolve(strict=False)
+    if source is None:
+        return list(argv), env
+    source = source.resolve(strict=False)
+    if source == candidate or not source.is_dir():
+        return list(argv), env
+
+    adjusted = list(argv)
+    python_env = next(
+        (source / name for name in (".venv", "venv", "env") if (source / name / "bin" / "python").is_file()),
+        None,
+    )
+    if python_env is not None and adjusted:
+        bin_dir = python_env / "bin"
+        executable = Path(adjusted[0]).name
+        candidate_exe = bin_dir / executable
+        if executable in {"python", "python3"}:
+            adjusted[0] = str(bin_dir / "python")
+        elif candidate_exe.is_file():
+            adjusted[0] = str(candidate_exe)
+        env["VIRTUAL_ENV"] = str(python_env)
+        env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
+        prior_pythonpath = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = str(candidate) + (os.pathsep + prior_pythonpath if prior_pythonpath else "")
+
+    node_modules = source / "node_modules"
+    if node_modules.is_dir():
+        node_bin = node_modules / ".bin"
+        if node_bin.is_dir():
+            env["PATH"] = str(node_bin) + os.pathsep + env.get("PATH", "")
+        prior_node_path = env.get("NODE_PATH", "")
+        env["NODE_PATH"] = str(node_modules) + (os.pathsep + prior_node_path if prior_node_path else "")
+
+    return adjusted, env
 
 
 def run_checked_project_command(tool_name: str, args: dict) -> Tuple[str, bool]:
@@ -1887,7 +1996,11 @@ def run_checked_project_command(tool_name: str, args: dict) -> Tuple[str, bool]:
             return f"{tool_name} error: Python module '{argv[2]}' is not allowed", True
     try:
         cwd = _workspace_path(args.get("cwd") or ".", allow_outside=bool(args.get("_workspace_escape_approved")))
-        completed = subprocess.run(argv, shell=False, cwd=str(cwd), capture_output=True, text=True, timeout=120)
+        execution_argv, execution_env = _disk_backed_project_environment(cwd, argv)
+        completed = subprocess.run(
+            execution_argv, shell=False, cwd=str(cwd), env=execution_env,
+            capture_output=True, text=True, timeout=120,
+        )
         output = (completed.stdout or "") + (completed.stderr or "")
         return output[:12000] or "(no output)", completed.returncode != 0
     except Exception as exc:
@@ -2124,6 +2237,8 @@ def _run_tool_impl(
             is_error=True, model=model, iteration=iteration,
         )
         return result, True
+
+    args = _normalize_accidental_workspace_read_path(name, args)
 
     if name in {"code_read", "code_tree", "code_search"}:
         try:

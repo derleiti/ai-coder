@@ -1671,6 +1671,8 @@ def _activate_startup_workspace(argv: list[str] | None = None) -> Path:
 
 
 def main() -> int:
+    from .team_orchestrator import reset_team_debug_log
+    reset_team_debug_log()
     # CLI/REPL intentionally use the launch cwd as workspace. GUI launchers often
     # start from the source/install directory, so GUI must honor persisted settings.
     _activate_startup_workspace()

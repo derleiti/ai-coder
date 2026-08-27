@@ -35,8 +35,8 @@ from .team_runtime import (
     RESEARCH_PLANNER_SYSTEM_PROMPT, TEST_PLANNER_SYSTEM_PROMPT, TeamConfig,
 )
 from .team_pipeline import (
-    StageLedger, TeamStage, blind_candidate_id, content_fingerprint, execute_verification_plan,
-    objective_rank_key, project_verification_plan, verification_passed,
+    StageLedger, TeamStage, VerificationResult, blind_candidate_id, content_fingerprint, execute_verification_plan,
+    objective_rank_key, project_verification_plan, verification_passed, test_change_evidence,
 )
 from .workspace_backend import (
     RamWorkspace, WorkspaceBackend, WorkspaceError, create_isolated_team_workspace,
@@ -180,7 +180,7 @@ def _clear_stage_handoffs(source_workspace: str) -> None:
 _RESEARCH_TOOL_NAMES = frozenset({
     "search", "crawl", "web_fetch_local", "web_search_local", "doc_read", "doc_search",
     "file_read", "file_tree", "code_read", "code_tree", "code_search", "code_grep",
-    "git", "skill_read", "test", "lint", "binary_exec",
+    "git", "skill_read",
 })
 _CODER_TOOL_NAMES = frozenset({
     "file_read", "file_edit", "file_tree", "directory_create", "code_read", "code_tree",
@@ -225,6 +225,169 @@ class TeamRunResult:
     error: str = ""
 
 
+def _plan_grounding_issues(plan: str, source_workspace: str) -> list[str]:
+    """Detect implementation plans that treat nonexistent top-level project areas as real.
+
+    The planner may propose new files, but inventing an unrelated top-level package (for
+    example ``src/`` in a project whose package is ``aicoder/``) sends every candidate
+    down the same invalid architecture. Keep this deterministic and conservative: only
+    path-like references with a missing top-level component are rejected.
+    """
+    root = Path(source_workspace).expanduser().resolve(strict=True)
+    try:
+        existing_top = {entry.name for entry in root.iterdir()}
+    except OSError:
+        return []
+    allowed_virtual = {".", ".."}
+    issues: list[str] = []
+    seen: set[str] = set()
+    # Backticks and ordinary slash-containing path tokens cover planner sections and
+    # verification commands without trying to parse arbitrary prose as filesystem data.
+    candidates = re.findall(r"`([^`]+)`|(?<![\w.-])(/?[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+)", str(plan or ""))
+    for pair in candidates:
+        raw = next((item for item in pair if item), "") if isinstance(pair, tuple) else str(pair)
+        token = raw.strip().strip("\'\"()[]{}:,;")
+        if not token or token.startswith(("http://", "https://")):
+            continue
+        if not re.fullmatch(r"(?:\./)?/?[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*/?", token):
+            continue
+        # Ignore command/module notation that is not a project path.
+        if " " in token or token.startswith(("python/", "pytest/")):
+            continue
+        path = Path(token)
+        if path.is_absolute():
+            try:
+                rel = path.resolve(strict=False).relative_to(root)
+            except ValueError:
+                # Absolute paths below /src, /tests etc. are a common hallucination. The
+                # authoritative root itself is the one allowed absolute project prefix.
+                if token.startswith(("/src/", "/tests/", "/aicoder/")):
+                    key = f"absolute project path outside authoritative root: {token}"
+                    if key not in seen:
+                        issues.append(key); seen.add(key)
+                continue
+        else:
+            rel = path
+        parts = [part for part in rel.parts if part not in allowed_virtual]
+        if not parts:
+            continue
+        top = parts[0]
+        if top not in existing_top and top not in {root.name}:
+            key = f"unknown top-level project area referenced by plan: {top}/ (from {token})"
+            if key not in seen:
+                issues.append(key); seen.add(key)
+    return issues[:12]
+
+
+def _repair_ungrounded_code_plan(
+    model_client: ModelTransport, *, model: str, task: str, source_workspace: str,
+    original_plan: AgentStageResult, event_fn: EventFn | None, stop_requested: StopFn | None,
+) -> AgentStageResult:
+    issues = _plan_grounding_issues(original_plan.response, source_workspace)
+    if not issues:
+        return original_plan
+    _emit(event_fn, "team_plan_grounding", status="repairing", issues=issues)
+    prompt = (
+        "The implementation plan below failed deterministic repository-grounding checks. "
+        "Repair the plan; do not broaden scope or implement anything. Preserve useful evidence-backed goals, "
+        "but map them onto the ACTUAL repository layout. Do not invent existing modules, packages, dependencies, "
+        "or integration points. New files may be proposed only inside existing project areas unless a new top-level "
+        "area is explicitly justified by the user task/evidence. Return the same required planner sections.\n\n"
+        f"USER TASK:\n{task}\n\nREPOSITORY CONTEXT:\n{_repository_context(source_workspace)}\n\n"
+        "GROUNDING FAILURES:\n- " + "\n- ".join(issues)
+        + "\n\nORIGINAL PLAN:\n" + original_plan.response
+    )
+    repaired = _call_advisor(
+        model_client, model=model, system=PLANNER_SYSTEM_PROMPT, prompt=prompt,
+        max_tokens=9000, event_fn=event_fn, role="plan_code_repair", stop_requested=stop_requested,
+    )
+    repaired.role = "plan_code"
+    if repaired.status != "completed":
+        return repaired
+    remaining = _plan_grounding_issues(repaired.response, source_workspace)
+    if remaining:
+        repaired.status = "failed"
+        repaired.error = "implementation plan remained ungrounded after repair: " + "; ".join(remaining)
+        _emit(event_fn, "team_plan_grounding", status="failed", issues=remaining)
+    else:
+        _emit(event_fn, "team_plan_grounding", status="passed", repaired=True)
+    return repaired
+
+
+def _coder_worker_count(configured_coders: int) -> int:
+    """Run every configured coding candidate concurrently; provider staggering happens inside workers."""
+    return max(1, int(configured_coders))
+
+
+def _redact_debug_value(value: Any, *, key: str = "") -> Any:
+    """Redact likely secrets without truncating diagnostic payloads."""
+    sensitive = {"password", "passwd", "token", "bearer", "secret", "api_key", "apikey",
+                 "authorization", "private_key", "privatekey", "client_secret", "clientsecret",
+                 "access_token", "accesstoken"}
+    normalized = key.lower().replace("-", "_")
+    if normalized in sensitive:
+        return "[REDACTED]"
+    if isinstance(value, dict):
+        return {str(k): _redact_debug_value(v, key=str(k)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_debug_value(item, key=key) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_debug_value(item, key=key) for item in value]
+    if isinstance(value, str):
+        try:
+            return audit._redact_inline(value)
+        except Exception:
+            return value
+    return value
+
+
+_TEAM_DEBUG_LOG_PATH = Path("/tmp/aicoder-experimental.log.jsonl")
+
+
+def reset_team_debug_log() -> Path:
+    """Start one fresh process-session trace at a stable /tmp path."""
+    try:
+        _TEAM_DEBUG_LOG_PATH.write_text("", encoding="utf-8")
+        os.chmod(_TEAM_DEBUG_LOG_PATH, 0o600)
+    except OSError:
+        pass
+    return _TEAM_DEBUG_LOG_PATH
+
+
+class _TeamDebugLog:
+    """Best-effort complete JSONL trace shared by all team runs in this process session."""
+
+    def __init__(self, run_id: str):
+        self.run_id = str(run_id)
+        self.path = _TEAM_DEBUG_LOG_PATH
+        try:
+            self.path.touch(mode=0o600, exist_ok=True)
+            os.chmod(self.path, 0o600)
+        except OSError:
+            pass
+
+    def write(self, kind: str, payload: dict[str, Any]) -> None:
+        try:
+            row = {
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "run_id": self.run_id,
+                "kind": str(kind),
+                "payload": _redact_debug_value(payload),
+            }
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+        except Exception:
+            pass
+
+
+def _event_with_debug(fn: EventFn | None, debug_log: _TeamDebugLog) -> EventFn:
+    def sink(kind: str, payload: dict[str, Any]) -> None:
+        debug_log.write(kind, payload)
+        if fn is not None:
+            fn(kind, payload)
+    return sink
+
+
 def _emit(fn: EventFn | None, kind: str, **payload: Any) -> None:
     if fn is None:
         return
@@ -243,27 +406,22 @@ def _emit_stage_result(fn: EventFn | None, result: AgentStageResult) -> None:
     if result.role in {"plan_research", "brainstorm_synthesis", "plan_code", "merge_plan", "plan_tests"} and result.response.strip():
         _emit(
             fn, "team_model_output", role=result.role, model=result.model,
-            text=result.response[:6000], final=True,
+            text=result.response, final=True,
         )
 
 
 def _worker_event_forwarder(fn: EventFn | None, role: str) -> EventFn:
-    allowed = {
-        "model_start", "model_response", "thought", "tool_call", "tool_result",
-        "error", "paused", "performance_warning", "performance_summary", "final",
-        "verification_required", "completion_audit", "runtime_status",
-    }
+    """Forward every worker runtime event; UI may ignore unknown kinds, debug logs keep them all."""
     def forward(kind: str, payload: dict[str, Any]) -> None:
-        if kind in allowed:
-            forwarded = dict(payload)
-            reserved = {}
-            for key in ("kind", "event", "role"):
-                if key in forwarded:
-                    reserved[key] = forwarded.pop(key)
-            _emit(
-                fn, "team_worker_event", role=role, event=kind,
-                worker_payload=reserved or None, **forwarded,
-            )
+        forwarded = dict(payload)
+        reserved = {}
+        for key in ("kind", "event", "role"):
+            if key in forwarded:
+                reserved[key] = forwarded.pop(key)
+        _emit(
+            fn, "team_worker_event", role=role, event=kind,
+            worker_payload=reserved or None, **forwarded,
+        )
     return forward
 
 
@@ -464,6 +622,10 @@ def _call_advisor(
         result: dict[str, Any] | None = None
         telemetry: dict[str, Any] = {}
         try:
+            _emit(
+                event_fn, "team_advisor_request", role=role, model=model,
+                system_prompt=system, prompt=prompt, max_tokens=max_tokens,
+            )
             result = model_client.chat(
                 message=prompt, model=model, system_prompt=system, temperature=0.2,
                 max_tokens=max_tokens, fallback_model=None, tools=None, tool_choice="none",
@@ -476,6 +638,10 @@ def _call_advisor(
                 "transport_telemetry": dict(result.get("_transport_telemetry") or {}) if isinstance(result, dict) else {},
             }
             if response:
+                _emit(
+                    event_fn, "team_advisor_response", role=role,
+                    model=str(result.get("model") or model), response=response, telemetry=telemetry,
+                )
                 return AgentStageResult(
                     "advisor", str(result.get("model") or model), "completed", response, elapsed_ms,
                     telemetry=telemetry,
@@ -530,6 +696,32 @@ def _filtered_tools(catalogue: list[dict], names: frozenset[str]) -> list[dict]:
     return [dict(tool) for tool in catalogue if str(tool.get("name") or "") in names]
 
 
+def _research_approval(tool_name: str, args: dict) -> bool:
+    """Research workers are read-only autonomous agents, never interactive users.
+
+    The executor invokes this callback only when a tool crosses an approval boundary.
+    Research must fail closed for mutation, elevation, destruction, security changes, or
+    workspace escape, but that denial is a host policy decision rather than a user rejection.
+    """
+    from .executor import is_destructive
+    from .privileges import assess_execution
+
+    risk = assess_execution(
+        tool_name, args, destructive=is_destructive(str(args.get("command") or "")),
+    )
+    if args.get("_workspace_escape"):
+        return False
+    return not bool(
+        risk.needs_approval or risk.elevation or risk.mutation or risk.deletion
+        or risk.destructive or risk.security_change
+    )
+
+
+# Executor uses this marker to distinguish an autonomous policy denial from an
+# explicit operator rejection. Research never owns an interactive approval dialog.
+_research_approval._aicoder_autonomous_policy = True
+
+
 def _run_researcher(
     *, client, model_client: ModelTransport, model: str, role: str, task: str,
     source_workspace: str, tools: list[dict], stop_requested: StopFn | None,
@@ -559,7 +751,7 @@ def _run_researcher(
             model=model, fallback_model=None, workspace_root=source_workspace,
             plan_workspace_root=source_workspace, protected_workspace_root=source_workspace,
             tools=tools, system_prompt=system, load_tools_on_start=True,
-            quick_chat=False, persistent_plan=False, approval_fn=lambda *_: False,
+            quick_chat=False, persistent_plan=False, approval_fn=_research_approval,
             max_iterations=10, max_output_tokens=6000, stop_requested=stop_requested,
             base_timeout=request_timeout, event_fn=research_event, conversation=conversation,
         )
@@ -596,6 +788,16 @@ def _repository_context(source_workspace: str) -> str:
         rows.append("git_status:\n" + (proc.stdout.strip() or proc.stderr.strip())[:6000])
     except Exception as exc:
         rows.append(f"git_status_unavailable={exc}")
+    try:
+        remote = subprocess.run(
+            ["git", "-C", str(root), "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=5,
+        )
+        remote_url = (remote.stdout.strip() or "") if remote.returncode == 0 else ""
+        if remote_url:
+            rows.append("git_remote_origin=" + remote_url)
+    except Exception:
+        pass
     try:
         entries = sorted(p.name for p in root.iterdir() if p.name not in {".git", ".venv", "node_modules"})[:80]
         rows.append("top_level=" + ", ".join(entries))
@@ -956,11 +1158,25 @@ def evaluate_candidate(candidate: CandidateResult) -> dict[str, Any]:
     if candidate.run.error:
         score -= 20
     diff = candidate.workspace.delta_diff() if isinstance(candidate.workspace, RamWorkspace) else _git_diff(root)
+    test_evidence = test_change_evidence(delta)
+    deterministic_ok = verification_passed(results)
+    coverage_ok = bool(test_evidence.get("coverage_evidence_ok"))
+    verified = deterministic_ok and coverage_ok
+    if not coverage_ok:
+        score -= 120
+        checks["test-change-evidence"] = {
+            "name": "test-change-evidence",
+            "ok": False,
+            "required": True,
+            "output": "behavior-changing source code requires a changed or newly created test",
+            **test_evidence,
+        }
     return {
         "score": score, "delta": delta, "checks": checks, "diff": diff,
+        "test_evidence": test_evidence,
         "candidate_id": blind_candidate_id(),
         "content_fingerprint": content_fingerprint(diff),
-        "verification_passed": verification_passed(results),
+        "verification_passed": verified,
     }
 
 
@@ -1035,6 +1251,26 @@ def _attach_blind_candidate_snapshots(integration: RamWorkspace, candidates: lis
         ".aicoder-team/candidates.json", json.dumps(evidence, ensure_ascii=False, indent=2)
     )
     return evidence
+
+
+def _test_evidence_result(integration: RamWorkspace) -> VerificationResult:
+    evidence = test_change_evidence(integration.delta_summary())
+    ok = bool(evidence.get("coverage_evidence_ok"))
+    if ok:
+        output = (
+            "test-change evidence satisfied"
+            if evidence.get("behavior_change")
+            else "no behavior-changing source delta requires a test change"
+        )
+    else:
+        output = (
+            "behavior-changing source code requires a changed or newly created test; "
+            f"source_paths={evidence.get('source_paths') or []}"
+        )
+    return VerificationResult(
+        name="test-change-evidence", argv=[], ok=ok, exit_code=0 if ok else 1,
+        elapsed_ms=0, output=output, required=True,
+    )
 
 
 def _verification_payload(results) -> list[dict[str, Any]]:
@@ -1227,6 +1463,12 @@ def run_team(
 
     started = time.monotonic()
     run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
+    debug_log = _TeamDebugLog(run_id)
+    event_fn = _event_with_debug(event_fn, debug_log)
+    debug_log.write("team_debug_start", {
+        "run_id": run_id, "task": task, "source_workspace": source_workspace,
+        "debug_log": str(debug_log.path),
+    })
     resume_code = bool(resume_checkpoint and resume_checkpoint.get("stage") == TeamStage.CODE.value and resume_checkpoint.get("code_plan"))
     ledger = StageLedger(completed=[TeamStage.PLAN_RESEARCH.value, TeamStage.RESEARCH.value, TeamStage.BRAINSTORM.value, TeamStage.PLAN_CODE.value]) if resume_code else StageLedger()
     stages: list[AgentStageResult] = []
@@ -1235,7 +1477,7 @@ def run_team(
     research_tools = _filtered_tools(all_tools, _RESEARCH_TOOL_NAMES)
     coder_tools = _filtered_tools(all_tools, _CODER_TOOL_NAMES)
     _emit(event_fn, "team_start", run_id=run_id, agents=config.active_count, research=len(config.research),
-          coders=len(config.coders), runtime_mode=runtime_mode, request_timeout=request_timeout)
+          coders=len(config.coders), runtime_mode=runtime_mode, request_timeout=request_timeout, debug_log=str(debug_log.path))
 
     if resume_code:
         saved_task = str(resume_checkpoint.get("task") or "").strip()
@@ -1381,7 +1623,13 @@ def run_team(
             + "\n\nBOUNDED BRAINSTORM SYNTHESIS:\n" + brainstorm_synthesis.response,
             max_tokens=9000, event_fn=event_fn, role="plan_code", stop_requested=stop_requested,
         )
-        code_plan.role = "plan_code"; stages.append(code_plan); _emit_stage_result(event_fn, code_plan)
+        code_plan.role = "plan_code"
+        if code_plan.status == "completed":
+            code_plan = _repair_ungrounded_code_plan(
+                model_client, model=config.planner_model or "", task=task, source_workspace=source_workspace,
+                original_plan=code_plan, event_fn=event_fn, stop_requested=stop_requested,
+            )
+        stages.append(code_plan); _emit_stage_result(event_fn, code_plan)
         if code_plan.status != "completed":
             return TeamRunResult("failed", "", code_plan.model, stages, [], {"ledger": ledger.as_dict()}, code_plan.error)
         _stage_complete(ledger, TeamStage.PLAN_CODE, event_fn)
@@ -1578,6 +1826,7 @@ def run_team(
     # 8) tests_function_ok — one focused debug attempt may repair a failed final gate.
     _stage_start(ledger, TeamStage.TESTS_FUNCTION_OK, event_fn)
     verification_results = execute_verification_plan(verification_root, deterministic_plan)
+    verification_results.append(_test_evidence_result(integration))
     initial_verification_payload = _verification_payload(verification_results)
     verification_payload = initial_verification_payload
     integration.write_candidate_artifact(
@@ -1630,6 +1879,7 @@ def run_team(
         # Always rerun the complete deterministic plan. Model self-assessment is
         # advisory; executable evidence alone decides whether disk write is opened.
         verification_results = execute_verification_plan(verification_root, deterministic_plan)
+        verification_results.append(_test_evidence_result(integration))
         verification_payload = _verification_payload(verification_results)
         for item in verification_results:
             _emit(event_fn, "team_verification", phase="after_debug", name=item.name, ok=item.ok,
@@ -1666,7 +1916,7 @@ def run_team(
                 detail += f"; failed workspace could not be saved: {preserve_error}"
             return TeamRunResult(
                 "failed", "", result_model, stages, candidates,
-                {"run_id": run_id, "ledger": ledger.as_dict(),
+                {"run_id": run_id, "debug_log": str(debug_log.path), "ledger": ledger.as_dict(),
                  "initial_verification": initial_verification_payload,
                  "verification": verification_payload, "failed_workspace": failed_workspace,
                  "debug_attempt": {"model": debug_stage.model, "status": debug_stage.status,
@@ -1700,7 +1950,7 @@ def run_team(
         integration.abort(); [c.workspace.abort() for c in candidates]
         return TeamRunResult(
             "failed", "", result_model, stages, candidates,
-            {"run_id": run_id, "ledger": ledger.as_dict(), "verification": verification_payload},
+            {"run_id": run_id, "debug_log": str(debug_log.path), "ledger": ledger.as_dict(), "verification": verification_payload},
             f"run backup failed before atomic_disk_write: {type(exc).__name__}: {exc}; persistent workspace was not modified",
         )
     try:
@@ -1711,7 +1961,7 @@ def run_team(
         [c.workspace.abort() for c in candidates]
         return TeamRunResult(
             "failed", "", result_model, stages, candidates,
-            {"run_id": run_id, "ledger": ledger.as_dict(), "verification": verification_payload,
+            {"run_id": run_id, "debug_log": str(debug_log.path), "ledger": ledger.as_dict(), "verification": verification_payload,
              "backup_path": str(backup_path)},
             f"atomic_disk_write failed: {type(exc).__name__}: {exc}",
         )
@@ -1725,7 +1975,7 @@ def run_team(
         candidate.elapsed_ms + candidate.evaluation_ms for candidate in candidates
     )
     perf = {
-        "run_id": run_id, "wall_ms": wall_ms,
+        "run_id": run_id, "debug_log": str(debug_log.path), "wall_ms": wall_ms,
         "runtime_mode": runtime_mode, "request_timeout": request_timeout,
         "accumulated_agent_ms": accumulated_agent_ms,
         "parallelism": round(accumulated_agent_ms / wall_ms, 2) if wall_ms else 0.0,

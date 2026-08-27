@@ -719,6 +719,52 @@ class ToolSecurityHardeningTests(unittest.TestCase):
             ) = saved
 
 class FrontierToolArgumentCompatibilityTests(unittest.TestCase):
+    def test_git_blame_is_supported_and_file_cwd_is_normalized(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / ".git").mkdir()
+            target = root / "aicoder" / "executor.py"
+            target.parent.mkdir()
+            target.write_text("value = 1\n", encoding="utf-8")
+            with patch("aicoder.executor._workspace_path", return_value=target):
+                with patch("aicoder.executor.subprocess.run") as run:
+                    run.return_value.returncode = 0
+                    run.return_value.stdout = "abc line\n"
+                    run.return_value.stderr = ""
+                    text, is_error = executor.run_git_read({"action": "blame", "cwd": str(target)})
+            self.assertFalse(is_error)
+            self.assertEqual(text, "abc line\n")
+            self.assertEqual(run.call_args.kwargs["cwd"], str(root))
+            self.assertEqual(run.call_args.args[0][-2:], ["blame", "aicoder/executor.py"])
+
+    def test_code_grep_normalizes_accidental_leading_slash_before_scope_policy(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            package = root / "aicoder"
+            package.mkdir()
+            (package / "x.py").write_text("needle = 1\n", encoding="utf-8")
+            result, is_error = executor.run_tool(
+                MagicMock(), "code_grep",
+                {"pattern": "needle", "path": "/aicoder", "glob": "*.py"},
+                approval_fn=lambda *_: False,
+                allowed_tools={"code_grep"}, workspace_root=str(root), protected_workspace_root=str(root),
+            )
+            self.assertFalse(is_error, result)
+            self.assertIn("aicoder/x.py", result)
+
+    def test_code_path_normalizes_accidental_leading_slash_inside_root(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = root / "aicoder" / "executor.py"
+            target.parent.mkdir()
+            target.write_text("value = 1\n", encoding="utf-8")
+            token = executor._RUNTIME_WORKSPACE_ROOT.set(str(root))
+            try:
+                resolved = executor._code_project_path({"root": str(root), "path": "/aicoder/executor.py"})
+            finally:
+                executor._RUNTIME_WORKSPACE_ROOT.reset(token)
+            self.assertEqual(resolved, target.resolve())
+
     def test_git_accepts_shell_style_string_args(self):
         with patch("aicoder.executor._workspace_path", return_value=Path(".")):
             with patch("aicoder.executor.subprocess.run") as run:
@@ -731,6 +777,73 @@ class FrontierToolArgumentCompatibilityTests(unittest.TestCase):
         argv = run.call_args.args[0]
         self.assertIn("--short", argv)
         self.assertIn("--branch", argv)
+
+
+class DiskBackedDependencyEnvironmentTests(unittest.TestCase):
+    def test_candidate_python_uses_source_venv_but_candidate_import_path_first(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source"
+            candidate = root / "candidate"
+            (source / ".venv" / "bin").mkdir(parents=True)
+            candidate.mkdir()
+            work_dir = candidate / "tests"
+            work_dir.mkdir()
+            python = source / ".venv" / "bin" / "python"
+            python.write_text("", encoding="utf-8")
+            protected_token = executor._RUNTIME_PROTECTED_ROOT.set(str(source))
+            workspace_token = executor._RUNTIME_WORKSPACE_ROOT.set(str(candidate))
+            try:
+                argv, env = executor._disk_backed_project_environment(work_dir, ["python3", "-m", "pytest"])
+            finally:
+                executor._RUNTIME_WORKSPACE_ROOT.reset(workspace_token)
+                executor._RUNTIME_PROTECTED_ROOT.reset(protected_token)
+            self.assertEqual(argv[0], str(python))
+            self.assertEqual(env["VIRTUAL_ENV"], str(source / ".venv"))
+            self.assertEqual(env["PYTHONPATH"].split(os.pathsep)[0], str(candidate))
+
+    def test_candidate_tool_binary_uses_source_venv_when_present(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source"
+            candidate = root / "candidate"
+            (source / ".venv" / "bin").mkdir(parents=True)
+            candidate.mkdir()
+            pytest_bin = source / ".venv" / "bin" / "pytest"
+            (source / ".venv" / "bin" / "python").write_text("", encoding="utf-8")
+            pytest_bin.write_text("", encoding="utf-8")
+            token = executor._RUNTIME_PROTECTED_ROOT.set(str(source))
+            try:
+                argv, _env = executor._disk_backed_project_environment(candidate, ["pytest", "-q"])
+            finally:
+                executor._RUNTIME_PROTECTED_ROOT.reset(token)
+            self.assertEqual(argv[0], str(pytest_bin))
+
+    def test_candidate_node_dependencies_are_exposed_from_source_disk(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source"
+            candidate = root / "candidate"
+            (source / "node_modules" / ".bin").mkdir(parents=True)
+            candidate.mkdir()
+            token = executor._RUNTIME_PROTECTED_ROOT.set(str(source))
+            try:
+                _argv, env = executor._disk_backed_project_environment(candidate, ["npm", "test"])
+            finally:
+                executor._RUNTIME_PROTECTED_ROOT.reset(token)
+            self.assertEqual(env["NODE_PATH"].split(os.pathsep)[0], str(source / "node_modules"))
+            self.assertEqual(env["PATH"].split(os.pathsep)[0], str(source / "node_modules" / ".bin"))
+
+    def test_normal_source_execution_does_not_rewrite_environment(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp)
+            token = executor._RUNTIME_PROTECTED_ROOT.set(str(source))
+            try:
+                argv, env = executor._disk_backed_project_environment(source, ["python3", "-m", "pytest"])
+            finally:
+                executor._RUNTIME_PROTECTED_ROOT.reset(token)
+            self.assertEqual(argv, ["python3", "-m", "pytest"])
+            self.assertEqual(env.get("PYTHONPATH"), os.environ.get("PYTHONPATH"))
 
 
 class RuntimeConsoleWidgetTests(unittest.TestCase):

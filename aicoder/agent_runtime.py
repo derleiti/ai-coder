@@ -824,6 +824,16 @@ class NativeLightRuntime:
             base_system, native=self._native_tool_calling_enabled(self.model)
         )
         system = self._with_plan_context(protocol_system, plan)
+        self._emit(
+            "runtime_context",
+            workspace=workspace,
+            model=self.model or "",
+            initial_prompt=self.initial_prompt,
+            system_prompt=system,
+            tools=tools,
+            persistent_plan=self.persistent_plan,
+            resumed=resumed,
+        )
 
         prior_context = [
             dict(message) for message in (self.conversation or [])
@@ -1074,6 +1084,7 @@ class NativeLightRuntime:
                 model=model_used, requested=active_model or "backend-default", request_id=request_id,
                 provider=(model_used.split("/", 1)[0] if "/" in model_used else ""),
                 transport_telemetry=(transport_telemetry if isinstance(transport_telemetry, dict) else {}),
+                response=response,
                 **usage,
             )
 

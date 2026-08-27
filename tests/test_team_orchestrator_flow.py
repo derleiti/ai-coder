@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from aicoder.agent_runtime import AgentRunResult, auto_resumable_pause, auto_resume_limit
-from aicoder.team_orchestrator import _coder_pool_size, CODER_MAX_ITERATIONS, AgentStageResult, CandidateResult, _anonymized_brainstorm_round, _brainstorm_rounds, _build_brainstorm_prompt, _RESEARCH_TOOL_NAMES, _brainstorm_participants, _merge_completion_contradiction, _run_worker_with_auto_resume, _run_candidate, _candidate_is_mergeable, _verification_root_for_delta, _working_project_root, _worker_event_forwarder, _call_advisor, _save_stage_handoff, _load_stage_handoff, _render_stage_handoff, _team_handoff_dir, _create_run_backup, _preserve_failed_workspace, clear_team_checkpoint, run_team
+from aicoder.team_orchestrator import _coder_pool_size, CODER_MAX_ITERATIONS, AgentStageResult, CandidateResult, _TeamDebugLog, reset_team_debug_log, _test_evidence_result, evaluate_candidate, _anonymized_brainstorm_round, _brainstorm_rounds, _build_brainstorm_prompt, _RESEARCH_TOOL_NAMES, _brainstorm_participants, _merge_completion_contradiction, _plan_grounding_issues, _research_approval, _run_worker_with_auto_resume, _run_candidate, _candidate_is_mergeable, _verification_root_for_delta, _working_project_root, _worker_event_forwarder, _call_advisor, _save_stage_handoff, _load_stage_handoff, _render_stage_handoff, _team_handoff_dir, _create_run_backup, _preserve_failed_workspace, clear_team_checkpoint, run_team
 from aicoder.team_runtime import BRAINSTORM_SYSTEM_PROMPT, PLANNER_SYSTEM_PROMPT, CODER_SYSTEM_TEMPLATE, config_from_state
 from aicoder.team_pipeline import TeamStage, VerificationResult
 from aicoder.workspace_backend import RamWorkspace
@@ -98,11 +100,9 @@ class TeamCandidateGateTests(unittest.TestCase):
             self.assertEqual(_verification_root_for_delta(root, delta), project)
 
 class TeamResearchToolPolicyTests(unittest.TestCase):
-    def test_research_workers_have_safe_diagnostic_tools(self):
-        self.assertTrue({"binary_exec", "test", "lint"}.issubset(_RESEARCH_TOOL_NAMES))
-        self.assertNotIn("shell", _RESEARCH_TOOL_NAMES)
-        self.assertNotIn("config_set", _RESEARCH_TOOL_NAMES)
-        self.assertNotIn("mail_send", _RESEARCH_TOOL_NAMES)
+    def test_research_workers_only_receive_read_only_evidence_tools(self):
+        self.assertTrue({"git", "code_read", "code_search", "search"}.issubset(_RESEARCH_TOOL_NAMES))
+        self.assertTrue({"binary_exec", "test", "lint", "shell", "config_set", "mail_send"}.isdisjoint(_RESEARCH_TOOL_NAMES))
 
 
 
@@ -593,6 +593,10 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
                 backend.prepare()
                 slot = kwargs["slot"]
                 (backend.info.execution_root / "app.py").write_text(f"value = {slot}\n", encoding="utf-8")
+                (backend.info.execution_root / "tests" / "test_app.py").write_text(
+                    "import unittest\nimport app\nclass T(unittest.TestCase):\n"
+                    f"    def test_value(self): self.assertEqual(app.value, {slot})\n", encoding="utf-8",
+                )
                 item = CandidateResult(slot, kwargs["model"], kwargs["strategy"], backend, _result(f"DONE: candidate {slot}"))
                 candidates.append(item)
                 return item
@@ -681,6 +685,9 @@ class TeamVerificationRecoveryTests(unittest.TestCase):
             backend = RamWorkspace(source, ram_root=ram_dir)
             backend.prepare()
             (backend.info.execution_root / "app.py").write_text("value = 1\n", encoding="utf-8")
+            (backend.info.execution_root / "tests" / "test_app.py").write_text(
+                "def test_value():\n    assert 1 == 1\n", encoding="utf-8",
+            )
             return CandidateResult(
                 kwargs["slot"], kwargs["model"], kwargs["strategy"], backend,
                 _result("DONE: candidate"),
@@ -818,3 +825,146 @@ class WorkingProjectRootTests(unittest.TestCase):
                 (project / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
             resolved = _working_project_root(workspace, "update all projects", "")
             self.assertEqual(resolved, workspace.resolve())
+
+class TeamPlanGroundingTests(unittest.TestCase):
+    def test_rejects_invented_top_level_architecture(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "aicoder").mkdir()
+            (root / "tests").mkdir()
+            plan = """
+[AFFECTED_AREAS]
+- /src/security/secrets/
+- `src/core/sanitization/adaptive_schema_validator.py`
+- tests/security/test_secrets_scrubber.py
+"""
+            issues = _plan_grounding_issues(plan, str(root))
+            self.assertTrue(any("src/" in issue for issue in issues))
+            self.assertFalse(any("tests/" in issue for issue in issues))
+
+    def test_allows_new_files_inside_existing_project_areas(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "aicoder").mkdir()
+            (root / "tests").mkdir()
+            plan = """
+[AFFECTED_AREAS]
+- `aicoder/plan_grounding.py` (new)
+- `tests/test_plan_grounding.py` (new)
+"""
+            self.assertEqual(_plan_grounding_issues(plan, str(root)), [])
+
+    def test_authoritative_absolute_root_is_allowed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "aicoder").mkdir()
+            plan = f"[AUTHORITATIVE_PROJECT_ROOT]\n`{root}`\n[AFFECTED_AREAS]\n- aicoder/runtime.py"
+            self.assertEqual(_plan_grounding_issues(plan, str(root)), [])
+
+    def test_all_configured_coders_receive_worker_capacity(self):
+        self.assertEqual(_coder_pool_size(1), 1)
+        self.assertEqual(_coder_pool_size(4), 4)
+
+
+class CandidateTestEvidenceGateTests(unittest.TestCase):
+    def _candidate(self, source: Path, ram_dir: str, *, change_test: bool) -> CandidateResult:
+        backend = RamWorkspace(source, ram_root=ram_dir)
+        backend.prepare()
+        (backend.info.execution_root / "app.py").write_text("value = 2\n", encoding="utf-8")
+        if change_test:
+            (backend.info.execution_root / "tests" / "test_app.py").write_text(
+                "def test_value():\n    assert 2 == 2\n", encoding="utf-8",
+            )
+        return CandidateResult(1, "test/model", "robustness/security", backend, _result("DONE: candidate"))
+
+    def test_behavior_change_without_test_change_is_not_verified(self):
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as ram_dir:
+            source = Path(source_dir)
+            (source / "tests").mkdir()
+            (source / "app.py").write_text("value = 1\n", encoding="utf-8")
+            (source / "tests" / "test_app.py").write_text("def test_value():\n    assert True\n", encoding="utf-8")
+            candidate = self._candidate(source, ram_dir, change_test=False)
+            try:
+                passed = [VerificationResult("python-tests", ["python3", "-m", "pytest"], True, 0, 1, "1 passed", True)]
+                with patch("aicoder.team_orchestrator.project_verification_plan", return_value=[]), patch(
+                    "aicoder.team_orchestrator.execute_verification_plan", return_value=passed
+                ):
+                    evaluation = evaluate_candidate(candidate)
+                self.assertFalse(evaluation["verification_passed"])
+                self.assertFalse(evaluation["test_evidence"]["coverage_evidence_ok"])
+                self.assertFalse(evaluation["checks"]["test-change-evidence"]["ok"])
+            finally:
+                candidate.workspace.abort()
+
+    def test_behavior_change_with_test_change_can_be_verified(self):
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as ram_dir:
+            source = Path(source_dir)
+            (source / "tests").mkdir()
+            (source / "app.py").write_text("value = 1\n", encoding="utf-8")
+            (source / "tests" / "test_app.py").write_text("def test_value():\n    assert True\n", encoding="utf-8")
+            candidate = self._candidate(source, ram_dir, change_test=True)
+            try:
+                passed = [VerificationResult("python-tests", ["python3", "-m", "pytest"], True, 0, 1, "1 passed", True)]
+                with patch("aicoder.team_orchestrator.project_verification_plan", return_value=[]), patch(
+                    "aicoder.team_orchestrator.execute_verification_plan", return_value=passed
+                ):
+                    evaluation = evaluate_candidate(candidate)
+                self.assertTrue(evaluation["verification_passed"])
+                self.assertTrue(evaluation["test_evidence"]["coverage_evidence_ok"])
+            finally:
+                candidate.workspace.abort()
+
+    def test_final_integration_test_evidence_matches_candidate_rule(self):
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as ram_dir:
+            source = Path(source_dir)
+            (source / "tests").mkdir()
+            (source / "app.py").write_text("before\n", encoding="utf-8")
+            (source / "tests" / "test_app.py").write_text("def test_x():\n    assert True\n", encoding="utf-8")
+            backend = RamWorkspace(source, ram_root=ram_dir)
+            backend.prepare()
+            try:
+                (backend.info.execution_root / "app.py").write_text("after\n", encoding="utf-8")
+                self.assertFalse(_test_evidence_result(backend).ok)
+                (backend.info.execution_root / "tests" / "test_app.py").write_text("def test_x():\n    assert 1 == 1\n", encoding="utf-8")
+                self.assertTrue(_test_evidence_result(backend).ok)
+            finally:
+                backend.abort()
+
+
+class TeamDebugLogTests(unittest.TestCase):
+    def test_debug_log_keeps_full_payload_and_redacts_sensitive_fields(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "session.jsonl"
+            with patch("aicoder.team_orchestrator._TEAM_DEBUG_LOG_PATH", path):
+                reset_team_debug_log()
+                long_text = "X" * 20000
+                first = _TeamDebugLog("run-one")
+                first.write("team_worker_event", {"response": long_text, "token": "super-secret-value"})
+                second = _TeamDebugLog("run-two")
+                second.write("team_worker_event", {"response": "second"})
+                rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+                self.assertEqual(rows[0]["run_id"], "run-one")
+                self.assertEqual(rows[0]["payload"]["response"], long_text)
+                self.assertEqual(rows[0]["payload"]["token"], "[REDACTED]")
+                self.assertEqual(rows[1]["run_id"], "run-two")
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_process_reset_overwrites_previous_session_log(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "session.jsonl"
+            path.write_text("old session\n", encoding="utf-8")
+            with patch("aicoder.team_orchestrator._TEAM_DEBUG_LOG_PATH", path):
+                reset_team_debug_log()
+                self.assertEqual(path.read_text(encoding="utf-8"), "")
+                _TeamDebugLog("fresh-run").write("team_start", {"value": 1})
+                text = path.read_text(encoding="utf-8")
+                self.assertNotIn("old session", text)
+                self.assertIn('"run_id": "fresh-run"', text)
+
+
+class ResearchAutonomousPolicyRegressionTests(unittest.TestCase):
+    def test_research_denial_is_not_user_rejection(self):
+        self.assertTrue(getattr(_research_approval, "_aicoder_autonomous_policy", False))
+        self.assertFalse(_research_approval(
+            "binary_exec", {"program": "python3", "arguments": ["-c", "print(1)"]},
+        ))

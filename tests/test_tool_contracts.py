@@ -12,7 +12,7 @@ def test_text_tool_description_includes_conditional_file_edit_contract():
 
 def test_text_tool_description_exposes_types_enums_and_field_meaning():
     desc = build_tool_desc([LOCAL_GIT_SCHEMA, LOCAL_CODE_READ_SCHEMA])
-    assert "action*:string enum[status|diff|log|show|branch]" in desc
+    assert "action*:string enum[status|diff|log|show|branch|blame]" in desc
     assert "args:array[string]" in desc
     assert "start_line:integer range[1..inf]" in desc
     assert "start_line and end_line are inclusive and 1-based" in desc
