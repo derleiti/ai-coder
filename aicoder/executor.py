@@ -1624,9 +1624,16 @@ def run_local_code_read(args: dict) -> Tuple[str, bool]:
             return f"code_read error: binary file; textual read not supported: {path}", True
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         start = max(1, int(args.get("start_line") or 1))
-        end = min(len(lines), int(args.get("end_line") or len(lines)))
-        if end < start:
+        requested_end = int(args.get("end_line") or len(lines))
+        if requested_end < start:
             return "code_read error: end_line must be >= start_line", True
+        if start > len(lines):
+            return (
+                f"code_read: requested start_line {start} is beyond EOF; file has {len(lines)} line(s). "
+                f"Use a start_line between 1 and {max(1, len(lines))}, or use the existing evidence instead.",
+                False,
+            )
+        end = min(len(lines), requested_end)
         output = "\n".join(f"{number}: {lines[number - 1]}" for number in range(start, end + 1))
         return output[:12000] + ("…" if len(output) > 12000 else ""), False
     except Exception as exc:

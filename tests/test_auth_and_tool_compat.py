@@ -347,6 +347,24 @@ class GuiToolModeTests(unittest.TestCase):
         execute.assert_not_called()
 
 
+
+class CodeReadBoundaryCompatibilityTests(unittest.TestCase):
+    def test_code_read_beyond_eof_is_actionable_non_error(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "sample.py"
+            path.write_text("one\ntwo\nthree\n", encoding="utf-8")
+            with (
+                patch.object(executor, "_code_project_path", return_value=path),
+                patch.object(executor, "_workspace_path", return_value=path),
+            ):
+                result, is_error = executor.run_local_code_read({
+                    "path": str(path), "start_line": 4, "end_line": 4,
+                })
+            self.assertFalse(is_error)
+            self.assertIn("beyond EOF", result)
+            self.assertIn("3 line(s)", result)
+
+
 class SettingsRegressionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

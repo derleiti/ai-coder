@@ -70,8 +70,6 @@ _AUTO_RESUMABLE_PAUSE_MARKERS = (
     "did not perform a successful post-change verification",
     "done was requested without a successful post-change verification",
     "merge self-reported incomplete",
-    "same tool operation",
-    "kept repeating without progress",
     "safety pause after an unusually long run",
 )
 

@@ -782,6 +782,10 @@ class AutoResumePolicyTests(unittest.TestCase):
         ))
         self.assertFalse(auto_resumable_pause("Agent stopped by user"))
         self.assertFalse(auto_resumable_pause("Agent paused because the user rejected file_edit."))
+        self.assertFalse(auto_resumable_pause(
+            "Agent paused because it kept requesting the same tool operation after that duplicate had already been blocked."
+        ))
+        self.assertFalse(auto_resumable_pause("Agent kept repeating without progress"))
         prompt = auto_resume_prompt("same tool operation kept repeating without progress", 1)
         self.assertIn("Automatic runtime resume 1/3", prompt)
         self.assertIn("Do not repeat the same failed action unchanged", prompt)
