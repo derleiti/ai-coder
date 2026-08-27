@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from aicoder.agent_runtime import AgentRunResult, auto_resumable_pause, auto_resume_limit
-from aicoder.team_orchestrator import AgentStageResult, CandidateResult, _anonymized_brainstorm_round, _brainstorm_rounds, _build_brainstorm_prompt, _RESEARCH_TOOL_NAMES, _brainstorm_participants, _merge_completion_contradiction, _run_worker_with_auto_resume, _run_candidate, _candidate_is_mergeable, _verification_root_for_delta, _worker_event_forwarder, _call_advisor, _save_stage_handoff, _load_stage_handoff, _render_stage_handoff, _team_handoff_dir, _create_run_backup, _preserve_failed_workspace, clear_team_checkpoint, run_team
+from aicoder.team_orchestrator import _coder_pool_size, CODER_MAX_ITERATIONS, AgentStageResult, CandidateResult, _anonymized_brainstorm_round, _brainstorm_rounds, _build_brainstorm_prompt, _RESEARCH_TOOL_NAMES, _brainstorm_participants, _merge_completion_contradiction, _run_worker_with_auto_resume, _run_candidate, _candidate_is_mergeable, _verification_root_for_delta, _worker_event_forwarder, _call_advisor, _save_stage_handoff, _load_stage_handoff, _render_stage_handoff, _team_handoff_dir, _create_run_backup, _preserve_failed_workspace, clear_team_checkpoint, run_team
 from aicoder.team_runtime import BRAINSTORM_SYSTEM_PROMPT, PLANNER_SYSTEM_PROMPT, CODER_SYSTEM_TEMPLATE, config_from_state
 from aicoder.team_pipeline import TeamStage, VerificationResult
 from aicoder.workspace_backend import RamWorkspace
@@ -778,3 +778,9 @@ class MergeRecoveryRequiredGuardTests(unittest.TestCase):
     def test_recovery_required_final_merge_is_contradictory_success(self):
         text = "[MERGE_RESULT]\nstatus: recovery_required\nverification: incomplete\nDONE: merge complete"
         self.assertTrue(_merge_completion_contradiction(text))
+
+
+class CoderSchedulingPolicyTests(unittest.TestCase):
+    def test_all_configured_coders_receive_worker_capacity(self):
+        self.assertEqual(_coder_pool_size(4), 4)
+        self.assertIsNone(CODER_MAX_ITERATIONS)

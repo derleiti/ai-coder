@@ -822,3 +822,17 @@ class BinaryExecVerificationClassificationTests(unittest.TestCase):
             "program": "python3",
             "arguments": ["-c", "print('hello')"],
         }))
+
+
+class UnlimitedIterationRuntimeTests(unittest.TestCase):
+    def test_none_iteration_limit_reports_unlimited(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp) / "workspace"
+            workspace.mkdir()
+            client = MagicMock(); client.timeout = 30
+            client.chat.return_value = {"response": "DONE: ok", "model": "test/model"}
+            events = []
+            runtime = NativeLightRuntime(client=client, initial_prompt="Explain state", model="test/model", fallback_model=None, workspace_root=str(workspace), tools=[], load_tools_on_start=False, persistent_plan=False, max_iterations=None, event_fn=lambda kind, payload: events.append((kind, payload)), base_timeout=30)
+            self.assertEqual(runtime.run().status, "completed")
+            active = [p for k, p in events if k == "runtime_status" and p.get("phase") == "iteration"]
+            self.assertIn("1/unlimited", active[0]["message"])

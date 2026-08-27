@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from aicoder.workspace_backend import (
     DiskWorkspace, RamWorkspace, WorkspaceConflict,
-    create_workspace_backend, open_workspace_for_run,
+    cleanup_process_ram_workspaces, create_workspace_backend, open_workspace_for_run,
 )
 
 
@@ -243,3 +243,14 @@ class WorkspaceNativeDiffTests(unittest.TestCase):
                 self.assertIn("two.txt", diff)
             finally:
                 backend.abort()
+
+
+class ProcessRamCleanupTests(unittest.TestCase):
+    def test_process_cleanup_removes_registered_ram_workspace(self):
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as ram_dir:
+            source = Path(source_dir); (source / "x.txt").write_text("x", encoding="utf-8")
+            backend = RamWorkspace(source, ram_root=ram_dir)
+            execution = backend.prepare()
+            cleanup_process_ram_workspaces()
+            self.assertFalse(execution.exists())
+            backend.abort()
