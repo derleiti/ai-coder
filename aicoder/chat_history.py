@@ -208,16 +208,6 @@ def delete_session(session_id: str) -> None:
     conn.close()
 
 
-def clear_history() -> None:
-    """Delete every persisted chat session and its display/tool history."""
-    conn = _connect()
-    conn.execute("DELETE FROM tool_events")
-    conn.execute("DELETE FROM messages")
-    conn.execute("DELETE FROM sessions")
-    conn.commit()
-    conn.close()
-
-
 def get_session_messages_for_api(session_id: str) -> List[Dict[str, str]]:
     """Load messages in API format (role + content only, for context replay)."""
     msgs = load_messages(session_id)

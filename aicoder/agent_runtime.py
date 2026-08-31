@@ -6,7 +6,6 @@ runtime events, so future skills/subagents can extend one loop instead of two.
 from __future__ import annotations
 
 import json
-import itertools
 import queue
 import re
 import threading
@@ -18,7 +17,7 @@ from typing import Any, Callable
 
 from .agent_journal import ContinuationJournalStore
 from .model_capabilities import model_context_window, supports_tools
-from .performance import RuntimePerformance, model_usage_metrics
+from .performance import RuntimePerformance
 from .agent_plan import AgentPlan, PlanStore, plan_prompt_context, resume_prompt_context
 from .client import ClientError, TriForceClient
 from .capabilities import (
@@ -60,74 +59,28 @@ from .privileges import assess_execution
 from .tool_policy import require_allowed_tool
 
 RuntimeEventFn = Callable[[str, dict[str, Any]], None]
-
-MAX_AUTO_RESUMES = 3
-MAX_SAFETY_CONTINUATIONS = 6
-READ_ONLY_PROGRESS_NUDGE_BATCHES = 6
-_AUTO_RESUMABLE_PAUSE_MARKERS = (
-    "transient model/backend failure",
-    "no usable final response",
-    "did not perform a successful post-change verification",
-    "done was requested without a successful post-change verification",
-    "merge self-reported incomplete",
-    "safety pause after an unusually long run",
-)
-
-def auto_resumable_pause(reason: str) -> bool:
-    text = str(reason or "").strip().lower()
-    if not text:
-        return False
-    hard_stops = (
-        "stopped by user", "user rejected", "aborted by user",
-        "approval denied", "workspace escape", "security policy",
-    )
-    if any(marker in text for marker in hard_stops):
-        return False
-    return any(marker in text for marker in _AUTO_RESUMABLE_PAUSE_MARKERS)
-
-
-def auto_resume_limit(reason: str) -> int:
-    text = str(reason or "").lower()
-    if "safety pause after an unusually long run" in text:
-        return MAX_SAFETY_CONTINUATIONS
-    if ("transient incomplete chat response" in text or "no recognized assistant response envelope" in text or "keys=['_transport_telemetry']" in text):
-        return 5
-    return MAX_AUTO_RESUMES
-
-
-def auto_resume_prompt(
-    reason: str, attempt: int, limit: int | None = None, *, unlimited: bool = False,
-) -> str:
-    active_limit = int(limit or auto_resume_limit(reason))
-    limit_label = "unlimited" if unlimited else str(active_limit)
-    text = str(reason or "")
-    if "safety pause after an unusually long run" in text.lower():
-        return (
-            f"Automatic continuation slice {attempt}/{limit_label}. This is NOT a fresh analysis pass. "
-            "Continue from the preserved conversation and tool evidence. Do not restart architecture discovery, "
-            "git-status loops, baseline tests, or reread unchanged files already present in context. "
-            "Move the assigned task toward a terminal state now: implement the smallest evidence-backed change, "
-            "then verify it; or, if no code change is justified, finish with DONE and cite the concrete evidence. "
-            "Prefer mutation/verification over further broad inspection unless a specific blocker requires one read. "
-            f"Previous pause reason: {text[:1200]}"
-        )
-    return (
-        f"Automatic runtime resume {attempt}/{limit_label}. "
-        "Continue the existing task from the preserved context. Do not repeat the same failed "
-        "action unchanged. Inspect existing tool results, choose a different approach when needed, "
-        "finish required verification, and continue until the assigned task is actually complete. "
-        f"Previous pause reason: {text[:1200]}"
-    )
-
-
-def continuation_messages(result: "AgentRunResult") -> list[dict[str, Any]]:
-    messages = [dict(item) for item in (result.messages or []) if isinstance(item, dict)]
-    if messages and messages[0].get("role") == "system":
-        messages = messages[1:]
-    return messages[-MAX_CONTEXT_MESSAGES:]
-
 ApprovalFn = Callable[[str, dict], bool]
 StopFn = Callable[[], bool]
+
+_RUNTIME_COMPLETE_TOOL = "runtime_complete"
+_RUNTIME_COMPLETE_SCHEMA = {
+    "name": _RUNTIME_COMPLETE_TOOL,
+    "description": (
+        "Signal that the current autonomous task is fully complete. The host validates mutation, "
+        "verification and completion guards before accepting this signal; it never bypasses safety checks. "
+        "Call it only as the sole tool call after all required work and verification are finished."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string"},
+            "evidence": {"type": "array", "items": {"type": "string"}},
+            "no_change_justified": {"type": "boolean"},
+        },
+        "required": ["summary"],
+    },
+    "annotations": {"readOnlyHint": True},
+}
 
 _BEHAVIOR_VERIFY_TOOLS = {"test", "lint", "dev_lint", "dev_analyze"}
 _SHELL_VERIFY_RE = re.compile(
@@ -146,19 +99,8 @@ def _is_behavior_verification_call(name: str, args: dict) -> bool:
         return bool(_SHELL_VERIFY_RE.search(str(args.get("command") or "")))
     if name == "binary_exec":
         program = str(args.get("program") or "").lower()
-        argv_items = [str(item) for item in (args.get("arguments") or [])]
-        argv = " ".join(argv_items)
-        if _SHELL_VERIFY_RE.search(f"{program} {argv}"):
-            return True
-        # Task-specific read-only verifiers commonly use ``python3 -B -c`` with
-        # assertions instead of a test framework. Treat only assertion/readback
-        # shaped invocations as verification evidence; arbitrary Python execution
-        # remains outside this path and still follows normal approval policy.
-        if program in {"python", "python3"} and "-c" in argv_items:
-            script = argv_items[argv_items.index("-c") + 1] if argv_items.index("-c") + 1 < len(argv_items) else ""
-            verification_markers = ("assert ", ".read_bytes(", ".read_text(", ".is_file(", ".is_dir(", ".is_symlink(")
-            return any(marker in script for marker in verification_markers)
-        return False
+        argv = " ".join(str(item) for item in (args.get("arguments") or []))
+        return bool(_SHELL_VERIFY_RE.search(f"{program} {argv}"))
     return False
 
 
@@ -230,13 +172,8 @@ def _has_embedded_text_tool_protocol(text: str) -> bool:
         and re.search(r"(?m)^\s*END_TOOL_CALL\s*$", raw)
     )
 
-COMPLETION_AUDIT_MAX_CHARS = 50_000
-
-
 def _completion_audit_prompt(prompt: str) -> str:
-    # Preserve long, requirement-heavy tasks during the final completion audit.
-    # The model context budget still provides the outer safety bound.
-    task = str(prompt or "")[:COMPLETION_AUDIT_MAX_CHARS]
+    task = str(prompt or "")[:5000]
     return (
         "Completion audit: compare every explicit requirement in the original task against the tool evidence already present. "
         "If anything remains unfinished, continue with the required tool. If all requirements are complete, return the final answer beginning with DONE:. "
@@ -348,8 +285,9 @@ class NativeLightRuntime:
     base_timeout: int = 300
     max_output_tokens: int = 16384
     tools_unavailable_reason: str = ""
-    max_iterations: int | None = MAX_ITERATIONS
-    require_test_verification: bool = False
+    max_iterations: int = MAX_ITERATIONS
+    require_mutation_or_explicit_no_change: bool = False
+    allow_completion_signal: bool = False
     progressive_tool_disclosure: bool = True
     native_openrouter_tool_calling: bool = False
     tool_budget: int = DEFAULT_TOOL_BUDGET
@@ -360,7 +298,6 @@ class NativeLightRuntime:
     _expansion_rounds: int = field(default=0, init=False, repr=False)
 
     def _emit(self, event_kind: str, **payload: Any) -> None:
-        """Emit a runtime event without colliding with payload fields named ``kind``."""
         if self.event_fn is not None:
             self.event_fn(event_kind, payload)
 
@@ -505,6 +442,10 @@ class NativeLightRuntime:
             self.tools = []
         else:
             self._tool_catalog = list(self.tools)
+        if self.allow_completion_signal and not any(
+            str(tool.get("name") or "") == _RUNTIME_COMPLETE_TOOL for tool in self.tools
+        ):
+            self.tools = [*self.tools, dict(_RUNTIME_COMPLETE_SCHEMA)]
         return self.tools
 
     def _run_meta_tool(self, name: str, args: dict, tools: list[dict]) -> tuple[str, bool, bool]:
@@ -802,7 +743,6 @@ class NativeLightRuntime:
             )
         if self.tools_unavailable_reason:
             reason = self.tools_unavailable_reason
-            self._emit("runtime_status", category="error", status="failed", phase="bootstrap", runtime_mode=("native-light" if self.persistent_plan else "classic"), message=reason)
             self._emit("error", message=reason)
             return AgentRunResult(
                 "failed", "", str(self.model or "?"), [], tools,
@@ -813,7 +753,6 @@ class NativeLightRuntime:
             plan, resumed = self._prepare_plan()
         except ValueError as exc:
             reason = str(exc)
-            self._emit("runtime_status", category="error", status="failed", phase="plan", runtime_mode=("native-light" if self.persistent_plan else "classic"), message=reason)
             self._emit("error", message=reason)
             return AgentRunResult(
                 "failed", "", str(self.model or "?"), [], tools, "",
@@ -879,13 +818,14 @@ class NativeLightRuntime:
         tool_was_called = False
         tool_nudge_sent = False
         mutation_seen, verification_seen = plan.progress_flags() if resumed and plan else (False, False)
-        test_verification_seen = False
         verification_nudge_sent = False
+        implementation_nudge_sent = False
+        no_change_nudge_sent = False
+        pre_mutation_inspection_count = 0
         fresh_inspection_after_resume = not resumed
         starting_plan_iteration = plan.iteration if plan is not None else 0
         loop_guard = AgentLoopGuard()
         failure_tracker = FailureTracker()
-        read_only_batch_streak = 0
         evidence_store = None
         run_file_reads: set[tuple[str, int, int]] = set()
         try:
@@ -912,10 +852,8 @@ class NativeLightRuntime:
             str(tool.get("name")) for tool in tools if tool.get("name")
         }
 
-        runtime_mode = "native-light" if self.persistent_plan else "classic"
         self._emit(
             "run_start",
-            runtime_mode=runtime_mode,
             model=active_model or "backend-default",
             configured_model=self.model or "backend-default",
             effective_model=active_model or "backend-default",
@@ -931,25 +869,11 @@ class NativeLightRuntime:
             plan_id=plan.id if plan else "",
             resumed=resumed,
         )
-        self._emit(
-            "runtime_status", category="run", status="ok", phase="bootstrap",
-            runtime_mode=runtime_mode,
-            message=(
-                f"{runtime_mode} runtime initialized · tools={len(tools)} · "
-                f"workspace={workspace} · protocol={'native' if self._native_tool_calling_enabled(active_model) else 'text'}"
-            ),
-        )
 
-        iteration_limit = None if self.max_iterations is None else max(1, min(MAX_ITERATIONS, int(self.max_iterations)))
+        iteration_limit = max(1, min(MAX_ITERATIONS, int(self.max_iterations or MAX_ITERATIONS)))
         final_response_repair_sent = False
         completion_audit_sent = False
-        iteration_source = itertools.count() if iteration_limit is None else range(iteration_limit)
-        for i in iteration_source:
-            self._emit(
-                "runtime_status", category="run", status="active", phase="iteration",
-                runtime_mode=runtime_mode, iteration=i + 1,
-                message=f"iteration {i + 1}/{'unlimited' if iteration_limit is None else iteration_limit} started",
-            )
+        for i in range(iteration_limit):
             if self._stopped():
                 reason = "Agent stopped by user"
                 self._pause_plan(plan, reason)
@@ -1017,10 +941,6 @@ class NativeLightRuntime:
             except (ClientError, RuntimeError) as exc:
                 reason = str(exc)
                 category, _signature, retryable = FailureTracker.classify(reason)
-                typed_retryable = bool(getattr(exc, "retryable", False))
-                if typed_retryable and category != "transient":
-                    category = "transient"
-                    retryable = True
                 if retryable and category == "transient":
                     retry_after = getattr(exc, "retry_after", None)
                     wait_hint = (
@@ -1036,10 +956,6 @@ class NativeLightRuntime:
                         plan, messages, pending_input=current_input, tool_batches=journal_batches
                     )
                     self._emit(
-                        "runtime_status", category="error", status="warning", phase="model",
-                        runtime_mode=runtime_mode, iteration=i + 1, message=pause_reason,
-                    )
-                    self._emit(
                         "paused", reason=pause_reason, failure_category=category, resumable=True,
                         retry_after=getattr(exc, "retry_after", None),
                     )
@@ -1050,7 +966,6 @@ class NativeLightRuntime:
                     )
                 self._fail_plan(plan, reason)
                 self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
-                self._emit("runtime_status", category="error", status="failed", phase="model", runtime_mode=runtime_mode, iteration=i + 1, message=reason)
                 self._emit("error", message=reason)
                 return AgentRunResult(
                     "failed", "", model_used, messages, tools, system,
@@ -1060,11 +975,7 @@ class NativeLightRuntime:
                 )
             model_response_received_at = time.monotonic()
             elapsed_ms = int((model_response_received_at - started) * 1000)
-            usage = model_usage_metrics(result, elapsed_ms)
-            performance.record_model(
-                elapsed_ms, input_tokens=usage["input_tokens"],
-                output_tokens=usage["output_tokens"], total_tokens=usage["total_tokens"],
-            )
+            performance.record_model(elapsed_ms)
             if elapsed_ms >= 10_000 and not model_latency_warned:
                 model_latency_warned = True
                 self._emit(
@@ -1082,10 +993,7 @@ class NativeLightRuntime:
             self._emit(
                 "model_response", iteration=i + 1, elapsed_ms=elapsed_ms,
                 model=model_used, requested=active_model or "backend-default", request_id=request_id,
-                provider=(model_used.split("/", 1)[0] if "/" in model_used else ""),
                 transport_telemetry=(transport_telemetry if isinstance(transport_telemetry, dict) else {}),
-                response=response,
-                **usage,
             )
 
             native_mode = self._native_tool_calling_enabled(active_model)
@@ -1124,11 +1032,6 @@ class NativeLightRuntime:
                         current_input = _FINAL_RESPONSE_REPAIR_PROMPT
                         final_response_repair_sent = True
                         self._emit(
-                            "runtime_status", category="recovery", status="warning", phase="response_repair",
-                            runtime_mode=runtime_mode, iteration=i + 1,
-                            message="model response was unusable; requesting a clean final response",
-                        )
-                        self._emit(
                             "final_response_repair", iteration=i + 1,
                             reason=(
                                 "empty_response" if not response
@@ -1154,17 +1057,39 @@ class NativeLightRuntime:
                         fallback_used=fallback_used, plan_id=plan.id if plan else "",
                     )
 
-                verification_ready = verification_seen and (not self.require_test_verification or test_verification_seen)
-                if mutation_seen and not verification_ready:
+                if self.require_mutation_or_explicit_no_change and not mutation_seen:
+                    explicit_no_change = response.lstrip().upper().startswith("DONE: NO CHANGE JUSTIFIED")
+                    if not explicit_no_change:
+                        messages.append({"role": "assistant", "content": response})
+                        if not no_change_nudge_sent:
+                            current_input = (
+                                "This is a coding-candidate run and no mutation has been made. "
+                                "Do not finish with analysis or a plan. Implement the best-supported change now and verify it. "
+                                "If the shared contract genuinely requires no repository change, finish exactly with "
+                                "`DONE: no change justified` followed by concise evidence explaining why no edit is correct."
+                            )
+                            no_change_nudge_sent = True
+                            self._emit("implementation_required", iteration=i + 1, reason="final_without_mutation")
+                            self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
+                            continue
+                        reason = (
+                            "Coding candidate paused because it attempted to finish without making a change "
+                            "and without explicitly justifying that no repository change was required."
+                        )
+                        self._pause_plan(plan, reason, response)
+                        self._save_journal(plan, messages, pending_input=reason, tool_batches=journal_batches)
+                        self._emit("paused", reason=reason)
+                        return AgentRunResult(
+                            "paused", reason, model_used, messages, tools, system,
+                            iterations=i + 1, latency_ms=total_latency,
+                            fallback_used=fallback_used, plan_id=plan.id if plan else "",
+                        )
+
+                if mutation_seen and not verification_seen:
                     messages.append({"role": "assistant", "content": response})
                     if not verification_nudge_sent:
-                        current_input = (_VERIFICATION_REQUIRED_PROMPT + (" Run the relevant test suite with the test tool; lint or an older test result is not sufficient." if self.require_test_verification else ""))
+                        current_input = _VERIFICATION_REQUIRED_PROMPT
                         verification_nudge_sent = True
-                        self._emit(
-                            "runtime_status", category="verify", status="required", phase="post_change",
-                            runtime_mode=runtime_mode, iteration=i + 1,
-                            message="workspace changed; successful post-change verification required before completion",
-                        )
                         self._emit("verification_required", iteration=i + 1)
                         self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
                         continue
@@ -1217,11 +1142,6 @@ class NativeLightRuntime:
                 perf = performance_snapshot()
                 self._emit("performance_summary", **perf)
                 self._emit(
-                    "runtime_status", category="run", status="completed", phase="complete",
-                    runtime_mode=runtime_mode, iteration=i + 1,
-                    message=f"runtime completed successfully after {i + 1} iteration(s)",
-                )
-                self._emit(
                     "final", response=response, model=model_used,
                     iterations=i + 1, latency_ms=total_latency,
                     fallback_used=fallback_used, performance=perf,
@@ -1257,11 +1177,6 @@ class NativeLightRuntime:
                         "answer/blocker. Do not repeat the same call unchanged."
                     )
                     self._emit(
-                        "runtime_status", category="recovery", status="warning", phase="loop_guard",
-                        runtime_mode=runtime_mode, iteration=i + 1,
-                        message="duplicate tool operation blocked; model must change approach",
-                    )
-                    self._emit(
                         "loop_prevented", iteration=i + 1, repeats=consecutive_call_batches,
                         action="nudge",
                     )
@@ -1283,8 +1198,6 @@ class NativeLightRuntime:
 
             tool_was_called = True
             tool_results: list[str] = []
-            batch_mutation = False
-            batch_verification = False
             native_tool_messages: list[dict[str, Any]] = []
             batch_records: list[dict[str, Any]] = []
             batch_failure_repeats = 0
@@ -1308,6 +1221,115 @@ class NativeLightRuntime:
                     "tool_call", name=name, arguments=args, iteration=i + 1,
                     request_id=request_id, handoff_ms=handoff_ms,
                 )
+                if name == _RUNTIME_COMPLETE_TOOL:
+                    started_tool = time.monotonic()
+                    summary = str(args.get("summary") or "").strip()
+                    evidence = [
+                        str(item).strip() for item in (args.get("evidence") or [])
+                        if str(item).strip()
+                    ] if isinstance(args.get("evidence"), list) else []
+                    no_change_justified = bool(args.get("no_change_justified"))
+                    accepted = True
+                    reject_reason = ""
+                    if len(calls) != 1:
+                        accepted = False
+                        reject_reason = "runtime_complete must be the sole tool call in its model turn"
+                    elif not summary:
+                        accepted = False
+                        reject_reason = "runtime_complete requires a non-empty summary"
+                    elif self.require_mutation_or_explicit_no_change and not mutation_seen and not no_change_justified:
+                        accepted = False
+                        reject_reason = "runtime completion rejected: no repository mutation was observed and no_change_justified was not set"
+                    elif mutation_seen and not verification_seen:
+                        accepted = False
+                        reject_reason = "runtime completion rejected: repository state changed but successful post-change verification is still missing"
+                    elif (
+                        mutation_seen and tool_was_called and not completion_audit_sent
+                        and _needs_completion_audit(self.initial_prompt)
+                    ):
+                        accepted = False
+                        completion_audit_sent = True
+                        reject_reason = "runtime completion rejected: perform the completion audit before declaring the task fully complete"
+
+                    elapsed = time.monotonic() - started_tool
+                    tool_result = json.dumps({
+                        "accepted": accepted,
+                        "runtime_verified": accepted,
+                        "mutation_seen": bool(mutation_seen),
+                        "verification_seen": bool(verification_seen),
+                        "summary": summary,
+                        "evidence": evidence[:12],
+                        "reason": reject_reason,
+                    }, ensure_ascii=False)
+                    self._emit(
+                        "completion_signal", requested=True, accepted=accepted,
+                        runtime_verified=accepted, mutation_seen=bool(mutation_seen),
+                        verification_seen=bool(verification_seen), summary=summary,
+                        evidence=evidence[:12], reason=reject_reason, iteration=i + 1,
+                        model=model_used,
+                    )
+                    performance.record_tool(name, elapsed, is_error=not accepted)
+                    self._emit(
+                        "tool_result", name=name, result=tool_result, is_error=not accepted,
+                        elapsed=elapsed, iteration=i + 1, request_id=request_id, handoff_ms=handoff_ms,
+                    )
+                    if accepted:
+                        if native_mode:
+                            messages.append({
+                                "role": "assistant", "content": response or None,
+                                "tool_calls": [{
+                                    "id": str(call.get("id") or ""), "type": "function",
+                                    "function": {
+                                        "name": name,
+                                        "arguments": json.dumps(args, ensure_ascii=False),
+                                    },
+                                }],
+                            })
+                            messages.append({
+                                "role": "tool", "tool_call_id": str(call.get("id") or ""),
+                                "name": name, "content": tool_result,
+                            })
+                        else:
+                            messages.append({"role": "assistant", "content": response})
+                            messages.append({"role": "user", "content": f"Tool {name} result:\n{tool_result}"})
+                        final_response = f"DONE: {summary}"
+                        guarded = self._guard_completion(
+                            plan, messages, tools, system, model_used=model_used, iterations=i + 1,
+                            total_latency=total_latency, fallback_used=fallback_used, journal_batches=journal_batches,
+                        )
+                        if guarded is not None:
+                            return guarded
+                        self._complete_plan(
+                            plan, final_response, mutation_seen=mutation_seen,
+                            verification_seen=verification_seen,
+                        )
+                        perf = performance_snapshot()
+                        self._emit("performance_summary", **perf)
+                        self._emit(
+                            "final", response=final_response, model=model_used, iterations=i + 1,
+                            latency_ms=total_latency, fallback_used=fallback_used, performance=perf,
+                        )
+                        if self.conversation is not None:
+                            self.conversation[:] = [dict(message) for message in messages[1:]][-MAX_CONTEXT_MESSAGES:]
+                        return AgentRunResult(
+                            "completed", final_response, model_used, messages, tools, system,
+                            iterations=i + 1, latency_ms=total_latency, fallback_used=fallback_used,
+                            plan_id=plan.id if plan else "",
+                        )
+                    tool_results.append(f"Tool {name} result:\n{tool_result}")
+                    if native_mode:
+                        native_tool_messages.append({
+                            "role": "tool", "tool_call_id": str(call.get("id") or ""),
+                            "name": name, "content": tool_result,
+                        })
+                    batch_records.append({
+                        "id": str(call.get("id") or ""), "name": name,
+                        "provider": str(call.get("provider") or ""),
+                        "raw_type": str(call.get("raw_type") or ""),
+                        "metadata": call.get("metadata") if isinstance(call.get("metadata"), dict) else {},
+                        "arguments": args, "is_error": True,
+                    })
+                    continue
                 if name in META_TOOL_NAMES:
                     started_tool = time.monotonic()
                     tool_result, is_error, tools_changed = self._run_meta_tool(name, args, tools)
@@ -1361,22 +1383,6 @@ class NativeLightRuntime:
                     "name": name, "arguments": dict(args), "workspace": workspace,
                     "iteration": i + 1, "risk": tuple(risk.reasons),
                 })
-                policy_status = "ok"
-                policy_message = f"tool {name} allowed"
-                if not allowed:
-                    policy_status = "blocked"
-                    policy_message = f"tool {name} blocked: {reason}"
-                elif pre_hook.blocked:
-                    policy_status = "blocked"
-                    policy_message = f"tool {name} blocked by policy hook: {pre_hook.reason or 'denied'}"
-                elif resumed and not fresh_inspection_after_resume and (risk.mutation or risk.destructive):
-                    policy_status = "blocked"
-                    policy_message = f"tool {name} blocked: resumed run requires fresh inspection before mutation"
-                self._emit(
-                    "runtime_status", category="policy", status=policy_status, phase="tool_policy",
-                    runtime_mode=runtime_mode, iteration=i + 1, tool=name,
-                    risk=list(risk.reasons), message=policy_message,
-                )
                 for diagnostic in pre_hook.diagnostics:
                     self._emit("hook_diagnostic", event="PreToolUse", message=diagnostic, tool=name)
                 if not allowed:
@@ -1574,37 +1580,20 @@ class NativeLightRuntime:
                         iterations=i + 1, latency_ms=total_latency,
                         fallback_used=fallback_used, plan_id=plan.id if plan else "",
                     )
-                previous_mutation_seen = mutation_seen
+                mutation_before_tool = mutation_seen
                 mutation_seen, verified_now = self._record_tool_progress(
                     plan, name, args, tool_result, is_error, mutation_seen,
                 )
-                mutation_effect = (
-                    not is_error
-                    and _has_mutation_effect(name, args)
-                    and not _is_behavior_verification_call(name, args)
-                )
-                if mutation_effect:
-                    verification_seen = verified_now
-                    test_verification_seen = False
-                    verification_nudge_sent = False
-                else:
-                    verification_seen = verification_seen or verified_now
-                if not is_error and name == "test" and verified_now and previous_mutation_seen:
-                    test_verification_seen = True
-                if is_error and name == "test":
-                    tool_results.append(
-                        "TEST FAILED. Diagnose the failure and change the implementation or its regression test before rerunning the same test. "
-                        "Do not loop on an unchanged failing test command."
-                    )
-                if not is_error and assess_execution(name, args, destructive=False).mutation:
-                    batch_mutation = True
-                batch_verification = batch_verification or verified_now
-                if verified_now:
-                    self._emit(
-                        "runtime_status", category="verify", status="ok", phase="post_change",
-                        runtime_mode=runtime_mode, iteration=i + 1, tool=name,
-                        message=f"post-change verification satisfied by {name}",
-                    )
+                verification_seen = verification_seen or verified_now
+                if mutation_seen and not mutation_before_tool:
+                    pre_mutation_inspection_count = 0
+                elif (
+                    self.require_mutation_or_explicit_no_change
+                    and not mutation_seen
+                    and not is_error
+                    and name in _INSPECTION_TOOLS
+                ):
+                    pre_mutation_inspection_count += 1
                 batch_records.append({
                     "id": str(call.get("id") or ""),
                     "name": name,
@@ -1621,22 +1610,6 @@ class NativeLightRuntime:
                     "calls": batch_records,
                 })
                 journal_batches = journal_batches[-20:]
-                if batch_mutation or batch_verification:
-                    read_only_batch_streak = 0
-                elif any(not bool(record.get("is_error")) for record in batch_records):
-                    read_only_batch_streak += 1
-                if read_only_batch_streak == READ_ONLY_PROGRESS_NUDGE_BATCHES:
-                    tool_results.append(
-                        "Progress guard: several consecutive read-only tool batches completed without a mutation "
-                        "or verification milestone. Consolidate the evidence already collected before reading more. "
-                        "Continue inspection only for a specific unresolved requirement; otherwise implement the "
-                        "smallest justified change, verify it, or finish with a concrete no-change conclusion."
-                    )
-                    self._emit(
-                        "runtime_status", category="recovery", status="warning", phase="progress_guard",
-                        runtime_mode=runtime_mode, iteration=i + 1,
-                        message=f"read-only progress guard after {read_only_batch_streak} consecutive batches",
-                    )
 
             base_tool_result_count = len(tool_results)
             repeats = loop_guard.observe(calls, tool_results)
@@ -1684,6 +1657,24 @@ class NativeLightRuntime:
                     )
                 else:
                     tool_results.append(STALL_RECOVERY_PROMPT)
+
+            if (
+                self.require_mutation_or_explicit_no_change
+                and not mutation_seen
+                and pre_mutation_inspection_count >= 8
+                and not implementation_nudge_sent
+            ):
+                tool_results.append(
+                    "IMPLEMENTATION REQUIRED: enough repository evidence has been inspected without any mutation. "
+                    "On the next turn, stop broad reading and implement the best-supported change using a write tool, "
+                    "then run focused verification. Only inspect more if one exact missing fact blocks the edit. "
+                    "If no repository change is actually justified, finish with `DONE: no change justified` and cite the evidence."
+                )
+                implementation_nudge_sent = True
+                self._emit(
+                    "implementation_required", iteration=i + 1,
+                    reason="inspection_without_mutation", inspections=pre_mutation_inspection_count,
+                )
 
             if repeats >= STALL_FALLBACK_REPEATS:
                 reason = (
@@ -1749,18 +1740,10 @@ class NativeLightRuntime:
             self._save_journal(plan, messages, tool_batches=journal_batches)
 
             if response.strip().upper().startswith("DONE:"):
-                verification_ready = verification_seen and (not self.require_test_verification or test_verification_seen)
-                if mutation_seen and not verification_ready:
+                if mutation_seen and not verification_seen:
                     if not verification_nudge_sent:
                         current_input += "\n\n" + _VERIFICATION_REQUIRED_PROMPT
-                        if self.require_test_verification:
-                            current_input += " Run the relevant test suite with the test tool; lint or an older test result is not sufficient."
                         verification_nudge_sent = True
-                        self._emit(
-                            "runtime_status", category="verify", status="required", phase="post_change",
-                            runtime_mode=runtime_mode, iteration=i + 1,
-                            message="workspace changed; successful post-change verification required before completion",
-                        )
                         self._emit("verification_required", iteration=i + 1)
                         continue
                     reason = (
@@ -1803,11 +1786,6 @@ class NativeLightRuntime:
                 )
                 perf = performance_snapshot()
                 self._emit("performance_summary", **perf)
-                self._emit(
-                    "runtime_status", category="run", status="completed", phase="complete",
-                    runtime_mode=runtime_mode, iteration=i + 1,
-                    message=f"runtime completed successfully after {i + 1} iteration(s)",
-                )
                 self._emit(
                     "final", response=visible or response, model=model_used,
                     iterations=i + 1, latency_ms=total_latency,

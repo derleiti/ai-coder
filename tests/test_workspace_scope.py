@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 from aicoder import cli
 from aicoder.agent import _cli_approval, _headless_approval
 from aicoder.executor import run_tool
-from aicoder.workspace import ACTIVE_WORKSPACE_ENV, activate_workspace, active_workspace, workspace_from_task
+from aicoder.workspace import ACTIVE_WORKSPACE_ENV, activate_workspace, active_workspace
 
 
 class ActiveWorkspaceTests(unittest.TestCase):
@@ -26,71 +26,6 @@ class ActiveWorkspaceTests(unittest.TestCase):
                 self.assertEqual(active_workspace(str(persisted)), persisted.resolve())
                 activate_workspace(launched)
                 self.assertEqual(active_workspace(str(persisted)), launched.resolve())
-
-    def test_explicit_prompt_workspace_overrides_persisted_parent(self):
-        with tempfile.TemporaryDirectory() as temp:
-            parent = Path(temp) / "workspace"
-            project = parent / "project-a"
-            project.mkdir(parents=True)
-            prompt = f"Workspace-Projekt: {project}\n\nOptimize this project."
-            with patch.dict(os.environ, {}, clear=False):
-                os.environ.pop(ACTIVE_WORKSPACE_ENV, None)
-                self.assertEqual(workspace_from_task(prompt, parent), project.resolve())
-
-    def test_inline_sentence_after_absolute_workspace_is_not_part_of_path(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp) / "workspace"
-            project = root / "aicoder-experimental"
-            project.mkdir(parents=True)
-            prompt = f"Workspace-Projekt: {project}. Work only in this project."
-            self.assertEqual(workspace_from_task(prompt, root), project.resolve())
-
-    def test_inline_sentence_after_relative_workspace_is_not_part_of_path(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp) / "workspace"
-            project = root / "aicoder-experimental"
-            project.mkdir(parents=True)
-            prompt = "Workspace-Projekt: aicoder-experimental; optimize only this project."
-            self.assertEqual(workspace_from_task(prompt, root), project.resolve())
-
-    def test_existing_workspace_with_sentence_like_punctuation_wins_as_complete_path(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp) / "workspace"
-            project = root / "release. candidate"
-            project.mkdir(parents=True)
-            prompt = f"Workspace: {project}"
-            self.assertEqual(workspace_from_task(prompt, root), project.resolve())
-
-    def test_english_workspace_project_label_resolves_relative_project(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp) / "workspace"
-            project = root / "aicoder-experimental"
-            project.mkdir(parents=True)
-            prompt = "Workspace project: aicoder-experimental\n\nOptimize this project."
-            self.assertEqual(workspace_from_task(prompt, root), project.resolve())
-
-    def test_relative_declared_workspace_resolves_inside_configured_project_container(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp) / "workspace"
-            project = root / "aicoder-experimental"
-            project.mkdir(parents=True)
-            prompt = "Workspace-Projekt: aicoder-experimental\n\nOptimize this project."
-            self.assertEqual(workspace_from_task(prompt, root), project.resolve())
-
-    def test_relative_declared_workspace_cannot_escape_project_container(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp) / "workspace"
-            root.mkdir()
-            outside = root.parent / "outside"
-            outside.mkdir()
-            with self.assertRaises(ValueError):
-                workspace_from_task("Workspace-Projekt: ../outside", root)
-
-    def test_declared_missing_workspace_fails_closed(self):
-        with tempfile.TemporaryDirectory() as temp:
-            missing = Path(temp) / "missing"
-            with self.assertRaises(ValueError):
-                workspace_from_task(f"Workspace: {missing}", temp)
 
     def test_workspace_command_accepts_non_git_directory_and_persists_exact_root(self):
         with tempfile.TemporaryDirectory() as temp:

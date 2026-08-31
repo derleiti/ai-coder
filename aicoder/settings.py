@@ -150,7 +150,7 @@ _register(SettingSpec(
     ),
 ))
 _register(SettingSpec(
-    key="request_timeout", type="int", default=120, minimum=10, maximum=300,
+    key="request_timeout", type="int", default=300, minimum=10, maximum=300,
     group="runtime", aliases=("timeout",),
     description=("Seconds of provider/network inactivity allowed while waiting for an LLM request. "
         "Streaming keepalive activity resets this idle timer; it is not a hard total turn deadline "
@@ -183,12 +183,6 @@ _register(SettingSpec(
     key="team_runtime_mode", type="enum", default="auto", choices=frozenset(TEAM_RUNTIME_MODES),
     group="team", aliases=("team_runtime",),
     description="Experimental team runtime: off, auto for complex coding tasks, or on for every action task.",
-))
-_register(SettingSpec(
-    key="team_brainstorm_rounds", type="int", default=2, minimum=1, maximum=5,
-    group="team", aliases=("brainstorm_rounds", "team_brainstorm_minutes", "brainstorm_minutes", "brainstorm_time"),
-    description=("Number of complete Brainstorm / Idea Evolution rounds. Each round runs all configured "
-                 "participants in parallel, then updates the anonymous shared Brainstorm State."),
 ))
 _register(SettingSpec(
     key="team_research_model_1", type="model", default="@primary", group="team",
@@ -492,12 +486,6 @@ class SettingsStore:
     def _normalize(self, raw: Dict[str, Any]) -> Dict[str, Any]:
         """Coerce persisted values, repairing invalid entries to their default."""
         data = dict(DEFAULTS)
-        # One-time compatibility migration from the former time-budget setting.
-        if "team_brainstorm_rounds" not in raw and "team_brainstorm_minutes" in raw:
-            try:
-                data["team_brainstorm_rounds"] = coerce("team_brainstorm_rounds", raw["team_brainstorm_minutes"])
-            except SettingsError:
-                pass
         for key, spec in REGISTRY.items():
             if key not in raw:
                 continue

@@ -2,7 +2,7 @@
 Name=ai-coder Terminal
 Comment=AILinux Coding Agent — Terminal REPL
 Exec=aicoder
-Icon=aicoder
+Icon=utilities-terminal
 Terminal=true
 Type=Application
 Categories=Development;

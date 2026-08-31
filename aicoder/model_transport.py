@@ -66,6 +66,7 @@ class OpenAICompatibleTransport:
         api_key: str = "",
         timeout: int = 300,
         headers: dict[str, str] | None = None,
+        reasoning_effort: str = "",
     ):
         base = str(base_url or "").strip()
         if not base:
@@ -74,6 +75,10 @@ class OpenAICompatibleTransport:
         self.api_key = str(api_key or "")
         self.timeout = max(10, min(300, int(timeout)))
         self.headers = {str(k): str(v) for k, v in (headers or {}).items()}
+        effort = str(reasoning_effort or "").strip().lower()
+        if effort not in {"", "high", "medium", "low", "none"}:
+            raise ValueError("reasoning_effort must be high, medium, low, none, or empty")
+        self.reasoning_effort = effort
         self._active_response_lock = threading.Lock()
         self._active_responses: dict[str, Any] = {}
 
@@ -164,6 +169,7 @@ class OpenAICompatibleTransport:
         tools: list | None = None,
         tool_choice: Any = "auto",
         request_id: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
         # ``fallback_model`` is a deprecated compatibility argument. Never route a
         # failed request to another model implicitly.
@@ -172,14 +178,28 @@ class OpenAICompatibleTransport:
             if system_prompt:
                 request_messages.append({"role": "system", "content": system_prompt})
             request_messages.append({"role": "user", "content": message})
+        requested_model = str(model or "").strip()
+        transport_model = requested_model
+        base_lower = self.base_url.lower()
+        if requested_model.startswith("ollama/") and ("11434" in base_lower or "ollama" in base_lower):
+            transport_model = requested_model[len("ollama/"):]
+        elif requested_model.startswith("openrouter/") and "openrouter.ai" in base_lower:
+            transport_model = requested_model[len("openrouter/"):]
+        elif requested_model.startswith("nvidia/nvidia/") and ("nvidia.com" in base_lower or "nvidia.ai" in base_lower):
+            transport_model = requested_model[len("nvidia/"):]
         payload: dict[str, Any] = {
-            "model": str(model or ""),
+            "model": transport_model,
             "messages": request_messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
         if not payload["model"]:
             raise ClientError("Direct OpenAI-compatible transport requires a model id")
+        effort = self.reasoning_effort if reasoning_effort is None else str(reasoning_effort or "").strip().lower()
+        if effort:
+            if effort not in {"high", "medium", "low", "none"}:
+                raise ClientError("Invalid reasoning_effort for direct model transport")
+            payload["reasoning_effort"] = effort
         converted_tools = _openai_tools(tools)
         if converted_tools:
             payload["tools"] = converted_tools
@@ -188,7 +208,7 @@ class OpenAICompatibleTransport:
         started = time.monotonic()
         normalized = _normalize_chat_response(self._post_json(payload, request_id=request_id))
         normalized = dict(normalized)
-        normalized.setdefault("model", payload["model"])
+        normalized.setdefault("model", requested_model or payload["model"])
         normalized.setdefault("backend", "openai-compatible-direct")
         elapsed_s = time.monotonic() - started
         normalized.setdefault("latency_ms", int(elapsed_s * 1000))
@@ -233,5 +253,6 @@ def native_model_transport_from_env(
         api_key=os.environ.get("AICODER_NATIVE_MODEL_API_KEY", ""),
         timeout=getattr(default, "timeout", 300),
         headers=headers,
+        reasoning_effort=os.environ.get("AICODER_NATIVE_REASONING_EFFORT", ""),
     )
     return transport, model

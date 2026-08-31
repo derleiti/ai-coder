@@ -9,12 +9,70 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from aicoder.agent_plan import PlanStore
-from aicoder.agent_runtime import NativeLightRuntime, _completion_audit_prompt, _is_behavior_verification_call, auto_resumable_pause, auto_resume_limit, auto_resume_prompt
+from aicoder.agent_runtime import NativeLightRuntime
 from aicoder.executor import LOCAL_FILE_EDIT_SCHEMA, LOCAL_FILE_READ_SCHEMA, LOCAL_TEST_SCHEMA
 from aicoder.gui.chat_widget import _AgentWorker
 
 
 class NativeLightPlanTests(unittest.TestCase):
+    def test_emit_allows_kind_field_inside_event_payload(self):
+        events = []
+        runtime = NativeLightRuntime(
+            client=MagicMock(), initial_prompt="x", model="test/model", fallback_model=None,
+            workspace_root=".", tools=[], event_fn=lambda event_kind, payload: events.append((event_kind, payload)),
+        )
+        runtime._emit("performance_warning", kind="model_latency", elapsed_ms=12000)
+        self.assertEqual(events[0][0], "performance_warning")
+        self.assertEqual(events[0][1]["kind"], "model_latency")
+
+    def test_coding_candidate_requires_mutation_or_explicit_no_change(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = MagicMock()
+            client.timeout = 30
+            client.chat.side_effect = [
+                {"response": "I inspected the code and would stop here.", "model": "test/model"},
+                {"response": "DONE: no change justified - the requested invariant is already satisfied.", "model": "test/model"},
+            ]
+            events = []
+            runtime = NativeLightRuntime(
+                client=client, initial_prompt="Fix the repository bug", model="test/model",
+                fallback_model=None, workspace_root=temp, tools=[], load_tools_on_start=False,
+                persistent_plan=False, base_timeout=30, require_mutation_or_explicit_no_change=True,
+                event_fn=lambda kind, payload: events.append((kind, payload)),
+            )
+            result = runtime.run()
+            self.assertEqual(result.status, "completed")
+            self.assertTrue(result.response.startswith("DONE: no change justified"))
+            self.assertEqual(client.chat.call_count, 2)
+            self.assertTrue(any(kind == "implementation_required" for kind, _ in events))
+
+    def test_coding_candidate_gets_progress_nudge_after_many_successful_reads(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = MagicMock()
+            client.timeout = 30
+            calls = "\n".join(
+                f'<tool_call>{{"name":"file_read","arguments":{{"path":"f{i}.txt"}}}}</tool_call>'
+                for i in range(8)
+            )
+            client.chat.side_effect = [
+                {"response": calls, "model": "test/model"},
+                {"response": "DONE: no change justified - all eight files already satisfy the contract.", "model": "test/model"},
+            ]
+            events = []
+            runtime = NativeLightRuntime(
+                client=client, initial_prompt="Fix the repository bug", model="test/model",
+                fallback_model=None, workspace_root=temp, tools=[LOCAL_FILE_READ_SCHEMA],
+                load_tools_on_start=True, persistent_plan=False, base_timeout=30,
+                require_mutation_or_explicit_no_change=True,
+                event_fn=lambda kind, payload: events.append((kind, payload)),
+            )
+            with patch("aicoder.agent_runtime.run_tool", return_value=("evidence", False)) as run_tool:
+                result = runtime.run()
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(run_tool.call_count, 8)
+            progress = [payload for kind, payload in events if kind == "implementation_required"]
+            self.assertTrue(any(item.get("reason") == "inspection_without_mutation" for item in progress))
+
     def test_compatibility_runtime_does_not_create_persistent_plan(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -24,7 +82,6 @@ class NativeLightPlanTests(unittest.TestCase):
             client = MagicMock()
             client.timeout = 30
             client.chat.return_value = {"response": "DONE: classic", "model": "test/model"}
-            events = []
             runtime = NativeLightRuntime(
                 client=client,
                 initial_prompt="Explain current state",
@@ -36,7 +93,6 @@ class NativeLightPlanTests(unittest.TestCase):
                 plan_store=store,
                 persistent_plan=False,
                 base_timeout=30,
-                event_fn=lambda kind, payload: events.append((kind, payload)),
             )
 
             result = runtime.run()
@@ -44,38 +100,6 @@ class NativeLightPlanTests(unittest.TestCase):
             self.assertEqual(result.status, "completed")
             self.assertFalse(result.plan_id)
             self.assertIsNone(store.load_current(str(workspace)))
-            runtime_events = [payload for kind, payload in events if kind == "runtime_status"]
-            self.assertTrue(runtime_events)
-            self.assertTrue(all(item.get("runtime_mode") == "classic" for item in runtime_events))
-            self.assertEqual(runtime_events[0]["phase"], "bootstrap")
-            self.assertEqual(runtime_events[-1]["status"], "completed")
-
-
-    def test_native_light_runtime_emits_same_runtime_status_contract(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            workspace = root / "workspace"
-            workspace.mkdir()
-            store = PlanStore(root / "plans")
-            client = MagicMock()
-            client.timeout = 30
-            client.chat.return_value = {"response": "DONE: native", "model": "test/model"}
-            events = []
-            runtime = NativeLightRuntime(
-                client=client, initial_prompt="Explain current state", model="test/model",
-                fallback_model=None, workspace_root=str(workspace), tools=[],
-                load_tools_on_start=False, plan_store=store, persistent_plan=True,
-                base_timeout=30, event_fn=lambda kind, payload: events.append((kind, payload)),
-            )
-
-            result = runtime.run()
-
-            self.assertEqual(result.status, "completed")
-            runtime_events = [payload for kind, payload in events if kind == "runtime_status"]
-            self.assertTrue(runtime_events)
-            self.assertTrue(all(item.get("runtime_mode") == "native-light" for item in runtime_events))
-            self.assertEqual(runtime_events[0]["phase"], "bootstrap")
-            self.assertEqual(runtime_events[-1]["status"], "completed")
 
     def test_plan_store_persists_current_plan_per_workspace(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -369,37 +393,6 @@ class NativeLightPlanTests(unittest.TestCase):
             self.assertEqual(run_tool.call_count, 1)
             self.assertEqual(client.chat.call_count, 3)
             self.assertTrue(any(name == "loop_prevented" for name, _ in events))
-
-
-    def test_progress_guard_nudges_after_six_read_only_batches(self):
-        with tempfile.TemporaryDirectory() as temp:
-            workspace = Path(temp)
-            client = MagicMock()
-            client.timeout = 30
-            client.chat.side_effect = [
-                {"response": f'<tool_call>{{"name":"file_read","arguments":{{"path":"file{i}.txt"}}}}</tool_call>', "model": "test/model"}
-                for i in range(6)
-            ] + [{"response": "DONE: evidence consolidated", "model": "test/model"}]
-            runtime = NativeLightRuntime(
-                client=client, initial_prompt="Inspect the relevant files and summarize", model="test/model",
-                fallback_model=None, workspace_root=str(workspace),
-                tools=[LOCAL_FILE_READ_SCHEMA], load_tools_on_start=True,
-                persistent_plan=False, base_timeout=30,
-            )
-            events = []
-            runtime.event_fn = lambda name, payload: events.append((name, payload))
-            with patch("aicoder.agent_runtime.run_tool", return_value=("contents", False)) as run_tool:
-                result = runtime.run()
-
-            self.assertEqual(result.status, "completed")
-            self.assertEqual(run_tool.call_count, 6)
-            guards = [payload for name, payload in events if name == "runtime_status" and payload.get("phase") == "progress_guard"]
-            self.assertEqual(len(guards), 1)
-            self.assertIn("6 consecutive batches", guards[0].get("message", ""))
-            self.assertTrue(any(
-                "Progress guard:" in str(message.get("content", ""))
-                for message in result.messages
-            ))
 
     def test_repeated_blocked_duplicate_pauses_with_visible_reason(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -762,147 +755,5 @@ class NativeLightGuiTests(unittest.TestCase):
 
 
 
-
-
-class CompletionAuditPromptTests(unittest.TestCase):
-    def test_completion_audit_preserves_long_requirement_prompt(self):
-        prompt = "BEGIN\n" + ("requirement-line\n" * 700) + "TAIL-REQUIREMENT-MUST-SURVIVE"
-        self.assertGreater(len(prompt), 5000)
-        audit = _completion_audit_prompt(prompt)
-        self.assertIn("TAIL-REQUIREMENT-MUST-SURVIVE", audit)
-
-
-class AutoResumePolicyTests(unittest.TestCase):
-    def test_only_runtime_recoverable_pauses_auto_resume(self):
-        self.assertTrue(auto_resumable_pause(
-            "Transient model/backend failure after request retries were exhausted: timeout"
-        ))
-        self.assertTrue(auto_resumable_pause(
-            "Agent paused: state changed successfully, but the model did not perform a successful post-change verification"
-        ))
-        self.assertFalse(auto_resumable_pause("Agent stopped by user"))
-        self.assertFalse(auto_resumable_pause("Agent paused because the user rejected file_edit."))
-        self.assertFalse(auto_resumable_pause(
-            "Agent paused because it kept requesting the same tool operation after that duplicate had already been blocked."
-        ))
-        self.assertFalse(auto_resumable_pause("Agent kept repeating without progress"))
-        prompt = auto_resume_prompt("same tool operation kept repeating without progress", 1)
-        self.assertIn("Automatic runtime resume 1/3", prompt)
-        self.assertIn("Do not repeat the same failed action unchanged", prompt)
-        safety = "Agent safety pause after an unusually long run. The persistent plan is preserved; resume it with continue."
-        self.assertEqual(auto_resume_limit(safety), 6)
-        safety_prompt = auto_resume_prompt(safety, 1)
-        self.assertIn("Automatic continuation slice 1/6", safety_prompt)
-        self.assertIn("NOT a fresh analysis pass", safety_prompt)
-        self.assertIn("Do not restart architecture discovery", safety_prompt)
-        self.assertIn("Move the assigned task toward a terminal state now", safety_prompt)
-
-
-class RuntimeEventPayloadRegressionTests(unittest.TestCase):
-    def test_emit_allows_payload_field_named_kind(self):
-        events = []
-        runtime = NativeLightRuntime(
-            client=MagicMock(), initial_prompt="test", model="test/model", fallback_model=None,
-            workspace_root=".", event_fn=lambda event_kind, payload: events.append((event_kind, payload)),
-        )
-        runtime._emit("performance_warning", kind="model_latency", elapsed_ms=12000)
-        self.assertEqual(events[0][0], "performance_warning")
-        self.assertEqual(events[0][1]["kind"], "model_latency")
-
-
-class CandidateTestCorrectionLoopTests(unittest.TestCase):
-    def test_successful_test_becomes_stale_after_later_mutation(self):
-        with tempfile.TemporaryDirectory() as temp:
-            workspace = Path(temp)
-            client = MagicMock()
-            client.timeout = 30
-            client.chat.side_effect = [
-                {"response": '<tool_call>{"name":"file_edit","arguments":{"path":"x.py","operation":"write","content":"x=1"}}</tool_call>', "model": "test/model"},
-                {"response": '<tool_call>{"name":"test","arguments":{"command":"python3 -m unittest"}}</tool_call>', "model": "test/model"},
-                {"response": '<tool_call>{"name":"file_edit","arguments":{"path":"x.py","operation":"write","content":"x=2"}}</tool_call>', "model": "test/model"},
-                {"response": "DONE: stale test must not count", "model": "test/model"},
-                {"response": '<tool_call>{"name":"test","arguments":{"command":"python3 -m unittest"}}</tool_call>', "model": "test/model"},
-                {"response": "DONE: retested after latest mutation", "model": "test/model"},
-            ]
-            runtime = NativeLightRuntime(
-                client=client, initial_prompt="Fix and test x.py", model="test/model",
-                fallback_model=None, workspace_root=str(workspace),
-                tools=[LOCAL_FILE_EDIT_SCHEMA, LOCAL_TEST_SCHEMA], load_tools_on_start=True,
-                approval_fn=lambda _name, _args: True, persistent_plan=False,
-                require_test_verification=True, base_timeout=30,
-            )
-            with patch("aicoder.agent_runtime.run_tool", return_value=("passed", False)) as run_tool:
-                result = runtime.run()
-            self.assertEqual(result.status, "completed")
-            self.assertEqual(result.response, "DONE: retested after latest mutation")
-            self.assertEqual(run_tool.call_count, 4)
-            self.assertTrue(any(
-                "older test result is not sufficient" in str(message.get("content", ""))
-                for message in result.messages
-            ))
-
-    def test_failed_test_can_be_repaired_then_retested(self):
-        with tempfile.TemporaryDirectory() as temp:
-            workspace = Path(temp)
-            client = MagicMock()
-            client.timeout = 30
-            client.chat.side_effect = [
-                {"response": '<tool_call>{"name":"file_edit","arguments":{"path":"x.py","operation":"write","content":"broken"}}</tool_call>', "model": "test/model"},
-                {"response": '<tool_call>{"name":"test","arguments":{"command":"python3 -m unittest"}}</tool_call>', "model": "test/model"},
-                {"response": '<tool_call>{"name":"file_edit","arguments":{"path":"x.py","operation":"write","content":"fixed"}}</tool_call>', "model": "test/model"},
-                {"response": '<tool_call>{"name":"test","arguments":{"command":"python3 -m unittest"}}</tool_call>', "model": "test/model"},
-                {"response": "DONE: fixed after failing test", "model": "test/model"},
-            ]
-            runtime = NativeLightRuntime(
-                client=client, initial_prompt="Fix and test x.py", model="test/model",
-                fallback_model=None, workspace_root=str(workspace),
-                tools=[LOCAL_FILE_EDIT_SCHEMA, LOCAL_TEST_SCHEMA], load_tools_on_start=True,
-                approval_fn=lambda _name, _args: True, persistent_plan=False,
-                require_test_verification=True, base_timeout=30,
-            )
-            outcomes = iter([
-                ("updated", False),
-                ("1 failed", True),
-                ("updated", False),
-                ("1 passed", False),
-            ])
-            with patch("aicoder.agent_runtime.run_tool", side_effect=lambda *_a, **_k: next(outcomes)) as run_tool:
-                result = runtime.run()
-            self.assertEqual(result.status, "completed")
-            self.assertEqual(result.response, "DONE: fixed after failing test")
-            self.assertEqual(run_tool.call_count, 4)
-            self.assertTrue(any(
-                "TEST FAILED" in str(message.get("content", ""))
-                for message in result.messages
-            ))
-
 if __name__ == "__main__":
     unittest.main()
-
-
-class BinaryExecVerificationClassificationTests(unittest.TestCase):
-    def test_assertion_readback_python_is_verification(self):
-        self.assertTrue(_is_behavior_verification_call("binary_exec", {
-            "program": "python3",
-            "arguments": ["-B", "-c", "from pathlib import Path; p=Path('x'); assert p.is_file(); assert p.read_bytes()==b'x'"],
-        }))
-
-    def test_arbitrary_python_is_not_verification(self):
-        self.assertFalse(_is_behavior_verification_call("binary_exec", {
-            "program": "python3",
-            "arguments": ["-c", "print('hello')"],
-        }))
-
-
-class UnlimitedIterationRuntimeTests(unittest.TestCase):
-    def test_none_iteration_limit_reports_unlimited(self):
-        with tempfile.TemporaryDirectory() as temp:
-            workspace = Path(temp) / "workspace"
-            workspace.mkdir()
-            client = MagicMock(); client.timeout = 30
-            client.chat.return_value = {"response": "DONE: ok", "model": "test/model"}
-            events = []
-            runtime = NativeLightRuntime(client=client, initial_prompt="Explain state", model="test/model", fallback_model=None, workspace_root=str(workspace), tools=[], load_tools_on_start=False, persistent_plan=False, max_iterations=None, event_fn=lambda kind, payload: events.append((kind, payload)), base_timeout=30)
-            self.assertEqual(runtime.run().status, "completed")
-            active = [p for k, p in events if k == "runtime_status" and p.get("phase") == "iteration"]
-            self.assertIn("1/unlimited", active[0]["message"])

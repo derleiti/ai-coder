@@ -34,7 +34,7 @@ class SettingsToolTests(unittest.TestCase):
         plan = settings_tools.plan_patch({"request_timeout": 180, "approval_mode": "all"})
         self.assertTrue(plan["security_confirmation_required"])
         self.assertEqual(before, self.path.read_text(encoding="utf-8"))
-        self.assertEqual(self.store.get("request_timeout"), 120)
+        self.assertEqual(self.store.get("request_timeout"), 300)
 
     def test_apply_patch_round_trips_and_verifies(self):
         text, is_error = settings_tools.run(

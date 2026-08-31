@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, re, subprocess
+import os, subprocess
 from pathlib import Path
 from typing import Any, Dict
 
@@ -22,69 +22,6 @@ def activate_workspace(path: str | Path | None = None) -> Path:
     os.environ[ACTIVE_WORKSPACE_ENV] = str(root)
     return root
 
-
-_TASK_WORKSPACE_RE = re.compile(
-    r"^\s*(?:workspace(?:[-_ ]?(?:project|projekt))?|project|projekt)\s*:\s*(?P<path>.+?)\s*$",
-    re.IGNORECASE,
-)
-
-
-def workspace_from_task(task: str, configured: str | Path | None = None) -> Path:
-    """Resolve an explicit user-declared project workspace before global settings.
-
-    Supported first-class labels include ``Workspace-Projekt:``, ``Workspace:``,
-    ``Project:`` and ``Projekt:``. Only an existing local directory is accepted.
-    If no explicit declaration is present, normal active/configured workspace
-    resolution is used.
-    """
-    for raw_line in str(task or "").splitlines():
-        match = _TASK_WORKSPACE_RE.match(raw_line)
-        if not match:
-            continue
-        raw = match.group("path").strip()
-        if not raw:
-            continue
-
-        base = (
-            Path(configured).expanduser().resolve(strict=False)
-            if configured is not None
-            else active_workspace()
-        )
-
-        def resolve_declared(value: str) -> Path:
-            cleaned = value.strip().strip("`\"" + chr(39))
-            requested = Path(cleaned).expanduser()
-            if requested.is_absolute():
-                return requested.resolve(strict=False)
-            candidate = (base / requested).resolve(strict=False)
-            try:
-                candidate.relative_to(base)
-            except ValueError as exc:
-                raise ValueError(
-                    f"relative workspace must stay inside configured workspace root: {candidate}"
-                ) from exc
-            return candidate
-
-        candidate = resolve_declared(raw)
-        if candidate.exists() and candidate.is_dir():
-            return candidate
-
-        # Direct CLI prompts may put prose after the declaration on the same
-        # line. Prefer the complete value first so real paths containing spaces
-        # or punctuation keep working; only then accept a clear sentence
-        # separator as the end of the workspace declaration.
-        for separator in (". ", "; "):
-            if separator not in raw:
-                continue
-            prefix = raw.split(separator, 1)[0].strip()
-            if not prefix:
-                continue
-            shortened = resolve_declared(prefix)
-            if shortened.exists() and shortened.is_dir():
-                return shortened
-
-        raise ValueError(f"declared workspace is not an existing directory: {candidate}")
-    return active_workspace(str(configured) if configured is not None else None)
 
 def path_within_workspace(value: str | Path, root: str | Path | None = None) -> tuple[Path, bool]:
     workspace = (Path(root).expanduser().resolve(strict=False) if root is not None else active_workspace())

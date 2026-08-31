@@ -365,11 +365,6 @@ LOCAL_SHELL_SCHEMA = {
 
 LOCAL_BINARY_EXEC_SCHEMA = {
     "name": "binary_exec",
-    "x-aicoder-contract": [
-        "arguments must be a JSON array of strings, never one shell command string",
-        "work_dir is the working directory; do not duplicate that directory in relative argument paths",
-        "use shell/task_runner only when shell composition is genuinely required",
-    ],
     "description": (
         "Execute one LOCAL program with structured arguments and no shell parsing. "
         "Prefer this for Python programs, test binaries, compilers and other direct executables."
@@ -451,12 +446,6 @@ LOCAL_FILE_EDIT_SCHEMA = {
         "UTF-8 FILE (not a directory). To create a folder/directory, use directory_create. "
         "Paths outside the active workspace trigger explicit one-time local scope approval."
     ),
-    "x-aicoder-contract": [
-        "create/write/append: use content",
-        "replace: use old_text + new_text; do not use content as the canonical replacement field",
-        "replace old_text must match exactly once",
-        "common model aliases are normalized when unambiguous",
-    ],
     "inputSchema": {
         "type": "object",
         "properties": {
@@ -503,11 +492,6 @@ LOCAL_FILE_TREE_SCHEMA = {
 
 LOCAL_CODE_READ_SCHEMA = {
     "name": "code_read",
-    "x-aicoder-contract": [
-        "start_line and end_line are inclusive and 1-based",
-        "omit line bounds to read the whole bounded file",
-        "if runtime reports EOF/line count, correct the range instead of repeating the same read",
-    ],
     "description": "Read code/text on the LOCAL AICoder host. TriForce is never a code execution target.",
     "inputSchema": {
         "type": "object",
@@ -538,11 +522,6 @@ LOCAL_CODE_TREE_SCHEMA = {
 
 LOCAL_CODE_SEARCH_SCHEMA = {
     "name": "code_search",
-    "x-aicoder-contract": [
-        "query is literal text unless regex=true",
-        "path scopes the search relative to root when root is supplied",
-        "after repeated no-match results change the query/evidence source instead of repeating it",
-    ],
     "description": "Recursively search project files on the LOCAL AICoder host. TriForce is never a code execution target.",
     "inputSchema": {
         "type": "object",
@@ -579,11 +558,6 @@ LOCAL_CODE_GREP_SCHEMA = {
 
 LOCAL_GIT_SCHEMA = {
     "name": "git",
-    "x-aicoder-contract": [
-        "read-only actions only: status, diff, log, show, branch, blame; blame takes the file path in args",
-        "args is a JSON array of git arguments, not a shell command",
-        "cwd is already the repository directory; project file paths in args are relative to cwd and normally must not start with /",
-    ],
     "description": "Read-only Git inspection. Outside-workspace cwd requires explicit one-time local scope approval.",
     "inputSchema": {
         "type": "object",
@@ -611,14 +585,10 @@ LOCAL_LINT_SCHEMA = {
 
 LOCAL_TEST_SCHEMA = {
     "name": "test",
-    "x-aicoder-contract": [
-        "use supported test-framework commands such as pytest or python -m unittest",
-        "cwd is already the project working directory; test paths are relative to cwd unless absolute",
-        "do not prefix a relative test path with the project directory name again when cwd is that project",
-        "a failed test requires a corrective code/test change before repeating the same test",
-        "zero tests collected is not successful behavior verification",
-    ],
-    "description": "Run LOCAL tests. Use pytest, python -m unittest, npm test, make test.",
+    "description": (
+        "Run LOCAL tests. Use pytest, python -m unittest, npm test, make test. "
+        "When AICODER_TEST_PYTHON or a project venv is available, Python tests automatically use that interpreter."
+    ),
     "inputSchema": {
         "type": "object",
         "properties": {
@@ -696,8 +666,8 @@ You are ai-coder — an autonomous AILinux operator agent for coding, DevOps, sy
 
 ## INIT — Only when needed:
 - Simple greeting/chat: respond directly. NO tool calls needed.
-- Coding task or complex question: if memory_search is active and prior project context is useful, use it first; otherwise inspect with the active tools and act.
-- Time-sensitive/version question: use an active search/research tool first; if none is active, report that evidence gap instead of guessing.
+- Coding task or complex question: memory_search first, then act.
+- Time-sensitive/version question: search first, never guess.
 - Do NOT run health/status/init/current_time for basic conversation.
 
 ## Tool Model:
@@ -707,30 +677,18 @@ You are ai-coder — an autonomous AILinux operator agent for coding, DevOps, sy
 - subagent_run delegates focused work. analyze/review/plan are advisory; debug/task may use the active parent tool subset.
 - MCP tools expose user-facing TriForce backend SERVICES under authenticated RBAC. TriForce itself is never an operator target: do not inspect or modify its host, repository, processes, services, containers, or federation nodes.
 
-## RUNTIME EXECUTION CONTRACT — follow literally:
-1. The model proposes tool calls; AICoder owns execution, approvals, workspace enforcement, retries, result correlation and recovery. Never pretend that you executed a tool yourself.
-2. To use a capability, CALL the exact active tool. Do not ask the user for tool permission in prose first. The host approval broker decides whether confirmation is required and, when needed, the UI/CLI asks the user.
-3. NEVER claim that the user approved, denied, rejected, or failed to approve an operation unless the runtime/tool result explicitly reports that decision. No approval dialog is NOT evidence of denial: the operation may be read-only, automatically allowed by configured host policy, or running inside an isolated autonomous candidate policy.
-4. If the runtime reports blocked/denied/rejected, treat that exact result as authoritative. Do not repeat the same blocked operation unchanged and do not invent a different reason. If no denial result exists, do not describe the step as denied.
-5. Use ONLY tools listed under ## Tools. A workflow name mentioned elsewhere is not proof that the tool is active. If a preferred tool is absent, choose an available equivalent or report the concrete capability gap.
-6. Tool arguments are a strict API contract. Required fields are marked with *. Use canonical field names, enum values and types shown below. Do not invent aliases even if AICoder can normalize some common model variants.
-7. Tool results are authoritative runtime evidence. After an error, read the error literally, correct arguments/path/query/range or change approach, then issue a NEW call. Never repeat an identical failing or already-successful call merely to make progress.
-8. A successful mutation makes earlier behavior verification stale. After the final behavior-changing mutation, run the appropriate test/reproducer. A failed test requires diagnosis and a justified code/test correction before rerunning the same test.
-9. Do not announce provider fallback, retries, recovery, workspace persistence, merge, approval, or atomic write success unless the runtime explicitly reports it. These are host-owned state transitions.
-10. Finish only when the requested work is actually complete and required verification is fresh. If blocked, identify the exact runtime/tool blocker instead of fabricating a user decision.
-
 ## When to use which:
-- LOCAL READ/ANALYZE: when listed as active, file_read, file_tree, code_grep, code_read, code_search and code_tree operate on the AICoder machine. code_* accepts an optional project root plus target=auto|local|remote; auto defaults to the local AICoder host, while remote explicitly executes through TriForce.
+- LOCAL READ/ANALYZE: file_read, file_tree, code_grep, code_read, code_search, code_tree on the AICoder machine. code_* accepts an optional project root plus target=auto|local|remote; auto defaults to the local AICoder host, while remote explicitly executes through TriForce.
 - MCP schema origin does not imply remote execution. AICoder dispatches workspace/code tools locally; backend-only tools remain remote.
-- CREATE DIRECTORIES: when directory_create is active, use it for directories. Never use file_edit on a directory path.
-- WRITE/MODIFY FILES: when file_edit is active, use it with path + operation + the operation-specific typed content fields.
-- BACKEND CONNECTIVITY: when health is active, health is read-only
-- SKILLS: when skill_read is active and a catalogued skill matches the task, call skill_read(name) before acting.
-- SUBAGENTS: when subagent_run is active, use it for bounded analysis/review/planning or focused debug/task work.
+- CREATE DIRECTORIES: use directory_create. Never use file_edit on a directory path.
+- WRITE/MODIFY FILES: use file_edit with path + operation + typed content fields.
+- BACKEND CONNECTIVITY: health (READ-ONLY)
+- SKILLS: when a catalogued skill matches the task, call skill_read(name) before acting.
+- SUBAGENTS: use subagent_run for bounded analysis/review/planning or focused debug/task work.
   Tool-capable subagents inherit only the active parent tools, cannot recurse into subagent_run, and remain subject to the same approvals and workspace policy.
-- SEARCH: use active research tools in this preference order when present: memory_search → search → crawl; skip names not listed under ## Tools
-- MODELS: when active, models and specialist are informational/advisory capabilities
-- STUCK >2 rounds: stop guessing; use a different ACTIVE evidence tool/query if available, otherwise report the concrete blocker or ask one focused question.
+- SEARCH: memory_search (first!) → search → crawl
+- MODELS: models, specialist (info only)
+- STUCK >2 rounds: Stop guessing. Use memory_search, then search, then ask user.
 
 ## SECURITY MODEL:
 - MCP read tools provide coding, documentation, search, memory, and model information.
@@ -812,7 +770,7 @@ _OBFUSCATION_PATTERNS = [
 ]
 
 def _has_unquoted_pipe(command: str) -> bool:
-    """Return True only for shell pipes outside balanced quotes.
+    """Return True only for shell-pipe characters outside balanced quotes.
 
     Regex arguments such as ``'(^|/)(foo|bar)'`` are data, not shell pipelines.
     Malformed/unclosed quoting stays conservative when a pipe was encountered.
@@ -960,58 +918,15 @@ def load_tools(client: TriForceClient, force_refresh: bool = False) -> list[dict
     return copy.deepcopy(result)
 
 
-def _compact_schema_type(spec: dict) -> str:
-    kind = str(spec.get("type") or "any")
-    if kind == "array":
-        items = spec.get("items") if isinstance(spec.get("items"), dict) else {}
-        kind = f"array[{items.get('type') or 'any'}]"
-    enum = spec.get("enum")
-    if isinstance(enum, list) and enum:
-        values = "|".join(str(item) for item in enum[:16])
-        if len(enum) > 16:
-            values += "|..."
-        kind += f" enum[{values}]"
-    minimum = spec.get("minimum")
-    maximum = spec.get("maximum")
-    if minimum is not None or maximum is not None:
-        kind += f" range[{minimum if minimum is not None else '-inf'}..{maximum if maximum is not None else 'inf'}]"
-    return kind
-
-
-def _compact_tool_arg(name: str, spec: dict, required: set[str]) -> str:
-    marker = "*" if name in required else ""
-    detail = _compact_schema_type(spec)
-    desc = " ".join(str(spec.get("description") or "").split())[:110]
-    return f"{name}{marker}:{detail}" + (f" — {desc}" if desc else "")
-
-
 def build_tool_desc(tools: list[dict]) -> str:
-    """Build a schema-derived text contract for models without reliable native schema use."""
+    """Build tool description string for system prompt."""
     out = []
-    for t in sorted(tools, key=lambda x: str(x.get("name") or "")):
-        name = str(t.get("name") or "").strip()
-        if not name:
-            continue
-        schema = t.get("inputSchema") if isinstance(t.get("inputSchema"), dict) else {}
-        props = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
-        required = {str(item) for item in (schema.get("required") or [])}
-        args = "; ".join(
-            _compact_tool_arg(str(arg_name), arg_spec if isinstance(arg_spec, dict) else {}, required)
-            for arg_name, arg_spec in props.items()
-        )
-        short_sig = ", ".join(
-            f"{arg_name}*" if str(arg_name) in required else str(arg_name)
-            for arg_name in props
-        )
-        desc = " ".join(str(t.get("description") or "").split())[:220]
-        schema_detail = f" [schema: {args}]" if args else ""
-        line = f"- {name}({short_sig}){schema_detail}: {desc}"
-        contract = t.get("x-aicoder-contract")
-        if isinstance(contract, list):
-            rules = [" ".join(str(item).split()) for item in contract if str(item).strip()]
-            if rules:
-                line += "\n  contract: " + "; ".join(rules[:8])
-        out.append(line)
+    for t in sorted(tools, key=lambda x: x["name"]):
+        props = list(t.get("inputSchema",{}).get("properties",{}).keys())
+        req = t.get("inputSchema",{}).get("required",[])
+        sig = ", ".join(f"{p}*" if p in req else p for p in props)
+        desc = (t.get("description","") or "")[:100].replace("\n"," ")
+        out.append(f"- {t['name']}({sig}): {desc}")
     return "\n".join(out)
 
 
@@ -1573,41 +1488,17 @@ def _rejects_broken_python(
 
 
 def _normalize_file_edit_args(args: dict) -> dict:
-    """Normalize unambiguous model/provider aliases to the canonical file_edit contract."""
+    """Accept common provider/model aliases while keeping one canonical API internally."""
     normalized = dict(args)
     if str(normalized.get("operation") or "").lower() == "replace":
-        if "old_text" not in normalized:
-            for alias in ("find", "search", "search_text"):
-                if isinstance(normalized.get(alias), str):
-                    normalized["old_text"] = normalized[alias]
-                    break
+        if "old_text" not in normalized and isinstance(normalized.get("find"), str):
+            normalized["old_text"] = normalized["find"]
         if "new_text" not in normalized:
-            for alias in ("replace", "replacement", "replacement_text", "content"):
+            for alias in ("replace", "replacement"):
                 if isinstance(normalized.get(alias), str):
                     normalized["new_text"] = normalized[alias]
                     break
     return normalized
-
-
-def _file_edit_contract_error(args: dict) -> str:
-    operation = str(args.get("operation") or "").lower()
-    if operation == "replace":
-        missing = []
-        old = args.get("old_text")
-        new = args.get("new_text")
-        if not isinstance(old, str) or not old:
-            missing.append("old_text")
-        if not isinstance(new, str):
-            missing.append("new_text")
-        supplied = ", ".join(sorted(str(key) for key in args if not str(key).startswith("_"))) or "none"
-        return (
-            "file_edit error: invalid replace arguments. Required: path, operation='replace', "
-            "non-empty old_text, and string new_text. "
-            f"Missing/invalid: {', '.join(missing) or 'unknown'}. Supplied fields: {supplied}. "
-            "Use content only for create/write/append; for replace use new_text. "
-            "Do not repeat the same invalid call unchanged."
-        )
-    return "file_edit error: invalid arguments"
 
 
 def run_file_edit(args: dict) -> Tuple[str, bool]:
@@ -1646,7 +1537,7 @@ def run_file_edit(args: dict) -> Tuple[str, bool]:
             old = args.get("old_text")
             new = args.get("new_text")
             if not isinstance(old, str) or not old or not isinstance(new, str):
-                return _file_edit_contract_error(args), True
+                return "file_edit error: replace requires non-empty old_text and string new_text", True
             original = previous or ""
             count = original.count(old)
             if count != 1:
@@ -1737,16 +1628,9 @@ def run_local_code_read(args: dict) -> Tuple[str, bool]:
             return f"code_read error: binary file; textual read not supported: {path}", True
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         start = max(1, int(args.get("start_line") or 1))
-        requested_end = int(args.get("end_line") or len(lines))
-        if requested_end < start:
+        end = min(len(lines), int(args.get("end_line") or len(lines)))
+        if end < start:
             return "code_read error: end_line must be >= start_line", True
-        if start > len(lines):
-            return (
-                f"code_read: requested start_line {start} is beyond EOF; file has {len(lines)} line(s). "
-                f"Use a start_line between 1 and {max(1, len(lines))}, or use the existing evidence instead.",
-                False,
-            )
-        end = min(len(lines), requested_end)
         output = "\n".join(f"{number}: {lines[number - 1]}" for number in range(start, end + 1))
         return output[:12000] + ("…" if len(output) > 12000 else ""), False
     except Exception as exc:
@@ -1861,16 +1745,8 @@ def run_git_read(args: dict) -> Tuple[str, bool]:
     if action not in supported:
         return "git error: supported read-only actions are status, diff, log, show, branch, and blame", True
     raw_args = args.get("args") or []
-    if isinstance(raw_args, str):
-        # Provider/model compatibility: some otherwise-correct tool calls encode
-        # CLI-style git arguments as one string. Canonicalize this unambiguous
-        # read-only form before applying the same deny rules below.
-        try:
-            raw_args = shlex.split(raw_args)
-        except ValueError as exc:
-            return f"git error: invalid args string: {exc}", True
     if not isinstance(raw_args, list) or not all(isinstance(item, str) for item in raw_args):
-        return "git error: args must be a string array or shell-style string", True
+        return "git error: args must be a string array", True
     denied = ("--output", "--exec", "--upload-pack", "--receive-pack", "-d", "-D", "-m", "-M")
     if any(item in denied or item.startswith("--output=") for item in raw_args):
         return "git error: mutating or output-writing argument rejected", True
@@ -1996,11 +1872,10 @@ def run_checked_project_command(tool_name: str, args: dict) -> Tuple[str, bool]:
             return f"{tool_name} error: Python module '{argv[2]}' is not allowed", True
     try:
         cwd = _workspace_path(args.get("cwd") or ".", allow_outside=bool(args.get("_workspace_escape_approved")))
-        execution_argv, execution_env = _disk_backed_project_environment(cwd, argv)
-        completed = subprocess.run(
-            execution_argv, shell=False, cwd=str(cwd), env=execution_env,
-            capture_output=True, text=True, timeout=120,
-        )
+        if tool_name == "test":
+            from .team_pipeline import normalize_project_test_argv
+            argv = normalize_project_test_argv(argv, cwd)
+        completed = subprocess.run(argv, shell=False, cwd=str(cwd), capture_output=True, text=True, timeout=120)
         output = (completed.stdout or "") + (completed.stderr or "")
         return output[:12000] or "(no output)", completed.returncode != 0
     except Exception as exc:
@@ -2295,12 +2170,7 @@ def _run_tool_impl(
     if risk.needs_approval or needs_scope_approval:
         if approval_fn is not None:
             if not approval_fn(name, approval_args):
-                autonomous_policy = bool(getattr(approval_fn, "_aicoder_autonomous_policy", False))
-                result = (
-                    f"{name}: blocked by autonomous policy"
-                    if autonomous_policy
-                    else f"{name}: aborted by user"
-                )
+                result = f"{name}: aborted by user"
                 audit.log_tool(
                     tool_name=name, arguments=args, result=result, duration_s=0,
                     is_error=True, model=model, iteration=iteration,

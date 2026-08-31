@@ -43,19 +43,6 @@ class ChatToolEvidenceTests(unittest.TestCase):
         chat_history.delete_session(sid)
         self.assertEqual(chat_history.load_tool_events(sid), [])
 
-
-    def test_clear_history_removes_all_sessions_messages_and_tool_events(self):
-        first = chat_history.create_session("one")
-        second = chat_history.create_session("two")
-        chat_history.save_message(first, "user", "hello")
-        chat_history.save_message(second, "assistant", "world")
-        chat_history.save_tool_event(first, "file_read", "ok")
-        chat_history.clear_history()
-        self.assertEqual(chat_history.list_sessions(), [])
-        self.assertEqual(chat_history.load_messages(first), [])
-        self.assertEqual(chat_history.load_messages(second), [])
-        self.assertEqual(chat_history.load_tool_events(first), [])
-
     def test_invalid_status_is_ignored(self):
         sid = chat_history.create_session("evidence")
         chat_history.save_tool_event(sid, "file_read", "maybe")

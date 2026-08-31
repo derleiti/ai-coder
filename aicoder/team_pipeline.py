@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import time
@@ -15,7 +16,6 @@ from typing import Any, Iterable
 class TeamStage(str, Enum):
     PLAN_RESEARCH = "plan_research"
     RESEARCH = "research"
-    BRAINSTORM = "brainstorm"
     PLAN_CODE = "plan_code"
     CODE = "code"
     MERGE_PLAN = "merge_plan"
@@ -76,29 +76,61 @@ class VerificationResult:
         }
 
 
-_TEST_DIR_NAMES = {"test", "tests", "spec", "specs", "__tests__"}
-_SOURCE_SUFFIXES = {".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java", ".kt", ".kts", ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".cs", ".rb", ".php", ".swift", ".scala", ".sh"}
+def configured_project_python(root: str | Path) -> str | None:
+    """Return an explicitly configured or project-local Python test interpreter.
 
-def _is_test_path(path: str) -> bool:
-    p = Path(path)
-    lowered_parts = {part.lower() for part in p.parts}
-    name = p.name.lower()
-    stem = p.stem.lower()
-    return bool(lowered_parts & _TEST_DIR_NAMES or name.startswith("test_") or stem.endswith("_test") or ".test." in name or ".spec." in name)
+    ``AICODER_TEST_PYTHON`` is intentionally process-scoped so a CI/dev runner
+    can provide the dependency-complete interpreter without persisting host paths
+    into project state. Project-local virtual environments remain automatic.
+    """
+    root = Path(root).expanduser().resolve(strict=False)
+    candidates: list[Path] = []
+    override = str(os.environ.get("AICODER_TEST_PYTHON") or "").strip()
+    if override:
+        candidates.append(Path(override).expanduser())
+    if os.name == "nt":
+        candidates.extend([root / ".venv" / "Scripts" / "python.exe", root / "venv" / "Scripts" / "python.exe"])
+    else:
+        candidates.extend([root / ".venv" / "bin" / "python", root / "venv" / "bin" / "python"])
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            continue
+        if resolved.is_file() and os.access(resolved, os.X_OK):
+            return str(resolved)
+    return None
 
-def test_change_evidence(delta: dict[str, Any]) -> dict[str, Any]:
-    paths = sorted({str(path) for path in (delta.get("changed") or []) + (delta.get("deleted") or [])})
-    test_paths = [path for path in paths if _is_test_path(path)]
-    source_paths = [path for path in paths if not _is_test_path(path) and Path(path).suffix.lower() in _SOURCE_SUFFIXES]
-    return {"source_paths": source_paths, "test_paths": test_paths, "behavior_change": bool(source_paths), "tests_changed": bool(test_paths), "coverage_evidence_ok": (not source_paths) or bool(test_paths)}
+
+def project_python_interpreter(root: str | Path) -> str:
+    """Interpreter used by deterministic Python project checks."""
+    return configured_project_python(root) or "python3"
+
+
+def normalize_project_test_argv(argv: list[str], root: str | Path) -> list[str]:
+    """Route Python test commands through the configured project interpreter.
+
+    Non-Python test runners and unconfigured environments are preserved exactly.
+    """
+    configured = configured_project_python(root)
+    if not configured or not argv:
+        return list(argv)
+    executable = Path(argv[0]).name.lower()
+    if executable in {"pytest", "py.test"}:
+        return [configured, "-m", "pytest", *argv[1:]]
+    if executable in {"python", "python3", "python.exe"} and len(argv) >= 3 and argv[1] == "-m" and argv[2] in {"pytest", "unittest"}:
+        return [configured, *argv[1:]]
+    return list(argv)
+
 
 def project_verification_plan(root: str | Path) -> list[VerificationCommand]:
     """Infer deterministic checks from repository-native metadata, without an LLM vote."""
     root = Path(root)
     commands: list[VerificationCommand] = []
+    python = project_python_interpreter(root)
 
     if (root / "pyproject.toml").exists() or (root / "setup.py").exists() or (root / "setup.cfg").exists():
-        commands.append(VerificationCommand("python-compile", ("python3", "-m", "compileall", "-q", "-x", r"(^|/)(\.aicoder-team|\.venv)(/|$)", "."), 120))
+        commands.append(VerificationCommand("python-compile", (python, "-m", "compileall", "-q", "."), 120))
         if (root / "tests").is_dir():
             pyproject_text = ""
             if (root / "pyproject.toml").exists():
@@ -109,13 +141,13 @@ def project_verification_plan(root: str | Path) -> list[VerificationCommand]:
                 or "pytest" in pyproject_text.lower()
             )
             if uses_pytest:
-                commands.append(VerificationCommand("python-tests", ("python3", "-m", "pytest", "-q"), 300))
+                commands.append(VerificationCommand("python-tests", (python, "-m", "pytest", "-q"), 300))
             else:
-                commands.append(VerificationCommand("python-tests", ("python3", "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py"), 300))
+                commands.append(VerificationCommand("python-tests", (python, "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py"), 300))
         if (root / "ruff.toml").exists() or (root / ".ruff.toml").exists():
-            commands.append(VerificationCommand("ruff", ("python3", "-m", "ruff", "check", "."), 180))
+            commands.append(VerificationCommand("ruff", (python, "-m", "ruff", "check", "."), 180))
         if (root / "mypy.ini").exists() or (root / ".mypy.ini").exists():
-            commands.append(VerificationCommand("mypy", ("python3", "-m", "mypy", "."), 240))
+            commands.append(VerificationCommand("mypy", (python, "-m", "mypy", "."), 240))
 
     if (root / "package.json").exists():
         try:

@@ -213,16 +213,7 @@ def _normalize_chat_response(data: Any) -> Dict[str, Any]:
             normalized["tool_calls"] = message["tool_calls"]
         return normalized
 
-    keys = sorted(str(key) for key in data.keys())[:40]
-    types = {key: type(data.get(key)).__name__ for key in keys}
-    metadata_only = bool(data) and all(
-        key in {"_transport_telemetry", "usage", "reasoning", "reasoning_content", "finish_reason"}
-        for key in data
-    )
-    raise ClientError(
-        "Transient incomplete chat response: no recognized assistant response envelope; "
-        f"keys={keys}; types={types}", payload=data, retryable=metadata_only,
-    )
+    raise ClientError("Chat backend response contains no recognized response envelope")
 
 
 def model_identifier(value: Any) -> str:
@@ -581,10 +572,29 @@ class TriForceClient:
             raise ClientError(f"MCP {tool_name} response contains neither result nor error")
         return response
 
-    def list_models(self) -> list:
-        """Fetch available models from /v1/client/models."""
+    def model_catalog(self) -> Dict[str, Any]:
+        """Fetch the model catalog, preserving tier access when authenticated.
+
+        The backend intentionally exposes a guest model catalog without auth.
+        If the local JWT is missing, expired, or rejected, model discovery may
+        safely retry without Authorization. This fallback is intentionally
+        limited to discovery; chat, MCP, and all privileged operations remain
+        strict-auth.
+        """
+        if not self.token or self.is_token_expired():
+            if self.token:
+                print("⚠ Token expired — showing public guest model catalog.", file=sys.stderr)
+            return self._request("GET", "/v1/client/models", require_auth=False, _label="models-public")
         try:
-            data = self._request("GET", "/v1/client/models", require_auth=True, _label="models")
+            return self._request("GET", "/v1/client/models", require_auth=True, _label="models")
+        except TokenExpiredError:
+            print("⚠ Session rejected — showing public guest model catalog.", file=sys.stderr)
+            return self._request("GET", "/v1/client/models", require_auth=False, _label="models-public")
+
+    def list_models(self) -> list:
+        """Fetch available model metadata from the backend catalog."""
+        try:
+            data = self.model_catalog()
             details = data.get("model_details") or []
             if isinstance(details, list) and details:
                 return [m for m in details if isinstance(m, dict)]
@@ -597,9 +607,6 @@ class TriForceClient:
                 elif isinstance(m, dict):
                     result.append(m)
             return result
-        except TokenExpiredError:
-            print("⚠ Token expired — run: aicoder setup", file=sys.stderr)
-            return []
         except ClientError as e:
             print(f"⚠ Models laden fehlgeschlagen: {e}", file=sys.stderr)
             return []
@@ -653,6 +660,26 @@ class TriForceClient:
                 primary_result["_transport_telemetry"] = telemetry
             return primary_result
         except TokenExpiredError:
+            # Ollama models are intentionally available through TriForce's
+            # public guest chat API. A stale local login must not make a
+            # no-tools Ollama request unusable. Never apply this downgrade to
+            # tool-bearing or non-Ollama requests.
+            if model and str(model).startswith("ollama/") and not tools:
+                print(
+                    "⚠ Token expired — retrying Ollama chat as public guest.",
+                    file=sys.stderr,
+                )
+                public_result = _normalize_chat_response(self._request(
+                    "POST", "/v1/client/chat", payload, require_auth=False,
+                    _label=f"chat-public/{model}", _retries=0,
+                    _extra_headers={"X-AICoder-Keepalive": "json", **({"X-AICoder-Request-ID": request_id} if request_id else {})},
+                ))
+                if isinstance(public_result, dict) and request_id:
+                    public_result = dict(public_result)
+                    telemetry = dict(public_result.get("_transport_telemetry") or {})
+                    telemetry["request_id"] = request_id
+                    public_result["_transport_telemetry"] = telemetry
+                return public_result
             raise
         except ClientError:
             raise

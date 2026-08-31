@@ -448,37 +448,13 @@ def _repl_settings_command(value: str) -> int:
 
 
 
-_MODEL_ROLE_KEYS = {
-    "base": "selected_model", "primary": "selected_model", "operator": "selected_model",
-    "r1": "team_research_model_1", "research1": "team_research_model_1", "sources": "team_research_model_1",
-    "r2": "team_research_model_2", "research2": "team_research_model_2", "best-practices": "team_research_model_2",
-    "r3": "team_research_model_3", "research3": "team_research_model_3", "security": "team_research_model_3",
-    "r4": "team_research_model_4", "research4": "team_research_model_4", "alternatives": "team_research_model_4",
-    "planner": "team_planner_model", "plan": "team_planner_model",
-    "coordinator": "team_coordinator_model", "coord": "team_coordinator_model",
-    "c1": "team_coder_model_1", "coder1": "team_coder_model_1",
-    "c2": "team_coder_model_2", "coder2": "team_coder_model_2",
-    "c3": "team_coder_model_3", "coder3": "team_coder_model_3",
-    "c4": "team_coder_model_4", "coder4": "team_coder_model_4",
-    "merge": "team_merge_model", "tests": "team_test_planner_model", "testplan": "team_test_planner_model",
-}
+from .team_runtime import TEAM_ROLE_ALIASES as _MODEL_ROLE_KEYS, team_model_rows as _shared_team_model_rows
 
 
 def _team_model_rows(state: dict) -> list[tuple[str, str, str]]:
     return [
-        ("base", "Basismodell", str(state.get("selected_model") or "backend-default")),
-        ("r1", "Research 1 · Primärquellen", str(state.get("team_research_model_1") or "off")),
-        ("r2", "Research 2 · Best Practices", str(state.get("team_research_model_2") or "off")),
-        ("r3", "Research 3 · Security/Reliability", str(state.get("team_research_model_3") or "off")),
-        ("r4", "Research 4 · Alternative Architekturen", str(state.get("team_research_model_4") or "off")),
-        ("planner", "Planer", str(state.get("team_planner_model") or "off")),
-        ("coordinator", "Koordinator", str(state.get("team_coordinator_model") or "off")),
-        ("c1", "Coder 1 · konservativ", str(state.get("team_coder_model_1") or "off")),
-        ("c2", "Coder 2 · Architektur", str(state.get("team_coder_model_2") or "off")),
-        ("c3", "Coder 3 · Performance", str(state.get("team_coder_model_3") or "off")),
-        ("c4", "Coder 4 · Robustheit/Security", str(state.get("team_coder_model_4") or "off")),
-        ("merge", "Merge/Integration", str(state.get("team_merge_model") or "off")),
-        ("tests", "Test-Planer", str(state.get("team_test_planner_model") or "off")),
+        (row["alias"], row["label"], row["configured"])
+        for row in _shared_team_model_rows(state)
     ]
 
 
@@ -499,7 +475,7 @@ def _repl_models_command(value: str) -> int:
             session = load_session()
             from .client import TriForceClient, model_identifier
             client = TriForceClient(session.base_url, token=session.token, timeout=15)
-            data = client._request("GET", "/v1/client/models", require_auth=True, _label="models")
+            data = client.model_catalog()
             models = sorted(
                 model_id for item in data.get("models", [])
                 if (model_id := model_identifier(item))
@@ -881,11 +857,23 @@ def run_repl(skip_setup: bool = False) -> int:
                     print("  Setzen: /permissions ask|autopilot|all")
             elif cmd == "/shell":
                 print("  /shell ist im Coding-only-Profil deaktiviert.")
+            elif cmd == "/team":
+                team_parts = val.split(None, 1)
+                team_action = team_parts[0].lower() if team_parts else "show"
+                team_rest = team_parts[1] if len(team_parts) > 1 else ""
+                if team_action == "mode":
+                    _repl_runtime_command("team " + team_rest)
+                elif team_action in {"models", "list"}:
+                    _repl_models_command("list")
+                elif team_action in {"show", "status", "roles", "set", "pick"}:
+                    _repl_models_command((team_action + (" " + team_rest if team_rest else "")).strip())
+                else:
+                    print("  usage: /team [show|models|mode auto|on|off|set ROLE MODEL|pick ROLE]")
             elif cmd == "/models":
                 _repl_models_command(val)
             elif cmd == "/help":
-                print("  /models · /settings · /runtime · /status")
-                print("  /runtime [agent|workspace|team] · /models [show|list|pick|set] · /settings [ask|set|get]")
+                print("  /team · /models · /settings · /runtime · /status")
+                print("  /team [show|models|mode|set|pick] · /runtime [agent|workspace|team] · /settings [ask|set|get]")
                 print("  /commands · /command <name> [args] · /guidelines")
                 print("  /setup · /new · /clear · /keys · /permissions · /exit")
             else:

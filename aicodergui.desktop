@@ -1,11 +1,9 @@
 [Desktop Entry]
 Type=Application
-Version=1.0
-Name=AICoder Experimental
-Comment=Experimental RAM Multi-Agent Runtime
-Exec=/bin/bash -lc 'cd /home/zombie/aicoder-experimental && exec /home/zombie/aicoder-experimental/.venv/bin/python -P -m aicoder gui'
-Path=/home/zombie/aicoder-experimental
-Icon=/home/zombie/aicoder-experimental/assets/aicoder.png
+Name=AI-Coder (Dev, Source)
+Exec=/home/zombie/ai-coder/.venv/bin/python /home/zombie/ai-coder/aicoder_main.py gui
+Path=/home/zombie/ai-coder
+Icon=utilities-terminal
 Terminal=false
 StartupNotify=true
 Categories=Development;IDE;

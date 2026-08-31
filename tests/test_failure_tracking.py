@@ -50,19 +50,5 @@ class FailureTrackerTests(unittest.TestCase):
         self.assertIsNone(FailureTracker().observe("ok", False))
 
 
-class NetworkFailureClassificationTests(unittest.TestCase):
-    def test_common_transport_disconnects_are_transient(self):
-        for message in (
-            "connection refused",
-            "connection aborted",
-            "remote end closed connection",
-            "network is unreachable",
-            "temporary failure in name resolution",
-        ):
-            category, _signature, retryable = FailureTracker.classify(message)
-            self.assertEqual(category, "transient", message)
-            self.assertTrue(retryable, message)
-
-
 if __name__ == "__main__":
     unittest.main()

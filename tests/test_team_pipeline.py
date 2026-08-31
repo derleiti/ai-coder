@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import os
+import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from aicoder.team_pipeline import (
     STAGE_ORDER, StageLedger, TeamStage, blind_candidate_id, content_fingerprint, objective_rank_key,
-    project_verification_plan, execute_verification_plan,
+    configured_project_python, normalize_project_test_argv, project_verification_plan,
 )
 
 
@@ -30,7 +33,7 @@ class BlindRankingTests(unittest.TestCase):
         first = blind_candidate_id("same diff")
         second = blind_candidate_id("same diff")
         self.assertNotEqual(first, second)
-        self.assertTrue(first.startswith("cand-"))
+        self.assertRegex(first, r"^cand-[0-9a-f]{12}$")
         self.assertEqual(content_fingerprint("same diff"), content_fingerprint("same diff"))
         self.assertNotEqual(content_fingerprint("diff a"), content_fingerprint("diff b"))
 
@@ -74,6 +77,31 @@ class ResearchEvidenceBiasTests(unittest.TestCase):
         self.assertIn("unverified-or-local-only", prompt)
 
 
+class ProjectPythonRuntimeTests(unittest.TestCase):
+    def test_explicit_test_python_routes_pytest_and_unittest(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"AICODER_TEST_PYTHON": sys.executable}):
+            root = Path(tmp)
+            self.assertEqual(configured_project_python(root), str(Path(sys.executable).resolve()))
+            self.assertEqual(
+                normalize_project_test_argv(["pytest", "-q"], root),
+                [str(Path(sys.executable).resolve()), "-m", "pytest", "-q"],
+            )
+            self.assertEqual(
+                normalize_project_test_argv(["python3", "-m", "unittest", "discover"], root),
+                [str(Path(sys.executable).resolve()), "-m", "unittest", "discover"],
+            )
+
+    def test_verification_plan_uses_explicit_test_python(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"AICODER_TEST_PYTHON": sys.executable}):
+            root = Path(tmp)
+            (root / "pyproject.toml").write_text('[project]\nname="x"\nversion="0.1"\n[tool.pytest.ini_options]\n', encoding="utf-8")
+            (root / "tests").mkdir()
+            plan = project_verification_plan(root)
+            python_commands = [item for item in plan if item.name.startswith("python-")]
+            self.assertTrue(python_commands)
+            self.assertTrue(all(item.argv[0] == str(Path(sys.executable).resolve()) for item in python_commands))
+
+
 class ProjectPlanTests(unittest.TestCase):
     def test_python_project_gets_compile_and_test_gates(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -84,18 +112,6 @@ class ProjectPlanTests(unittest.TestCase):
             names = [item.name for item in plan]
             self.assertIn("python-compile", names)
             self.assertIn("python-tests", names)
-
-    def test_compile_gate_ignores_internal_candidate_snapshots(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "pyproject.toml").write_text('[project]\nname="x"\nversion="0.1"\n', encoding="utf-8")
-            (root / "good.py").write_text('VALUE = 1\n', encoding="utf-8")
-            rejected = root / ".aicoder-team" / "candidates" / "rejected"
-            rejected.mkdir(parents=True)
-            (rejected / "bad.py").write_text('def broken(:\n', encoding="utf-8")
-            compile_command = next(item for item in project_verification_plan(root) if item.name == "python-compile")
-            result = execute_verification_plan(root, [compile_command])[0]
-            self.assertTrue(result.ok, result.output)
 
 
 if __name__ == "__main__":

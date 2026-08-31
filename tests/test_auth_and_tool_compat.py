@@ -5,7 +5,6 @@ import contextlib
 import io
 import json
 import os
-import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -16,12 +15,11 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt6.QtWidgets import QApplication
 
 from aicoder.client import ClientError, TriForceClient, _decode_jwt_exp, _normalize_chat_response
-from aicoder import chat_history
 from aicoder.config import Session
 from aicoder.executor import (
     is_action_request, is_simple_chat_message, merge_tool_calls, normalize_tool_calls, parse_tool_calls,
 )
-from aicoder.gui.chat_widget import _AgentWorker, ChatWidget
+from aicoder.gui.chat_widget import _AgentWorker
 import aicoder.gui.settings_widget as settings_widget
 import aicoder.agent as cli_agent
 from aicoder.setup import _is_token_expired, run_setup
@@ -35,18 +33,6 @@ import aicoder.repl_input as repl_input_module
 def _unsigned_token(exp: int) -> str:
     payload = base64.urlsafe_b64encode(json.dumps({"exp": exp}).encode()).decode().rstrip("=")
     return f"header.{payload}.signature"
-
-
-class DestructiveCommandParsingTests(unittest.TestCase):
-    def test_compileall_regex_pipe_inside_quotes_is_not_destructive(self):
-        command = "python3 -m compileall -q -x '(^|/)(\\.aicoder-team|\\.venv)(/|$)' ."
-        self.assertFalse(executor.is_destructive(command))
-
-    def test_unquoted_python_pipe_remains_destructive(self):
-        self.assertTrue(executor.is_destructive("python3 -m compileall . | sh"))
-
-    def test_unclosed_quote_with_pipe_remains_conservative(self):
-        self.assertTrue(executor.is_destructive("python3 -m compileall -x '(^|/)"))
 
 
 class AuthCompatibilityTests(unittest.TestCase):
@@ -345,24 +331,6 @@ class GuiToolModeTests(unittest.TestCase):
         with patch("aicoder.agent_runtime.run_tool") as execute:
             worker.run()
         execute.assert_not_called()
-
-
-
-class CodeReadBoundaryCompatibilityTests(unittest.TestCase):
-    def test_code_read_beyond_eof_is_actionable_non_error(self):
-        with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "sample.py"
-            path.write_text("one\ntwo\nthree\n", encoding="utf-8")
-            with (
-                patch.object(executor, "_code_project_path", return_value=path),
-                patch.object(executor, "_workspace_path", return_value=path),
-            ):
-                result, is_error = executor.run_local_code_read({
-                    "path": str(path), "start_line": 4, "end_line": 4,
-                })
-            self.assertFalse(is_error)
-            self.assertIn("beyond EOF", result)
-            self.assertIn("3 line(s)", result)
 
 
 class SettingsRegressionTests(unittest.TestCase):
@@ -717,219 +685,3 @@ class ToolSecurityHardeningTests(unittest.TestCase):
                 executor.AGENT_TOOLS, executor._tool_cache, executor._tool_cache_ts,
                 executor._tool_cache_key, executor._tool_security_hints,
             ) = saved
-
-class FrontierToolArgumentCompatibilityTests(unittest.TestCase):
-    def test_git_blame_is_supported_and_file_cwd_is_normalized(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            (root / ".git").mkdir()
-            target = root / "aicoder" / "executor.py"
-            target.parent.mkdir()
-            target.write_text("value = 1\n", encoding="utf-8")
-            with patch("aicoder.executor._workspace_path", return_value=target):
-                with patch("aicoder.executor.subprocess.run") as run:
-                    run.return_value.returncode = 0
-                    run.return_value.stdout = "abc line\n"
-                    run.return_value.stderr = ""
-                    text, is_error = executor.run_git_read({"action": "blame", "cwd": str(target)})
-            self.assertFalse(is_error)
-            self.assertEqual(text, "abc line\n")
-            self.assertEqual(run.call_args.kwargs["cwd"], str(root))
-            self.assertEqual(run.call_args.args[0][-2:], ["blame", "aicoder/executor.py"])
-
-    def test_code_grep_normalizes_accidental_leading_slash_before_scope_policy(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            package = root / "aicoder"
-            package.mkdir()
-            (package / "x.py").write_text("needle = 1\n", encoding="utf-8")
-            result, is_error = executor.run_tool(
-                MagicMock(), "code_grep",
-                {"pattern": "needle", "path": "/aicoder", "glob": "*.py"},
-                approval_fn=lambda *_: False,
-                allowed_tools={"code_grep"}, workspace_root=str(root), protected_workspace_root=str(root),
-            )
-            self.assertFalse(is_error, result)
-            self.assertIn("aicoder/x.py", result)
-
-    def test_code_path_normalizes_accidental_leading_slash_inside_root(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            target = root / "aicoder" / "executor.py"
-            target.parent.mkdir()
-            target.write_text("value = 1\n", encoding="utf-8")
-            token = executor._RUNTIME_WORKSPACE_ROOT.set(str(root))
-            try:
-                resolved = executor._code_project_path({"root": str(root), "path": "/aicoder/executor.py"})
-            finally:
-                executor._RUNTIME_WORKSPACE_ROOT.reset(token)
-            self.assertEqual(resolved, target.resolve())
-
-    def test_git_accepts_shell_style_string_args(self):
-        with patch("aicoder.executor._workspace_path", return_value=Path(".")):
-            with patch("aicoder.executor.subprocess.run") as run:
-                run.return_value.returncode = 0
-                run.return_value.stdout = "ok\n"
-                run.return_value.stderr = ""
-                text, is_error = executor.run_git_read({"action": "status", "args": "--short --branch"})
-        self.assertFalse(is_error)
-        self.assertEqual(text, "ok\n")
-        argv = run.call_args.args[0]
-        self.assertIn("--short", argv)
-        self.assertIn("--branch", argv)
-
-
-class DiskBackedDependencyEnvironmentTests(unittest.TestCase):
-    def test_candidate_python_uses_source_venv_but_candidate_import_path_first(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            source = root / "source"
-            candidate = root / "candidate"
-            (source / ".venv" / "bin").mkdir(parents=True)
-            candidate.mkdir()
-            work_dir = candidate / "tests"
-            work_dir.mkdir()
-            python = source / ".venv" / "bin" / "python"
-            python.write_text("", encoding="utf-8")
-            protected_token = executor._RUNTIME_PROTECTED_ROOT.set(str(source))
-            workspace_token = executor._RUNTIME_WORKSPACE_ROOT.set(str(candidate))
-            try:
-                argv, env = executor._disk_backed_project_environment(work_dir, ["python3", "-m", "pytest"])
-            finally:
-                executor._RUNTIME_WORKSPACE_ROOT.reset(workspace_token)
-                executor._RUNTIME_PROTECTED_ROOT.reset(protected_token)
-            self.assertEqual(argv[0], str(python))
-            self.assertEqual(env["VIRTUAL_ENV"], str(source / ".venv"))
-            self.assertEqual(env["PYTHONPATH"].split(os.pathsep)[0], str(candidate))
-
-    def test_candidate_tool_binary_uses_source_venv_when_present(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            source = root / "source"
-            candidate = root / "candidate"
-            (source / ".venv" / "bin").mkdir(parents=True)
-            candidate.mkdir()
-            pytest_bin = source / ".venv" / "bin" / "pytest"
-            (source / ".venv" / "bin" / "python").write_text("", encoding="utf-8")
-            pytest_bin.write_text("", encoding="utf-8")
-            token = executor._RUNTIME_PROTECTED_ROOT.set(str(source))
-            try:
-                argv, _env = executor._disk_backed_project_environment(candidate, ["pytest", "-q"])
-            finally:
-                executor._RUNTIME_PROTECTED_ROOT.reset(token)
-            self.assertEqual(argv[0], str(pytest_bin))
-
-    def test_candidate_node_dependencies_are_exposed_from_source_disk(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            source = root / "source"
-            candidate = root / "candidate"
-            (source / "node_modules" / ".bin").mkdir(parents=True)
-            candidate.mkdir()
-            token = executor._RUNTIME_PROTECTED_ROOT.set(str(source))
-            try:
-                _argv, env = executor._disk_backed_project_environment(candidate, ["npm", "test"])
-            finally:
-                executor._RUNTIME_PROTECTED_ROOT.reset(token)
-            self.assertEqual(env["NODE_PATH"].split(os.pathsep)[0], str(source / "node_modules"))
-            self.assertEqual(env["PATH"].split(os.pathsep)[0], str(source / "node_modules" / ".bin"))
-
-    def test_normal_source_execution_does_not_rewrite_environment(self):
-        with tempfile.TemporaryDirectory() as temp:
-            source = Path(temp)
-            token = executor._RUNTIME_PROTECTED_ROOT.set(str(source))
-            try:
-                argv, env = executor._disk_backed_project_environment(source, ["python3", "-m", "pytest"])
-            finally:
-                executor._RUNTIME_PROTECTED_ROOT.reset(token)
-            self.assertEqual(argv, ["python3", "-m", "pytest"])
-            self.assertEqual(env.get("PYTHONPATH"), os.environ.get("PYTHONPATH"))
-
-
-class RuntimeConsoleWidgetTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.app = QApplication.instance() or QApplication([])
-
-    def test_runtime_messages_stay_out_of_main_chat_and_keep_four_lines(self):
-        widget = ChatWidget()
-        for index in range(5):
-            widget._on_agent_msg("runtime", f"iteration {index} completed", "RUN complete")
-        self.assertNotIn("iteration 4 completed", widget.log.toPlainText())
-        lines = widget.runtime_log.toPlainText().splitlines()
-        self.assertEqual(len(lines), 4)
-        self.assertIn("iteration 4 completed", lines[-1])
-        self.assertEqual(widget._runtime_success_count, 5)
-        self.assertEqual(widget._runtime_error_count, 0)
-        widget.deleteLater()
-
-
-    def test_expected_policy_block_is_warning_not_runtime_error(self):
-        widget = ChatWidget()
-        widget._on_agent_msg("runtime", "coder:4 · tool error · file_tree", "file_tree: blocked — source workspace is protected")
-        self.assertEqual(widget._runtime_error_count, 0)
-        self.assertIn("WARN", widget.runtime_log.toPlainText())
-        widget.deleteLater()
-
-    def test_live_model_chat_messages_are_persisted_for_history(self):
-        with tempfile.TemporaryDirectory() as temp:
-            db = Path(temp) / "chat_history.db"
-            with patch("aicoder.chat_history.DB_PATH", db):
-                sid = chat_history.create_session("live")
-                widget = ChatWidget()
-                widget._session_id = sid
-                widget._on_agent_msg("thought", "research reasoning", "research:1")
-                widget._on_agent_msg("model", "coder final", "coder:2")
-                widget._on_agent_msg("system", "stage completed", "team")
-                rows = chat_history.load_messages(sid)
-                self.assertEqual([row["role"] for row in rows], ["thought", "model", "system"])
-                self.assertEqual(rows[1]["content"], "coder final")
-                widget.deleteLater()
-
-    def test_session_restore_shows_display_roles_but_context_only_user_assistant(self):
-        with tempfile.TemporaryDirectory() as temp:
-            db = Path(temp) / "chat_history.db"
-            with patch("aicoder.chat_history.DB_PATH", db):
-                sid = chat_history.create_session("restore")
-                chat_history.save_message(sid, "user", "prompt")
-                chat_history.save_message(sid, "thought", "planner thought", "plan")
-                chat_history.save_message(sid, "model", "coder result", "coder:1")
-                chat_history.save_message(sid, "system", "stage completed", "team")
-                chat_history.save_message(sid, "assistant", "final")
-                widget = ChatWidget()
-                widget._load_session(sid)
-                visible = widget.log.toPlainText()
-                self.assertIn("planner thought", visible)
-                self.assertIn("coder result", visible)
-                self.assertIn("stage completed", visible)
-                self.assertEqual(
-                    widget._messages,
-                    [{"role": "user", "content": "prompt"}, {"role": "assistant", "content": "final"}],
-                )
-                widget.deleteLater()
-
-    def test_runtime_error_filter_and_counter(self):
-        widget = ChatWidget()
-        widget._on_agent_msg("runtime", "iteration completed", "RUN complete")
-        widget._on_agent_msg("runtime", "runtime failed: timeout", "coder:1")
-        self.assertEqual(widget._runtime_success_count, 1)
-        self.assertEqual(widget._runtime_error_count, 1)
-        widget.runtime_errors_btn.setChecked(True)
-        visible = widget.runtime_log.toPlainText()
-        self.assertIn("runtime failed: timeout", visible)
-        self.assertNotIn("iteration completed", visible)
-        widget.deleteLater()
-
-class TransientEnvelopeRecoveryTests(unittest.TestCase):
-    def test_transport_telemetry_only_response_is_retryable(self):
-        from aicoder.client import _normalize_chat_response
-        with self.assertRaises(ClientError) as ctx:
-            _normalize_chat_response({"_transport_telemetry": {"chunks": 2}})
-        self.assertTrue(ctx.exception.retryable)
-        self.assertIn("Transient incomplete chat response", str(ctx.exception))
-
-    def test_unknown_malformed_response_is_not_implicitly_retryable(self):
-        from aicoder.client import _normalize_chat_response
-        with self.assertRaises(ClientError) as ctx:
-            _normalize_chat_response({"unexpected": {"x": 1}})
-        self.assertFalse(bool(ctx.exception.retryable))

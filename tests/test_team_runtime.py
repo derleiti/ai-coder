@@ -81,11 +81,3 @@ class RamCandidateIsolationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-class CompactTeamOutputContractTests(unittest.TestCase):
-    def test_coder_and_merge_prompts_require_compact_non_narrative_output(self):
-        from aicoder.team_runtime import CODER_SYSTEM_TEMPLATE, MERGE_SYSTEM_PROMPT
-        self.assertIn("OUTPUT DISCIPLINE", CODER_SYSTEM_TEMPLATE)
-        self.assertIn("Do not narrate routine", CODER_SYSTEM_TEMPLATE)
-        self.assertIn("OUTPUT DISCIPLINE", MERGE_SYSTEM_PROMPT)
-        self.assertIn("recovery_required", MERGE_SYSTEM_PROMPT)

@@ -47,12 +47,7 @@ class FailureTracker:
             category = "permission"
             retryable = False
         elif "429" in lower or _HTTP_5XX_RE.search(text) or any(
-            token in lower for token in (
-                "timed out", "timeout", "temporarily unavailable", "connection reset",
-                "connection refused", "connection aborted", "remote end closed connection",
-                "network is unreachable", "temporary failure in name resolution",
-                "name or service not known", "transient incomplete chat response",
-            )
+            token in lower for token in ("timed out", "timeout", "temporarily unavailable", "connection reset")
         ):
             category = "transient"
             retryable = True
