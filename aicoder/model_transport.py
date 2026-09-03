@@ -17,6 +17,9 @@ from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
 from .client import ClientError, USER_AGENT, _normalize_chat_response
+from .provider_credentials import (
+    direct_provider_spec, provider_api_key, provider_for_model, transport_model_id,
+)
 
 
 class ModelTransport(Protocol):
@@ -183,10 +186,11 @@ class OpenAICompatibleTransport:
         base_lower = self.base_url.lower()
         if requested_model.startswith("ollama/") and ("11434" in base_lower or "ollama" in base_lower):
             transport_model = requested_model[len("ollama/"):]
-        elif requested_model.startswith("openrouter/") and "openrouter.ai" in base_lower:
-            transport_model = requested_model[len("openrouter/"):]
-        elif requested_model.startswith("nvidia/nvidia/") and ("nvidia.com" in base_lower or "nvidia.ai" in base_lower):
-            transport_model = requested_model[len("nvidia/"):]
+        else:
+            provider = provider_for_model(requested_model)
+            spec = direct_provider_spec(provider) if provider else None
+            if spec and spec.base_url and spec.base_url.lower().rstrip("/") == self.base_url.lower().rstrip("/"):
+                transport_model = transport_model_id(requested_model, provider)
         payload: dict[str, Any] = {
             "model": transport_model,
             "messages": request_messages,
@@ -224,6 +228,64 @@ class OpenAICompatibleTransport:
         return normalized
 
 
+class ProviderRoutingTransport:
+    """Route individual model calls through a user's secure provider credential.
+
+    This wrapper is intentionally per-request: a Team Runtime can mix Gemini,
+    OpenRouter, NVIDIA and other models without pinning the entire run to the
+    provider of the primary model. Calls without a supported/configured direct
+    provider fall through unchanged to the existing TriForce client.
+    """
+
+    def __init__(self, default: ModelTransport):
+        self.default = default
+        self.timeout = int(getattr(default, "timeout", 300))
+        self._direct: dict[str, OpenAICompatibleTransport] = {}
+
+    def _transport_for_model(self, model: str | None) -> ModelTransport:
+        provider = provider_for_model(model)
+        spec = direct_provider_spec(provider) if provider else None
+        if not spec or not spec.direct_supported or not spec.base_url:
+            return self.default
+        api_key, source = provider_api_key(provider)
+        # Existing provider environment variables historically served diagnostics
+        # only. Do not silently change routing for users who already have them.
+        # Direct routing is enabled by an explicit AICoder OS-keyring credential;
+        # AICODER_NATIVE_MODEL_* remains the explicit environment-based opt-in.
+        if not api_key or source != "keyring":
+            return self.default
+        cached = self._direct.get(provider)
+        if cached is None or cached.api_key != api_key:
+            cached = OpenAICompatibleTransport(spec.base_url, api_key=api_key, timeout=self.timeout)
+            self._direct[provider] = cached
+        return cached
+
+    def chat(self, **kwargs: Any) -> dict[str, Any]:
+        transport = self._transport_for_model(kwargs.get("model"))
+        return transport.chat(**kwargs)
+
+    def cancel_current_request(self, request_id: str | None = None) -> bool:
+        cancelled = False
+        targets = [self.default, *self._direct.values()]
+        for target in targets:
+            cancel = getattr(target, "cancel_current_request", None)
+            if callable(cancel):
+                try:
+                    try:
+                        result = cancel(request_id) if request_id is not None else cancel()
+                    except TypeError:
+                        # Preserve compatibility with older transports whose
+                        # cancellation hook accepts no request identifier.
+                        result = cancel()
+                    cancelled = bool(result) or cancelled
+                except Exception:
+                    pass
+        return cancelled
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.default, name)
+
+
 def native_model_transport_from_env(
     default: ModelTransport,
     *,
@@ -236,7 +298,11 @@ def native_model_transport_from_env(
     """
     base_url = os.environ.get("AICODER_NATIVE_MODEL_BASE_URL", "").strip()
     if not base_url:
-        return default, default_model
+        # Secure per-provider keys are an opt-in routing layer; unsupported or
+        # unconfigured models continue through the existing backend unchanged.
+        if isinstance(default, ProviderRoutingTransport):
+            return default, default_model
+        return ProviderRoutingTransport(default), default_model
     raw_headers = os.environ.get("AICODER_NATIVE_MODEL_HEADERS", "").strip()
     headers: dict[str, str] = {}
     if raw_headers:

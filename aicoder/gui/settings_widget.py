@@ -16,6 +16,9 @@ from ..session_state import (
 from ..client import TriForceClient, model_identifier
 from .. import settings as settings_core
 from ..executor import load_tools
+from ..provider_credentials import (
+    CredentialStoreError, credential_summary, delete_provider_key, set_provider_key,
+)
 
 
 
@@ -116,6 +119,8 @@ class SettingsWidget(QWidget):
         self._tools = []
         self._schema_widgets = {}
         self._team_model_combos = {}
+        self._provider_key_edits = {}
+        self._provider_status_labels = {}
         self._loading_settings = False
         self._settings_snapshot = None
         self._build_ui()
@@ -215,6 +220,53 @@ class SettingsWidget(QWidget):
 
         model_group.setLayout(model_form)
         layout.addWidget(model_group)
+
+        # --- Provider credentials (OS keyring only) ---
+        credential_group = QGroupBox("Provider API Keys · sicher im Betriebssystem-Schlüsselbund")
+        credential_form = QFormLayout()
+        credential_form.setHorizontalSpacing(14)
+        credential_form.setVerticalSpacing(7)
+        provider_rows = [
+            ("google", "Google / Gemini"),
+            ("openrouter", "OpenRouter"),
+            ("openai", "OpenAI"),
+            ("anthropic", "Anthropic"),
+            ("mistral", "Mistral"),
+            ("groq", "Groq"),
+            ("cerebras", "Cerebras"),
+            ("nvidia", "NVIDIA"),
+        ]
+        for provider, label in provider_rows:
+            row = QHBoxLayout()
+            edit = QLineEdit()
+            edit.setEchoMode(QLineEdit.EchoMode.Password)
+            edit.setPlaceholderText("API-Key eingeben · gespeicherte Keys werden nie angezeigt")
+            edit.setMinimumWidth(360)
+            save_key_btn = QPushButton("Speichern")
+            delete_key_btn = QPushButton("Löschen")
+            status = QLabel("")
+            status.setStyleSheet("color: #888; font-size: 11px;")
+            save_key_btn.clicked.connect(lambda _checked=False, p=provider: self._save_provider_key(p))
+            delete_key_btn.clicked.connect(lambda _checked=False, p=provider: self._delete_provider_key(p))
+            row.addWidget(edit, stretch=1)
+            row.addWidget(save_key_btn)
+            row.addWidget(delete_key_btn)
+            row.addWidget(status)
+            self._provider_key_edits[provider] = edit
+            self._provider_status_labels[provider] = status
+            credential_form.addRow(label + ":", row)
+        credential_note = QLabel(
+            "Keys werden ausschließlich über den OS-Keyring (z. B. KWallet/Secret Service) gespeichert, "
+            "nie in state.json, Logs oder Chat-History. Ein gespeicherter Key routet passende Modell-IDs "
+            "direkt zum Provider; ohne Key bleibt der bisherige TriForce-Weg unverändert. "
+            "Anthropic wird sicher gespeichert, benötigt für Direktaufrufe aber noch einen nativen Messages-Adapter."
+        )
+        credential_note.setWordWrap(True)
+        credential_note.setStyleSheet("color: #888; font-size: 11px;")
+        credential_form.addRow(credential_note)
+        credential_group.setLayout(credential_form)
+        layout.addWidget(credential_group)
+        self._refresh_provider_credentials()
 
         # --- Agent Team Group ---
         team_group = QGroupBox("Agent-Team · RAM Multi-Agent Runtime")
@@ -545,6 +597,55 @@ class SettingsWidget(QWidget):
         if signature != self._settings_snapshot:
             self._apply_state_to_widgets(state, emit_changes=True)
 
+    def _refresh_provider_credentials(self):
+        for provider, label in self._provider_status_labels.items():
+            try:
+                summary = credential_summary(provider)
+                source = str(summary.get("source") or "none")
+                if summary.get("configured"):
+                    if source == "keyring":
+                        text, color = "Gespeichert · OS-Keyring", "#00ff88"
+                    elif source.startswith("environment:"):
+                        text, color = "Aktiv · Environment", "#00d4ff"
+                    else:
+                        text, color = "Konfiguriert", "#00ff88"
+                else:
+                    text, color = "Nicht gesetzt", "#888"
+                if provider == "anthropic" and summary.get("configured"):
+                    text += " · Direktadapter folgt"
+                label.setText(text)
+                label.setStyleSheet(f"color: {color}; font-size: 11px;")
+            except Exception:
+                label.setText("Keyring nicht verfügbar")
+                label.setStyleSheet("color: #ffb020; font-size: 11px;")
+
+    def _save_provider_key(self, provider: str):
+        edit = self._provider_key_edits[provider]
+        secret = edit.text().strip()
+        if not secret:
+            self._provider_status_labels[provider].setText("Kein Key eingegeben")
+            return
+        try:
+            set_provider_key(provider, secret)
+        except CredentialStoreError as exc:
+            self._provider_status_labels[provider].setText(str(exc))
+            self._provider_status_labels[provider].setStyleSheet("color: #ff6b6b; font-size: 11px;")
+            return
+        finally:
+            # Never leave a credential in a GUI widget longer than necessary.
+            edit.clear()
+        self._refresh_provider_credentials()
+
+    def _delete_provider_key(self, provider: str):
+        try:
+            delete_provider_key(provider)
+        except CredentialStoreError as exc:
+            self._provider_status_labels[provider].setText(str(exc))
+            self._provider_status_labels[provider].setStyleSheet("color: #ff6b6b; font-size: 11px;")
+            return
+        self._provider_key_edits[provider].clear()
+        self._refresh_provider_credentials()
+
     def _load_current(self):
         # Session
         try:
@@ -628,6 +729,8 @@ class SettingsWidget(QWidget):
             session = load_session()
             timeout = min(30, self.timeout_spin.value())
             client = TriForceClient(session.base_url, token=session.token, timeout=timeout)
+            from ..model_transport import native_model_transport_from_env
+            client, _ = native_model_transport_from_env(client, default_model=model or None)
         except Exception as e:
             self.model_status.setText(f"Test unavailable: {e}")
             return

@@ -8,6 +8,7 @@ from aicoder.client import ClientError
 from aicoder.executor import LOCAL_FILE_READ_SCHEMA
 from aicoder.model_transport import (
     OpenAICompatibleTransport,
+    ProviderRoutingTransport,
     _openai_tools,
     native_model_transport_from_env,
 )
@@ -124,6 +125,38 @@ class OpenAICompatibleTransportTests(unittest.TestCase):
                     result = transport.chat(message="x", model=requested)
                 self.assertEqual(post.call_args.args[0]["model"], expected)
                 self.assertEqual(result["response"], "ok")
+
+
+    @patch("aicoder.model_transport.provider_api_key", return_value=("stored-key", "keyring"))
+    def test_provider_router_routes_matching_model_directly(self, key_lookup):
+        default = MagicMock()
+        default.timeout = 55
+        router = ProviderRoutingTransport(default)
+        with patch.object(OpenAICompatibleTransport, "chat", return_value={"response": "OK"}) as direct_chat:
+            result = router.chat(message="x", model="gemini/gemini-2.5-flash")
+        self.assertEqual(result["response"], "OK")
+        default.chat.assert_not_called()
+        self.assertEqual(router._direct["google"].base_url, "https://generativelanguage.googleapis.com/v1beta/openai")
+        direct_chat.assert_called_once()
+
+    @patch("aicoder.model_transport.provider_api_key", return_value=("", "none"))
+    def test_provider_router_falls_back_to_triforce_without_own_key(self, key_lookup):
+        default = MagicMock()
+        default.timeout = 30
+        default.chat.return_value = {"response": "backend"}
+        router = ProviderRoutingTransport(default)
+        result = router.chat(message="x", model="gemini/gemini-2.5-flash")
+        self.assertEqual(result["response"], "backend")
+        default.chat.assert_called_once()
+
+    def test_native_transport_wraps_default_once_when_no_explicit_env_override(self):
+        default = MagicMock()
+        default.timeout = 30
+        with patch.dict(os.environ, {"AICODER_NATIVE_MODEL_BASE_URL": ""}, clear=False):
+            first, _ = native_model_transport_from_env(default, default_model="gemini/test")
+            second, _ = native_model_transport_from_env(first, default_model="gemini/test")
+        self.assertIsInstance(first, ProviderRoutingTransport)
+        self.assertIs(first, second)
 
     def test_env_reasoning_effort_is_forwarded_without_persisting_state(self):
         default = MagicMock()
