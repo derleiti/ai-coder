@@ -15,6 +15,64 @@ from aicoder.gui.chat_widget import _AgentWorker
 
 
 class NativeLightPlanTests(unittest.TestCase):
+    def test_emit_allows_kind_field_inside_event_payload(self):
+        events = []
+        runtime = NativeLightRuntime(
+            client=MagicMock(), initial_prompt="x", model="test/model", fallback_model=None,
+            workspace_root=".", tools=[], event_fn=lambda event_kind, payload: events.append((event_kind, payload)),
+        )
+        runtime._emit("performance_warning", kind="model_latency", elapsed_ms=12000)
+        self.assertEqual(events[0][0], "performance_warning")
+        self.assertEqual(events[0][1]["kind"], "model_latency")
+
+    def test_coding_candidate_requires_mutation_or_explicit_no_change(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = MagicMock()
+            client.timeout = 30
+            client.chat.side_effect = [
+                {"response": "I inspected the code and would stop here.", "model": "test/model"},
+                {"response": "DONE: no change justified - the requested invariant is already satisfied.", "model": "test/model"},
+            ]
+            events = []
+            runtime = NativeLightRuntime(
+                client=client, initial_prompt="Fix the repository bug", model="test/model",
+                fallback_model=None, workspace_root=temp, tools=[], load_tools_on_start=False,
+                persistent_plan=False, base_timeout=30, require_mutation_or_explicit_no_change=True,
+                event_fn=lambda kind, payload: events.append((kind, payload)),
+            )
+            result = runtime.run()
+            self.assertEqual(result.status, "completed")
+            self.assertTrue(result.response.startswith("DONE: no change justified"))
+            self.assertEqual(client.chat.call_count, 2)
+            self.assertTrue(any(kind == "implementation_required" for kind, _ in events))
+
+    def test_coding_candidate_gets_progress_nudge_after_many_successful_reads(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = MagicMock()
+            client.timeout = 30
+            calls = "\n".join(
+                f'<tool_call>{{"name":"file_read","arguments":{{"path":"f{i}.txt"}}}}</tool_call>'
+                for i in range(8)
+            )
+            client.chat.side_effect = [
+                {"response": calls, "model": "test/model"},
+                {"response": "DONE: no change justified - all eight files already satisfy the contract.", "model": "test/model"},
+            ]
+            events = []
+            runtime = NativeLightRuntime(
+                client=client, initial_prompt="Fix the repository bug", model="test/model",
+                fallback_model=None, workspace_root=temp, tools=[LOCAL_FILE_READ_SCHEMA],
+                load_tools_on_start=True, persistent_plan=False, base_timeout=30,
+                require_mutation_or_explicit_no_change=True,
+                event_fn=lambda kind, payload: events.append((kind, payload)),
+            )
+            with patch("aicoder.agent_runtime.run_tool", return_value=("evidence", False)) as run_tool:
+                result = runtime.run()
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(run_tool.call_count, 8)
+            progress = [payload for kind, payload in events if kind == "implementation_required"]
+            self.assertTrue(any(item.get("reason") == "inspection_without_mutation" for item in progress))
+
     def test_compatibility_runtime_does_not_create_persistent_plan(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -651,7 +709,7 @@ class NativeLightGuiTests(unittest.TestCase):
                     {"role": "system", "content": "simple"},
                     {"role": "user", "content": "Run the tests"},
                 ],
-                "test/model", "", [LOCAL_TEST_SCHEMA], "simple",
+                "test/model", [LOCAL_TEST_SCHEMA], "simple",
                 load_tools_on_start=True,
             )
             finished = []

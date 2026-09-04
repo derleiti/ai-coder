@@ -46,9 +46,10 @@ class GuiSettingsSchemaTests(unittest.TestCase):
     def test_enum_choices_and_timeout_bounds_come_from_registry(self):
         widget = self.make_widget()
         self.assertEqual(
-            [widget.swarm_combo.itemText(i) for i in range(widget.swarm_combo.count())],
-            settings.REGISTRY["swarm_mode"].choice_list(),
+            [widget.team_runtime_combo.itemData(i) for i in range(widget.team_runtime_combo.count())],
+            settings.REGISTRY["team_runtime_mode"].choice_list(),
         )
+        self.assertEqual(len(widget._team_model_combos), 12)
         self.assertEqual(
             [widget.tool_mode_combo.itemData(i) for i in range(widget.tool_mode_combo.count())],
             settings.REGISTRY["tool_mode"].choice_list(),
@@ -80,6 +81,8 @@ class GuiSettingsSchemaTests(unittest.TestCase):
             approval_mode="autopilot",
             runtime_mode="classic",
             native_openrouter_tool_calling=True,
+            team_runtime_mode="on",
+            team_coder_model_1="provider/new-model",
         )
         widget._refresh_external_settings()
         self.assertEqual(widget.model_combo.currentText(), "provider/new-model")
@@ -88,6 +91,8 @@ class GuiSettingsSchemaTests(unittest.TestCase):
         self.assertTrue(widget.native_openrouter_checkbox.isChecked())
         self.assertEqual(widget.approval_mode_combo.currentData(), "autopilot")
         self.assertEqual(widget._schema_widgets["runtime_mode"].currentData(), "classic")
+        self.assertEqual(widget.team_runtime_combo.currentData(), "on")
+        self.assertEqual(widget._team_model_combos["team_coder_model_1"].currentText(), "provider/new-model")
 
     def test_unhandled_settings_are_schema_generated_and_saved_through_store(self):
         widget = self.make_widget()

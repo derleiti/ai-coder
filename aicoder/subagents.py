@@ -129,6 +129,7 @@ def run_subagent(
     execution_client=None,
     tools: list[dict] | None = None,
     workspace_root: str | None = None,
+    protected_workspace_root: str | None = None,
     approval_fn: Callable[[str, dict], bool] | None = None,
     enabled_tool_names: list[str] | None = None,
     fallback_model: str | None = None,
@@ -173,6 +174,7 @@ def run_subagent(
     runtime = NativeLightRuntime(
         client=execution_client, model_client=model_client, initial_prompt=prompt,
         model=model, fallback_model=fallback_model, workspace_root=workspace_root,
+        protected_workspace_root=protected_workspace_root,
         tools=child_tools, system_prompt=system, load_tools_on_start=True,
         enabled_tool_names=enabled_tool_names, quick_chat=False, approval_fn=approval_fn,
         persistent_plan=False, base_timeout=int(getattr(execution_client, "timeout", 300) or 300),

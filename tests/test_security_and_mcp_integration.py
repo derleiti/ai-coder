@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import os
-import contextlib
-import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,7 +13,6 @@ from aicoder import audit
 from aicoder import clipboard, web_search
 from aicoder.client import CLIENT_PROFILE, ClientError, TokenExpiredError, TriForceClient
 from aicoder.privileges import assess_execution
-from aicoder.swarm_runner import run_swarm_ask
 from aicoder.session_state import migrate_enabled_tools
 from aicoder.tool_policy import (
     OPERATOR_MCP_TOOLS,
@@ -359,17 +356,43 @@ class McpProtocolTests(unittest.TestCase):
         self.assertEqual(mutating, (True, None))
 
 
-class FallbackAndSwarmTests(unittest.TestCase):
-    def test_fallback_result_is_marked_locally(self):
-        client = TriForceClient("https://example.invalid", token="opaque")
-        with patch.object(
-            client, "_request",
-            side_effect=[ClientError("timeout"), {"response": "ok", "model": "fallback"}],
+class ModelCatalogAuthFallbackTests(unittest.TestCase):
+    def test_expired_local_token_uses_public_catalog_without_sending_auth(self):
+        client = TriForceClient("https://example.invalid", token="expired.jwt.value")
+        with (
+            patch.object(client, "is_token_expired", return_value=True),
+            patch.object(client, "_request", return_value={"tier": "guest", "models": []}) as request,
         ):
-            with contextlib.redirect_stderr(io.StringIO()):
-                result = client.chat(message="x", model="primary", fallback_model="fallback")
-        self.assertTrue(result["fallback_used"])
-        self.assertEqual(result["primary_model"], "primary")
+            result = client.model_catalog()
+        self.assertEqual(result["tier"], "guest")
+        request.assert_called_once_with(
+            "GET", "/v1/client/models", require_auth=False, _label="models-public"
+        )
+
+    def test_server_rejected_session_retries_only_model_catalog_publicly(self):
+        client = TriForceClient("https://example.invalid", token="opaque")
+        with (
+            patch.object(client, "is_token_expired", return_value=False),
+            patch.object(
+                client, "_request",
+                side_effect=[TokenExpiredError("expired"), {"tier": "guest", "models": ["ollama/gemma4:cloud"]}],
+            ) as request,
+        ):
+            result = client.model_catalog()
+        self.assertEqual(result["models"], ["ollama/gemma4:cloud"] )
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(request.call_args_list[0].kwargs["require_auth"], True)
+        self.assertEqual(request.call_args_list[1].kwargs["require_auth"], False)
+
+
+
+class FallbackAndSwarmTests(unittest.TestCase):
+    def test_legacy_fallback_argument_does_not_hide_primary_failure(self):
+        client = TriForceClient("https://example.invalid", token="opaque")
+        with patch.object(client, "_request", side_effect=ClientError("timeout")) as request:
+            with self.assertRaises(ClientError):
+                client.chat(message="x", model="primary", fallback_model="fallback")
+        self.assertEqual(request.call_count, 1)
 
     def test_auth_failure_does_not_try_fallback(self):
         client = TriForceClient("https://example.invalid", token="opaque")
@@ -378,22 +401,28 @@ class FallbackAndSwarmTests(unittest.TestCase):
                 client.chat(message="x", model="primary", fallback_model="fallback")
         self.assertEqual(request.call_count, 1)
 
-    def test_swarm_without_fallback_does_not_duplicate_operator(self):
-        client = MagicMock()
-        client.chat.return_value = {"response": "operator", "model": "primary"}
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(run_swarm_ask("x", "primary", None, None, "on", client), 0)
-        self.assertEqual(client.chat.call_count, 1)
+    def test_expired_auth_retries_no_tools_ollama_chat_as_public_guest(self):
+        client = TriForceClient("https://example.invalid", token="opaque")
+        success = {"response": "OK", "model": "ollama/gemma4:cloud", "backend": "ollama"}
+        with patch.object(
+            client, "_request", side_effect=[TokenExpiredError("expired"), success]
+        ) as request:
+            result = client.chat(message="x", model="ollama/gemma4:cloud")
+        self.assertEqual(result["response"], "OK")
+        self.assertEqual(request.call_count, 2)
+        self.assertTrue(request.call_args_list[0].kwargs["require_auth"])
+        self.assertFalse(request.call_args_list[1].kwargs["require_auth"])
 
-    def test_review_receives_operator_response(self):
-        client = MagicMock()
-        client.chat.side_effect = [
-            {"response": "operator answer", "model": "primary"},
-            {"response": "review", "model": "advisor"},
-        ]
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(run_swarm_ask("request", "primary", "advisor", None, "review", client), 0)
-        self.assertIn("operator answer", client.chat.call_args_list[1].kwargs["message"])
+    def test_expired_auth_does_not_downgrade_ollama_tool_chat_to_guest(self):
+        client = TriForceClient("https://example.invalid", token="opaque")
+        with patch.object(client, "_request", side_effect=TokenExpiredError("expired")) as request:
+            with self.assertRaises(TokenExpiredError):
+                client.chat(
+                    message="x", model="ollama/gemma4:cloud",
+                    tools=[{"name": "health", "inputSchema": {"type": "object"}}],
+                )
+        self.assertEqual(request.call_count, 1)
+
 
 
 class AuditRedactionTests(unittest.TestCase):

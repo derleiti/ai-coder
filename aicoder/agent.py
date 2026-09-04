@@ -3,15 +3,17 @@ from __future__ import annotations
 agent.py — CLI Agent runner. Uses shared executor for tool execution.
 """
 import json
+import signal
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Optional
 
 from .client import TriForceClient
 from .config import load_session
 from .executor import (
-    AGENT_TOOLS, FALLBACK_TOOLS as _FALLBACK_TOOLS, OS_INSTRUCTIONS, OS_NAME,
+    AGENT_TOOLS, RECOVERY_TOOLS as _RECOVERY_TOOLS, OS_INSTRUCTIONS, OS_NAME,
     SYSTEM_TEMPLATE as SYSTEM, is_destructive, is_short_confirmation,
     is_simple_chat_message, run_tool as run_tool, should_load_tools,
 )
@@ -21,6 +23,7 @@ from .privileges import (
 )
 from .session_state import DEFAULT_RUNTIME_MODE, get_state
 from .workspace import active_workspace
+from .workspace_backend import open_workspace_for_run, preserve_workspace_for_resume
 from .ui import (
     C,
     print_header, print_task, print_thought,
@@ -189,6 +192,31 @@ def _run_native_light_agent(
             request_id = str(payload.get("request_id") or "")
             req = f" · req {request_id[-8:]}" if request_id else ""
             print(f"  {C.DIM}✓ Model response · {elapsed:.1f}s{req}{C.RESET}", file=sys.stderr, flush=True)
+        elif kind == "performance_warning":
+            warning_kind = str(payload.get("kind") or "performance")
+            elapsed = int(payload.get("elapsed_ms") or 0) / 1000.0
+            if warning_kind == "model_latency":
+                print(
+                    f"  {C.BYELLOW}⚠ Performance · hohe Model/API-Latenz: {elapsed:.1f}s{C.RESET}",
+                    file=sys.stderr, flush=True,
+                )
+            elif warning_kind == "filesystem_latency":
+                tool_name = str(payload.get("tool") or "filesystem")
+                print(
+                    f"  {C.BYELLOW}⚠ Performance · langsames I/O: {tool_name} {elapsed:.1f}s{C.RESET}",
+                    file=sys.stderr, flush=True,
+                )
+        elif kind == "performance_summary":
+            wall = int(payload.get("wall_ms") or 0) / 1000.0
+            model_s = int(payload.get("model_ms") or 0) / 1000.0
+            tools_s = int(payload.get("tool_ms") or 0) / 1000.0
+            io_s = int(payload.get("filesystem_ms") or 0) / 1000.0
+            bottleneck = str(payload.get("bottleneck") or "?")
+            print(
+                f"  {C.DIM}⚡ Performance · wall {wall:.1f}s · model {model_s:.1f}s · "
+                f"tools {tools_s:.1f}s · I/O {io_s:.1f}s · bottleneck {bottleneck}{C.RESET}",
+                file=sys.stderr, flush=True,
+            )
         elif kind == "model_without_tool_support":
             model_name = payload.get("model") or "?"
             print(
@@ -233,12 +261,31 @@ def _run_native_light_agent(
             stop_model_heartbeat()
             print_error(str(payload.get("reason") or "native-light runtime paused"))
 
+    workspace_mode = str(state.get("workspace_mode", "auto") or "auto")
+    workspace_backend = open_workspace_for_run(
+        str(ws_path), workspace_mode, resume=resume_requested, resume_plan_id=resume_plan_id,
+    )
+    execution_root = workspace_backend.info.execution_root
+    if not (json_output or json_events):
+        info = workspace_backend.info
+        detail = f"execution workspace: {info.mode}"
+        if info.mode == "ram":
+            detail += f" · RAM transactional · budget {info.safe_budget_bytes // (1024**2)} MiB"
+            if info.restored_checkpoint:
+                detail += " · checkpoint restored"
+        elif info.fallback_reason:
+            detail += f" · fallback: {info.fallback_reason}"
+        print(f"  {C.DIM}⚙ {detail}{C.RESET}", file=sys.stderr, flush=True)
+
     runtime = NativeLightRuntime(
         client=client,
         initial_prompt=initial_prompt,
         model=model,
-        fallback_model=fallback_model,
-        workspace_root=str(ws_path),
+        fallback_model=None,
+        workspace_root=str(execution_root),
+        plan_workspace_root=str(ws_path),
+        protected_workspace_root=(str(ws_path) if workspace_backend.info.transactional else None),
+        completion_guard=(lambda: workspace_backend.finalize(verified=True)),
         tools=None if should_load_tools_now else [],
         load_tools_on_start=should_load_tools_now,
         enabled_tool_names=enabled_tool_names,
@@ -255,34 +302,26 @@ def _run_native_light_agent(
         progressive_tool_disclosure=(tool_mode == "on_demand"),
         native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
     )
-    result = runtime.run()
-    stop_model_heartbeat()
+    try:
+        result = runtime.run()
+        if result.status == "completed":
+            # NativeLightRuntime normally finalizes via completion_guard. Keep the
+            # wrapper as the last owner too, so mocked/abnormal completed paths
+            # cannot leave an allocated transactional workspace behind.
+            if workspace_backend.info.transactional and Path(execution_root).exists():
+                workspace_backend.finalize(verified=True)
+        else:
+            preserve_workspace_for_resume(workspace_backend, result.plan_id or None)
+    finally:
+        stop_model_heartbeat()
+        if workspace_backend.info.transactional and Path(execution_root).exists():
+            workspace_backend.abort()
     if not header_printed and not (json_output or json_events):
         print_header(
-            model=model or "backend-default", fallback=fallback_model or "", tools=0,
+            model=model or "backend-default", fallback="", tools=0,
             workspace=ws_path.name, tool_mode=f"{runtime_label}/{tool_mode}", timeout=request_timeout,
         )
         print_task(initial_prompt)
-
-    swarm_mode = state.get("swarm_mode", "off")
-    if swarm_mode == "auto":
-        from .swarm_runner import should_auto_swarm
-        swarm_mode = "review" if should_auto_swarm(initial_prompt) else "off"
-    if (
-        not (json_output or json_events)
-        and swarm_mode in {"on", "review"}
-        and result.response
-        and result.status == "completed"
-    ):
-        from .swarm_runner import run_swarm_review
-        run_swarm_review(
-            original_task=initial_prompt,
-            operator_response=result.response,
-            operator_model=result.model,
-            fallback_model=state.get("fallback_model"),
-            system_prompt=result.system_prompt,
-            client=client,
-        )
 
     try:
         history_record(
@@ -318,8 +357,99 @@ def run_agent(
     resume_plan_id: Optional[str] = None,
     json_output: bool = False,
     json_events: bool = False,
+    team_overrides: Optional[dict[str, Any]] = None,
 ) -> int:
-    state = get_state()
+    from .team_runtime import config_from_state, should_use_team, state_with_team_overrides
+    state = state_with_team_overrides(
+        get_state(), team_overrides, primary_model=model,
+    )
+    if (
+        not resume_plan_id
+        and not is_short_confirmation(initial_prompt)
+        and should_use_team(initial_prompt, str(state.get("team_runtime_mode") or "off"))
+    ):
+        from .model_transport import native_model_transport_from_env
+        from .team_orchestrator import run_team
+        session = load_session()
+        request_timeout = int(state.get("request_timeout", 300))
+        client = TriForceClient(session.base_url, token=session.token, timeout=request_timeout)
+        source_workspace = str(active_workspace(state.get("workspace_root")))
+        model_client, _ = native_model_transport_from_env(client, default_model=model or state.get("selected_model"))
+
+        def team_event(kind: str, payload: dict) -> None:
+            if json_events:
+                print(json.dumps({"type": kind, **payload}, ensure_ascii=False, default=_json_default))
+                return
+            if json_output:
+                return
+            if kind == "team_start":
+                print(f"  {C.DIM}◆ Team runtime · research={payload.get('research')} · coders={payload.get('coders')}{C.RESET}", file=sys.stderr)
+            elif kind == "team_pipeline":
+                if payload.get("status") == "started":
+                    print(f"  {C.DIM}→ {payload.get('stage')}{C.RESET}", file=sys.stderr)
+            elif kind == "team_workspace_plan":
+                reason = str(payload.get("reason") or "")
+                suffix = f" · {reason}" if reason else ""
+                print(
+                    f"  {C.DIM}◆ workspace={payload.get('backend_mode')} · candidates={payload.get('candidate_count')}{suffix}{C.RESET}",
+                    file=sys.stderr,
+                )
+            elif kind == "team_stage":
+                error = str(payload.get("error") or "").strip()
+                suffix = f" · {error[:240]}" if error else ""
+                print(
+                    f"  {C.DIM}✓ {payload.get('role')} · {payload.get('status')} · {payload.get('model')}{suffix}{C.RESET}",
+                    file=sys.stderr,
+                )
+            elif kind == "completion_signal":
+                accepted = bool(payload.get("accepted"))
+                mark = "✓" if accepted else "↳"
+                state = "confirmed" if accepted else "rejected"
+                reason = str(payload.get("reason") or "").strip()
+                suffix = f" · {reason[:180]}" if reason else ""
+                print(
+                    f"  {C.DIM}{mark} model completion signal · {state} · "
+                    f"mutation={bool(payload.get('mutation_seen'))} · "
+                    f"verified={bool(payload.get('verification_seen'))}{suffix}{C.RESET}",
+                    file=sys.stderr,
+                )
+            elif kind == "team_candidate":
+                print(f"  {C.DIM}◆ {payload.get('candidate_id')} · {payload.get('status')} · score={payload.get('score')}{C.RESET}", file=sys.stderr)
+            elif kind == "team_complete":
+                print(f"  {C.DIM}⚡ team complete · winner={payload.get('winner_candidate_id')} · wall={int(payload.get('wall_ms') or 0)/1000.0:.1f}s{C.RESET}", file=sys.stderr)
+            elif kind == "team_ram_cleanup":
+                print(f"  {C.DIM}✓ RAM cleanup · released={payload.get('released', 0)}{C.RESET}", file=sys.stderr)
+
+        previous_sigterm = None
+        sigterm_installed = False
+        if threading.current_thread() is threading.main_thread() and hasattr(signal, "SIGTERM"):
+            previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+            def _team_sigterm(_signum, _frame):
+                raise KeyboardInterrupt
+
+            signal.signal(signal.SIGTERM, _team_sigterm)
+            sigterm_installed = True
+        try:
+            result = run_team(
+                task=initial_prompt, state=state, config=config_from_state(state), client=client,
+                model_client=model_client, source_workspace=source_workspace, event_fn=team_event,
+            )
+        finally:
+            if sigterm_installed and previous_sigterm is not None:
+                signal.signal(signal.SIGTERM, previous_sigterm)
+        if json_output or json_events:
+            print(json.dumps({
+                "type": "result", "status": result.status, "response": result.response,
+                "model": result.model, "team": True, "performance": result.performance,
+                "error": result.error,
+            }, ensure_ascii=False))
+        elif result.status == "completed":
+            print_final(response=result.response, model=result.model, latency_ms=int(result.performance.get("wall_ms") or 0), total_iters=0, fallback_used=False)
+        else:
+            print_error(result.error or "Team runtime failed")
+        return 0 if result.status == "completed" else 1
+
     effective_runtime = runtime_mode or state.get("runtime_mode", DEFAULT_RUNTIME_MODE)
     if json_output or json_events:
         effective_runtime = "native-light"

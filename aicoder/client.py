@@ -234,33 +234,48 @@ class TriForceClient:
         self.token = token
         self.timeout = timeout
         self._active_response_lock = threading.Lock()
-        self._active_response = None
+        self._active_responses: dict[str, Any] = {}
 
-    def _set_active_response(self, response: Any) -> None:
+    def _set_active_response(self, response: Any, request_id: str | None = None) -> str:
+        key = str(request_id or f"thread-{threading.get_ident()}")
         with self._active_response_lock:
-            self._active_response = response
+            self._active_responses[key] = response
+        return key
 
-    def _clear_active_response(self, response: Any) -> None:
+    def _clear_active_response(self, response: Any, request_id: str | None = None) -> None:
         with self._active_response_lock:
-            if self._active_response is response:
-                self._active_response = None
+            if request_id:
+                key = str(request_id)
+                if self._active_responses.get(key) is response:
+                    self._active_responses.pop(key, None)
+                return
+            for key, active in list(self._active_responses.items()):
+                if active is response:
+                    self._active_responses.pop(key, None)
+                    return
 
-    def cancel_current_request(self) -> bool:
-        """Best-effort cancellation by closing the active HTTP response handle."""
+    def cancel_current_request(self, request_id: str | None = None) -> bool:
+        """Cancel a specific parallel request when possible; no-id keeps legacy semantics."""
         with self._active_response_lock:
-            response = self._active_response
-            self._active_response = None
-        if response is None:
-            return False
+            if request_id:
+                responses = [self._active_responses.pop(str(request_id), None)]
+            elif len(self._active_responses) == 1:
+                key, response = next(iter(self._active_responses.items()))
+                self._active_responses.pop(key, None); responses = [response]
+            else:
+                responses = list(self._active_responses.values())
+                self._active_responses.clear()
         closed = False
-        for method_name in ("close", "release_conn"):
-            method = getattr(response, method_name, None)
-            if callable(method):
-                try:
-                    method()
-                    closed = True
-                except Exception:
-                    pass
+        for response in responses:
+            if response is None:
+                continue
+            for method_name in ("close", "release_conn"):
+                method = getattr(response, method_name, None)
+                if callable(method):
+                    try:
+                        method(); closed = True
+                    except Exception:
+                        pass
         return closed
 
     def token_expires_in(self) -> Optional[float]:
@@ -351,6 +366,7 @@ class TriForceClient:
         self, method: str, url: str, headers: dict, data: Optional[bytes], _label: str
     ) -> Dict[str, Any]:
         """Execute single HTTP request. Uses urllib3 pool if available, else urlopen."""
+        request_id = str(headers.get("X-AICoder-Request-ID") or "") or None
         pool = _get_pool()
         if pool is not None:
             try:
@@ -360,7 +376,7 @@ class TriForceClient:
                     timeout=self.timeout, redirect=False,
                     preload_content=not keepalive_stream,
                 )
-                self._set_active_response(resp)
+                self._set_active_response(resp, request_id)
                 if resp.status >= 400:
                     raw_error = resp.read() if keepalive_stream else resp.data
                     body = raw_error.decode("utf-8", errors="replace")
@@ -376,7 +392,7 @@ class TriForceClient:
                                 f"Token expired (HTTP {resp.status}). Please re-login: aicoder setup"
                             )
                     status, retryable, retry_after = _error_metadata(parsed, resp.status)
-                    self._clear_active_response(resp)
+                    self._clear_active_response(resp, request_id)
                     raise ClientError(
                         f"HTTP {resp.status}{label} bei {url}: {parsed}",
                         status_code=status, retryable=retryable, retry_after=retry_after, payload=parsed,
@@ -412,7 +428,7 @@ class TriForceClient:
                                 payload_chunks += 1
                             parts.append(chunk)
                     finally:
-                        self._clear_active_response(resp)
+                        self._clear_active_response(resp, request_id)
                         try:
                             resp.release_conn()
                         except Exception:
@@ -436,7 +452,7 @@ class TriForceClient:
                     raw = resp.data.decode("utf-8")
                     return json.loads(raw) if raw else {}
                 finally:
-                    self._clear_active_response(resp)
+                    self._clear_active_response(resp, request_id)
             except (TokenExpiredError, ClientError):
                 raise
             except Exception as e:
@@ -452,12 +468,12 @@ class TriForceClient:
         req = Request(url=url, data=data, headers=headers, method=method.upper())
         try:
             resp = urlopen(req, timeout=self.timeout, context=_ssl_context())
-            self._set_active_response(resp)
+            self._set_active_response(resp, request_id)
             try:
                 raw = resp.read().decode("utf-8")
                 return json.loads(raw) if raw else {}
             finally:
-                self._clear_active_response(resp)
+                self._clear_active_response(resp, request_id)
                 try:
                     resp.close()
                 except Exception:
@@ -556,10 +572,29 @@ class TriForceClient:
             raise ClientError(f"MCP {tool_name} response contains neither result nor error")
         return response
 
-    def list_models(self) -> list:
-        """Fetch available models from /v1/client/models."""
+    def model_catalog(self) -> Dict[str, Any]:
+        """Fetch the model catalog, preserving tier access when authenticated.
+
+        The backend intentionally exposes a guest model catalog without auth.
+        If the local JWT is missing, expired, or rejected, model discovery may
+        safely retry without Authorization. This fallback is intentionally
+        limited to discovery; chat, MCP, and all privileged operations remain
+        strict-auth.
+        """
+        if not self.token or self.is_token_expired():
+            if self.token:
+                print("⚠ Token expired — showing public guest model catalog.", file=sys.stderr)
+            return self._request("GET", "/v1/client/models", require_auth=False, _label="models-public")
         try:
-            data = self._request("GET", "/v1/client/models", require_auth=True, _label="models")
+            return self._request("GET", "/v1/client/models", require_auth=True, _label="models")
+        except TokenExpiredError:
+            print("⚠ Session rejected — showing public guest model catalog.", file=sys.stderr)
+            return self._request("GET", "/v1/client/models", require_auth=False, _label="models-public")
+
+    def list_models(self) -> list:
+        """Fetch available model metadata from the backend catalog."""
+        try:
+            data = self.model_catalog()
             details = data.get("model_details") or []
             if isinstance(details, list) and details:
                 return [m for m in details if isinstance(m, dict)]
@@ -572,9 +607,6 @@ class TriForceClient:
                 elif isinstance(m, dict):
                     result.append(m)
             return result
-        except TokenExpiredError:
-            print("⚠ Token expired — run: aicoder setup", file=sys.stderr)
-            return []
         except ClientError as e:
             print(f"⚠ Models laden fehlgeschlagen: {e}", file=sys.stderr)
             return []
@@ -595,7 +627,11 @@ class TriForceClient:
         tool_choice: Any = "auto",
         request_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Call /v1/client/chat. Supports messages array for multi-turn context."""
+        """Call /v1/client/chat. Supports messages array for multi-turn context.
+
+        ``fallback_model`` is accepted only for source compatibility and is intentionally ignored.
+        AICoder never switches models implicitly.
+        """
         payload: Dict[str, Any] = {
             "temperature": temperature,
             "max_tokens": max_tokens,
@@ -624,29 +660,26 @@ class TriForceClient:
                 primary_result["_transport_telemetry"] = telemetry
             return primary_result
         except TokenExpiredError:
-            raise
-        except ClientError as e:
-            if fallback_model and fallback_model != model:
-                # Authentication/authorization and other client-side 4xx errors
-                # cannot be repaired by selecting another model.
-                message = str(e)
-                if "HTTP 4" in message and "HTTP 408" not in message and "HTTP 429" not in message:
-                    raise
-                import sys
-                print(f"\n[FALLBACK: {model} failed → {fallback_model}]", file=sys.stderr)
-                payload["model"] = fallback_model
-                fallback_result = _normalize_chat_response(self._request(
-                    "POST", "/v1/client/chat", payload, require_auth=True,
-                    _label=f"chat/{fallback_model}(fallback)", _retries=0,
+            # Ollama models are intentionally available through TriForce's
+            # public guest chat API. A stale local login must not make a
+            # no-tools Ollama request unusable. Never apply this downgrade to
+            # tool-bearing or non-Ollama requests.
+            if model and str(model).startswith("ollama/") and not tools:
+                print(
+                    "⚠ Token expired — retrying Ollama chat as public guest.",
+                    file=sys.stderr,
+                )
+                public_result = _normalize_chat_response(self._request(
+                    "POST", "/v1/client/chat", payload, require_auth=False,
+                    _label=f"chat-public/{model}", _retries=0,
                     _extra_headers={"X-AICoder-Keepalive": "json", **({"X-AICoder-Request-ID": request_id} if request_id else {})},
                 ))
-                if isinstance(fallback_result, dict):
-                    fallback_result = dict(fallback_result)
-                    fallback_result["fallback_used"] = True
-                    fallback_result.setdefault("primary_model", model)
-                    if request_id:
-                        telemetry = dict(fallback_result.get("_transport_telemetry") or {})
-                        telemetry["request_id"] = request_id
-                        fallback_result["_transport_telemetry"] = telemetry
-                return fallback_result
+                if isinstance(public_result, dict) and request_id:
+                    public_result = dict(public_result)
+                    telemetry = dict(public_result.get("_transport_telemetry") or {})
+                    telemetry["request_id"] = request_id
+                    public_result["_transport_telemetry"] = telemetry
+                return public_result
+            raise
+        except ClientError:
             raise

@@ -17,6 +17,7 @@ from typing import Any, Callable
 
 from .agent_journal import ContinuationJournalStore
 from .model_capabilities import model_context_window, supports_tools
+from .performance import RuntimePerformance
 from .agent_plan import AgentPlan, PlanStore, plan_prompt_context, resume_prompt_context
 from .client import ClientError, TriForceClient
 from .capabilities import (
@@ -60,6 +61,26 @@ from .tool_policy import require_allowed_tool
 RuntimeEventFn = Callable[[str, dict[str, Any]], None]
 ApprovalFn = Callable[[str, dict], bool]
 StopFn = Callable[[], bool]
+
+_RUNTIME_COMPLETE_TOOL = "runtime_complete"
+_RUNTIME_COMPLETE_SCHEMA = {
+    "name": _RUNTIME_COMPLETE_TOOL,
+    "description": (
+        "Signal that the current autonomous task is fully complete. The host validates mutation, "
+        "verification and completion guards before accepting this signal; it never bypasses safety checks. "
+        "Call it only as the sole tool call after all required work and verification are finished."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string"},
+            "evidence": {"type": "array", "items": {"type": "string"}},
+            "no_change_justified": {"type": "boolean"},
+        },
+        "required": ["summary"],
+    },
+    "annotations": {"readOnlyHint": True},
+}
 
 _BEHAVIOR_VERIFY_TOOLS = {"test", "lint", "dev_lint", "dev_analyze"}
 _SHELL_VERIFY_RE = re.compile(
@@ -241,8 +262,11 @@ class NativeLightRuntime:
     client: TriForceClient
     initial_prompt: str
     model: str | None
-    fallback_model: str | None
+    fallback_model: str | None  # deprecated compatibility input; never activated
     workspace_root: str
+    plan_workspace_root: str | None = None
+    protected_workspace_root: str | None = None
+    completion_guard: Callable[[], None] | None = None
     model_client: ModelTransport | None = None
     tools: list[dict] | None = None
     system_prompt: str | None = None
@@ -262,6 +286,8 @@ class NativeLightRuntime:
     max_output_tokens: int = 16384
     tools_unavailable_reason: str = ""
     max_iterations: int = MAX_ITERATIONS
+    require_mutation_or_explicit_no_change: bool = False
+    allow_completion_signal: bool = False
     progressive_tool_disclosure: bool = True
     native_openrouter_tool_calling: bool = False
     tool_budget: int = DEFAULT_TOOL_BUDGET
@@ -271,9 +297,9 @@ class NativeLightRuntime:
     _tool_catalog: list[dict] = field(default_factory=list, init=False, repr=False)
     _expansion_rounds: int = field(default=0, init=False, repr=False)
 
-    def _emit(self, kind: str, **payload: Any) -> None:
+    def _emit(self, event_kind: str, **payload: Any) -> None:
         if self.event_fn is not None:
-            self.event_fn(kind, payload)
+            self.event_fn(event_kind, payload)
 
     def _stopped(self) -> bool:
         return bool(self.stop_requested and self.stop_requested())
@@ -298,7 +324,11 @@ class NativeLightRuntime:
                 cancel = getattr(model_client, "cancel_current_request", None)
                 if callable(cancel):
                     try:
-                        cancel()
+                        request_id = kwargs.get("request_id")
+                        try:
+                            cancel(request_id)
+                        except TypeError:
+                            cancel()
                     except Exception:
                         # Cancellation is best-effort; Stop must still return promptly.
                         pass
@@ -367,6 +397,9 @@ class NativeLightRuntime:
             )
         return None
 
+    def _plan_workspace(self) -> str:
+        return str(Path(self.plan_workspace_root or self.workspace_root or ".").expanduser().resolve(strict=False))
+
     def _prepare_tools(self) -> list[dict]:
         if self.tools is None and self.load_tools_on_start:
             started = time.monotonic()
@@ -380,11 +413,11 @@ class NativeLightRuntime:
                 if self.resume and self.persistent_plan:
                     try:
                         if self.resume_plan_id == "current":
-                            resume_plan = self.plan_store.load_current(self.workspace_root)
+                            resume_plan = self.plan_store.load_current(self._plan_workspace())
                         elif self.resume_plan_id:
-                            resume_plan = self.plan_store.load(self.workspace_root, self.resume_plan_id)
+                            resume_plan = self.plan_store.load(self._plan_workspace(), self.resume_plan_id)
                         else:
-                            resume_plan = self.plan_store.load_current(self.workspace_root)
+                            resume_plan = self.plan_store.load_current(self._plan_workspace())
                     except (OSError, ValueError):
                         resume_plan = None
                     if resume_plan is not None and resume_plan.task:
@@ -409,6 +442,10 @@ class NativeLightRuntime:
             self.tools = []
         else:
             self._tool_catalog = list(self.tools)
+        if self.allow_completion_signal and not any(
+            str(tool.get("name") or "") == _RUNTIME_COMPLETE_TOOL for tool in self.tools
+        ):
+            self.tools = [*self.tools, dict(_RUNTIME_COMPLETE_SCHEMA)]
         return self.tools
 
     def _run_meta_tool(self, name: str, args: dict, tools: list[dict]) -> tuple[str, bool, bool]:
@@ -458,15 +495,15 @@ class NativeLightRuntime:
         plan: AgentPlan | None = None
         if self.resume:
             if self.resume_plan_id == "current":
-                plan = self.plan_store.load_current(self.workspace_root)
+                plan = self.plan_store.load_current(self._plan_workspace())
                 if plan is None:
                     raise ValueError("no current persistent plan to resume in this workspace")
             elif self.resume_plan_id:
-                plan = self.plan_store.load(self.workspace_root, self.resume_plan_id)
+                plan = self.plan_store.load(self._plan_workspace(), self.resume_plan_id)
                 if plan is None:
                     raise ValueError(f"resume plan not found in this workspace: {self.resume_plan_id}")
             else:
-                plan = self.plan_store.load_current(self.workspace_root)
+                plan = self.plan_store.load_current(self._plan_workspace())
             if plan is not None and plan.status in {"running", "paused", "failed"}:
                 previous_reason = plan.pause_reason
                 plan.status = "running"
@@ -482,7 +519,7 @@ class NativeLightRuntime:
                     f"resume plan is not resumable (status={plan.status}): {plan.id}"
                 )
         plan = self.plan_store.create(
-            self.initial_prompt, self.workspace_root, str(self.model or "")
+            self.initial_prompt, self._plan_workspace(), str(self.model or "")
         )
         self._emit("plan", action="created", plan=plan)
         return plan, False
@@ -621,6 +658,25 @@ class NativeLightRuntime:
         self._save_plan(plan)
         return mutation_seen, verification_seen
 
+    def _guard_completion(self, plan: AgentPlan | None, messages: list[dict], tools: list[dict], system: str, *,
+                          model_used: str, iterations: int, total_latency: int, fallback_used: bool,
+                          journal_batches: list[dict[str, Any]]) -> AgentRunResult | None:
+        if self.completion_guard is None:
+            return None
+        try:
+            self.completion_guard()
+            return None
+        except Exception as exc:
+            reason = f"Workspace finalization failed: {type(exc).__name__}: {exc}"
+            self._fail_plan(plan, reason)
+            self._save_journal(plan, messages, pending_input=reason, tool_batches=journal_batches)
+            self._emit("error", message=reason)
+            return AgentRunResult(
+                "failed", "", model_used, messages, tools, system,
+                iterations=iterations, latency_ms=total_latency,
+                fallback_used=fallback_used, plan_id=plan.id if plan else "", error=reason,
+            )
+
     def _complete_plan(
         self,
         plan: AgentPlan | None,
@@ -665,6 +721,13 @@ class NativeLightRuntime:
         self._save_plan(plan)
 
     def run(self) -> AgentRunResult:
+        performance = RuntimePerformance()
+        model_latency_warned = False
+        filesystem_latency_warned = False
+
+        def performance_snapshot() -> dict[str, Any]:
+            return performance.snapshot()
+
         workspace = str(Path(self.workspace_root or ".").resolve())
         self.workspace_root = workspace
         tools = self._prepare_tools()
@@ -700,6 +763,16 @@ class NativeLightRuntime:
             base_system, native=self._native_tool_calling_enabled(self.model)
         )
         system = self._with_plan_context(protocol_system, plan)
+        self._emit(
+            "runtime_context",
+            workspace=workspace,
+            model=self.model or "",
+            initial_prompt=self.initial_prompt,
+            system_prompt=system,
+            tools=tools,
+            persistent_plan=self.persistent_plan,
+            resumed=resumed,
+        )
 
         prior_context = [
             dict(message) for message in (self.conversation or [])
@@ -731,7 +804,7 @@ class NativeLightRuntime:
             self.model_client or self.client, default_model=self.model
         )
         active_model = configured_model
-        active_fallback = self.fallback_model
+        active_fallback = None  # automatic fallback routing intentionally removed
         model_used = active_model or "?"
         context_window_tokens = model_context_window(model_client, active_model)
         if context_window_tokens:
@@ -746,6 +819,9 @@ class NativeLightRuntime:
         tool_nudge_sent = False
         mutation_seen, verification_seen = plan.progress_flags() if resumed and plan else (False, False)
         verification_nudge_sent = False
+        implementation_nudge_sent = False
+        no_change_nudge_sent = False
+        pre_mutation_inspection_count = 0
         fresh_inspection_after_resume = not resumed
         starting_plan_iteration = plan.iteration if plan is not None else 0
         loop_guard = AgentLoopGuard()
@@ -789,6 +865,7 @@ class NativeLightRuntime:
             context_char_budget=context_char_budget,
             tools=len(tools),
             workspace=workspace,
+            source_workspace=self._plan_workspace(),
             plan_id=plan.id if plan else "",
             resumed=resumed,
         )
@@ -898,23 +975,20 @@ class NativeLightRuntime:
                 )
             model_response_received_at = time.monotonic()
             elapsed_ms = int((model_response_received_at - started) * 1000)
+            performance.record_model(elapsed_ms)
+            if elapsed_ms >= 10_000 and not model_latency_warned:
+                model_latency_warned = True
+                self._emit(
+                    "performance_warning",
+                    kind="model_latency",
+                    message="Model/API response latency is high.",
+                    elapsed_ms=elapsed_ms,
+                    model=active_model or "backend-default",
+                )
             response = str(result.get("response", "") or "").strip()
             model_used = str(result.get("model", active_model or "?") or "?")
             latency = int(result.get("latency_ms") or elapsed_ms)
             total_latency += latency
-            if result.get("fallback_used"):
-                fallback_used = True
-                # A successful provider fallback becomes the effective model for the
-                # rest of this run. Otherwise the next turn would retry the failed
-                # primary and capability/tool-protocol decisions would use stale data.
-                if model_used not in {"", "?"} and model_used != active_model:
-                    previous_model = active_model or "backend-default"
-                    active_model = model_used
-                    active_fallback = None
-                    self._emit(
-                        "model_switch", previous=previous_model, model=active_model,
-                        reason="provider fallback promoted for remainder of run",
-                    )
             transport_telemetry = result.get("_transport_telemetry") if isinstance(result, dict) else None
             self._emit(
                 "model_response", iteration=i + 1, elapsed_ms=elapsed_ms,
@@ -983,6 +1057,34 @@ class NativeLightRuntime:
                         fallback_used=fallback_used, plan_id=plan.id if plan else "",
                     )
 
+                if self.require_mutation_or_explicit_no_change and not mutation_seen:
+                    explicit_no_change = response.lstrip().upper().startswith("DONE: NO CHANGE JUSTIFIED")
+                    if not explicit_no_change:
+                        messages.append({"role": "assistant", "content": response})
+                        if not no_change_nudge_sent:
+                            current_input = (
+                                "This is a coding-candidate run and no mutation has been made. "
+                                "Do not finish with analysis or a plan. Implement the best-supported change now and verify it. "
+                                "If the shared contract genuinely requires no repository change, finish exactly with "
+                                "`DONE: no change justified` followed by concise evidence explaining why no edit is correct."
+                            )
+                            no_change_nudge_sent = True
+                            self._emit("implementation_required", iteration=i + 1, reason="final_without_mutation")
+                            self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
+                            continue
+                        reason = (
+                            "Coding candidate paused because it attempted to finish without making a change "
+                            "and without explicitly justifying that no repository change was required."
+                        )
+                        self._pause_plan(plan, reason, response)
+                        self._save_journal(plan, messages, pending_input=reason, tool_batches=journal_batches)
+                        self._emit("paused", reason=reason)
+                        return AgentRunResult(
+                            "paused", reason, model_used, messages, tools, system,
+                            iterations=i + 1, latency_ms=total_latency,
+                            fallback_used=fallback_used, plan_id=plan.id if plan else "",
+                        )
+
                 if mutation_seen and not verification_seen:
                     messages.append({"role": "assistant", "content": response})
                     if not verification_nudge_sent:
@@ -1026,15 +1128,23 @@ class NativeLightRuntime:
                     self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
                     continue
                 messages.append({"role": "assistant", "content": response})
+                guarded = self._guard_completion(
+                    plan, messages, tools, system, model_used=model_used, iterations=i + 1,
+                    total_latency=total_latency, fallback_used=fallback_used, journal_batches=journal_batches,
+                )
+                if guarded is not None:
+                    return guarded
                 self._complete_plan(
                     plan, response,
                     mutation_seen=mutation_seen,
                     verification_seen=verification_seen,
                 )
+                perf = performance_snapshot()
+                self._emit("performance_summary", **perf)
                 self._emit(
                     "final", response=response, model=model_used,
                     iterations=i + 1, latency_ms=total_latency,
-                    fallback_used=fallback_used,
+                    fallback_used=fallback_used, performance=perf,
                 )
                 if self.conversation is not None:
                     self.conversation[:] = [dict(message) for message in messages[1:]][-MAX_CONTEXT_MESSAGES:]
@@ -1069,22 +1179,6 @@ class NativeLightRuntime:
                     self._emit(
                         "loop_prevented", iteration=i + 1, repeats=consecutive_call_batches,
                         action="nudge",
-                    )
-                    self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
-                    continue
-                if active_fallback and active_fallback != model_used:
-                    previous_model = model_used
-                    active_model = active_fallback
-                    active_fallback = None
-                    fallback_used = True
-                    loop_guard.reset()
-                    current_input = (
-                        "Repeated duplicate tool call blocked. Continue with a different approach "
-                        "using the prior tool result; do not repeat the blocked call unchanged."
-                    )
-                    self._emit(
-                        "model_switch", previous=previous_model, model=active_model,
-                        reason="duplicate tool call prevented before execution",
                     )
                     self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
                     continue
@@ -1127,6 +1221,115 @@ class NativeLightRuntime:
                     "tool_call", name=name, arguments=args, iteration=i + 1,
                     request_id=request_id, handoff_ms=handoff_ms,
                 )
+                if name == _RUNTIME_COMPLETE_TOOL:
+                    started_tool = time.monotonic()
+                    summary = str(args.get("summary") or "").strip()
+                    evidence = [
+                        str(item).strip() for item in (args.get("evidence") or [])
+                        if str(item).strip()
+                    ] if isinstance(args.get("evidence"), list) else []
+                    no_change_justified = bool(args.get("no_change_justified"))
+                    accepted = True
+                    reject_reason = ""
+                    if len(calls) != 1:
+                        accepted = False
+                        reject_reason = "runtime_complete must be the sole tool call in its model turn"
+                    elif not summary:
+                        accepted = False
+                        reject_reason = "runtime_complete requires a non-empty summary"
+                    elif self.require_mutation_or_explicit_no_change and not mutation_seen and not no_change_justified:
+                        accepted = False
+                        reject_reason = "runtime completion rejected: no repository mutation was observed and no_change_justified was not set"
+                    elif mutation_seen and not verification_seen:
+                        accepted = False
+                        reject_reason = "runtime completion rejected: repository state changed but successful post-change verification is still missing"
+                    elif (
+                        mutation_seen and tool_was_called and not completion_audit_sent
+                        and _needs_completion_audit(self.initial_prompt)
+                    ):
+                        accepted = False
+                        completion_audit_sent = True
+                        reject_reason = "runtime completion rejected: perform the completion audit before declaring the task fully complete"
+
+                    elapsed = time.monotonic() - started_tool
+                    tool_result = json.dumps({
+                        "accepted": accepted,
+                        "runtime_verified": accepted,
+                        "mutation_seen": bool(mutation_seen),
+                        "verification_seen": bool(verification_seen),
+                        "summary": summary,
+                        "evidence": evidence[:12],
+                        "reason": reject_reason,
+                    }, ensure_ascii=False)
+                    self._emit(
+                        "completion_signal", requested=True, accepted=accepted,
+                        runtime_verified=accepted, mutation_seen=bool(mutation_seen),
+                        verification_seen=bool(verification_seen), summary=summary,
+                        evidence=evidence[:12], reason=reject_reason, iteration=i + 1,
+                        model=model_used,
+                    )
+                    performance.record_tool(name, elapsed, is_error=not accepted)
+                    self._emit(
+                        "tool_result", name=name, result=tool_result, is_error=not accepted,
+                        elapsed=elapsed, iteration=i + 1, request_id=request_id, handoff_ms=handoff_ms,
+                    )
+                    if accepted:
+                        if native_mode:
+                            messages.append({
+                                "role": "assistant", "content": response or None,
+                                "tool_calls": [{
+                                    "id": str(call.get("id") or ""), "type": "function",
+                                    "function": {
+                                        "name": name,
+                                        "arguments": json.dumps(args, ensure_ascii=False),
+                                    },
+                                }],
+                            })
+                            messages.append({
+                                "role": "tool", "tool_call_id": str(call.get("id") or ""),
+                                "name": name, "content": tool_result,
+                            })
+                        else:
+                            messages.append({"role": "assistant", "content": response})
+                            messages.append({"role": "user", "content": f"Tool {name} result:\n{tool_result}"})
+                        final_response = f"DONE: {summary}"
+                        guarded = self._guard_completion(
+                            plan, messages, tools, system, model_used=model_used, iterations=i + 1,
+                            total_latency=total_latency, fallback_used=fallback_used, journal_batches=journal_batches,
+                        )
+                        if guarded is not None:
+                            return guarded
+                        self._complete_plan(
+                            plan, final_response, mutation_seen=mutation_seen,
+                            verification_seen=verification_seen,
+                        )
+                        perf = performance_snapshot()
+                        self._emit("performance_summary", **perf)
+                        self._emit(
+                            "final", response=final_response, model=model_used, iterations=i + 1,
+                            latency_ms=total_latency, fallback_used=fallback_used, performance=perf,
+                        )
+                        if self.conversation is not None:
+                            self.conversation[:] = [dict(message) for message in messages[1:]][-MAX_CONTEXT_MESSAGES:]
+                        return AgentRunResult(
+                            "completed", final_response, model_used, messages, tools, system,
+                            iterations=i + 1, latency_ms=total_latency, fallback_used=fallback_used,
+                            plan_id=plan.id if plan else "",
+                        )
+                    tool_results.append(f"Tool {name} result:\n{tool_result}")
+                    if native_mode:
+                        native_tool_messages.append({
+                            "role": "tool", "tool_call_id": str(call.get("id") or ""),
+                            "name": name, "content": tool_result,
+                        })
+                    batch_records.append({
+                        "id": str(call.get("id") or ""), "name": name,
+                        "provider": str(call.get("provider") or ""),
+                        "raw_type": str(call.get("raw_type") or ""),
+                        "metadata": call.get("metadata") if isinstance(call.get("metadata"), dict) else {},
+                        "arguments": args, "is_error": True,
+                    })
+                    continue
                 if name in META_TOOL_NAMES:
                     started_tool = time.monotonic()
                     tool_result, is_error, tools_changed = self._run_meta_tool(name, args, tools)
@@ -1141,6 +1344,18 @@ class NativeLightRuntime:
                         )
                         messages[0]["content"] = self._with_plan_context(protocol_system, plan)
                         system = messages[0]["content"]
+                    performance.record_tool(name, elapsed, is_error=is_error)
+                    if (
+                        name in {"file_read", "file_edit", "file_tree", "code_search", "code_grep"}
+                        and elapsed >= 2.0
+                        and not filesystem_latency_warned
+                    ):
+                        filesystem_latency_warned = True
+                        self._emit(
+                            "performance_warning", kind="filesystem_latency",
+                            message="A filesystem operation is unusually slow.",
+                            elapsed_ms=int(elapsed * 1000), tool=name,
+                        )
                     self._emit(
                         "tool_result", name=name, result=tool_result,
                         is_error=is_error, elapsed=elapsed, iteration=i + 1,
@@ -1254,6 +1469,7 @@ class NativeLightRuntime:
                             execution_client=self.client,
                             tools=[tool for tool in tools if tool.get("name") != "subagent_run"],
                             workspace_root=self.workspace_root,
+                            protected_workspace_root=self.protected_workspace_root,
                             approval_fn=self.approval_fn,
                             enabled_tool_names=self.enabled_tool_names,
                             fallback_model=active_fallback,
@@ -1274,10 +1490,23 @@ class NativeLightRuntime:
                             iteration=i,
                             allowed_tools=allowed_tool_names,
                             workspace_root=self.workspace_root,
+                            protected_workspace_root=self.protected_workspace_root,
                         )
                     elapsed = time.monotonic() - started_tool
                 if not is_error and name in _INSPECTION_TOOLS:
                     fresh_inspection_after_resume = True
+                performance.record_tool(name, elapsed, is_error=is_error)
+                if (
+                    name in {"file_read", "file_edit", "file_tree", "code_search", "code_grep"}
+                    and elapsed >= 2.0
+                    and not filesystem_latency_warned
+                ):
+                    filesystem_latency_warned = True
+                    self._emit(
+                        "performance_warning", kind="filesystem_latency",
+                        message="A filesystem operation is unusually slow.",
+                        elapsed_ms=int(elapsed * 1000), tool=name,
+                    )
                 self._emit(
                     "tool_result", name=name, result=tool_result,
                     is_error=is_error, elapsed=elapsed, iteration=i + 1,
@@ -1351,10 +1580,20 @@ class NativeLightRuntime:
                         iterations=i + 1, latency_ms=total_latency,
                         fallback_used=fallback_used, plan_id=plan.id if plan else "",
                     )
+                mutation_before_tool = mutation_seen
                 mutation_seen, verified_now = self._record_tool_progress(
                     plan, name, args, tool_result, is_error, mutation_seen,
                 )
                 verification_seen = verification_seen or verified_now
+                if mutation_seen and not mutation_before_tool:
+                    pre_mutation_inspection_count = 0
+                elif (
+                    self.require_mutation_or_explicit_no_change
+                    and not mutation_seen
+                    and not is_error
+                    and name in _INSPECTION_TOOLS
+                ):
+                    pre_mutation_inspection_count += 1
                 batch_records.append({
                     "id": str(call.get("id") or ""),
                     "name": name,
@@ -1419,54 +1658,58 @@ class NativeLightRuntime:
                 else:
                     tool_results.append(STALL_RECOVERY_PROMPT)
 
+            if (
+                self.require_mutation_or_explicit_no_change
+                and not mutation_seen
+                and pre_mutation_inspection_count >= 8
+                and not implementation_nudge_sent
+            ):
+                tool_results.append(
+                    "IMPLEMENTATION REQUIRED: enough repository evidence has been inspected without any mutation. "
+                    "On the next turn, stop broad reading and implement the best-supported change using a write tool, "
+                    "then run focused verification. Only inspect more if one exact missing fact blocks the edit. "
+                    "If no repository change is actually justified, finish with `DONE: no change justified` and cite the evidence."
+                )
+                implementation_nudge_sent = True
+                self._emit(
+                    "implementation_required", iteration=i + 1,
+                    reason="inspection_without_mutation", inspections=pre_mutation_inspection_count,
+                )
+
             if repeats >= STALL_FALLBACK_REPEATS:
-                if active_fallback and active_fallback != model_used:
-                    self._emit(
-                        "model_switch", previous=model_used, model=active_fallback,
-                        reason="repeated tool loop",
-                    )
-                    tool_results.append(
-                        f"Loop recovery: switch to {active_fallback} and continue the task "
-                        "with a different approach. Do not repeat the prior call."
-                    )
-                    active_model = active_fallback
-                    active_fallback = None
-                    fallback_used = True
-                    loop_guard.reset()
+                reason = (
+                    "Agent paused because the same tool operation kept repeating without "
+                    "progress. Resume the persistent plan with 'continue' after correcting "
+                    "the approach or environment."
+                )
+                if native_mode:
+                    messages.append({
+                        "role": "assistant", "content": response or None,
+                        "tool_calls": [
+                            {
+                                "id": str(item.get("id") or ""), "type": "function",
+                                "function": {
+                                    "name": str(item.get("name") or ""),
+                                    "arguments": json.dumps(item.get("arguments") or {}, ensure_ascii=False),
+                                },
+                            }
+                            for item in calls
+                        ],
+                    })
+                    messages.extend(native_tool_messages)
                 else:
-                    reason = (
-                        "Agent paused because the same tool operation kept repeating without "
-                        "progress. Resume the persistent plan with 'continue' after correcting "
-                        "the approach or environment."
-                    )
-                    if native_mode:
-                        messages.append({
-                            "role": "assistant", "content": response or None,
-                            "tool_calls": [
-                                {
-                                    "id": str(item.get("id") or ""), "type": "function",
-                                    "function": {
-                                        "name": str(item.get("name") or ""),
-                                        "arguments": json.dumps(item.get("arguments") or {}, ensure_ascii=False),
-                                    },
-                                }
-                                for item in calls
-                            ],
-                        })
-                        messages.extend(native_tool_messages)
-                    else:
-                        messages.append({"role": "assistant", "content": response})
-                        messages.append({"role": "user", "content": format_untrusted_tool_results(tool_results)})
-                    self._pause_plan(plan, reason, response)
-                    self._save_journal(plan, messages, tool_batches=journal_batches)
-                    self._emit("paused", reason=reason)
-                    if self.conversation is not None:
-                        self.conversation[:] = [dict(message) for message in messages[1:]][-MAX_CONTEXT_MESSAGES:]
-                    return AgentRunResult(
-                        "paused", reason, model_used, messages, tools, system,
-                        iterations=i + 1, latency_ms=total_latency,
-                        fallback_used=fallback_used, plan_id=plan.id if plan else "",
-                    )
+                    messages.append({"role": "assistant", "content": response})
+                    messages.append({"role": "user", "content": format_untrusted_tool_results(tool_results)})
+                self._pause_plan(plan, reason, response)
+                self._save_journal(plan, messages, tool_batches=journal_batches)
+                self._emit("paused", reason=reason)
+                if self.conversation is not None:
+                    self.conversation[:] = [dict(message) for message in messages[1:]][-MAX_CONTEXT_MESSAGES:]
+                return AgentRunResult(
+                    "paused", reason, model_used, messages, tools, system,
+                    iterations=i + 1, latency_ms=total_latency,
+                    fallback_used=fallback_used, plan_id=plan.id if plan else "",
+                )
 
             if (i + 1) % AGENT_CHECKPOINT_INTERVAL == 0:
                 tool_results.append(agent_checkpoint(i + 1))
@@ -1530,15 +1773,23 @@ class NativeLightRuntime:
                         plan, messages, pending_input=current_input, tool_batches=journal_batches
                     )
                     continue
+                guarded = self._guard_completion(
+                    plan, messages, tools, system, model_used=model_used, iterations=i + 1,
+                    total_latency=total_latency, fallback_used=fallback_used, journal_batches=journal_batches,
+                )
+                if guarded is not None:
+                    return guarded
                 self._complete_plan(
                     plan, visible or response,
                     mutation_seen=mutation_seen,
                     verification_seen=verification_seen,
                 )
+                perf = performance_snapshot()
+                self._emit("performance_summary", **perf)
                 self._emit(
                     "final", response=visible or response, model=model_used,
                     iterations=i + 1, latency_ms=total_latency,
-                    fallback_used=fallback_used,
+                    fallback_used=fallback_used, performance=perf,
                 )
                 if self.conversation is not None:
                     self.conversation[:] = [dict(message) for message in messages[1:]][-MAX_CONTEXT_MESSAGES:]

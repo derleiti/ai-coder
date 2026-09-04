@@ -17,6 +17,9 @@ from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
 from .client import ClientError, USER_AGENT, _normalize_chat_response
+from .provider_credentials import (
+    direct_provider_spec, provider_api_key, provider_for_model, transport_model_id,
+)
 
 
 class ModelTransport(Protocol):
@@ -66,6 +69,7 @@ class OpenAICompatibleTransport:
         api_key: str = "",
         timeout: int = 300,
         headers: dict[str, str] | None = None,
+        reasoning_effort: str = "",
     ):
         base = str(base_url or "").strip()
         if not base:
@@ -74,24 +78,35 @@ class OpenAICompatibleTransport:
         self.api_key = str(api_key or "")
         self.timeout = max(10, min(300, int(timeout)))
         self.headers = {str(k): str(v) for k, v in (headers or {}).items()}
+        effort = str(reasoning_effort or "").strip().lower()
+        if effort not in {"", "high", "medium", "low", "none"}:
+            raise ValueError("reasoning_effort must be high, medium, low, none, or empty")
+        self.reasoning_effort = effort
         self._active_response_lock = threading.Lock()
-        self._active_response = None
+        self._active_responses: dict[str, Any] = {}
 
-    def cancel_current_request(self) -> bool:
-        """Best-effort cancellation once the HTTP response handle exists."""
+    def cancel_current_request(self, request_id: str | None = None) -> bool:
+        """Best-effort cancellation of one request, safe under parallel team calls."""
         with self._active_response_lock:
-            response = self._active_response
-            self._active_response = None
-        if response is None:
-            return False
-        close = getattr(response, "close", None)
-        if callable(close):
-            try:
-                close()
-                return True
-            except Exception:
-                return False
-        return False
+            if request_id:
+                responses = [self._active_responses.pop(str(request_id), None)]
+            elif len(self._active_responses) == 1:
+                key, response = next(iter(self._active_responses.items()))
+                self._active_responses.pop(key, None); responses = [response]
+            else:
+                responses = list(self._active_responses.values())
+                self._active_responses.clear()
+        closed = False
+        for response in responses:
+            if response is None:
+                continue
+            close = getattr(response, "close", None)
+            if callable(close):
+                try:
+                    close(); closed = True
+                except Exception:
+                    pass
+        return closed
 
     @property
     def endpoint(self) -> str:
@@ -119,14 +134,15 @@ class OpenAICompatibleTransport:
         context = ssl.create_default_context()
         try:
             response = urlopen(request, timeout=self.timeout, context=context)
+            active_key = str(request_id or f"thread-{threading.get_ident()}")
             with self._active_response_lock:
-                self._active_response = response
+                self._active_responses[active_key] = response
             try:
                 raw = response.read().decode("utf-8", errors="replace")
             finally:
                 with self._active_response_lock:
-                    if self._active_response is response:
-                        self._active_response = None
+                    if self._active_responses.get(active_key) is response:
+                        self._active_responses.pop(active_key, None)
                 try:
                     response.close()
                 except Exception:
@@ -156,39 +172,47 @@ class OpenAICompatibleTransport:
         tools: list | None = None,
         tool_choice: Any = "auto",
         request_id: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
+        # ``fallback_model`` is a deprecated compatibility argument. Never route a
+        # failed request to another model implicitly.
         request_messages = [dict(item) for item in (messages or []) if isinstance(item, dict)]
         if not request_messages:
             if system_prompt:
                 request_messages.append({"role": "system", "content": system_prompt})
             request_messages.append({"role": "user", "content": message})
+        requested_model = str(model or "").strip()
+        transport_model = requested_model
+        base_lower = self.base_url.lower()
+        if requested_model.startswith("ollama/") and ("11434" in base_lower or "ollama" in base_lower):
+            transport_model = requested_model[len("ollama/"):]
+        else:
+            provider = provider_for_model(requested_model)
+            spec = direct_provider_spec(provider) if provider else None
+            if spec and spec.base_url and spec.base_url.lower().rstrip("/") == self.base_url.lower().rstrip("/"):
+                transport_model = transport_model_id(requested_model, provider)
         payload: dict[str, Any] = {
-            "model": str(model or ""),
+            "model": transport_model,
             "messages": request_messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
         if not payload["model"]:
             raise ClientError("Direct OpenAI-compatible transport requires a model id")
+        effort = self.reasoning_effort if reasoning_effort is None else str(reasoning_effort or "").strip().lower()
+        if effort:
+            if effort not in {"high", "medium", "low", "none"}:
+                raise ClientError("Invalid reasoning_effort for direct model transport")
+            payload["reasoning_effort"] = effort
         converted_tools = _openai_tools(tools)
         if converted_tools:
             payload["tools"] = converted_tools
             payload["tool_choice"] = tool_choice
 
         started = time.monotonic()
-        try:
-            normalized = _normalize_chat_response(self._post_json(payload, request_id=request_id))
-        except ClientError:
-            if fallback_model and fallback_model != model:
-                payload["model"] = fallback_model
-                normalized = _normalize_chat_response(self._post_json(payload, request_id=request_id))
-                normalized = dict(normalized)
-                normalized["fallback_used"] = True
-                normalized.setdefault("primary_model", model)
-            else:
-                raise
+        normalized = _normalize_chat_response(self._post_json(payload, request_id=request_id))
         normalized = dict(normalized)
-        normalized.setdefault("model", payload["model"])
+        normalized.setdefault("model", requested_model or payload["model"])
         normalized.setdefault("backend", "openai-compatible-direct")
         elapsed_s = time.monotonic() - started
         normalized.setdefault("latency_ms", int(elapsed_s * 1000))
@@ -204,6 +228,64 @@ class OpenAICompatibleTransport:
         return normalized
 
 
+class ProviderRoutingTransport:
+    """Route individual model calls through a user's secure provider credential.
+
+    This wrapper is intentionally per-request: a Team Runtime can mix Gemini,
+    OpenRouter, NVIDIA and other models without pinning the entire run to the
+    provider of the primary model. Calls without a supported/configured direct
+    provider fall through unchanged to the existing TriForce client.
+    """
+
+    def __init__(self, default: ModelTransport):
+        self.default = default
+        self.timeout = int(getattr(default, "timeout", 300))
+        self._direct: dict[str, OpenAICompatibleTransport] = {}
+
+    def _transport_for_model(self, model: str | None) -> ModelTransport:
+        provider = provider_for_model(model)
+        spec = direct_provider_spec(provider) if provider else None
+        if not spec or not spec.direct_supported or not spec.base_url:
+            return self.default
+        api_key, source = provider_api_key(provider)
+        # Existing provider environment variables historically served diagnostics
+        # only. Do not silently change routing for users who already have them.
+        # Direct routing is enabled by an explicit AICoder OS-keyring credential;
+        # AICODER_NATIVE_MODEL_* remains the explicit environment-based opt-in.
+        if not api_key or source != "keyring":
+            return self.default
+        cached = self._direct.get(provider)
+        if cached is None or cached.api_key != api_key:
+            cached = OpenAICompatibleTransport(spec.base_url, api_key=api_key, timeout=self.timeout)
+            self._direct[provider] = cached
+        return cached
+
+    def chat(self, **kwargs: Any) -> dict[str, Any]:
+        transport = self._transport_for_model(kwargs.get("model"))
+        return transport.chat(**kwargs)
+
+    def cancel_current_request(self, request_id: str | None = None) -> bool:
+        cancelled = False
+        targets = [self.default, *self._direct.values()]
+        for target in targets:
+            cancel = getattr(target, "cancel_current_request", None)
+            if callable(cancel):
+                try:
+                    try:
+                        result = cancel(request_id) if request_id is not None else cancel()
+                    except TypeError:
+                        # Preserve compatibility with older transports whose
+                        # cancellation hook accepts no request identifier.
+                        result = cancel()
+                    cancelled = bool(result) or cancelled
+                except Exception:
+                    pass
+        return cancelled
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.default, name)
+
+
 def native_model_transport_from_env(
     default: ModelTransport,
     *,
@@ -216,7 +298,11 @@ def native_model_transport_from_env(
     """
     base_url = os.environ.get("AICODER_NATIVE_MODEL_BASE_URL", "").strip()
     if not base_url:
-        return default, default_model
+        # Secure per-provider keys are an opt-in routing layer; unsupported or
+        # unconfigured models continue through the existing backend unchanged.
+        if isinstance(default, ProviderRoutingTransport):
+            return default, default_model
+        return ProviderRoutingTransport(default), default_model
     raw_headers = os.environ.get("AICODER_NATIVE_MODEL_HEADERS", "").strip()
     headers: dict[str, str] = {}
     if raw_headers:
@@ -233,5 +319,6 @@ def native_model_transport_from_env(
         api_key=os.environ.get("AICODER_NATIVE_MODEL_API_KEY", ""),
         timeout=getattr(default, "timeout", 300),
         headers=headers,
+        reasoning_effort=os.environ.get("AICODER_NATIVE_REASONING_EFFORT", ""),
     )
     return transport, model

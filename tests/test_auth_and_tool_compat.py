@@ -19,7 +19,7 @@ from aicoder.config import Session
 from aicoder.executor import (
     is_action_request, is_simple_chat_message, merge_tool_calls, normalize_tool_calls, parse_tool_calls,
 )
-from aicoder.gui.chat_widget import _AgentWorker, _select_chat_route
+from aicoder.gui.chat_widget import _AgentWorker
 import aicoder.gui.settings_widget as settings_widget
 import aicoder.agent as cli_agent
 from aicoder.setup import _is_token_expired, run_setup
@@ -237,19 +237,7 @@ class FastChatTests(unittest.TestCase):
         self.assertFalse(is_simple_chat_message("Hi, prüfe bitte den OAuth-Code"))
         self.assertFalse(is_simple_chat_message("Warum ist das Modell langsam?"))
 
-    def test_greeting_preserves_primary_and_fallback(self):
-        expected = ("anthropic/slow", "ollama/llama3.2:latest", False)
-        self.assertEqual(
-            _select_chat_route("anthropic/slow", "ollama/llama3.2:latest", True),
-            expected,
-        )
-        self.assertEqual(
-            _select_chat_route("anthropic/slow", "ollama/llama3.2:latest", False),
-            expected,
-        )
 
-
-class ClientLatencyGuardTests(unittest.TestCase):
     def test_pool_timeout_does_not_repeat_request_with_urlopen(self):
         client = TriForceClient("https://example.invalid", timeout=1)
         pool = MagicMock()
@@ -297,7 +285,7 @@ class GuiToolModeTests(unittest.TestCase):
         worker = _AgentWorker(
             client,
             [{"role": "system", "content": "simple"}, {"role": "user", "content": "check"}],
-            "openrouter/nvidia/nemotron-3-ultra-550b-a55b", "",
+            "openrouter/nvidia/nemotron-3-ultra-550b-a55b",
             [{"name": "health", "inputSchema": {}}], "simple",
             load_tools_on_start=True,
         )
@@ -320,7 +308,7 @@ class GuiToolModeTests(unittest.TestCase):
         worker = _AgentWorker(
             client,
             [{"role": "system", "content": "simple"}, {"role": "user", "content": "hi"}],
-            "test", "", [], "simple",
+            "test", [], "simple",
             load_tools_on_start=False, quick_chat=True,
         )
         with patch("aicoder.agent_runtime.load_tools") as discover:
@@ -337,7 +325,7 @@ class GuiToolModeTests(unittest.TestCase):
         worker = _AgentWorker(
             client,
             [{"role": "system", "content": "simple"}, {"role": "user", "content": "hi"}],
-            "test", "", [], "simple",
+            "test", [], "simple",
             load_tools_on_start=False,
         )
         with patch("aicoder.agent_runtime.run_tool") as execute:
@@ -362,7 +350,8 @@ class SettingsRegressionTests(unittest.TestCase):
         )
         self.assertEqual(widget.model_combo.currentText(), "")
         self.assertGreaterEqual(widget.model_combo.minimumWidth(), 500)
-        self.assertGreaterEqual(widget.fallback_combo.minimumWidth(), 500)
+        self.assertFalse(hasattr(widget, "fallback_combo"))
+        self.assertEqual(len(widget._team_model_combos), 12)
         widget.close()
 
 
@@ -474,7 +463,7 @@ class ReplRegressionTests(unittest.TestCase):
         self.assertEqual(result, 0)
         discover.assert_not_called()
         self.assertEqual(client.chat.call_args.kwargs["model"], "anthropic/slow")
-        self.assertEqual(client.chat.call_args.kwargs["fallback_model"], "ollama/fast")
+        self.assertIsNone(client.chat.call_args.kwargs["fallback_model"])
         self.assertIsNone(client.chat.call_args.kwargs["tools"])
 
     def test_repl_conversation_is_reused_and_action_gets_one_tool_nudge(self):
@@ -532,27 +521,24 @@ class ReplRegressionTests(unittest.TestCase):
         self.assertTrue(any(m["content"] == "Wir arbeiten in meinem Home-Verzeichnis." for m in conversation))
         self.assertEqual(conversation[-1]["content"], "DONE: Dokumente geprüft.")
 
-    def test_gui_switches_to_fallback_after_repeated_tool_loop(self):
+    def test_gui_pauses_after_repeated_tool_loop_without_switching_model(self):
         client = MagicMock()
         repeated = {
             "response": '<tool_call>{"name":"health","arguments":{}}</tool_call>',
             "model": "operator",
         }
-        client.chat.side_effect = [
-            repeated.copy(), repeated.copy(), repeated.copy(),
-            {"response": "DONE: recovered", "model": "fallback"},
-        ]
+        client.chat.side_effect = [repeated.copy(), repeated.copy(), repeated.copy()]
         worker = _AgentWorker(
             client,
             [{"role": "system", "content": "simple"}, {"role": "user", "content": "check"}],
-            "operator", "fallback", [{"name": "health", "inputSchema": {}}], "simple",
+            "operator", [{"name": "health", "inputSchema": {}}], "simple",
             load_tools_on_start=True,
         )
         with patch("aicoder.agent_runtime.run_tool", return_value=("same result", False)):
             worker.run()
-        self.assertEqual(client.chat.call_count, 4)
-        self.assertEqual(client.chat.call_args_list[3].kwargs["model"], "fallback")
-        self.assertIsNone(client.chat.call_args_list[3].kwargs["fallback_model"])
+        self.assertEqual(client.chat.call_count, 3)
+        self.assertTrue(all(call.kwargs["model"] == "operator" for call in client.chat.call_args_list))
+        self.assertTrue(all(call.kwargs["fallback_model"] is None for call in client.chat.call_args_list))
 
 
 class PrivilegeBrokerTests(unittest.TestCase):

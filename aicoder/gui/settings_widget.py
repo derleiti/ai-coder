@@ -1,4 +1,4 @@
-"""Settings tab — Login, model dropdown, fallback dropdown, swarm."""
+"""Settings tab — login, base model, team models, tools and runtime."""
 from __future__ import annotations
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
@@ -9,13 +9,16 @@ from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 
 from ..config import DEFAULT_BASE_URL, Session, load_session, save_session, delete_session
 from ..session_state import (
-    SWARM_MODES, get_state, set_model, set_fallback, set_swarm,
+    SWARM_MODES, get_state, set_model, set_swarm,
     set_tool_mode, set_enabled_tools, set_request_timeout,
     set_approval_mode, set_native_openrouter_tool_calling,
 )
 from ..client import TriForceClient, model_identifier
 from .. import settings as settings_core
 from ..executor import load_tools
+from ..provider_credentials import (
+    CredentialStoreError, credential_summary, delete_provider_key, set_provider_key,
+)
 
 
 
@@ -50,10 +53,7 @@ class _ModelLoader(QThread):
 
     def run(self):
         try:
-            data = self.client._request(
-                "GET", "/v1/client/models",
-                require_auth=True, _label="models"
-            )
+            data = self.client.model_catalog()
             models = [
                 model_id for item in data.get("models", [])
                 if (model_id := model_identifier(item))
@@ -107,7 +107,7 @@ class _ModelProbe(QThread):
 
 class SettingsWidget(QWidget):
     models_loaded = pyqtSignal(list)  # emitted with sorted model list
-    selection_changed = pyqtSignal(str, str)  # (model, fallback)
+    selection_changed = pyqtSignal(str)  # base model
     tools_changed = pyqtSignal(str, object)  # (mode, selected names or None)
 
     def __init__(self, parent=None):
@@ -118,6 +118,9 @@ class SettingsWidget(QWidget):
         self._models = []
         self._tools = []
         self._schema_widgets = {}
+        self._team_model_combos = {}
+        self._provider_key_edits = {}
+        self._provider_status_labels = {}
         self._loading_settings = False
         self._settings_snapshot = None
         self._build_ui()
@@ -172,7 +175,7 @@ class SettingsWidget(QWidget):
         layout.addWidget(login_group)
 
         # --- Model Group ---
-        model_group = QGroupBox("Model Configuration")
+        model_group = QGroupBox("Modell-Konfiguration")
         model_form = QFormLayout()
         model_form.setHorizontalSpacing(14)
         model_form.setVerticalSpacing(9)
@@ -181,48 +184,32 @@ class SettingsWidget(QWidget):
         self.model_combo = QComboBox()
         self.model_combo.setEditable(True)
         self.model_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        self.model_combo.lineEdit().setPlaceholderText("Select or enter model...")
+        self.model_combo.lineEdit().setPlaceholderText("Modell auswählen oder ID eingeben...")
         self.model_combo.setMinimumWidth(500)
         self.model_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
-        # Fallback Dropdown
-        self.fallback_combo = QComboBox()
-        self.fallback_combo.setEditable(True)
-        self.fallback_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        self.fallback_combo.lineEdit().setPlaceholderText("Select fallback...")
-        self.fallback_combo.setMinimumWidth(500)
-        self.fallback_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-
         # Refresh button
-        refresh_btn = QPushButton("Load Models")
+        refresh_btn = QPushButton("Modelle laden")
         refresh_btn.clicked.connect(self._load_models)
 
         self.model_status = QLabel("")
         self.model_status.setStyleSheet("color: #888; font-size: 11px;")
 
-        model_form.addRow("Model:", self.model_combo)
-        model_form.addRow("Fallback:", self.fallback_combo)
+        model_form.addRow("Basismodell:", self.model_combo)
 
         timeout_spec = settings_core.REGISTRY["request_timeout"]
         self.timeout_spin = QSpinBox()
         self.timeout_spin.setRange(int(timeout_spec.minimum or 0), int(timeout_spec.maximum or 2_147_483_647))
         self.timeout_spin.setSuffix(" s")
         self.timeout_spin.setToolTip(timeout_spec.description)
-        model_form.addRow("Timeout:", self.timeout_spin)
-
-        # Swarm — values and help come from the canonical registry.
-        swarm_spec = settings_core.REGISTRY["swarm_mode"]
-        self.swarm_combo = QComboBox()
-        self.swarm_combo.addItems(swarm_spec.choice_list())
-        self.swarm_combo.setToolTip(swarm_spec.description)
-        model_form.addRow("Swarm:", self.swarm_combo)
+        model_form.addRow("Request-Timeout:", self.timeout_spin)
 
         # Buttons row
         model_btn_row = QHBoxLayout()
-        save_btn = QPushButton("Save")
+        save_btn = QPushButton("Basismodell speichern")
         save_btn.clicked.connect(self._save_model_config)
-        self.probe_btn = QPushButton("Test Model")
-        self.probe_btn.setToolTip("Tiny request without fallback; measures the selected model itself")
+        self.probe_btn = QPushButton("Modell testen")
+        self.probe_btn.setToolTip("Kleine Direktanfrage; misst die reale End-to-End-Latenz dieses Modells")
         self.probe_btn.clicked.connect(self._test_model)
         model_btn_row.addWidget(refresh_btn)
         model_btn_row.addWidget(save_btn)
@@ -233,6 +220,117 @@ class SettingsWidget(QWidget):
 
         model_group.setLayout(model_form)
         layout.addWidget(model_group)
+
+        # --- Provider credentials (OS keyring only) ---
+        credential_group = QGroupBox("Provider API Keys · sicher im Betriebssystem-Schlüsselbund")
+        credential_form = QFormLayout()
+        credential_form.setHorizontalSpacing(14)
+        credential_form.setVerticalSpacing(7)
+        provider_rows = [
+            ("google", "Google / Gemini"),
+            ("openrouter", "OpenRouter"),
+            ("openai", "OpenAI"),
+            ("anthropic", "Anthropic"),
+            ("mistral", "Mistral"),
+            ("groq", "Groq"),
+            ("cerebras", "Cerebras"),
+            ("nvidia", "NVIDIA"),
+        ]
+        for provider, label in provider_rows:
+            row = QHBoxLayout()
+            edit = QLineEdit()
+            edit.setEchoMode(QLineEdit.EchoMode.Password)
+            edit.setPlaceholderText("API-Key eingeben · gespeicherte Keys werden nie angezeigt")
+            edit.setMinimumWidth(360)
+            save_key_btn = QPushButton("Speichern")
+            delete_key_btn = QPushButton("Löschen")
+            status = QLabel("")
+            status.setStyleSheet("color: #888; font-size: 11px;")
+            save_key_btn.clicked.connect(lambda _checked=False, p=provider: self._save_provider_key(p))
+            delete_key_btn.clicked.connect(lambda _checked=False, p=provider: self._delete_provider_key(p))
+            row.addWidget(edit, stretch=1)
+            row.addWidget(save_key_btn)
+            row.addWidget(delete_key_btn)
+            row.addWidget(status)
+            self._provider_key_edits[provider] = edit
+            self._provider_status_labels[provider] = status
+            credential_form.addRow(label + ":", row)
+        credential_note = QLabel(
+            "Keys werden ausschließlich über den OS-Keyring (z. B. KWallet/Secret Service) gespeichert, "
+            "nie in state.json, Logs oder Chat-History. Ein gespeicherter Key routet passende Modell-IDs "
+            "direkt zum Provider; ohne Key bleibt der bisherige TriForce-Weg unverändert. "
+            "Anthropic wird sicher gespeichert, benötigt für Direktaufrufe aber noch einen nativen Messages-Adapter."
+        )
+        credential_note.setWordWrap(True)
+        credential_note.setStyleSheet("color: #888; font-size: 11px;")
+        credential_form.addRow(credential_note)
+        credential_group.setLayout(credential_form)
+        layout.addWidget(credential_group)
+        self._refresh_provider_credentials()
+
+        # --- Agent Team Group ---
+        team_group = QGroupBox("Agent-Team · RAM Multi-Agent Runtime")
+        team_form = QFormLayout()
+        team_form.setHorizontalSpacing(14)
+        team_form.setVerticalSpacing(7)
+
+        self.team_runtime_combo = QComboBox()
+        team_mode_labels = {
+            "off": "Aus — normaler Einzelagent",
+            "auto": "Auto — Team nur für größere Coding-Aufgaben",
+            "on": "An — Team bevorzugen",
+        }
+        for value in settings_core.REGISTRY["team_runtime_mode"].choice_list():
+            self.team_runtime_combo.addItem(team_mode_labels.get(value, value), value)
+        self.team_runtime_combo.setToolTip(settings_core.REGISTRY["team_runtime_mode"].description)
+        team_form.addRow("Team-Runtime:", self.team_runtime_combo)
+
+        team_labels = [
+            ("team_research_model_1", "Recherche 1 · Primärquellen / aktuelle Docs"),
+            ("team_research_model_2", "Recherche 2 · Best Practices / bewährte Architektur"),
+            ("team_research_model_3", "Recherche 3 · Sicherheit / Zuverlässigkeit"),
+            ("team_research_model_4", "Recherche 4 · Alternativen / ähnliche Systeme"),
+            ("team_planner_model", "Planer · gemeinsamer Implementierungsplan"),
+            ("team_coordinator_model", "Koordinator · Planprüfung / Laufsteuerung"),
+            ("team_coder_model_1", "Coder 1 · konservativ / minimal"),
+            ("team_coder_model_2", "Coder 2 · Architektur-first"),
+            ("team_coder_model_3", "Coder 3 · Performance / Effizienz"),
+            ("team_coder_model_4", "Coder 4 · Robustheit / Sicherheit"),
+            ("team_merge_model", "Merge · Integration der besten Kandidaten"),
+            ("team_test_planner_model", "Test-Planer · Verifikationsplan"),
+        ]
+        for key, label in team_labels:
+            combo = QComboBox()
+            combo.setEditable(True)
+            combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+            combo.setMinimumWidth(500)
+            combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            combo.addItem("off", "")
+            combo.addItem("@primary", "@primary")
+            combo.setToolTip(settings_core.REGISTRY[key].description)
+            team_form.addRow(label + ":", combo)
+            self._team_model_combos[key] = combo
+
+        note = QLabel(
+            "Leere/off Slots werden übersprungen. @primary verwendet das Basismodell. "
+            "Dasselbe Modell darf beliebig oft eingesetzt werden. Recherche läuft read-only; "
+            "Coder arbeiten in getrennten RAM-Workspaces. Bewertung erfolgt zuerst durch Tests und Messdaten."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #888; font-size: 11px;")
+        team_form.addRow(note)
+
+        team_save = QPushButton("Agent-Team speichern")
+        team_save.clicked.connect(self._save_team_config)
+        self.team_status = QLabel("")
+        self.team_status.setStyleSheet("color: #888; font-size: 11px;")
+        team_row = QHBoxLayout()
+        team_row.addWidget(team_save)
+        team_row.addWidget(self.team_status)
+        team_row.addStretch()
+        team_form.addRow(team_row)
+        team_group.setLayout(team_form)
+        layout.addWidget(team_group)
 
         # --- Permission Group ---
         permission_group = QGroupBox("Berechtigungen und Autopilot")
@@ -323,16 +421,16 @@ class SettingsWidget(QWidget):
 
         # --- Schema-driven settings not represented by the dedicated controls above ---
         handled = {
-            "selected_model", "fallback_model", "swarm_mode", "tool_mode",
+            "selected_model", "swarm_mode", "tool_mode",
             "enabled_tools", "request_timeout", "approval_mode",
             "native_openrouter_tool_calling",
         }
         additional = [
             spec for key, spec in sorted(settings_core.REGISTRY.items(), key=lambda item: (item[1].group, item[0]))
-            if key not in handled and not spec.sensitive
+            if key not in handled and not key.startswith("team_") and not spec.sensitive
         ]
         if additional:
-            schema_group = QGroupBox("Additional Settings")
+            schema_group = QGroupBox("Weitere Einstellungen")
             schema_form = QFormLayout()
             schema_form.setHorizontalSpacing(14)
             schema_form.setVerticalSpacing(9)
@@ -342,7 +440,7 @@ class SettingsWidget(QWidget):
                 label = f"{spec.key}{' ⚠' if spec.security_impact else ''}:"
                 schema_form.addRow(label, widget)
                 self._schema_widgets[spec.key] = widget
-            schema_save = QPushButton("Save Additional Settings")
+            schema_save = QPushButton("Weitere Einstellungen speichern")
             schema_save.clicked.connect(self._save_schema_settings)
             self.schema_status = QLabel("")
             self.schema_status.setStyleSheet("color: #888; font-size: 11px;")
@@ -463,10 +561,6 @@ class SettingsWidget(QWidget):
         self._loading_settings = True
         try:
             self.model_combo.setCurrentText(str(state.get("selected_model") or ""))
-            self.fallback_combo.setCurrentText(str(state.get("fallback_model") or ""))
-            swarm_idx = self.swarm_combo.findText(str(state.get("swarm_mode", settings_core.REGISTRY["swarm_mode"].default)))
-            if swarm_idx >= 0:
-                self.swarm_combo.setCurrentIndex(swarm_idx)
             mode_idx = self.tool_mode_combo.findData(state.get("tool_mode", settings_core.REGISTRY["tool_mode"].default))
             if mode_idx >= 0:
                 self.tool_mode_combo.setCurrentIndex(mode_idx)
@@ -477,6 +571,12 @@ class SettingsWidget(QWidget):
             approval_idx = self.approval_mode_combo.findData(state.get("approval_mode", settings_core.REGISTRY["approval_mode"].default))
             if approval_idx >= 0:
                 self.approval_mode_combo.setCurrentIndex(approval_idx)
+            team_idx = self.team_runtime_combo.findData(state.get("team_runtime_mode", settings_core.REGISTRY["team_runtime_mode"].default))
+            if team_idx >= 0:
+                self.team_runtime_combo.setCurrentIndex(team_idx)
+            for key, combo in self._team_model_combos.items():
+                value = str(state.get(key, settings_core.REGISTRY[key].default) or "")
+                combo.setCurrentText(value or "off")
             for key, spec in self._schema_widgets.items():
                 self._set_schema_widget_value(key, state.get(key, settings_core.REGISTRY[key].default))
         finally:
@@ -484,10 +584,7 @@ class SettingsWidget(QWidget):
 
         self._settings_snapshot = self._state_signature(state)
         if emit_changes and previous is not None:
-            self.selection_changed.emit(
-                str(state.get("selected_model") or ""),
-                str(state.get("fallback_model") or ""),
-            )
+            self.selection_changed.emit(str(state.get("selected_model") or ""))
             self.tools_changed.emit(
                 str(state.get("tool_mode", settings_core.REGISTRY["tool_mode"].default)),
                 state.get("enabled_tools"),
@@ -499,6 +596,55 @@ class SettingsWidget(QWidget):
         signature = self._state_signature(state)
         if signature != self._settings_snapshot:
             self._apply_state_to_widgets(state, emit_changes=True)
+
+    def _refresh_provider_credentials(self):
+        for provider, label in self._provider_status_labels.items():
+            try:
+                summary = credential_summary(provider)
+                source = str(summary.get("source") or "none")
+                if summary.get("configured"):
+                    if source == "keyring":
+                        text, color = "Gespeichert · OS-Keyring", "#00ff88"
+                    elif source.startswith("environment:"):
+                        text, color = "Aktiv · Environment", "#00d4ff"
+                    else:
+                        text, color = "Konfiguriert", "#00ff88"
+                else:
+                    text, color = "Nicht gesetzt", "#888"
+                if provider == "anthropic" and summary.get("configured"):
+                    text += " · Direktadapter folgt"
+                label.setText(text)
+                label.setStyleSheet(f"color: {color}; font-size: 11px;")
+            except Exception:
+                label.setText("Keyring nicht verfügbar")
+                label.setStyleSheet("color: #ffb020; font-size: 11px;")
+
+    def _save_provider_key(self, provider: str):
+        edit = self._provider_key_edits[provider]
+        secret = edit.text().strip()
+        if not secret:
+            self._provider_status_labels[provider].setText("Kein Key eingegeben")
+            return
+        try:
+            set_provider_key(provider, secret)
+        except CredentialStoreError as exc:
+            self._provider_status_labels[provider].setText(str(exc))
+            self._provider_status_labels[provider].setStyleSheet("color: #ff6b6b; font-size: 11px;")
+            return
+        finally:
+            # Never leave a credential in a GUI widget longer than necessary.
+            edit.clear()
+        self._refresh_provider_credentials()
+
+    def _delete_provider_key(self, provider: str):
+        try:
+            delete_provider_key(provider)
+        except CredentialStoreError as exc:
+            self._provider_status_labels[provider].setText(str(exc))
+            self._provider_status_labels[provider].setStyleSheet("color: #ff6b6b; font-size: 11px;")
+            return
+        self._provider_key_edits[provider].clear()
+        self._refresh_provider_credentials()
 
     def _load_current(self):
         # Session
@@ -532,7 +678,7 @@ class SettingsWidget(QWidget):
             self.model_status.setStyleSheet("color: #ff6b6b; font-size: 11px;")
             return
 
-        self.model_status.setText("Loading models...")
+        self.model_status.setText("Modelle werden geladen...")
         self.model_status.setStyleSheet("color: #00d4ff; font-size: 11px;")
 
         self._loader = _ModelLoader(client)
@@ -545,25 +691,31 @@ class SettingsWidget(QWidget):
 
         # Save current selection
         cur_model = self.model_combo.currentText()
-        cur_fallback = self.fallback_combo.currentText()
 
         # Populate dropdowns
         self.model_combo.clear()
-        self.fallback_combo.clear()
         self.model_combo.addItem("")     # empty = backend default
-        self.fallback_combo.addItem("")  # empty = no fallback
 
         for m in self._models:
             self.model_combo.addItem(m)
-            self.fallback_combo.addItem(m)
+        state = get_state()
+        for key, combo in self._team_model_combos.items():
+            current = combo.currentText().strip()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("off", "")
+            combo.addItem("@primary", "@primary")
+            for m in self._models:
+                combo.addItem(m, m)
+            desired = current or str(state.get(key, settings_core.REGISTRY[key].default) or "off")
+            combo.setCurrentText(desired)
+            combo.blockSignals(False)
 
         # Restore selection
         if cur_model:
             self.model_combo.setCurrentText(cur_model)
-        if cur_fallback:
-            self.fallback_combo.setCurrentText(cur_fallback)
 
-        self.model_status.setText(f"{len(models)} models ({tier})")
+        self.model_status.setText(f"{len(models)} Modelle ({tier})")
         self.model_status.setStyleSheet("color: #00ff88; font-size: 11px;")
         self.models_loaded.emit(self._models)
 
@@ -577,11 +729,13 @@ class SettingsWidget(QWidget):
             session = load_session()
             timeout = min(30, self.timeout_spin.value())
             client = TriForceClient(session.base_url, token=session.token, timeout=timeout)
+            from ..model_transport import native_model_transport_from_env
+            client, _ = native_model_transport_from_env(client, default_model=model or None)
         except Exception as e:
             self.model_status.setText(f"Test unavailable: {e}")
             return
         self.probe_btn.setEnabled(False)
-        self.model_status.setText(f"Testing {model or 'backend default'}...")
+        self.model_status.setText(f"Teste {model or 'Backend-Standard'}...")
         self.model_status.setStyleSheet("color: #00d4ff; font-size: 11px;")
         self._probe = _ModelProbe(client, model)
         self._probe.success.connect(lambda result, elapsed: self._on_probe_success(model, result, elapsed))
@@ -696,6 +850,32 @@ class SettingsWidget(QWidget):
         self.tools_changed.emit(mode, selected)
 
 
+    def _save_team_config(self):
+        if self._loading_settings:
+            return
+        proposed = {"team_runtime_mode": self.team_runtime_combo.currentData() or "auto"}
+        for key, combo in self._team_model_combos.items():
+            text = combo.currentText().strip()
+            proposed[key] = "" if text.lower() in {"off", "none", "disabled"} else text
+        try:
+            settings_core.STORE.update(**proposed)
+            from ..team_runtime import config_from_state
+            config = config_from_state(get_state())
+            errors = config.validate()
+        except settings_core.SettingsError as exc:
+            self.team_status.setText(f"Ungültige Einstellung: {exc}")
+            self.team_status.setStyleSheet("color: #ff6b6b; font-size: 11px;")
+            return
+        if errors:
+            self.team_status.setText("Gespeichert mit Hinweis · " + "; ".join(errors))
+            self.team_status.setStyleSheet("color: #ffb020; font-size: 11px;")
+        else:
+            self.team_status.setText(
+                f"Gespeichert · {len(config.research)} Recherche · {len(config.coders)} Coder · {config.active_count} Rollen"
+            )
+            self.team_status.setStyleSheet("color: #00ff88; font-size: 11px;")
+        self._settings_snapshot = self._state_signature(get_state())
+
     def _save_permission_config(self):
         if self._loading_settings:
             return
@@ -747,29 +927,21 @@ class SettingsWidget(QWidget):
         self.status_label.setText("Not logged in")
         self.status_label.setStyleSheet("color: #ff6b6b;")
         self.model_combo.clear()
-        self.fallback_combo.clear()
         self._models = []
         self.tool_list.clear()
         self._tools = []
 
     def _save_model_config(self):
         model = self.model_combo.currentText().strip()
-        fallback = self.fallback_combo.currentText().strip()
-        swarm = self.swarm_combo.currentText()
         set_model(model)
-        set_fallback(fallback)
-        set_swarm(swarm)
         set_request_timeout(self.timeout_spin.value())
-        self.model_status.setText("Saved.")
+        self.model_status.setText("Gespeichert.")
         self.model_status.setStyleSheet("color: #00ff88; font-size: 11px;")
         self._settings_snapshot = self._state_signature(get_state())
-        self.selection_changed.emit(model, fallback)
+        self.selection_changed.emit(model)
 
     def get_current_model(self) -> str:
         return self.model_combo.currentText().strip()
-
-    def get_current_fallback(self) -> str:
-        return self.fallback_combo.currentText().strip()
 
     def get_tool_mode(self) -> str:
         return self.tool_mode_combo.currentData() or "on_demand"

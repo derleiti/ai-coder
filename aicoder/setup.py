@@ -18,7 +18,7 @@ from typing import Optional
 from .config import CONFIG_DIR, DEFAULT_BASE_URL, Session, load_session, save_session
 from .session_state import (
     SWARM_MODES, APPROVAL_MODES, DEFAULT_RUNTIME_MODE, get_state,
-    set_approval_mode, set_fallback, set_model, set_runtime_mode, set_swarm, set_tool_mode, set_workspace,
+    set_approval_mode, set_model, set_runtime_mode, set_swarm, set_tool_mode, set_workspace,
 )
 from .ui import C, bold, dim, cyan, green, yellow, red, magenta, white, panel, term_width, reset_live_line
 from .workspace import active_workspace
@@ -312,50 +312,14 @@ def run_setup(force: bool = False) -> bool:
     if _picked:
         model = _picked
     else:
-        model = "groq/llama-3.3-70b-versatile"  # fallback
+        model = "groq/llama-3.3-70b-versatile"  # setup default
 
     set_model(model)
     print(f"  model → {_c('green', model)}")
 
-    print("\n── Fallback-Modell ────────────────────────")
-    fallback_opts = [
-        "groq/moonshotai/kimi-k2-instruct",
-        "groq/llama-3.3-70b-versatile",
-        "groq/qwen/qwen3-32b",
-        "ollama/deepseek-v3.2:cloud",
-        "(keins)",
-        "(andere eingeben)",
-    ]
-    fallback = _pick("Fallback bei Fehler/Timeout:", fallback_opts,
-                     default=state.get("fallback_model") or "groq/moonshotai/kimi-k2-instruct")
-    if fallback == "(andere eingeben)":
-        fallback = _ask("Fallback-ID", "")
-    if fallback and fallback != "(keins)":
-        set_fallback(fallback)
-        state = get_state()
-        effective_fallback = state.get("fallback_model") or ""
-        if effective_fallback:
-            print(f"  fallback → {_c('green', effective_fallback)}")
-        else:
-            print(f"  fallback → {_c('dim', 'disabled (same as operator)')}")
-    else:
-        set_fallback("")
-        print(f"  fallback → {_c('dim', 'disabled')}")
-
-    print("\n── Swarm-Modus ────────────────────────────")
-    swarm_descs = {
-        "off":    "Kein Swarm — nur Operator-Modell",
-        "auto":   "Auto — Swarm bei komplexen Prompts (>150 Zeichen oder Keywords)",
-        "on":     "Immer — Operator + Fallback parallel",
-        "review": "Review — Fallback bewertet Operator-Output nach Task",
-    }
-    swarm_opts = [f"{k}  ({v})" for k,v in swarm_descs.items()]
-    swarm_choice = _pick("Swarm-Modus:", swarm_opts,
-                          default=f"{state.get('swarm_mode','auto')}  ({swarm_descs.get(state.get('swarm_mode','auto'),'')})")
-    swarm = swarm_choice.split()[0].strip()
-    if swarm in SWARM_MODES:
-        set_swarm(swarm)
-        print(f"  swarm → {_c('green', swarm)}")
+    print("\n── Agent-Team ─────────────────────────────")
+    print(_c("dim", "  Team-Modelle werden in Settings oder per /models konfiguriert."))
+    print(_c("dim", "  Standard: team_runtime=auto · Rollen verwenden @primary."))
 
     print("\n── Workspace ──────────────────────────────")
     ws_default = str(active_workspace(state.get("workspace_root")))
@@ -423,6 +387,9 @@ def _repl_settings_command(value: str) -> int:
     """Handle /settings through the same canonical registry/store as CLI and GUI."""
     parts = (value or "").split(None, 2)
     action = parts[0].lower() if parts else "list"
+    if action in {"ask", "ai"}:
+        request = (value or "").split(None, 1)[1] if len((value or "").split(None, 1)) > 1 else ""
+        return _repl_settings_ai(request)
     try:
         if action in {"list", "ls"}:
             state = settings_core.STORE.load()
@@ -479,6 +446,193 @@ def _repl_settings_command(value: str) -> int:
     return 2
 
 
+
+
+from .team_runtime import TEAM_ROLE_ALIASES as _MODEL_ROLE_KEYS, team_model_rows as _shared_team_model_rows
+
+
+def _team_model_rows(state: dict) -> list[tuple[str, str, str]]:
+    return [
+        (row["alias"], row["label"], row["configured"])
+        for row in _shared_team_model_rows(state)
+    ]
+
+
+def _repl_models_command(value: str) -> int:
+    parts = str(value or "").split(None, 2)
+    action = parts[0].lower() if parts else "show"
+    if action in {"show", "status", "roles"}:
+        state = get_state()
+        print("\n  ── Agent-Team Modelle ─────────────────────────")
+        for alias, label, model in _team_model_rows(state):
+            print(f"  {alias:<12} {label:<38} {model}")
+        print("\n  /models pick <rolle>        interaktiver Picker")
+        print("  /models set <rolle> <id>    Modell direkt setzen; off deaktiviert Slot")
+        print("  /models list                verfügbare Backend-Modelle anzeigen")
+        return 0
+    if action == "list":
+        try:
+            session = load_session()
+            from .client import TriForceClient, model_identifier
+            client = TriForceClient(session.base_url, token=session.token, timeout=15)
+            data = client.model_catalog()
+            models = sorted(
+                model_id for item in data.get("models", [])
+                if (model_id := model_identifier(item))
+            )
+            groups: dict[str, list[str]] = {}
+            for model in models:
+                provider = model.split("/", 1)[0] if "/" in model else "other"
+                groups.setdefault(provider, []).append(model)
+            print(f"  {data.get('tier','?')} · {len(models)} Modelle")
+            for provider, rows in sorted(groups.items()):
+                print(f"\n  [{provider}] ({len(rows)})")
+                for model in rows:
+                    print(f"    {model}")
+            return 0
+        except Exception as exc:
+            print(f"  Fehler: {exc}")
+            return 1
+    if action in {"set", "pick"} and len(parts) >= 2:
+        alias = parts[1].lower()
+        key = _MODEL_ROLE_KEYS.get(alias)
+        if not key:
+            print(f"  Unbekannte Rolle: {alias}")
+            return 2
+        if action == "pick":
+            current = str(get_state().get(key) or "")
+            selected = model_picker_interactive(current_model=current if current != "@primary" else str(get_state().get("selected_model") or ""))
+            if not selected:
+                print("  nicht geändert")
+                return 0
+            value_to_set = selected
+        else:
+            if len(parts) < 3:
+                print("  usage: /models set <rolle> <model|@primary|off>")
+                return 2
+            value_to_set = parts[2].strip()
+        if value_to_set.lower() in {"off", "none", "disabled"}:
+            value_to_set = ""
+        try:
+            saved = settings_core.STORE.set(key, value_to_set)
+        except settings_core.SettingsError as exc:
+            print(f"  Fehler: {exc}")
+            return 2
+        print(f"  {alias} → {saved.get(key) or 'off'}")
+        return 0
+    print("  usage: /models [show|list|pick ROLE|set ROLE MODEL]")
+    return 2
+
+
+def _repl_runtime_command(value: str) -> int:
+    parts = str(value or "").split()
+    state = get_state()
+    if not parts:
+        print("\n  ── Runtime ────────────────────────────────────")
+        print(f"  agent      {state.get('runtime_mode', DEFAULT_RUNTIME_MODE)}")
+        print(f"  workspace  {state.get('workspace_mode', 'auto')}")
+        print(f"  team       {state.get('team_runtime_mode', 'auto')}")
+        print("\n  /runtime agent native-light|classic")
+        print("  /runtime workspace auto|ram|disk")
+        print("  /runtime team auto|on|off")
+        return 0
+    if len(parts) == 1 and parts[0] in settings_core.RUNTIME_MODES:
+        return _repl_runtime_command("agent " + parts[0])
+    if len(parts) != 2:
+        print("  usage: /runtime [agent MODE|workspace MODE|team MODE]")
+        return 2
+    target, value_to_set = parts[0].lower(), parts[1].lower()
+    key = {"agent": "runtime_mode", "workspace": "workspace_mode", "team": "team_runtime_mode"}.get(target)
+    if not key:
+        print(f"  Unbekannter Runtime-Bereich: {target}")
+        return 2
+    try:
+        saved = settings_core.STORE.set(key, value_to_set)
+    except settings_core.SettingsError as exc:
+        print(f"  Fehler: {exc}")
+        return 2
+    print(f"  {target} → {saved.get(key)}")
+    return 0
+
+
+def _extract_json_object(text: str) -> dict:
+    raw = str(text or "").strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        if raw.lstrip().startswith("json"):
+            raw = raw.lstrip()[4:].lstrip()
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        start, end = raw.find("{"), raw.rfind("}")
+        if start < 0 or end <= start:
+            raise ValueError("model returned no JSON object")
+        value = json.loads(raw[start:end+1])
+    if not isinstance(value, dict):
+        raise ValueError("model returned non-object JSON")
+    return value
+
+
+def _repl_settings_ai(request: str) -> int:
+    if not request.strip():
+        print("  usage: /settings ask <was du ändern möchtest>")
+        return 2
+    try:
+        from .client import TriForceClient
+        from .settings_tools import plan_patch
+        session = load_session()
+        state = get_state()
+        model = str(state.get("selected_model") or "").strip()
+        client = TriForceClient(session.base_url, token=session.token, timeout=int(state.get("request_timeout", 300)))
+        schema_rows = []
+        for key, spec in sorted(settings_core.REGISTRY.items()):
+            if spec.sensitive or not spec.mutable:
+                continue
+            schema_rows.append({
+                "key": key, "type": spec.type, "default": spec.default,
+                "choices": spec.choice_list(), "description": spec.description,
+                "security_impact": spec.security_impact,
+            })
+        result = client.chat(
+            message=(
+                "User request for AICoder settings:\n" + request +
+                "\n\nCurrent settings:\n" + json.dumps({k: state.get(k) for k in settings_core.REGISTRY}, ensure_ascii=False) +
+                "\n\nAllowed schema:\n" + json.dumps(schema_rows, ensure_ascii=False) +
+                "\n\nReturn ONLY JSON: {\"patch\":{...},\"reason\":\"short explanation\"}. "
+                "Use only schema keys. Do not change security-impacting settings unless the request explicitly asks for it."
+            ),
+            model=model or None,
+            system_prompt="You are a settings assistant. Propose configuration only; never execute tools or invent settings.",
+            temperature=0.1, max_tokens=2000, fallback_model=None,
+        )
+        proposal = _extract_json_object(str(result.get("response") or ""))
+        patch = proposal.get("patch")
+        plan = plan_patch(patch)
+        changes = plan.get("changes", [])
+        if not changes:
+            print("  KI-Vorschlag enthält keine wirksame Änderung.")
+            return 0
+        print("\n  ── KI-Vorschlag ───────────────────────────────")
+        if proposal.get("reason"):
+            print(f"  {proposal['reason']}")
+        for change in changes:
+            flag = " ⚠ security" if change.get("security_impact") else ""
+            print(f"  {change['key']}: {change['old']} → {change['new']}{flag}")
+        answer = input("  Änderungen übernehmen? [y/N] ").strip().lower()
+        if answer not in {"y", "yes", "j", "ja"}:
+            print("  nicht übernommen")
+            return 0
+        normalized = {
+            settings_core.resolve_key(str(key)): settings_core.coerce(str(key), value)
+            for key, value in dict(patch or {}).items()
+        }
+        settings_core.STORE.update(**normalized)
+        print("  ✓ Einstellungen übernommen und validiert")
+        return 0
+    except Exception as exc:
+        print(f"  KI-Settings-Hilfe fehlgeschlagen: {type(exc).__name__}: {exc}")
+        return 1
+
 def run_repl(skip_setup: bool = False) -> int:
     """
     Interaktiver Agent-REPL.
@@ -494,8 +648,6 @@ def run_repl(skip_setup: bool = False) -> int:
 
     state = get_state()
     model    = state.get("selected_model")
-    fallback = state.get("fallback_model")
-    swarm    = state.get("swarm_mode","off")
     ws       = str(active_workspace(state.get("workspace_root")))
 
     def _toolbar() -> str:
@@ -504,17 +656,15 @@ def run_repl(skip_setup: bool = False) -> int:
         mode = current.get("tool_mode", "on_demand")
         approval = current.get("approval_mode", "ask")
         runtime = current.get("runtime_mode", DEFAULT_RUNTIME_MODE)
-        return f"  {active_model} · runtime:{runtime} · tools:{mode} · approvals:{approval} · swarm:{current.get('swarm_mode', 'off')}"
+        return f"  {active_model} · runtime:{runtime} · workspace:{current.get('workspace_mode','auto')} · team:{current.get('team_runtime_mode','auto')} · tools:{mode} · approvals:{approval}"
 
     repl_input = ReplInput(CONFIG_DIR / "history", _toolbar)
     conversation: list[dict] = []
 
     def _print_repl_header() -> None:
-        nonlocal state, model, fallback, swarm, ws
+        nonlocal state, model, ws
         state = get_state()
         model = state.get("selected_model")
-        fallback = state.get("fallback_model")
-        swarm = state.get("swarm_mode", "off")
         ws = str(active_workspace(state.get("workspace_root")))
         tool_mode = state.get("tool_mode", "on_demand")
         enabled = state.get("enabled_tools")
@@ -532,11 +682,10 @@ def run_repl(skip_setup: bool = False) -> int:
         print(f"  {C.DIM}{rule}{C.RESET}")
         print(f"  {dim('account  ')} {cyan(identity)}")
         print(f"  {dim('operator ')} {cyan(model or '(backend default)')}")
-        print(f"  {dim('fallback ')} {dim(fallback or '—')}")
         approval_mode = state.get("approval_mode", "ask")
         runtime_mode = state.get("runtime_mode", DEFAULT_RUNTIME_MODE)
         print(f"  {dim('runtime  ')} mode={cyan(runtime_mode)} · tools={cyan(tool_mode)} · enabled={cyan('all' if enabled is None else str(len(enabled)))} · "
-              f"approvals={cyan(approval_mode)} · swarm={cyan(swarm)} · timeout={cyan(str(timeout)+'s')}")
+              f"approvals={cyan(approval_mode)} · workspace={cyan(str(state.get('workspace_mode','auto')))} · team={cyan(str(state.get('team_runtime_mode','auto')))} · timeout={cyan(str(timeout)+'s')}")
         print(f"  {dim('workspace')} {dim(ws)}")
         print(f"  {C.DIM}{rule}{C.RESET}")
         if repl_input.enhanced:
@@ -584,7 +733,6 @@ def run_repl(skip_setup: bool = False) -> int:
                     set_model(val)
                     refreshed = get_state()
                     model = refreshed.get("selected_model")
-                    fallback = refreshed.get("fallback_model")
                     print(f"  model → {val}")
                 else:
                     new = model_picker_interactive(current_model=model or "")
@@ -592,17 +740,6 @@ def run_repl(skip_setup: bool = False) -> int:
                         set_model(new)
                         model = new
                         print(f"  model → {cyan(model)}")
-            elif cmd == "/fallback" and val:
-                set_fallback(val)
-                fallback = get_state().get("fallback_model") or ""
-                print(f"  fallback → {fallback or 'disabled'}")
-            elif cmd == "/swarm" and val:
-                try:
-                    set_swarm(val)
-                    swarm = val
-                    print(f"  swarm → {val}")
-                except ValueError as e:
-                    print(f"  Fehler: {e}")
             elif cmd == "/status":
                 _print_repl_header()
             elif cmd == "/tools":
@@ -620,18 +757,9 @@ def run_repl(skip_setup: bool = False) -> int:
                 _repl_settings_command(val)
                 state = get_state()
                 model = state.get("selected_model")
-                fallback = state.get("fallback_model")
-                swarm = state.get("swarm_mode", "off")
             elif cmd == "/runtime":
-                if val:
-                    try:
-                        set_runtime_mode(val.strip())
-                        print(f"  runtime → {val.strip()}")
-                        _print_repl_header()
-                    except ValueError as e:
-                        print(f"  Fehler: {e}")
-                else:
-                    print(f"  runtime = {get_state().get('runtime_mode', DEFAULT_RUNTIME_MODE)}")
+                _repl_runtime_command(val)
+                _print_repl_header()
             elif cmd == "/guidelines":
                 from .guidelines import load_guidelines
                 workspace = str(active_workspace(get_state().get("workspace_root")))
@@ -668,7 +796,7 @@ def run_repl(skip_setup: bool = False) -> int:
                             run_agent(
                                 initial_prompt=expanded,
                                 model=model,
-                                fallback_model=fallback,
+                                fallback_model=None,
                                 conversation=conversation,
                                 runtime_mode="native-light",
                             )
@@ -729,30 +857,23 @@ def run_repl(skip_setup: bool = False) -> int:
                     print("  Setzen: /permissions ask|autopilot|all")
             elif cmd == "/shell":
                 print("  /shell ist im Coding-only-Profil deaktiviert.")
+            elif cmd == "/team":
+                team_parts = val.split(None, 1)
+                team_action = team_parts[0].lower() if team_parts else "show"
+                team_rest = team_parts[1] if len(team_parts) > 1 else ""
+                if team_action == "mode":
+                    _repl_runtime_command("team " + team_rest)
+                elif team_action in {"models", "list"}:
+                    _repl_models_command("list")
+                elif team_action in {"show", "status", "roles", "set", "pick"}:
+                    _repl_models_command((team_action + (" " + team_rest if team_rest else "")).strip())
+                else:
+                    print("  usage: /team [show|models|mode auto|on|off|set ROLE MODEL|pick ROLE]")
             elif cmd == "/models":
-                try:
-                    from .client import TriForceClient
-                    s = load_session()
-                    c = TriForceClient(s.base_url, token=s.token, timeout=10)
-                    data = c._request("GET", "/v1/client/models", require_auth=True, _label="models")
-                    from .client import model_identifier
-                    models = sorted(
-                        model_id for item in data.get("models", [])
-                        if (model_id := model_identifier(item))
-                    )
-                    tier = data.get("tier", "?")
-                    groups: dict = {}
-                    for m in models:
-                        p = m.split("/")[0] if "/" in m else "other"
-                        groups.setdefault(p, []).append(m)
-                    print(f"  {tier} — {len(models)} Modelle, {len(groups)} Provider")
-                    for provider, mlist in sorted(groups.items()):
-                        print(f"    [{provider}] {len(mlist)}: {', '.join(mlist[:3])}{'...' if len(mlist) > 3 else ''}")
-                except Exception as e:
-                    print(f"  Fehler: {e}")
+                _repl_models_command(val)
             elif cmd == "/help":
-                print("  /model <n> · /fallback <n> · /swarm <m> · /models · /status")
-                print("  /runtime classic|native-light · /tools off|on_demand|always · /settings · /plan [list|clear]")
+                print("  /team · /models · /settings · /runtime · /status")
+                print("  /team [show|models|mode|set|pick] · /runtime [agent|workspace|team] · /settings [ask|set|get]")
                 print("  /commands · /command <name> [args] · /guidelines")
                 print("  /setup · /new · /clear · /keys · /permissions · /exit")
             else:
@@ -764,7 +885,7 @@ def run_repl(skip_setup: bool = False) -> int:
             run_agent(
                 initial_prompt=prompt,
                 model=model,
-                fallback_model=fallback,
+                fallback_model=None,
                 conversation=conversation,
             )
         except KeyboardInterrupt:

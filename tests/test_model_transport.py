@@ -8,6 +8,7 @@ from aicoder.client import ClientError
 from aicoder.executor import LOCAL_FILE_READ_SCHEMA
 from aicoder.model_transport import (
     OpenAICompatibleTransport,
+    ProviderRoutingTransport,
     _openai_tools,
     native_model_transport_from_env,
 )
@@ -54,10 +55,22 @@ class OpenAICompatibleTransportTests(unittest.TestCase):
         transport = OpenAICompatibleTransport("https://example.invalid/v1", api_key="x")
         response = MagicMock()
         with transport._active_response_lock:
-            transport._active_response = response
-        self.assertTrue(transport.cancel_current_request())
+            transport._active_responses["req-one"] = response
+        self.assertTrue(transport.cancel_current_request("req-one"))
         response.close.assert_called_once()
         self.assertFalse(transport.cancel_current_request())
+
+
+    def test_direct_transport_cancels_only_named_parallel_request(self):
+        transport = OpenAICompatibleTransport("https://example.invalid/v1", api_key="x")
+        first, second = MagicMock(), MagicMock()
+        with transport._active_response_lock:
+            transport._active_responses["req-a"] = first
+            transport._active_responses["req-b"] = second
+        self.assertTrue(transport.cancel_current_request("req-a"))
+        first.close.assert_called_once()
+        second.close.assert_not_called()
+        self.assertIn("req-b", transport._active_responses)
 
     def test_direct_transport_reports_blocking_timeout_semantics(self):
         transport = OpenAICompatibleTransport("https://example.invalid/v1", api_key="x", timeout=45)
@@ -71,20 +84,95 @@ class OpenAICompatibleTransportTests(unittest.TestCase):
         self.assertEqual(telemetry["timeout_semantics"], "blocking-request")
         self.assertEqual(telemetry["keepalive_chunks"], 0)
 
-    def test_fallback_retries_same_endpoint_with_other_model(self):
+
+    def test_ollama_canonical_model_id_is_stripped_only_for_transport(self):
+        transport = OpenAICompatibleTransport("http://127.0.0.1:11434/v1")
+        with patch.object(transport, "_post_json", return_value={
+            "choices": [{"message": {"content": "OK"}}],
+            "model": "nemotron-3-ultra:cloud",
+        }) as post:
+            result = transport.chat(
+                message="ping", model="ollama/nemotron-3-ultra:cloud", max_tokens=32
+            )
+        payload = post.call_args.args[0]
+        self.assertEqual(payload["model"], "nemotron-3-ultra:cloud")
+        self.assertEqual(result["model"], "nemotron-3-ultra:cloud")
+
+    def test_legacy_fallback_argument_never_switches_models(self):
         transport = OpenAICompatibleTransport("http://localhost:1234/v1", timeout=30)
-        transport._post_json = MagicMock(side_effect=[
-            ClientError("primary failed"),
-            {"choices": [{"message": {"content": "ok"}}], "model": "fallback/model"},
-        ])
-        result = transport.chat(
-            model="primary/model",
-            fallback_model="fallback/model",
-            messages=[{"role": "user", "content": "hello"}],
-        )
-        self.assertEqual(result["response"], "ok")
-        self.assertTrue(result["fallback_used"])
-        self.assertEqual(transport._post_json.call_args.args[0]["model"], "fallback/model")
+        transport._post_json = MagicMock(side_effect=ClientError("primary failed"))
+        with self.assertRaises(ClientError):
+            transport.chat(
+                model="primary/model",
+                fallback_model="fallback/model",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+        self.assertEqual(transport._post_json.call_count, 1)
+        self.assertEqual(transport._post_json.call_args.args[0]["model"], "primary/model")
+
+    def test_direct_transport_strips_canonical_provider_prefix_for_matching_endpoint(self):
+        cases = [
+            ("http://127.0.0.1:11434/v1", "ollama/qwen3.5:cloud", "qwen3.5:cloud"),
+            ("https://openrouter.ai/api/v1", "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free", "nvidia/nemotron-3-ultra-550b-a55b:free"),
+            ("https://integrate.api.nvidia.com/v1", "nvidia/nvidia/nemotron-3-ultra-550b-a55b", "nvidia/nemotron-3-ultra-550b-a55b"),
+        ]
+        for base_url, requested, expected in cases:
+            with self.subTest(base_url=base_url, requested=requested):
+                transport = OpenAICompatibleTransport(base_url)
+                with patch.object(transport, "_post_json", return_value={
+                    "choices": [{"message": {"content": "ok"}}]
+                }) as post:
+                    result = transport.chat(message="x", model=requested)
+                self.assertEqual(post.call_args.args[0]["model"], expected)
+                self.assertEqual(result["response"], "ok")
+
+
+    @patch("aicoder.model_transport.provider_api_key", return_value=("stored-key", "keyring"))
+    def test_provider_router_routes_matching_model_directly(self, key_lookup):
+        default = MagicMock()
+        default.timeout = 55
+        router = ProviderRoutingTransport(default)
+        with patch.object(OpenAICompatibleTransport, "chat", return_value={"response": "OK"}) as direct_chat:
+            result = router.chat(message="x", model="gemini/gemini-2.5-flash")
+        self.assertEqual(result["response"], "OK")
+        default.chat.assert_not_called()
+        self.assertEqual(router._direct["google"].base_url, "https://generativelanguage.googleapis.com/v1beta/openai")
+        direct_chat.assert_called_once()
+
+    @patch("aicoder.model_transport.provider_api_key", return_value=("", "none"))
+    def test_provider_router_falls_back_to_triforce_without_own_key(self, key_lookup):
+        default = MagicMock()
+        default.timeout = 30
+        default.chat.return_value = {"response": "backend"}
+        router = ProviderRoutingTransport(default)
+        result = router.chat(message="x", model="gemini/gemini-2.5-flash")
+        self.assertEqual(result["response"], "backend")
+        default.chat.assert_called_once()
+
+    def test_native_transport_wraps_default_once_when_no_explicit_env_override(self):
+        default = MagicMock()
+        default.timeout = 30
+        with patch.dict(os.environ, {"AICODER_NATIVE_MODEL_BASE_URL": ""}, clear=False):
+            first, _ = native_model_transport_from_env(default, default_model="gemini/test")
+            second, _ = native_model_transport_from_env(first, default_model="gemini/test")
+        self.assertIsInstance(first, ProviderRoutingTransport)
+        self.assertIs(first, second)
+
+    def test_env_reasoning_effort_is_forwarded_without_persisting_state(self):
+        default = MagicMock()
+        default.timeout = 45
+        with patch.dict(os.environ, {
+            "AICODER_NATIVE_MODEL_BASE_URL": "http://localhost:11434/v1",
+            "AICODER_NATIVE_REASONING_EFFORT": "low",
+        }, clear=False):
+            transport, _ = native_model_transport_from_env(default, default_model="ollama/test:cloud")
+        self.assertEqual(transport.reasoning_effort, "low")
+        with patch.object(transport, "_post_json", return_value={
+            "choices": [{"message": {"content": "ok"}}]
+        }) as post:
+            transport.chat(message="x", model="ollama/test:cloud")
+        self.assertEqual(post.call_args.args[0]["reasoning_effort"], "low")
+        self.assertEqual(post.call_args.args[0]["model"], "test:cloud")
 
     def test_env_opt_in_does_not_persist_api_key(self):
         default = MagicMock()

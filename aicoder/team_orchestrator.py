@@ -1,0 +1,1119 @@
+"""Experimental RAM-backed multi-agent orchestration for AICoder.
+
+The orchestrator deliberately reuses NativeLightRuntime for every tool-capable
+worker so tool calling, approvals, recovery, telemetry and workspace protection
+stay identical to normal AICoder runs.
+"""
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import time
+from typing import Any, Callable
+
+from .agent_runtime import AgentRunResult, NativeLightRuntime
+from .executor import build_system_prompt, load_tools
+from .model_transport import ModelTransport
+from .performance import RuntimePerformance
+from .team_runtime import (
+    CODER_SYSTEM_TEMPLATE, MERGE_PLANNER_SYSTEM_PROMPT, MERGE_SYSTEM_PROMPT,
+    PLANNER_SYSTEM_PROMPT, RESEARCH_INSTRUCTIONS, RESEARCH_OUTPUT_CONTRACT,
+    RESEARCH_PLANNER_SYSTEM_PROMPT, TEST_PLANNER_SYSTEM_PROMPT, TeamConfig,
+)
+from .team_handoff import (
+    CODE_PLAN_SECTIONS, MERGE_PLAN_SECTIONS, RESEARCH_SECTIONS, HandoffEnvelope, make_handoff,
+)
+from .team_pipeline import (
+    StageLedger, TeamStage, blind_candidate_id, configured_project_python, execute_verification_plan,
+    objective_rank_key, project_verification_plan, verification_passed,
+)
+from .workspace_backend import (
+    RamWorkspace, WorkspaceBackend, WorkspaceError, create_isolated_team_workspace,
+    team_workspace_plan,
+)
+
+EventFn = Callable[[str, dict[str, Any]], None]
+StopFn = Callable[[], bool]
+
+_RESEARCH_TOOL_NAMES = frozenset({
+    "search", "crawl", "web_fetch_local", "web_search_local", "doc_read", "doc_search",
+    "file_read", "file_tree", "code_read", "code_tree", "code_search", "code_grep",
+    "git", "skill_read",
+})
+_CODER_TOOL_NAMES = frozenset({
+    "file_read", "file_edit", "file_tree", "directory_create", "code_read", "code_tree",
+    "code_search", "code_grep", "git", "lint", "test", "binary_exec", "skill_read",
+    "doc_read", "doc_search",
+})
+
+
+@dataclass
+class AgentStageResult:
+    role: str
+    model: str
+    status: str
+    response: str
+    elapsed_ms: int
+    error: str = ""
+    evidence: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class CandidateResult:
+    slot: int
+    model: str
+    strategy: str
+    workspace: WorkspaceBackend
+    run: AgentRunResult
+    score: int = 0
+    evaluation: dict[str, Any] = field(default_factory=dict)
+    elapsed_ms: int = 0
+    evaluation_ms: int = 0
+
+
+@dataclass
+class TeamRunResult:
+    status: str
+    response: str
+    model: str
+    stages: list[AgentStageResult]
+    candidates: list[CandidateResult]
+    performance: dict[str, Any]
+    error: str = ""
+
+
+def _plan_grounding_issues(plan: str, source_workspace: str) -> list[str]:
+    """Detect implementation plans that treat nonexistent top-level project areas as real.
+
+    The planner may propose new files, but inventing an unrelated top-level package (for
+    example ``src/`` in a project whose package is ``aicoder/``) sends every candidate
+    down the same invalid architecture. Keep this deterministic and conservative: only
+    path-like references with a missing top-level component are rejected.
+    """
+    root = Path(source_workspace).expanduser().resolve(strict=True)
+    try:
+        existing_top = {entry.name for entry in root.iterdir()}
+    except OSError:
+        return []
+    allowed_virtual = {".", ".."}
+    issues: list[str] = []
+    seen: set[str] = set()
+    # Backticks and ordinary slash-containing path tokens cover planner sections and
+    # verification commands without trying to parse arbitrary prose as filesystem data.
+    candidates = re.findall(r"`([^`]+)`|(?<![\w.-])(/?[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+)", str(plan or ""))
+    for pair in candidates:
+        raw = next((item for item in pair if item), "") if isinstance(pair, tuple) else str(pair)
+        token = raw.strip().strip("\'\"()[]{}:,;")
+        if not token or token.startswith(("http://", "https://")):
+            continue
+        if not re.fullmatch(r"(?:\./)?/?[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*/?", token):
+            continue
+        # Ignore command/module notation that is not a project path.
+        if " " in token or token.startswith(("python/", "pytest/")):
+            continue
+        path = Path(token)
+        if path.is_absolute():
+            try:
+                rel = path.resolve(strict=False).relative_to(root)
+            except ValueError:
+                # Absolute paths below /src, /tests etc. are a common hallucination. The
+                # authoritative root itself is the one allowed absolute project prefix.
+                if token.startswith(("/src/", "/tests/", "/aicoder/")):
+                    key = f"absolute project path outside authoritative root: {token}"
+                    if key not in seen:
+                        issues.append(key); seen.add(key)
+                continue
+        else:
+            rel = path
+        parts = [part for part in rel.parts if part not in allowed_virtual]
+        if not parts:
+            continue
+        top = parts[0]
+        if top not in existing_top and top not in {root.name}:
+            key = f"unknown top-level project area referenced by plan: {top}/ (from {token})"
+            if key not in seen:
+                issues.append(key); seen.add(key)
+    return issues[:12]
+
+
+def _repair_ungrounded_code_plan(
+    model_client: ModelTransport, *, model: str, task: str, source_workspace: str,
+    original_plan: AgentStageResult, event_fn: EventFn | None, stop_requested: StopFn | None,
+) -> AgentStageResult:
+    issues = _plan_grounding_issues(original_plan.response, source_workspace)
+    if not issues:
+        return original_plan
+    _emit(event_fn, "team_plan_grounding", status="repairing", issues=issues)
+    prompt = (
+        "The implementation plan below failed deterministic repository-grounding checks. "
+        "Repair the plan; do not broaden scope or implement anything. Preserve useful evidence-backed goals, "
+        "but map them onto the ACTUAL repository layout. Do not invent existing modules, packages, dependencies, "
+        "or integration points. New files may be proposed only inside existing project areas unless a new top-level "
+        "area is explicitly justified by the user task/evidence. Return the same required planner sections.\n\n"
+        f"USER TASK:\n{task}\n\nREPOSITORY CONTEXT:\n{_repository_context(source_workspace)}\n\n"
+        "GROUNDING FAILURES:\n- " + "\n- ".join(issues)
+        + "\n\nORIGINAL PLAN:\n" + original_plan.response
+    )
+    repaired = _call_advisor(
+        model_client, model=model, system=PLANNER_SYSTEM_PROMPT, prompt=prompt,
+        max_tokens=9000, event_fn=event_fn, role="plan_code_repair", stop_requested=stop_requested,
+    )
+    repaired.role = "plan_code"
+    if repaired.status != "completed":
+        return repaired
+    remaining = _plan_grounding_issues(repaired.response, source_workspace)
+    if remaining:
+        repaired.status = "failed"
+        repaired.error = "implementation plan remained ungrounded after repair: " + "; ".join(remaining)
+        _emit(event_fn, "team_plan_grounding", status="failed", issues=remaining)
+    else:
+        _emit(event_fn, "team_plan_grounding", status="passed", repaired=True)
+    return repaired
+
+
+def _coder_worker_count(configured_coders: int) -> int:
+    """Run every configured coding candidate concurrently; provider staggering happens inside workers."""
+    return max(1, int(configured_coders))
+
+
+def _redact_debug_value(value: Any, *, key: str = "") -> Any:
+    """Redact likely secrets without truncating diagnostic payloads."""
+    sensitive = {"password", "passwd", "token", "bearer", "secret", "api_key", "apikey",
+                 "authorization", "private_key", "privatekey", "client_secret", "clientsecret",
+                 "access_token", "accesstoken"}
+    normalized = key.lower().replace("-", "_")
+    if normalized in sensitive:
+        return "[REDACTED]"
+    if isinstance(value, dict):
+        return {str(k): _redact_debug_value(v, key=str(k)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_debug_value(item, key=key) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_debug_value(item, key=key) for item in value]
+    if isinstance(value, str):
+        try:
+            return audit._redact_inline(value)
+        except Exception:
+            return value
+    return value
+
+
+_TEAM_DEBUG_LOG_PATH = Path("/tmp/aicoder-experimental.log.jsonl")
+
+
+def reset_team_debug_log() -> Path:
+    """Start one fresh process-session trace at a stable /tmp path."""
+    try:
+        _TEAM_DEBUG_LOG_PATH.write_text("", encoding="utf-8")
+        os.chmod(_TEAM_DEBUG_LOG_PATH, 0o600)
+    except OSError:
+        pass
+    return _TEAM_DEBUG_LOG_PATH
+
+
+class _TeamDebugLog:
+    """Best-effort complete JSONL trace shared by all team runs in this process session."""
+
+    def __init__(self, run_id: str):
+        self.run_id = str(run_id)
+        self.path = _TEAM_DEBUG_LOG_PATH
+        try:
+            self.path.touch(mode=0o600, exist_ok=True)
+            os.chmod(self.path, 0o600)
+        except OSError:
+            pass
+
+    def write(self, kind: str, payload: dict[str, Any]) -> None:
+        try:
+            row = {
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "run_id": self.run_id,
+                "kind": str(kind),
+                "payload": _redact_debug_value(payload),
+            }
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+        except Exception:
+            pass
+
+
+def _event_with_debug(fn: EventFn | None, debug_log: _TeamDebugLog) -> EventFn:
+    def sink(kind: str, payload: dict[str, Any]) -> None:
+        debug_log.write(kind, payload)
+        if fn is not None:
+            fn(kind, payload)
+    return sink
+
+
+def _emit(fn: EventFn | None, kind: str, **payload: Any) -> None:
+    if fn is None:
+        return
+    try:
+        fn(kind, payload)
+    except Exception:
+        pass
+
+
+def _call_advisor(
+    model_client: ModelTransport,
+    *,
+    model: str,
+    system: str,
+    prompt: str,
+    max_tokens: int = 6000,
+) -> AgentStageResult:
+    started = time.monotonic()
+    try:
+        result = model_client.chat(
+            message=prompt, model=model, system_prompt=system, temperature=0.2,
+            max_tokens=max_tokens, fallback_model=None, tools=None, tool_choice="none",
+        )
+        response = str(result.get("response") or "").strip() if isinstance(result, dict) else ""
+        prompt_metrics = {"prompt_chars": len(prompt), "response_chars": len(response)}
+        if not response:
+            return AgentStageResult(
+                "advisor", model, "failed", "", int((time.monotonic()-started)*1000),
+                "empty response", evidence=prompt_metrics,
+            )
+        return AgentStageResult(
+            "advisor", str(result.get("model") or model), "completed", response,
+            int((time.monotonic()-started)*1000), evidence=prompt_metrics,
+        )
+    except Exception as exc:
+        return AgentStageResult(
+            "advisor", model, "failed", "", int((time.monotonic()-started)*1000),
+            f"{type(exc).__name__}: {exc}", evidence={"prompt_chars": len(prompt), "response_chars": 0},
+        )
+
+
+def _filtered_tools(catalogue: list[dict], names: frozenset[str]) -> list[dict]:
+    return [dict(tool) for tool in catalogue if str(tool.get("name") or "") in names]
+
+
+def _task_handoff(task: str) -> HandoffEnvelope:
+    return make_handoff("task", task, max_chars=5000)
+
+
+def _research_plan_handoff(text: str) -> HandoffEnvelope:
+    return make_handoff("research-contract", text, max_chars=4500)
+
+
+def _code_plan_handoff(text: str) -> HandoffEnvelope:
+    return make_handoff("code-contract", text, max_chars=9000, section_labels=CODE_PLAN_SECTIONS)
+
+
+def _merge_plan_handoff(text: str) -> HandoffEnvelope:
+    return make_handoff("merge-contract", text, max_chars=6000, section_labels=MERGE_PLAN_SECTIONS)
+
+
+def _compact_check_summary(checks: dict[str, Any]) -> dict[str, Any]:
+    rows: dict[str, Any] = {}
+    for name, raw in sorted((checks or {}).items()):
+        item = raw if isinstance(raw, dict) else {}
+        rows[str(name)] = {
+            "ok": bool(item.get("ok")),
+            "exit_code": item.get("exit_code"),
+            "elapsed_ms": item.get("elapsed_ms"),
+            "required": bool(item.get("required", True)),
+        }
+    return rows
+
+
+def _compact_diff(diff: str, max_chars: int = 6000) -> str:
+    text = str(diff or "")
+    if len(text) <= max_chars:
+        return text
+    headers = []
+    for line in text.splitlines():
+        if line.startswith(("diff --git ", "--- ", "+++ ", "@@ ")):
+            headers.append(line)
+    header_text = "\n".join(headers[:80])
+    remaining = max(512, max_chars - len(header_text) - 120)
+    sample = text[:remaining]
+    return (header_text + "\n\nDIFF SAMPLE:\n" + sample).strip()[:max_chars]
+
+
+def _compact_candidate_evidence(evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    compact: list[dict[str, Any]] = []
+    for item in evidence:
+        delta = item.get("delta") if isinstance(item.get("delta"), dict) else {}
+        compact.append({
+            "candidate_id": item.get("candidate_id"),
+            "score": item.get("score"),
+            "verification_passed": bool(item.get("verification_passed")),
+            "checks": _compact_check_summary(item.get("checks") or {}),
+            "delta": {
+                "changed_count": int(delta.get("changed_count") or 0),
+                "deleted_count": int(delta.get("deleted_count") or 0),
+                "added_count": int(delta.get("added_count") or 0),
+                "modified_count": int(delta.get("modified_count") or 0),
+                "changed": list(delta.get("changed") or [])[:60],
+                "deleted": list(delta.get("deleted") or [])[:60],
+                "added_files": list(delta.get("added_files") or [])[:120],
+                "modified_files": list(delta.get("modified_files") or [])[:120],
+                "deleted_files": list(delta.get("deleted_files") or [])[:120],
+            },
+            "diff_excerpt": _compact_diff(str(item.get("diff") or "")),
+            "snapshot": item.get("snapshot"),
+            "change_manifest": item.get("change_manifest"),
+        })
+    return compact
+
+
+def _run_researcher(
+    *, client, model_client: ModelTransport, model: str, role: str, task: str,
+    source_workspace: str, tools: list[dict], stop_requested: StopFn | None,
+    research_plan: str = "",
+) -> AgentStageResult:
+    task_handoff = _task_handoff(task)
+    research_handoff = _research_plan_handoff(research_plan or "(none)")
+    prompt = (
+        f"USER TASK HANDOFF:\n{task_handoff.render()}\n\n"
+        f"Repository root for read-only inspection: {source_workspace}\n\n"
+        f"RESEARCH CONTRACT HANDOFF:\n{research_handoff.render()}\n\n"
+        + RESEARCH_INSTRUCTIONS[role] + "\n\n" + RESEARCH_OUTPUT_CONTRACT
+    )
+    system = build_system_prompt(tools, source_workspace).rstrip() + (
+        "\n\n## RESEARCH AGENT ROLE\n" + RESEARCH_INSTRUCTIONS[role] + "\n\n" + RESEARCH_OUTPUT_CONTRACT
+    )
+    started = time.monotonic()
+    evidence_events: list[dict[str, Any]] = []
+
+    def research_event(kind: str, payload: dict[str, Any]) -> None:
+        if kind in {"tool_call", "tool_result"}:
+            row = {"kind": kind, **dict(payload)}
+            evidence_events.append(row)
+
+    runtime = NativeLightRuntime(
+        client=client, model_client=model_client, initial_prompt=prompt,
+        model=model, fallback_model=None, workspace_root=source_workspace,
+        plan_workspace_root=source_workspace, protected_workspace_root=source_workspace,
+        tools=tools, system_prompt=system, load_tools_on_start=True,
+        quick_chat=False, persistent_plan=False, approval_fn=lambda *_: False,
+        max_iterations=10, max_output_tokens=6000, stop_requested=stop_requested,
+        event_fn=research_event,
+    )
+    result = runtime.run()
+    research_tool_names = {
+        str(item.get("name") or "") for item in evidence_events
+        if item.get("kind") == "tool_result" and not bool(item.get("is_error"))
+    }
+    external_tools = sorted(name for name in research_tool_names if name in {
+        "search", "crawl", "web_fetch_local", "web_search_local", "doc_search", "doc_read",
+    })
+    evidence = {
+        "successful_tools": sorted(research_tool_names),
+        "external_tools": external_tools,
+        "externally_verified": bool(external_tools),
+        "tool_event_count": len(evidence_events),
+    }
+    return AgentStageResult(
+        role=f"research:{role}", model=result.model or model, status=result.status,
+        response=result.response, elapsed_ms=int((time.monotonic()-started)*1000), error=result.error,
+        evidence=evidence,
+    )
+
+
+def _repository_context(source_workspace: str) -> str:
+    root = Path(source_workspace)
+    rows: list[str] = [f"workspace={root}"]
+    try:
+        proc = subprocess.run(["git", "-C", str(root), "status", "--short", "--branch"], capture_output=True, text=True, timeout=5)
+        rows.append("git_status:\n" + (proc.stdout.strip() or proc.stderr.strip())[:6000])
+    except Exception as exc:
+        rows.append(f"git_status_unavailable={exc}")
+    try:
+        remote = subprocess.run(
+            ["git", "-C", str(root), "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=5,
+        )
+        remote_url = (remote.stdout.strip() or "") if remote.returncode == 0 else ""
+        if remote_url:
+            rows.append("git_remote_origin=" + remote_url)
+    except Exception:
+        pass
+    try:
+        entries = sorted(p.name for p in root.iterdir() if p.name not in {".git", ".venv", "node_modules"})[:80]
+        rows.append("top_level=" + ", ".join(entries))
+    except Exception:
+        pass
+    return "\n".join(rows)
+
+
+def _build_planner_prompt(task: str, repo_context: str, research: list[AgentStageResult]) -> str:
+    task_handoff = _task_handoff(task)
+    reports = []
+    for item in research:
+        evidence = item.evidence or {}
+        verified = "verified-tool-evidence" if evidence.get("externally_verified") else "unverified-or-local-only"
+        tools = ",".join(evidence.get("successful_tools") or []) or "none"
+        raw = item.response or item.error or "(no report)"
+        handoff = make_handoff(
+            f"{item.role}-report", raw, max_chars=3500, section_labels=RESEARCH_SECTIONS,
+        )
+        reports.append(
+            f"### {item.role} · status={item.status} · evidence={verified} · tools={tools}\n"
+            f"{handoff.render()}"
+        )
+    repo_handoff = make_handoff("repository-context", repo_context, max_chars=5000)
+    return (
+        f"ORIGINAL USER TASK:\n{task_handoff.render()}\n\n"
+        f"REPOSITORY CONTEXT:\n{repo_handoff.render()}\n\n"
+        "INDEPENDENT RESEARCH HANDOFFS:\n" + "\n\n".join(reports)
+    )
+
+
+def _candidate_prompt(task: str, plan: str, coordinator: str, strategy: str) -> str:
+    task_handoff = _task_handoff(task)
+    plan_handoff = _code_plan_handoff(plan)
+    coordinator_handoff = make_handoff("coordination-notes", coordinator or "(none)", max_chars=2500)
+    return (
+        f"ORIGINAL USER TASK:\n{task_handoff.render()}\n\n"
+        f"SHARED IMPLEMENTATION CONTRACT:\n{plan_handoff.render()}\n\n"
+        f"COORDINATION NOTES:\n{coordinator_handoff.render()}\n\n"
+        f"Your strategy emphasis is {strategy}. Implement the complete shared contract, not only the strategy-specific parts."
+    )
+
+
+def _candidate_approval(tool_name: str, args: dict) -> bool:
+    """Autonomous candidate policy: safe RAM mutations yes; elevation/destruction/escape/security never."""
+    from .executor import is_destructive
+    from .privileges import assess_execution
+    risk = assess_execution(tool_name, args, destructive=is_destructive(str(args.get("command") or "")))
+    if args.get("_workspace_escape") or risk.elevation or risk.deletion or risk.destructive or risk.security_change:
+        return False
+    return bool(risk.mutation) or not risk.needs_approval
+
+
+_TEAM_CANDIDATE_MAX_AUTO_RESUMES = 4
+
+
+def _candidate_pause_is_resumable(run: AgentRunResult, stop_requested: StopFn | None) -> bool:
+    """Return whether a team candidate pause may be continued without human input."""
+    if run.status != "paused":
+        return False
+    if stop_requested is not None and stop_requested():
+        return False
+    reason = str(run.response or run.error or "").strip().lower()
+    non_resumable_markers = (
+        "stopped by user",
+        "user rejected",
+        "approval rejected",
+        "approval denied",
+        "explicit confirmation",
+        "security policy",
+        "high-risk",
+    )
+    return not any(marker in reason for marker in non_resumable_markers)
+
+
+def _candidate_resume_prompt(run: AgentRunResult, delta: dict[str, Any], attempt: int) -> str:
+    """Build a targeted autonomous continuation turn for a paused RAM candidate."""
+    reason = str(run.response or run.error or "paused without a specific reason").strip()
+    changed = int(delta.get("changed_count") or 0)
+    deleted = int(delta.get("deleted_count") or 0)
+    has_delta = bool(changed or deleted)
+    lower = reason.lower()
+    if "without making a change" in lower or "no mutation" in lower:
+        action = (
+            "No repository mutation was completed. Implement the best-supported change from the shared contract now, "
+            "then verify it."
+        )
+    elif "verification" in lower or "verify" in lower:
+        action = (
+            "The candidate already has work in progress. Run the appropriate post-change verification now, fix any "
+            "failures, and only then finish."
+        )
+    elif "same tool" in lower or "repeating" in lower or "without progress" in lower:
+        action = (
+            "Do not repeat the previous tool operation unchanged. Use the existing result, inspect a different signal, "
+            "or take the next concrete implementation/verification step."
+        )
+    elif "transient" in lower or "backend" in lower or "provider" in lower:
+        action = (
+            "Continue the same task after the transient provider/backend interruption. Do not restart the analysis."
+        )
+    elif "final response" in lower or "usable final" in lower:
+        action = (
+            "Continue from the preserved state and produce a valid completion only after the remaining work and checks "
+            "are actually finished."
+        )
+    else:
+        action = "Continue the unfinished candidate from the preserved state and complete the remaining work."
+
+    delta_note = (
+        f"The current RAM candidate already contains {changed} changed and {deleted} deleted paths relative to its "
+        "start snapshot. Preserve useful work and verify/fix it; do not redo the task from scratch."
+        if has_delta else
+        "The current RAM candidate has no repository delta yet, so make the required implementation change before finishing."
+    )
+    return (
+        f"AUTONOMOUS TEAM RESUME {attempt}/{_TEAM_CANDIDATE_MAX_AUTO_RESUMES}\n\n"
+        f"Previous pause reason:\n{reason[:1800]}\n\n"
+        f"{action}\n{delta_note}\n\n"
+        "Stay inside this same isolated RAM workspace and continue with the existing conversation/tool evidence. "
+        "Do not ask for human input or confirmation, and do not restart the analysis from the beginning. "
+        "Finish only when the shared implementation contract is complete and the result is ready for deterministic "
+        "candidate evaluation. Use `DONE:` for a genuine completion."
+    )
+
+
+def _candidate_conversation(run: AgentRunResult) -> list[dict[str, Any]]:
+    """Carry the model/tool history forward without duplicating the old system prompt."""
+    return [
+        dict(message) for message in (run.messages or [])
+        if isinstance(message, dict) and str(message.get("role") or "") != "system"
+    ]
+
+
+def _run_candidate(
+    *, client, model_client: ModelTransport, source_workspace: str, backend_mode: str,
+    slot: int, model: str, strategy: str, task: str, plan: str, coordinator: str,
+    tools: list[dict], stop_requested: StopFn | None,
+) -> CandidateResult:
+    backend = create_isolated_team_workspace(source_workspace, backend_mode)
+    try:
+        backend.prepare()
+        if not isinstance(backend, RamWorkspace):
+            raise WorkspaceError("parallel candidate runtime requires a transactional isolated workspace")
+    except Exception:
+        backend.abort()
+        raise
+    try:
+        test_python = configured_project_python(backend.info.execution_root)
+        test_runtime_note = (
+            f"\n\nPROJECT TEST RUNTIME\n- Use the `test` tool for Python test execution. "
+            f"It is configured to use {test_python}.\n"
+            "- Do not install pytest/pip/system packages merely because `pytest` or system Python lacks dependencies. "
+            "Do not use apt/pip/sudo to repair the test runner.\n"
+            if test_python else ""
+        )
+        system = (
+            build_system_prompt(tools, str(backend.info.execution_root)).rstrip()
+            + "\n\n" + CODER_SYSTEM_TEMPLATE.format(slot=slot, strategy=strategy)
+            + test_runtime_note
+        )
+        started = time.monotonic()
+        prompt = _candidate_prompt(task, plan, coordinator, strategy)
+        conversation: list[dict[str, Any]] = []
+        run: AgentRunResult | None = None
+        auto_resumes = 0
+
+        while True:
+            delta = backend.delta_summary()
+            has_existing_delta = bool(
+                int(delta.get("changed_count") or 0) or int(delta.get("deleted_count") or 0)
+            )
+            runtime = NativeLightRuntime(
+                client=client, model_client=model_client,
+                initial_prompt=prompt,
+                model=model, fallback_model=None, workspace_root=str(backend.info.execution_root),
+                plan_workspace_root=source_workspace, protected_workspace_root=source_workspace,
+                tools=tools, system_prompt=system, load_tools_on_start=True,
+                quick_chat=False, persistent_plan=False, approval_fn=_candidate_approval,
+                max_iterations=18, max_output_tokens=12000, stop_requested=stop_requested,
+                conversation=conversation,
+                require_mutation_or_explicit_no_change=not has_existing_delta,
+                allow_completion_signal=True,
+            )
+            run = runtime.run()
+            if not _candidate_pause_is_resumable(run, stop_requested):
+                break
+            if auto_resumes >= _TEAM_CANDIDATE_MAX_AUTO_RESUMES:
+                break
+            auto_resumes += 1
+            conversation = _candidate_conversation(run)
+            delta = backend.delta_summary()
+            prompt = _candidate_resume_prompt(run, delta, auto_resumes)
+
+        assert run is not None
+        if hasattr(run, "performance") and isinstance(run.performance, dict):
+            run.performance.setdefault("team_auto_resumes", auto_resumes)
+        return CandidateResult(
+            slot=slot, model=model, strategy=strategy, workspace=backend, run=run,
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+        )
+    except Exception:
+        backend.abort()
+        raise
+
+
+def _git_diff(root: Path) -> str:
+    try:
+        proc = subprocess.run(["git", "-C", str(root), "diff", "--no-ext-diff", "--binary"], capture_output=True, text=True, timeout=20)
+        untracked = subprocess.run(["git", "-C", str(root), "ls-files", "--others", "--exclude-standard"], capture_output=True, text=True, timeout=10)
+        text = proc.stdout
+        for rel in untracked.stdout.splitlines()[:120]:
+            path = root / rel
+            if path.is_file() and path.stat().st_size <= 200_000:
+                try:
+                    content = path.read_text(encoding="utf-8")
+                except Exception:
+                    continue
+                text += f"\n--- /dev/null\n+++ b/{rel}\n" + "\n".join("+" + line for line in content.splitlines()) + "\n"
+        return text[:100_000]
+    except Exception as exc:
+        return f"diff unavailable: {exc}"
+
+
+def _run_check(root: Path, command: list[str], timeout: int = 90) -> dict[str, Any]:
+    started = time.monotonic()
+    try:
+        proc = subprocess.run(command, cwd=str(root), capture_output=True, text=True, timeout=timeout)
+        return {
+            "ok": proc.returncode == 0, "exit_code": proc.returncode,
+            "elapsed_ms": int((time.monotonic()-started)*1000),
+            "output": (proc.stdout + "\n" + proc.stderr)[-6000:],
+        }
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"ok": False, "exit_code": -1, "elapsed_ms": int((time.monotonic()-started)*1000), "output": str(exc)}
+
+
+def evaluate_candidate(candidate: CandidateResult) -> dict[str, Any]:
+    root = Path(candidate.workspace.info.execution_root)
+    delta = candidate.workspace.delta_summary() if isinstance(candidate.workspace, RamWorkspace) else {}
+    plan = project_verification_plan(root)
+    results = execute_verification_plan(root, plan)
+    checks = {row.name: row.as_dict() for row in results}
+    passed = sum(1 for row in results if row.ok and row.required)
+    failed = sum(1 for row in results if (not row.ok) and row.required)
+    score = (40 if candidate.run.status == "completed" else 0) + passed * 25 - failed * 60
+    if delta.get("changed_count", 0) or delta.get("deleted_count", 0):
+        score += 10
+    if candidate.run.error:
+        score -= 20
+    diff = _git_diff(root)
+    return {
+        "score": score, "delta": delta, "checks": checks, "diff": diff,
+        "candidate_id": blind_candidate_id(diff),
+        "verification_passed": verification_passed(results),
+    }
+
+
+def _evaluation_prompt(candidates: list[CandidateResult]) -> str:
+    rows = []
+    for c in sorted(candidates, key=lambda item: item.slot):
+        rows.append(json.dumps({
+            "slot": c.slot, "model": c.model, "strategy": c.strategy,
+            "run_status": c.run.status, "score": c.score,
+            "evaluation": {k: v for k, v in c.evaluation.items() if k != "diff"},
+            "summary": c.run.response[:5000], "diff": c.evaluation.get("diff", "")[:25000],
+        }, ensure_ascii=False))
+    return "\n\n".join(rows)
+
+
+
+def _stage_start(ledger: StageLedger, stage: TeamStage, event_fn: EventFn | None) -> None:
+    ledger.start(stage)
+    _emit(event_fn, "team_pipeline", stage=stage.value, status="started", ledger=ledger.as_dict())
+
+
+def _stage_complete(ledger: StageLedger, stage: TeamStage, event_fn: EventFn | None) -> None:
+    ledger.complete(stage)
+    _emit(event_fn, "team_pipeline", stage=stage.value, status="completed", ledger=ledger.as_dict())
+
+
+def _cleanup_team_workspaces(
+    candidates: list[CandidateResult],
+    integration: WorkspaceBackend | None,
+    event_fn: EventFn | None = None,
+) -> None:
+    """Release every isolated workspace owned by one team job.
+
+    abort() is idempotent, so this is safe after successful finalize() as well as
+    on any terminal failure or unexpected exception.
+    """
+    released = 0
+    seen: set[int] = set()
+    workspaces: list[WorkspaceBackend] = [candidate.workspace for candidate in candidates]
+    if integration is not None:
+        workspaces.append(integration)
+    for workspace in workspaces:
+        marker = id(workspace)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        try:
+            workspace.abort()
+            released += 1
+        except Exception:
+            pass
+    _emit(event_fn, "team_ram_cleanup", released=released)
+
+
+def _link_or_copy(src: str, dst: str) -> str:
+    try:
+        os.link(src, dst)
+        return dst
+    except OSError:
+        return shutil.copy2(src, dst)
+
+
+def _attach_blind_candidate_snapshots(integration: RamWorkspace, candidates: list[CandidateResult]) -> list[dict[str, Any]]:
+    base = integration.info.execution_root / ".aicoder-team" / "candidates"
+    base.mkdir(parents=True, exist_ok=True)
+    evidence: list[dict[str, Any]] = []
+    for candidate in sorted(candidates, key=lambda item: str(item.evaluation.get("candidate_id") or "")):
+        cid = str(candidate.evaluation.get("candidate_id") or blind_candidate_id(candidate.evaluation.get("diff", "")))
+        target = base / cid
+        shutil.copytree(
+            candidate.workspace.info.execution_root, target, symlinks=True,
+            ignore=shutil.ignore_patterns(".git", ".aicoder-team", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"),
+            copy_function=_link_or_copy, dirs_exist_ok=True,
+        )
+        delta = candidate.evaluation.get("delta") or {}
+        snapshot_rel = f".aicoder-team/candidates/{cid}"
+        manifest_rel = f".aicoder-team/candidates/{cid}.changes.json"
+        integration.write_candidate_artifact(
+            manifest_rel,
+            json.dumps({
+                "candidate_id": cid,
+                "snapshot": snapshot_rel,
+                "added_files": list(delta.get("added_files") or []),
+                "modified_files": list(delta.get("modified_files") or []),
+                "deleted_files": list(delta.get("deleted_files") or []),
+            }, ensure_ascii=False, indent=2),
+        )
+        evidence.append({
+            "candidate_id": cid,
+            "score": int(candidate.evaluation.get("score") or 0),
+            "verification_passed": bool(candidate.evaluation.get("verification_passed")),
+            "checks": candidate.evaluation.get("checks") or {},
+            "delta": delta,
+            "diff": str(candidate.evaluation.get("diff") or "")[:50000],
+            "snapshot": snapshot_rel,
+            "change_manifest": manifest_rel,
+        })
+    integration.write_candidate_artifact(
+        ".aicoder-team/candidates.json", json.dumps(evidence, ensure_ascii=False, indent=2)
+    )
+    return evidence
+
+
+def _blind_merge_prompt(task: str, code_plan: str, evidence: list[dict[str, Any]]) -> str:
+    task_handoff = _task_handoff(task)
+    code_handoff = _code_plan_handoff(code_plan)
+    compact = _compact_candidate_evidence(evidence)
+    evidence_text = json.dumps(compact, ensure_ascii=False, indent=2)
+    evidence_handoff = make_handoff("candidate-evidence", evidence_text, max_chars=30000)
+    return (
+        f"USER TASK:\n{task_handoff.render()}\n\n"
+        f"SHARED CODE CONTRACT:\n{code_handoff.render()}\n\n"
+        f"ANONYMIZED CANDIDATE EVIDENCE:\n{evidence_handoff.render()}"
+    )
+
+
+def run_team(
+    *, task: str, state: dict[str, Any], config: TeamConfig, client,
+    model_client: ModelTransport, source_workspace: str,
+    event_fn: EventFn | None = None, stop_requested: StopFn | None = None,
+) -> TeamRunResult:
+    errors = config.validate()
+    if errors:
+        return TeamRunResult("failed", "", "", [], [], {}, "; ".join(errors))
+
+    started = time.monotonic()
+    ledger = StageLedger()
+    stages: list[AgentStageResult] = []
+    candidates: list[CandidateResult] = []
+    handoff_metrics: list[dict[str, int | str]] = []
+    handoff_archive: dict[str, dict[str, Any]] = {}
+    all_tools = load_tools(client)
+    research_tools = _filtered_tools(all_tools, _RESEARCH_TOOL_NAMES)
+    coder_tools = _filtered_tools(all_tools, _CODER_TOOL_NAMES)
+    _emit(event_fn, "team_start", agents=config.active_count, research=len(config.research), coders=len(config.coders))
+
+    # 1) plan_research
+    _stage_start(ledger, TeamStage.PLAN_RESEARCH, event_fn)
+    research_planner_model = config.coordinator_model or config.planner_model or ""
+    research_plan = _call_advisor(
+        model_client, model=research_planner_model, system=RESEARCH_PLANNER_SYSTEM_PROMPT,
+        prompt=(
+            f"USER TASK:\n{_task_handoff(task).render()}\n\n"
+            f"REPOSITORY CONTEXT:\n{make_handoff('repository-context', _repository_context(source_workspace), max_chars=5000).render()}"
+        ),
+        max_tokens=3000,
+    )
+    research_plan.role = "plan_research"; stages.append(research_plan)
+    if research_plan.status != "completed":
+        return TeamRunResult("failed", "", research_plan.model, stages, [], {"ledger": ledger.as_dict()}, research_plan.error)
+    research_contract_handoff = _research_plan_handoff(research_plan.response)
+    handoff_metrics.append(research_contract_handoff.metrics())
+    handoff_archive[research_contract_handoff.handoff_id] = {
+        "kind": research_contract_handoff.kind, "raw": research_contract_handoff.raw,
+        "compact": research_contract_handoff.compact,
+    }
+    _stage_complete(ledger, TeamStage.PLAN_RESEARCH, event_fn)
+
+    # 2) research
+    _stage_start(ledger, TeamStage.RESEARCH, event_fn)
+    research_results: list[AgentStageResult] = []
+    if config.research:
+        with ThreadPoolExecutor(max_workers=len(config.research), thread_name_prefix="aicoder-research") as pool:
+            futures = {
+                pool.submit(
+                    _run_researcher, client=client, model_client=model_client, model=slot.model,
+                    role=slot.role, task=task, source_workspace=source_workspace,
+                    tools=research_tools, stop_requested=stop_requested,
+                    research_plan=research_contract_handoff.compact,
+                ): slot for slot in config.research
+            }
+            for future in as_completed(futures):
+                slot = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = AgentStageResult(f"research:{slot.role}", slot.model, "failed", "", 0, f"{type(exc).__name__}: {exc}")
+                research_results.append(result); stages.append(result)
+                _emit(
+                    event_fn, "team_stage", role=result.role, status=result.status, model=result.model,
+                    elapsed_ms=result.elapsed_ms, error=result.error, evidence=result.evidence,
+                )
+    for item in research_results:
+        report_handoff = make_handoff(
+            f"{item.role}-report", item.response or item.error or "(no report)",
+            max_chars=3500, section_labels=RESEARCH_SECTIONS,
+        )
+        handoff_metrics.append(report_handoff.metrics())
+        handoff_archive[report_handoff.handoff_id] = {
+            "kind": report_handoff.kind, "role": item.role, "status": item.status,
+            "raw": report_handoff.raw, "compact": report_handoff.compact,
+        }
+    _stage_complete(ledger, TeamStage.RESEARCH, event_fn)
+
+    # 3) plan_code
+    _stage_start(ledger, TeamStage.PLAN_CODE, event_fn)
+    code_plan = _call_advisor(
+        model_client, model=config.planner_model or "", system=PLANNER_SYSTEM_PROMPT,
+        prompt=_build_planner_prompt(task, _repository_context(source_workspace), research_results)
+        + "\n\nRESEARCH CONTRACT:\n" + research_contract_handoff.render(),
+        max_tokens=5000,
+    )
+    code_plan.role = "plan_code"; stages.append(code_plan)
+    if code_plan.status == "completed":
+        code_contract_handoff = _code_plan_handoff(code_plan.response)
+        handoff_metrics.append(code_contract_handoff.metrics())
+        handoff_archive[code_contract_handoff.handoff_id] = {
+            "kind": code_contract_handoff.kind, "raw": code_contract_handoff.raw,
+            "compact": code_contract_handoff.compact,
+        }
+    else:
+        code_contract_handoff = _code_plan_handoff(code_plan.response or code_plan.error)
+    if code_plan.status != "completed":
+        return TeamRunResult("failed", "", code_plan.model, stages, [], {"ledger": ledger.as_dict()}, code_plan.error)
+    _stage_complete(ledger, TeamStage.PLAN_CODE, event_fn)
+
+    # 4) code — isolated parallel candidates with one fair global backing mode.
+    workspace_plan = team_workspace_plan(
+        source_workspace, len(config.coders), str(state.get("workspace_mode") or "auto")
+    )
+    _emit(event_fn, "team_workspace_plan", **workspace_plan.as_dict())
+    integration: WorkspaceBackend | None = None
+    futures: dict[Any, Any] = {}
+    try:
+        _stage_start(ledger, TeamStage.CODE, event_fn)
+        with ThreadPoolExecutor(max_workers=len(config.coders), thread_name_prefix="aicoder-coder") as pool:
+            futures = {
+                pool.submit(
+                    _run_candidate, client=client, model_client=model_client, source_workspace=source_workspace,
+                    backend_mode=workspace_plan.backend_mode, slot=slot.slot, model=slot.model,
+                    strategy=slot.strategy, task=task, plan=code_contract_handoff.compact, coordinator="",
+                    tools=coder_tools, stop_requested=stop_requested,
+                ): slot for slot in config.coders
+            }
+            for future in as_completed(futures):
+                slot = futures[future]
+                candidate: CandidateResult | None = None
+                try:
+                    candidate = future.result()
+                    evaluation_started = time.monotonic()
+                    candidate.evaluation = evaluate_candidate(candidate)
+                    candidate.evaluation_ms = int((time.monotonic() - evaluation_started) * 1000)
+                    candidate.score = int(candidate.evaluation.get("score") or 0)
+                    candidates.append(candidate)
+                    _emit(event_fn, "team_candidate", candidate_id=candidate.evaluation.get("candidate_id"),
+                          status=candidate.run.status, score=candidate.score,
+                          elapsed_ms=candidate.elapsed_ms, evaluation_ms=candidate.evaluation_ms)
+                except Exception as exc:
+                    if candidate is not None:
+                        candidate.workspace.abort()
+                    _emit(event_fn, "team_candidate", candidate_id="failed", status="failed", score=-999,
+                          error=f"{type(exc).__name__}: {exc}")
+        viable = [candidate for candidate in candidates if candidate.run.status == "completed"]
+        if not viable:
+            return TeamRunResult("failed", "", "", stages, candidates, {"ledger": ledger.as_dict()}, "no coding candidate completed")
+        winner = max(viable, key=lambda item: objective_rank_key(item.evaluation))
+        _stage_complete(ledger, TeamStage.CODE, event_fn)
+
+        # Build fresh integration workspace and attach anonymized full snapshots.
+        integration = create_isolated_team_workspace(source_workspace, workspace_plan.backend_mode)
+        integration.prepare()
+        if not isinstance(integration, RamWorkspace):
+            return TeamRunResult("failed", "", "", stages, candidates, {"ledger": ledger.as_dict()}, "integration requires transactional isolation")
+        _emit(
+            event_fn, "team_integration_workspace", mode=integration.info.mode,
+            fallback_reason=integration.info.fallback_reason,
+        )
+        integration.seed_from(winner.workspace.info.execution_root)
+        blind_evidence = _attach_blind_candidate_snapshots(integration, candidates)
+        integration.write_candidate_artifact(
+            ".aicoder-team/handoffs.json",
+            json.dumps(handoff_archive, ensure_ascii=False, indent=2),
+        )
+        winner_id = str(winner.evaluation.get("candidate_id"))
+
+        # 5) merge_plan — blind to model/provider/slot identity.
+        _stage_start(ledger, TeamStage.MERGE_PLAN, event_fn)
+        merge_planner_model = config.coordinator_model or config.planner_model or ""
+        merge_plan = _call_advisor(
+            model_client, model=merge_planner_model, system=MERGE_PLANNER_SYSTEM_PROMPT,
+            prompt=_blind_merge_prompt(task, code_contract_handoff.compact, blind_evidence)
+            + f"\n\nDETERMINISTIC BASE CANDIDATE: {winner_id}",
+            max_tokens=4000,
+        )
+        merge_plan.role = "merge_plan"; stages.append(merge_plan)
+        if merge_plan.status == "completed":
+            merge_contract_handoff = _merge_plan_handoff(merge_plan.response)
+            handoff_metrics.append(merge_contract_handoff.metrics())
+            handoff_archive[merge_contract_handoff.handoff_id] = {
+                "kind": merge_contract_handoff.kind, "raw": merge_contract_handoff.raw,
+                "compact": merge_contract_handoff.compact,
+            }
+        else:
+            merge_contract_handoff = _merge_plan_handoff(merge_plan.response or merge_plan.error)
+        if merge_plan.status != "completed":
+            return TeamRunResult("failed", "", merge_plan.model, stages, candidates, {"ledger": ledger.as_dict()}, merge_plan.error)
+        integration.write_candidate_artifact(".aicoder-team/merge-plan.txt", merge_plan.response)
+        integration.write_candidate_artifact(
+            ".aicoder-team/handoffs.json",
+            json.dumps(handoff_archive, ensure_ascii=False, indent=2),
+        )
+        _stage_complete(ledger, TeamStage.MERGE_PLAN, event_fn)
+
+        # 6) merge — optional LLM. Empty merge slot means deterministic winner only.
+        _stage_start(ledger, TeamStage.MERGE, event_fn)
+        merge_model = config.merge_model
+        if merge_model:
+            merge_runtime = NativeLightRuntime(
+                client=client, model_client=model_client,
+                initial_prompt=(
+                    f"USER TASK:\n{_task_handoff(task).render()}\n\n"
+                    f"CODE CONTRACT:\n{code_contract_handoff.render()}\n\n"
+                    f"BLIND MERGE CONTRACT:\n{merge_contract_handoff.render()}\n\n"
+                    "Candidate snapshots are under .aicoder-team/candidates/. Integrate only evidence-backed improvements."
+                ),
+                model=merge_model, fallback_model=None, workspace_root=str(integration.info.execution_root),
+                plan_workspace_root=source_workspace, protected_workspace_root=source_workspace,
+                tools=coder_tools, system_prompt=build_system_prompt(coder_tools, str(integration.info.execution_root)).rstrip()+"\n\n"+MERGE_SYSTEM_PROMPT,
+                load_tools_on_start=True, quick_chat=False, persistent_plan=False,
+                approval_fn=_candidate_approval, max_iterations=14, max_output_tokens=10000, stop_requested=stop_requested,
+            )
+            merge_started = time.monotonic(); merge_run = merge_runtime.run()
+            merge_elapsed = int((time.monotonic() - merge_started) * 1000)
+            stages.append(AgentStageResult("merge", merge_run.model or merge_model, merge_run.status, merge_run.response, merge_elapsed, merge_run.error))
+            if merge_run.status != "completed":
+                    return TeamRunResult("failed", "", merge_run.model, stages, candidates, {"ledger": ledger.as_dict()}, merge_run.error or "merge failed")
+            final_response = merge_run.response
+            result_model = merge_run.model or merge_model
+        else:
+            stages.append(AgentStageResult("merge", "deterministic", "completed", f"Selected {winner_id} without LLM merge", 0))
+            final_response = f"Selected verified base candidate {winner_id}."
+            result_model = winner.run.model
+        _stage_complete(ledger, TeamStage.MERGE, event_fn)
+
+        # 7) plan_tests — model may explain/extend intent, deterministic commands remain authoritative.
+        _stage_start(ledger, TeamStage.PLAN_TESTS, event_fn)
+        deterministic_plan = project_verification_plan(integration.info.execution_root)
+        test_plan_text = json.dumps([
+            {"name": item.name, "argv": list(item.argv), "timeout": item.timeout, "required": item.required}
+            for item in deterministic_plan
+        ], ensure_ascii=False, indent=2)
+        if config.test_planner_model:
+            test_plan = _call_advisor(
+                model_client, model=config.test_planner_model, system=TEST_PLANNER_SYSTEM_PROMPT,
+                prompt=(
+                    f"USER TASK:\n{_task_handoff(task).render()}\n\n"
+                    f"CODE CONTRACT:\n{code_contract_handoff.render()}\n\n"
+                    f"MERGE CONTRACT:\n{merge_contract_handoff.render()}\n\n"
+                    f"DETERMINISTIC REPOSITORY CHECKS (authoritative):\n{make_handoff('deterministic-checks', test_plan_text, max_chars=6000).render()}"
+                ),
+                max_tokens=3000,
+            )
+            test_plan.role = "plan_tests"; stages.append(test_plan)
+            if test_plan.status != "completed":
+                    return TeamRunResult("failed", "", test_plan.model, stages, candidates, {"ledger": ledger.as_dict()}, test_plan.error)
+            integration.write_candidate_artifact(".aicoder-team/test-plan.txt", test_plan.response)
+        else:
+            stages.append(AgentStageResult("plan_tests", "deterministic", "completed", test_plan_text, 0))
+        _stage_complete(ledger, TeamStage.PLAN_TESTS, event_fn)
+
+        # 8) tests_function_ok — only executable evidence can open the disk-write gate.
+        _stage_start(ledger, TeamStage.TESTS_FUNCTION_OK, event_fn)
+        verification_results = execute_verification_plan(integration.info.execution_root, deterministic_plan)
+        verification_payload = [item.as_dict() for item in verification_results]
+        integration.write_candidate_artifact(".aicoder-team/final-verification.json", json.dumps(verification_payload, ensure_ascii=False, indent=2))
+        if not verification_passed(verification_results):
+            return TeamRunResult(
+                "failed", "", result_model, stages, candidates,
+                {"ledger": ledger.as_dict(), "verification": verification_payload},
+                "tests_function_ok gate failed; persistent workspace was not modified",
+            )
+        _stage_complete(ledger, TeamStage.TESTS_FUNCTION_OK, event_fn)
+
+        # 9) atomic_disk_write — the only persistent mutation stage.
+        _stage_start(ledger, TeamStage.ATOMIC_DISK_WRITE, event_fn)
+        integration.finalize(verified=True)
+        _stage_complete(ledger, TeamStage.ATOMIC_DISK_WRITE, event_fn)
+
+        wall_ms = int((time.monotonic() - started) * 1000)
+        accumulated_agent_ms = sum(stage.elapsed_ms for stage in stages) + sum(
+            candidate.elapsed_ms + candidate.evaluation_ms for candidate in candidates
+        )
+        perf = {
+            "wall_ms": wall_ms,
+            "accumulated_agent_ms": accumulated_agent_ms,
+            "parallelism": round(accumulated_agent_ms / wall_ms, 2) if wall_ms else 0.0,
+            "research_agents": len(research_results), "coding_candidates": len(candidates),
+            "winner_candidate_id": winner_id, "winner_score": winner.score,
+            "workspace_plan": workspace_plan.as_dict(),
+            "integration_workspace_mode": integration.info.mode,
+            "handoffs": handoff_metrics,
+            "handoff_original_chars": sum(int(item.get("original_chars") or 0) for item in handoff_metrics),
+            "handoff_compact_chars": sum(int(item.get("compact_chars") or 0) for item in handoff_metrics),
+            "handoff_saved_chars": sum(int(item.get("saved_chars") or 0) for item in handoff_metrics),
+            "advisor_prompt_chars": sum(
+                int((stage.evidence or {}).get("prompt_chars") or 0) for stage in stages
+            ),
+            "advisor_response_chars": sum(
+                int((stage.evidence or {}).get("response_chars") or 0) for stage in stages
+            ),
+            "ledger": ledger.as_dict(), "verification": verification_payload,
+            "stage_timings": [
+                {"role": stage.role, "model": stage.model, "status": stage.status, "elapsed_ms": stage.elapsed_ms}
+                for stage in stages
+            ],
+        }
+        _emit(event_fn, "team_complete", **perf)
+        return TeamRunResult("completed", final_response, result_model or "", stages, candidates, perf)
+    finally:
+        # On Ctrl+C/SIGTERM the executor may have completed workers whose futures
+        # were never consumed by the main thread. Recover those results solely so
+        # their isolated workspaces can be released as part of this job cleanup.
+        for future in list(futures):
+            if not future.done() or future.cancelled():
+                continue
+            try:
+                finished_candidate = future.result()
+            except BaseException:
+                continue
+            if isinstance(finished_candidate, CandidateResult) and all(
+                existing is not finished_candidate for existing in candidates
+            ):
+                candidates.append(finished_candidate)
+        _cleanup_team_workspaces(candidates, integration, event_fn)

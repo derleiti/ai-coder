@@ -10,7 +10,7 @@ from .docs_context import context_summary, read_agents_md
 from .history import record as history_record, get_history, clear_history
 from .session_state import (
     RUNTIME_MODES, DEFAULT_RUNTIME_MODE, SWARM_MODES, TOOL_MODES, get_state,
-    set_fallback, set_model, set_runtime_mode, set_swarm, set_tool_mode, set_workspace,
+    set_model, set_runtime_mode, set_swarm, set_tool_mode, set_workspace,
 )
 from .status import Spinner, phase_label
 from . import settings as settings_core
@@ -257,21 +257,6 @@ def cmd_model(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_fallback(args: argparse.Namespace) -> int:
-    if args.value:
-        set_fallback(args.value)
-        effective = get_state().get("fallback_model") or ""
-        if effective:
-            print(f"fallback → {effective}")
-        else:
-            print("fallback → disabled (same as operator)")
-    else:
-        state = get_state()
-        val = state.get("fallback_model") or "(not set)"
-        print(f"fallback = {val}")
-    return 0
-
-
 def cmd_swarm(args: argparse.Namespace) -> int:
     if args.value:
         try:
@@ -459,6 +444,178 @@ def cmd_changes(args: argparse.Namespace) -> int:
         print(f"Error: rollback failed: {exc}",file=sys.stderr); return 1
     print(json.dumps(result,indent=2,ensure_ascii=False,sort_keys=True)); return 0
 
+def _team_catalog_models(filter_text: str = "") -> tuple[dict[str, Any], list[str]]:
+    _session, client = session_client()
+    data = client.model_catalog()
+    models = sorted(
+        model_id for item in data.get("models", [])
+        if (model_id := model_identifier(item))
+    )
+    needle = str(filter_text or "").strip().lower()
+    if needle:
+        models = [model for model in models if needle in model.lower()]
+    return data, models
+
+
+def _parse_team_role_assignments(values: list[str] | None) -> dict[str, str]:
+    from .team_runtime import normalize_team_model, team_role_key
+    updates: dict[str, str] = {}
+    for raw in values or []:
+        if "=" not in raw:
+            raise ValueError(f"team role override must be ROLE=MODEL: {raw}")
+        role, value = raw.split("=", 1)
+        key = team_role_key(role)
+        if key == "selected_model":
+            raise ValueError("use --model for the per-run primary model")
+        updates[key] = normalize_team_model(value)
+    return updates
+
+
+def _team_configure_updates(args: argparse.Namespace) -> dict[str, Any]:
+    from .team_runtime import normalize_team_model, team_role_key
+    updates: dict[str, Any] = {}
+    if getattr(args, "mode", None) is not None:
+        updates["team_runtime_mode"] = args.mode
+    if getattr(args, "primary", None) is not None:
+        primary = normalize_team_model(args.primary)
+        if primary == "@primary":
+            raise ValueError("the primary model cannot reference @primary")
+        updates["selected_model"] = primary or None
+    flag_map = {
+        "r1": "team_research_model_1", "r2": "team_research_model_2",
+        "r3": "team_research_model_3", "r4": "team_research_model_4",
+        "planner": "team_planner_model", "coordinator": "team_coordinator_model",
+        "c1": "team_coder_model_1", "c2": "team_coder_model_2",
+        "c3": "team_coder_model_3", "c4": "team_coder_model_4",
+        "merge": "team_merge_model", "tests": "team_test_planner_model",
+    }
+    for flag, key in flag_map.items():
+        value = getattr(args, flag, None)
+        if value is not None:
+            updates[key] = normalize_team_model(value)
+    for raw in getattr(args, "assignments", None) or []:
+        if "=" not in raw:
+            raise ValueError(f"team assignment must be ROLE=MODEL: {raw}")
+        role, value = raw.split("=", 1)
+        key = team_role_key(role)
+        normalized = normalize_team_model(value)
+        if key == "selected_model" and normalized == "@primary":
+            raise ValueError("the primary model cannot reference @primary")
+        updates[key] = normalized or (None if key == "selected_model" else "")
+    return updates
+
+
+def _print_team_status(*, json_output: bool = False) -> int:
+    from .team_runtime import config_from_state, team_model_rows
+    state = get_state()
+    config = config_from_state(state)
+    rows = team_model_rows(state)
+    direct_override = bool(os.environ.get("AICODER_NATIVE_MODEL_BASE_URL", "").strip())
+    payload = {
+        "mode": state.get("team_runtime_mode", "auto"),
+        "routing": "direct-native-override" if direct_override else "triforce-provider-router",
+        "roles": rows,
+        "active_research": len(config.research),
+        "active_coders": len(config.coders),
+        "active_roles": config.active_count,
+        "validation_errors": config.validate(),
+    }
+    if json_output:
+        print_json(payload)
+        return 0
+    print("── ai-coder team ─────────────────────────────────────────")
+    print(f"mode={payload['mode']}  routing={payload['routing']}  active_roles={payload['active_roles']}")
+    if direct_override:
+        print("WARN: AICODER_NATIVE_MODEL_BASE_URL is set; all team model calls use that direct endpoint.")
+    print("role         description                              configured → resolved")
+    print("─" * 88)
+    for row in rows:
+        configured = row["configured"]
+        resolved = row["resolved"]
+        route = configured if configured == resolved else f"{configured} → {resolved}"
+        print(f"{row['alias']:<12} {row['label']:<40} {route}")
+    for error in payload["validation_errors"]:
+        print(f"WARN: {error}")
+    return 0
+
+
+def cmd_team(args: argparse.Namespace) -> int:
+    from .team_runtime import normalize_team_model, team_role_key
+    action = getattr(args, "team_action", None) or "status"
+    if action == "status":
+        return _print_team_status(json_output=bool(getattr(args, "json_out", False)))
+    if action == "models":
+        try:
+            data, models = _team_catalog_models(getattr(args, "filter", "") or "")
+        except Exception as exc:
+            print(f"Error: model catalog unavailable: {exc}", file=sys.stderr)
+            return 1
+        if getattr(args, "json_out", False):
+            print_json({"tier": data.get("tier", "?"), "models": models, "count": len(models)})
+            return 0
+        groups: dict[str, list[str]] = {}
+        for model in models:
+            groups.setdefault(model.split("/", 1)[0] if "/" in model else "other", []).append(model)
+        print(f"tier={data.get('tier','?')}  models={len(models)}")
+        for provider, provider_models in sorted(groups.items()):
+            print(f"\n[{provider}] ({len(provider_models)})")
+            for model in provider_models:
+                print(f"  {model}")
+        return 0
+    if action == "mode":
+        saved = settings_core.STORE.set("team_runtime_mode", args.value)
+        print(f"team mode → {saved.get('team_runtime_mode')}")
+        return 0
+    if action == "set":
+        try:
+            key = team_role_key(args.role)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
+        value = normalize_team_model(args.model)
+        if key == "selected_model" and value == "@primary":
+            print("Error: the primary model cannot reference @primary", file=sys.stderr)
+            return 2
+        saved = settings_core.STORE.set(key, value or (None if key == "selected_model" else ""))
+        print(f"{args.role} → {saved.get(key) or ('backend-default' if key == 'selected_model' else 'off')}")
+        return 0
+    if action == "configure":
+        try:
+            updates = _team_configure_updates(args)
+        except (ValueError, settings_core.SettingsError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
+        if not updates and sys.stdin.isatty():
+            state = get_state()
+            mode = input(f"team mode [{state.get('team_runtime_mode','auto')}]: ").strip()
+            if mode:
+                updates["team_runtime_mode"] = mode
+            from .team_runtime import TEAM_ROLE_SPECS
+            for alias, key, label in TEAM_ROLE_SPECS:
+                current = state.get(key) or ("backend-default" if key == "selected_model" else "off")
+                value = input(f"{alias:<12} {label} [{current}]: ").strip()
+                if value:
+                    updates[key] = normalize_team_model(value) or (None if key == "selected_model" else "")
+        if not updates:
+            print("No changes. Use flags such as --r1 MODEL --c1 MODEL --planner MODEL, or run interactively.", file=sys.stderr)
+            return 2
+        try:
+            settings_core.STORE.update(**updates)
+        except settings_core.SettingsError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
+        return _print_team_status(json_output=bool(getattr(args, "json_out", False)))
+    if action == "reset":
+        from .team_runtime import TEAM_SETTING_KEYS
+        updates = {key: settings_core.REGISTRY[key].default for key in TEAM_SETTING_KEYS}
+        updates["team_runtime_mode"] = settings_core.REGISTRY["team_runtime_mode"].default
+        settings_core.STORE.update(**updates)
+        print("team configuration → defaults")
+        return 0
+    print(f"Error: unknown team action: {action}", file=sys.stderr)
+    return 2
+
+
 def cmd_runtime(args: argparse.Namespace) -> int:
     value = getattr(args, "value", None)
     if value:
@@ -470,6 +627,32 @@ def cmd_runtime(args: argparse.Namespace) -> int:
         print(f"runtime → {value}")
     else:
         print(f"runtime = {get_state().get('runtime_mode', DEFAULT_RUNTIME_MODE)}")
+    return 0
+
+
+def _peter_run_state() -> tuple[bool, str]:
+    """Return whether the current locally tracked AICoder team run is alive."""
+    pid_path = Path("/tmp/aicoder-current-run-pid")
+    run_path = Path("/tmp/aicoder-current-run-id")
+    try:
+        pid = int(pid_path.read_text(encoding="utf-8").strip())
+        run_id = run_path.read_text(encoding="utf-8").strip() if run_path.exists() else ""
+        os.kill(pid, 0)
+        return True, run_id
+    except (OSError, ValueError):
+        return False, ""
+
+
+def cmd_peter(_: argparse.Namespace) -> int:
+    """Tiny hidden codename easter egg; intentionally has no side effects."""
+    active, run_id = _peter_run_state()
+    print("AICoder — Codename: PETER")
+    print("Vier Köpfe rein. Ein verifizierter Patch raus.")
+    if active:
+        suffix = f" · {run_id}" if run_id else ""
+        print(f"Status: Peter arbeitet{suffix}")
+    else:
+        print("Status: Peter macht gerade Pause.")
     return 0
 
 
@@ -705,7 +888,7 @@ def cmd_command(args: argparse.Namespace) -> int:
     return run_agent(
         initial_prompt=text,
         model=getattr(args, "model", None) or state.get("selected_model"),
-        fallback_model=state.get("fallback_model"),
+        fallback_model=None,
         verbose=getattr(args, "verbose", False),
         runtime_mode="native-light",
         json_output=bool(getattr(args, "json_out", False)),
@@ -781,11 +964,13 @@ def cmd_status(_: argparse.Namespace) -> int:
 
 
 def _print_header(state: dict, model_override: str | None = None) -> None:
-    """Print active model/fallback/swarm before any LLM task."""
+    """Print the settings-driven model/runtime route before an LLM task."""
     model = model_override or state.get("selected_model") or "(backend default)"
-    fallback = state.get("fallback_model") or "(not set)"
-    swarm = state.get("swarm_mode", "off")
-    print(f"model={model}  fallback={fallback}  swarm={swarm}", file=sys.stderr)
+    print(
+        f"model={model}  runtime={state.get('runtime_mode','native-light')}  "
+        f"workspace={state.get('workspace_mode','auto')}  team={state.get('team_runtime_mode','auto')}",
+        file=sys.stderr,
+    )
 
 def _resolve_model(state: dict, override: str | None) -> str | None:
     """Return model to use: CLI arg > state selected_model > None (backend default)."""
@@ -798,7 +983,6 @@ def _print_response(result: dict) -> None:
     model_used = result.get("model", "?")
     backend = result.get("backend", "?")
     latency = result.get("latency_ms")
-    fallback = result.get("fallback_used", False)
 
     print()
     print(resp)
@@ -806,8 +990,6 @@ def _print_response(result: dict) -> None:
     meta = f"[{model_used} · {backend}"
     if latency:
         meta += f" · {latency}ms"
-    if fallback:
-        meta += " · FALLBACK"
     meta += "]"
     print(meta, file=sys.stderr)
 
@@ -819,7 +1001,6 @@ def cmd_ask(args: argparse.Namespace) -> int:
     client = TriForceClient(session.base_url, token=session.token, timeout=_timeout)
     state = get_state()
     model = _resolve_model(state, getattr(args, "model", None))
-    swarm = state.get("swarm_mode", "off")
 
     # Collect prompt: args.prompt (joined) or stdin
     if args.prompt:
@@ -846,25 +1027,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
 
     _print_header(state, model)
 
-    # Swarm V2: on|review → parallel; auto → Heuristik
-    _effective_swarm = swarm
-    if swarm == "auto":
-        from .swarm_runner import should_auto_swarm
-        if should_auto_swarm(message):
-            _effective_swarm = "on"
-            print("swarm: auto-triggered (complex prompt)", file=sys.stderr)
-
-    if _effective_swarm in ("on", "review"):
-        from .swarm_runner import run_swarm_ask
-        return run_swarm_ask(
-            message=message,
-            operator_model=model,
-            fallback_model=state.get("fallback_model"),
-            system_prompt=system_prompt,
-            mode=_effective_swarm,
-        )
-
-    label = phase_label(swarm if swarm != "off" else "work")
+    label = phase_label("work")
 
     with Spinner(label):
         result = client.chat(
@@ -873,7 +1036,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
             system_prompt=system_prompt,
             temperature=getattr(args, "temperature", 0.7),
             max_tokens=getattr(args, "max_tokens", 4096),
-            fallback_model=state.get("fallback_model") or None,
+            fallback_model=None,
         )
 
     _print_response(result)
@@ -895,7 +1058,6 @@ def cmd_chat(args: argparse.Namespace) -> int:
     client = TriForceClient(session.base_url, token=session.token, timeout=120)
     state = get_state()
     model = _resolve_model(state, getattr(args, "model", None))
-    swarm = state.get("swarm_mode", "off")
 
     workspace = str(active_workspace(state.get("workspace_root")))
     system_prompt = None
@@ -903,8 +1065,8 @@ def cmd_chat(args: argparse.Namespace) -> int:
         system_prompt = read_agents_md(workspace)
 
     agents_hint = " [AGENTS.md loaded]" if system_prompt else ""
-    print(f"ai-coder chat · model={model or 'backend default'} · swarm={swarm}{agents_hint}")
-    print("Commands: /exit  /model <name>  /swarm <mode>  /status")
+    print(f"ai-coder chat · model={model or 'backend default'}{agents_hint}")
+    print("Commands: /exit  /model <name>  /models  /status")
     print("─" * 50)
 
     history: list[dict] = []
@@ -932,25 +1094,10 @@ def cmd_chat(args: argparse.Namespace) -> int:
                 set_model(val)
                 state = get_state()
                 print(f"model → {val}")
-            elif cmd == "/swarm" and val:
-                try:
-                    set_swarm(val)
-                    swarm = val
-                    print(f"swarm → {val}")
-                except ValueError as e:
-                    print(f"Error: {e}")
             elif cmd == "/status":
-                print(f"model={model or 'backend default'}  swarm={swarm}  turns={len(history)}")
-            elif cmd == "/fallback" and val:
-                set_fallback(val)
-                effective = get_state().get("fallback_model") or ""
-                state["fallback_model"] = effective
-                if effective:
-                    print(f"fallback → {effective}")
-                else:
-                    print("fallback → disabled (same as operator)")
+                print(f"model={model or 'backend default'}  turns={len(history)}")
             elif cmd == "/help":
-                print("  /model <n>  /fallback <n>  /swarm <mode>  /status  /clear  /exit")
+                print("  /model <n>  /models  /status  /clear  /exit")
             elif cmd == "/clear":
                 history.clear()
                 print("History cleared.")
@@ -971,14 +1118,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
                 chat_messages.append({"role": "assistant", "content": resp_trimmed})
         chat_messages.append({"role": "user", "content": user_input})
 
-        # Auto-swarm heuristik
-        _cs = swarm
-        if swarm == "auto":
-            from .swarm_runner import should_auto_swarm
-            if should_auto_swarm(user_input):
-                _cs = "on"
-        label = phase_label(_cs if _cs != "off" else "work")
-        fallback = state.get("fallback_model") or None
+        label = phase_label("work")
         with Spinner(label):
             try:
                 result = client.chat(
@@ -987,7 +1127,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
                     system_prompt=system_prompt,
                     temperature=0.7,
                     max_tokens=4096,
-                    fallback_model=fallback,
+                    fallback_model=None,
                 )
             except (ClientError, RuntimeError) as e:
                 print(f"\nFehler: {e}", file=sys.stderr)
@@ -1001,22 +1141,9 @@ def cmd_chat(args: argparse.Namespace) -> int:
         meta = f"[{model_used}"
         if latency:
             meta += f" · {latency}ms"
-        if result.get("fallback_used"):
-            meta += " · FALLBACK"
         meta += "]"
         print(meta)
         print()
-
-        if _cs in {"on", "review"}:
-            from .swarm_runner import run_swarm_review
-            run_swarm_review(
-                original_task=user_input,
-                operator_response=resp,
-                operator_model=model_used,
-                fallback_model=fallback,
-                system_prompt=system_prompt,
-                client=client,
-            )
 
         history.append({"user": user_input, "assistant": resp})
         try:
@@ -1234,6 +1361,8 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=textwrap.dedent("""        Examples:
           aicoder login --base-url http://127.0.0.1:9000
           aicoder model anthropic/claude-sonnet-4
+          aicoder team status
+          aicoder team configure --mode on --r1 ollama/gemma4:cloud --c1 @primary
           aicoder fallback gemini/gemini-2.0-flash
           aicoder swarm auto
           aicoder settings list
@@ -1300,9 +1429,37 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("value", nargs="?")
     p.set_defaults(func=cmd_model)
 
-    p = sub.add_parser("fallback", help="Show or set fallback model")
-    p.add_argument("value", nargs="?")
-    p.set_defaults(func=cmd_fallback)
+    p = sub.add_parser(
+        "team",
+        help="Configure mixed-provider team models (same settings as GUI)",
+        description="Configure persistent team roles or inspect the provider-aware team routing used by terminal and GUI.",
+    )
+    team_sub = p.add_subparsers(dest="team_action")
+    p.set_defaults(func=cmd_team, team_action="status", json_out=False)
+    sp = team_sub.add_parser("status", help="Show configured and resolved model for every team role")
+    sp.add_argument("--json", dest="json_out", action="store_true")
+    sp.set_defaults(func=cmd_team)
+    sp = team_sub.add_parser("models", help="List models available to team roles")
+    sp.add_argument("filter", nargs="?", default="")
+    sp.add_argument("--json", dest="json_out", action="store_true")
+    sp.set_defaults(func=cmd_team)
+    sp = team_sub.add_parser("mode", help="Set persistent team runtime mode")
+    sp.add_argument("value", choices=["off", "auto", "on"])
+    sp.set_defaults(func=cmd_team)
+    sp = team_sub.add_parser("set", help="Set one role; arbitrary provider/model ids are accepted like the GUI")
+    sp.add_argument("role", help="base|r1..r4|planner|coordinator|c1..c4|merge|tests")
+    sp.add_argument("model", help="model id, @primary, or off")
+    sp.set_defaults(func=cmd_team)
+    sp = team_sub.add_parser("configure", help="Atomically configure multiple team roles")
+    sp.add_argument("--mode", choices=["off", "auto", "on"])
+    sp.add_argument("--primary")
+    for flag in ("r1", "r2", "r3", "r4", "planner", "coordinator", "c1", "c2", "c3", "c4", "merge", "tests"):
+        sp.add_argument(f"--{flag}")
+    sp.add_argument("--set", dest="assignments", action="append", default=[], metavar="ROLE=MODEL", help="Additional role assignment; repeatable")
+    sp.add_argument("--json", dest="json_out", action="store_true")
+    sp.set_defaults(func=cmd_team)
+    sp = team_sub.add_parser("reset", help="Reset team mode and role slots to defaults")
+    sp.set_defaults(func=cmd_team)
 
     p = sub.add_parser("swarm", help=f"Swarm-Modus anzeigen oder setzen ({', '.join(sorted(SWARM_MODES))})")
     p.add_argument("value", nargs="?")
@@ -1555,6 +1712,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("agent", help="Agent REPL / autonomous terminal agent")
     p.add_argument("prompt", nargs="*", help="Direct prompt (no REPL)")
     p.add_argument("--model", default=None)
+    p.add_argument("--team-mode", choices=["off", "auto", "on"], default=None, help="Per-run team mode override; does not change saved settings")
+    p.add_argument(
+        "--team-role", action="append", default=[], metavar="ROLE=MODEL",
+        help="Per-run team role override (r1..r4, planner, coordinator, c1..c4, merge, tests); repeatable",
+    )
     p.add_argument(
         "--resume", action="store_true",
         help="Resume the current persistent native-light plan (implies native-light)",
@@ -1601,10 +1763,18 @@ def cmd_agent(args: argparse.Namespace) -> int:
         from .session_state import get_state
         state = get_state()
         initial_prompt = " ".join(prompt_parts) if prompt_parts else "continue"
+        try:
+            team_overrides = _parse_team_role_assignments(getattr(args, "team_role", None))
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
+        if getattr(args, "team_mode", None) is not None:
+            team_overrides["team_runtime_mode"] = args.team_mode
         return run_agent(
             initial_prompt=initial_prompt,
             model=getattr(args, "model", None) or state.get("selected_model"),
-            fallback_model=state.get("fallback_model"),
+            team_overrides=team_overrides,
+            fallback_model=None,
             verbose=getattr(args, "verbose", False),
             runtime_mode="native-light" if resume_requested else None,
             resume_plan_id=(plan_id or "current") if resume_requested else None,
@@ -1617,7 +1787,7 @@ def cmd_models(args: argparse.Namespace) -> int:
     """List available models from backend."""
     session, client = session_client()
     with Spinner("working..."):
-        data = client._request("GET", "/v1/client/models", require_auth=True, _label="models")
+        data = client.model_catalog()
     models = [
         model_id for item in data.get("models", [])
         if (model_id := model_identifier(item))
@@ -1746,6 +1916,8 @@ def _activate_startup_workspace(argv: list[str] | None = None) -> Path:
 
 
 def main() -> int:
+    from .team_orchestrator import reset_team_debug_log
+    reset_team_debug_log()
     # CLI/REPL intentionally use the launch cwd as workspace. GUI launchers often
     # start from the source/install directory, so GUI must honor persisted settings.
     _activate_startup_workspace()
@@ -1753,6 +1925,10 @@ def main() -> int:
     if len(sys.argv) == 1:
         from .setup import run_repl
         return run_repl()
+
+    # Intentionally bypass argparse so the codename easter egg stays out of --help.
+    if len(sys.argv) == 2 and sys.argv[1].lower() == "peter":
+        return cmd_peter(argparse.Namespace())
 
     parser = build_parser()
     args = parser.parse_args()

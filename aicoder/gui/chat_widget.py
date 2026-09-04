@@ -14,7 +14,7 @@ except ImportError:
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
-    QTextEdit, QPlainTextEdit, QPushButton, QLabel, QMessageBox, QComboBox,
+    QTextEdit, QPlainTextEdit, QPushButton, QLabel, QMessageBox,
     QMenu, QInputDialog,
 )
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, QMetaObject, Q_ARG, QMimeData, QUrl
@@ -28,6 +28,7 @@ from ..privileges import (
 )
 from ..session_state import DEFAULT_RUNTIME_MODE, get_state
 from ..workspace import active_workspace
+from ..workspace_backend import open_workspace_for_run, preserve_workspace_for_resume
 from ..client import TriForceClient
 from .. import chat_history
 from ..executor import (
@@ -45,7 +46,7 @@ class _AgentWorker(QThread):
     approval_needed = pyqtSignal(str, object)  # tool, complete approval arguments
 
     def __init__(
-        self, client, messages_array, model, fallback, tools, system_prompt,
+        self, client, messages_array, model, tools, system_prompt,
         load_tools_on_start=True, enabled_tool_names=None, quick_chat=False,
         tools_unavailable_reason="", progressive_tool_disclosure=True,
         session_id="", evidence_context="",
@@ -54,7 +55,6 @@ class _AgentWorker(QThread):
         self.client = client
         self.messages = list(messages_array)
         self.model = model
-        self.fallback = fallback
         self.tools = tools
         self.system = system_prompt
         self.load_tools_on_start = load_tools_on_start
@@ -100,49 +100,14 @@ class _AgentWorker(QThread):
             args["_elevation_strategy"] = self._approval_strategy
         return self._approval_result
 
-    def _emit_advisor_review(self, original_request: str, response: str, operator_model: str) -> None:
-        """Run the configured swarm as a non-executing post-response advisor."""
-        from ..session_state import get_state
-        from ..swarm_runner import should_auto_swarm
-
-        state = get_state()
-        mode = state.get("swarm_mode", "off")
-        if mode == "auto" and not should_auto_swarm(original_request):
-            return
-        if mode not in {"auto", "on", "review"}:
-            return
-        advisor = self.fallback
-        if not advisor or advisor == operator_model:
-            return
-        prompt = (
-            "Act only as an advisor. Review the operator response for bugs, security "
-            "risks, missing verification, and conflicts with the request. Do not call "
-            "tools.\n\n"
-            f"Request:\n{original_request[:4000]}\n\n"
-            f"Operator response:\n{response[:12000]}"
-        )
-        try:
-            result = self.client.chat(
-                message=prompt, model=advisor, system_prompt=self.system,
-                temperature=0.2, max_tokens=2048,
-            )
-            review = str(result.get("response", "") or "").strip()
-            if review:
-                self.msg.emit("system", review, f"Swarm review · {result.get('model', advisor)}")
-        except Exception as exc:
-            self.msg.emit("system", f"Swarm review unavailable: {exc}", "advisor")
-
     def run(self):
-        # GUI-Resilienz: in PyQt6 killt eine unbehandelte Exception in einer
-        # QThread.run()-Reimplementation den ganzen Prozess (stiller GUI-Abbruch).
-        # Die REPL ueberlebt dieselben Fehler, weil sie im Main-Thread unter
-        # hoeheren except-Handlern laeuft. Dasselbe Sicherheitsnetz hier:
+        # A QThread exception must never terminate the GUI process.
         try:
             self._run_impl()
-        except Exception as e:  # bewusster catch-all: Thread darf nie ungebremst sterben
+        except Exception as exc:
             import traceback
             try:
-                self.error.emit(f"Agent crashed: {e}\n{traceback.format_exc()}")
+                self.error.emit(f"Agent crashed: {exc}\n{traceback.format_exc()}")
             except Exception:
                 pass
 
@@ -180,11 +145,8 @@ class _AgentWorker(QThread):
             elif kind == "run_start":
                 configured = str(payload.get("configured_model") or payload.get("model") or "default")
                 effective = str(payload.get("effective_model") or payload.get("model") or configured)
-                fallback = str(payload.get("fallback") or "")
                 route = configured if configured == effective else f"{configured} → {effective}"
                 detail = f"effective={route}"
-                if fallback:
-                    detail += f" · fallback={fallback}"
                 detail += f" · transport={payload.get('transport') or 'default'}"
                 self.msg.emit("system", "Run route", detail)
                 if bool(payload.get("resumed")):
@@ -193,6 +155,27 @@ class _AgentWorker(QThread):
                         "Resume safety",
                         "Raw tool evidence is not restored · fresh inspection required before mutation",
                     )
+            elif kind == "performance_warning":
+                warning_kind = str(payload.get("kind") or "performance")
+                elapsed = int(payload.get("elapsed_ms") or 0) / 1000.0
+                if warning_kind == "model_latency":
+                    text = f"High model/API latency detected: {elapsed:.1f}s"
+                elif warning_kind == "filesystem_latency":
+                    text = f"Slow filesystem operation: {payload.get('tool') or 'I/O'} {elapsed:.1f}s"
+                else:
+                    text = str(payload.get("message") or "Performance bottleneck detected")
+                self.msg.emit("system", text, "performance")
+            elif kind == "performance_summary":
+                wall = int(payload.get("wall_ms") or 0) / 1000.0
+                model_s = int(payload.get("model_ms") or 0) / 1000.0
+                tools_s = int(payload.get("tool_ms") or 0) / 1000.0
+                io_s = int(payload.get("filesystem_ms") or 0) / 1000.0
+                bottleneck = str(payload.get("bottleneck") or "?")
+                self.msg.emit(
+                    "system",
+                    f"Performance: {wall:.1f}s wall · {model_s:.1f}s model · {tools_s:.1f}s tools · {io_s:.1f}s I/O",
+                    f"bottleneck={bottleneck}",
+                )
             elif kind == "model_without_tool_support":
                 _msg = (
                     f"{payload.get('model') or '?'} meldet kein natives Function Calling — "
@@ -267,12 +250,29 @@ class _AgentWorker(QThread):
                 )
 
         resume_requested = persistent_plan and is_short_confirmation(initial_prompt)
+        source_workspace = str(active_workspace(state.get("workspace_root")))
+        workspace_mode = str(state.get("workspace_mode", "auto") or "auto")
+        workspace_backend = open_workspace_for_run(
+            source_workspace, workspace_mode, resume=resume_requested, resume_plan_id=None,
+        )
+        info = workspace_backend.info
+        workspace_detail = info.mode
+        if info.mode == "ram":
+            workspace_detail += f" · transactional · budget {info.safe_budget_bytes // (1024**2)} MiB"
+            if info.restored_checkpoint:
+                workspace_detail += " · restored"
+        elif info.fallback_reason:
+            workspace_detail += f" · fallback: {info.fallback_reason}"
+        self.msg.emit("system", f"Execution workspace: {workspace_detail}", runtime_label)
         runtime = NativeLightRuntime(
             client=self.client,
             initial_prompt=initial_prompt,
             model=self.model or None,
-            fallback_model=self.fallback or None,
-            workspace_root=str(active_workspace(state.get("workspace_root"))),
+            fallback_model=None,
+            workspace_root=str(info.execution_root),
+            plan_workspace_root=source_workspace,
+            protected_workspace_root=(source_workspace if workspace_backend.info.transactional else None),
+            completion_guard=(lambda: workspace_backend.finalize(verified=True)),
             tools=self.tools,
             system_prompt=self.system,
             conversation=prior,
@@ -291,6 +291,8 @@ class _AgentWorker(QThread):
             native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
         )
         result = runtime.run()
+        if result.status != "completed":
+            preserve_workspace_for_resume(workspace_backend, result.plan_id or None)
         self.tools = result.tools
         self.system = result.system_prompt
         self.messages = result.messages
@@ -298,18 +300,82 @@ class _AgentWorker(QThread):
         if result.status == "failed":
             self.error.emit(result.error or f"{runtime_label} runtime failed")
             return
-        if result.status == "completed":
-            self._emit_advisor_review(initial_prompt, result.response, result.model)
+        self.finished.emit(result.response, result.model)
+
+    def _run_team_impl(self, initial_prompt: str):
+        from ..model_transport import native_model_transport_from_env
+        from ..team_orchestrator import run_team
+        from ..team_runtime import config_from_state
+
+        state = get_state()
+        source_workspace = str(active_workspace(state.get("workspace_root")))
+        config = config_from_state(state)
+        model_client, _ = native_model_transport_from_env(self.client, default_model=self.model or None)
+
+        def on_team_event(kind: str, payload: dict):
+            if kind == "team_start":
+                self.activity.emit(f"Team runtime · {payload.get('agents', 0)} configured roles")
+                self.msg.emit(
+                    "system",
+                    f"Team runtime started · {payload.get('research', 0)} research · {payload.get('coders', 0)} coders",
+                    "RAM candidates",
+                )
+            elif kind == "team_pipeline":
+                stage = str(payload.get("stage") or "stage")
+                status = str(payload.get("status") or "?")
+                self.activity.emit(f"Team · {stage} · {status}")
+                if status == "started":
+                    self.msg.emit("system", f"Pipeline · {stage}", "stage")
+            elif kind == "team_workspace_plan":
+                mode = str(payload.get("backend_mode") or "?")
+                count = int(payload.get("candidate_count") or 0)
+                reason = str(payload.get("reason") or "").strip()
+                detail = f"{count} Kandidaten · {mode}" + (f" · {reason}" if reason else "")
+                self.msg.emit("system", "Workspace-Plan", detail)
+            elif kind == "team_stage":
+                role = str(payload.get("role") or "stage")
+                status = str(payload.get("status") or "?")
+                model = str(payload.get("model") or "?")
+                elapsed = int(payload.get("elapsed_ms") or 0) / 1000.0
+                self.activity.emit(f"Team · {role} · {status}")
+                self.msg.emit("system", f"{role} · {status} · {elapsed:.1f}s", model)
+            elif kind == "team_candidate":
+                cid = str(payload.get("candidate_id") or "candidate")
+                self.msg.emit(
+                    "system",
+                    f"{cid} · {payload.get('status')} · score {payload.get('score')}",
+                    "anonymized candidate",
+                )
+            elif kind == "team_complete":
+                self.msg.emit(
+                    "system",
+                    f"Team complete · winner {payload.get('winner_candidate_id')} · score {payload.get('winner_score')}",
+                    f"wall {int(payload.get('wall_ms') or 0)/1000.0:.1f}s",
+                )
+
+        result = run_team(
+            task=initial_prompt, state=state, config=config, client=self.client,
+            model_client=model_client, source_workspace=source_workspace,
+            event_fn=on_team_event, stop_requested=lambda: self._stopped,
+        )
+        if result.status != "completed":
+            self.error.emit(result.error or "Team runtime failed")
+            return
+        self.messages.append({"role": "assistant", "content": result.response})
+        self.messages_updated.emit(self.messages)
         self.finished.emit(result.response, result.model)
 
     def _run_impl(self):
-        runtime_mode = get_state().get("runtime_mode", DEFAULT_RUNTIME_MODE)
+        state = get_state()
+        messages = list(self.messages)
+        latest = next((str(m.get("content") or "") for m in reversed(messages) if m.get("role") == "user"), "")
+        from ..team_runtime import should_use_team
+        if latest and should_use_team(latest, str(state.get("team_runtime_mode") or "off")) and not is_short_confirmation(latest):
+            self._run_team_impl(latest)
+            return
+        runtime_mode = state.get("runtime_mode", DEFAULT_RUNTIME_MODE)
         self._run_shared_runtime_impl(persistent_plan=(runtime_mode == "native-light"))
 
-
-def _select_chat_route(model: str, fallback: str, quick_chat: bool):
-    """Preserve the configured primary route; fallback means fallback."""
-    return model, fallback, False
 
 
 class PromptEdit(QPlainTextEdit):
@@ -338,8 +404,6 @@ class ChatWidget(QWidget):
         self._system = None
         self._messages = []
         self._syncing = False
-        self._model_override_dirty = False
-        self._fallback_override_dirty = False
         self._session_id = None
         self._dropped_files = []
         self._activity_started = 0.0
@@ -350,62 +414,13 @@ class ChatWidget(QWidget):
         self._activity_timer.timeout.connect(self._tick_activity)
         self._build_ui()
         self.setAcceptDrops(True)
-        # Connect to settings model list + selection changes
-        if self.settings_ref:
-            if hasattr(self.settings_ref, "models_loaded"):
-                self.settings_ref.models_loaded.connect(self._on_models_updated)
-            if hasattr(self.settings_ref, "selection_changed"):
-                self.settings_ref.selection_changed.connect(self._on_settings_selection_changed)
-            if hasattr(self.settings_ref, "tools_changed"):
-                self.settings_ref.tools_changed.connect(self._on_tools_changed)
-            # Editable combos can show the persisted route before the async
-            # model catalogue arrives, avoiding blank selectors on startup.
-            self.model_combo.setCurrentText(self.settings_ref.get_current_model())
-            self.fallback_combo.setCurrentText(self.settings_ref.get_current_fallback())
+        if self.settings_ref and hasattr(self.settings_ref, "tools_changed"):
+            self.settings_ref.tools_changed.connect(self._on_tools_changed)
 
     def _on_tools_changed(self, _mode: str, _names):
         """Invalidate the filtered cache after a settings change."""
         self._tools = None
         self._system = None
-
-    def _mark_model_override_dirty(self, *_args):
-        if not self._syncing:
-            self._model_override_dirty = True
-
-    def _mark_fallback_override_dirty(self, *_args):
-        if not self._syncing:
-            self._fallback_override_dirty = True
-
-    def _on_models_updated(self, models: list):
-        """Refresh model choices without clobbering manual Chat overrides."""
-        current_model = self.model_combo.currentText()
-        current_fallback = self.fallback_combo.currentText()
-        self._syncing = True
-        self.model_combo.clear()
-        self.fallback_combo.clear()
-        self.model_combo.addItem("")    # Backend-Default
-        self.fallback_combo.addItem("")  # kein Fallback
-        for m in models:
-            self.model_combo.addItem(m)
-            self.fallback_combo.addItem(m)
-        if self._model_override_dirty:
-            self.model_combo.setCurrentText(current_model)
-        elif self.settings_ref:
-            self.model_combo.setCurrentText(self.settings_ref.get_current_model())
-        if self._fallback_override_dirty:
-            self.fallback_combo.setCurrentText(current_fallback)
-        elif self.settings_ref:
-            self.fallback_combo.setCurrentText(self.settings_ref.get_current_fallback())
-        self._syncing = False
-
-    def _on_settings_selection_changed(self, model: str, fallback: str):
-        """Settings tab selection changed — explicitly resync Chat routing."""
-        self._syncing = True
-        self.model_combo.setCurrentText(model)
-        self.fallback_combo.setCurrentText(fallback)
-        self._model_override_dirty = False
-        self._fallback_override_dirty = False
-        self._syncing = False
 
     # ── Drag & Drop ──────────────────────────────────────────────
     def dragEnterEvent(self, event: QDragEnterEvent):
@@ -494,42 +509,6 @@ class ChatWidget(QWidget):
         self.log.setObjectName("ChatLog")
         self.log.setReadOnly(True)
         layout.addWidget(self.log, stretch=1)
-
-        # Model-Selector Row
-        model_row = QHBoxLayout()
-        model_row.setSpacing(6)
-
-        model_label = QLabel("Model:")
-        model_label.setObjectName("Caption")
-        model_label.setFixedWidth(45)
-        model_row.addWidget(model_label)
-
-        self.model_combo = QComboBox()
-        self.model_combo.setEditable(True)
-        self.model_combo.setMinimumWidth(250)
-        self.model_combo.addItem("")  # Backend-Default (liste wird dynamisch geladen)
-        self.model_combo.setCurrentText("")
-        self.model_combo.setToolTip("Select model (empty = backend default)")
-        self.model_combo.lineEdit().textEdited.connect(self._mark_model_override_dirty)
-        self.model_combo.activated.connect(self._mark_model_override_dirty)
-        model_row.addWidget(self.model_combo, stretch=1)
-
-        fb_label = QLabel("Fallback:")
-        fb_label.setObjectName("Caption")
-        fb_label.setFixedWidth(55)
-        model_row.addWidget(fb_label)
-
-        self.fallback_combo = QComboBox()
-        self.fallback_combo.setEditable(True)
-        self.fallback_combo.setMinimumWidth(250)
-        self.fallback_combo.addItem("")  # (liste wird dynamisch geladen)
-        self.fallback_combo.setCurrentText("")
-        self.fallback_combo.setToolTip("Fallback model (optional)")
-        self.fallback_combo.lineEdit().textEdited.connect(self._mark_fallback_override_dirty)
-        self.fallback_combo.activated.connect(self._mark_fallback_override_dirty)
-        model_row.addWidget(self.fallback_combo, stretch=1)
-
-        layout.addLayout(model_row)
 
         # Status-Zeile (erweitert: User, Tier, Workspace, Tools)
         self.status = QLabel("Ready.")
@@ -798,27 +777,15 @@ class ChatWidget(QWidget):
             self._stop_activity()
             return
 
-        # Priority: combo box > settings tab > state file
-        model = self.model_combo.currentText().strip()
-        fallback = self.fallback_combo.currentText().strip()
+        # Model routing is settings-driven. The Chat page never overrides it.
         state = get_state()
-        if not model and self.settings_ref:
-            model = self.settings_ref.get_current_model()
-        if not fallback and self.settings_ref:
-            fallback = self.settings_ref.get_current_fallback()
-        if not model:
-            model = state.get("selected_model", "")
-        if not fallback:
-            fallback = state.get("fallback_model", "")
+        model = str(state.get("selected_model") or "").strip()
 
         resume_requested = (
             state.get("runtime_mode", DEFAULT_RUNTIME_MODE) == "native-light"
             and is_short_confirmation(text)
         )
         quick_chat = is_simple_chat_message(text) and not resume_requested
-        model, fallback, fast_fallback = _select_chat_route(model, fallback, quick_chat)
-        if fast_fallback:
-            self._append_msg("system", f"Fast chat model · {model}", "")
         tool_mode = state.get("tool_mode", "on_demand")
         enabled_tool_names = state.get("enabled_tools")
         if self.settings_ref and hasattr(self.settings_ref, "get_tool_mode"):
@@ -879,7 +846,7 @@ class ChatWidget(QWidget):
         evidence_context = chat_history.render_tool_evidence(self._session_id, limit=40)
 
         self._worker = _AgentWorker(
-            client, self._messages, model, fallback, run_tools, run_system,
+            client, self._messages, model, run_tools, run_system,
             load_tools_on_start=should_load_tools_now,
             enabled_tool_names=enabled_tool_names,
             quick_chat=quick_chat,
