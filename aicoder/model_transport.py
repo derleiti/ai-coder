@@ -228,6 +228,187 @@ class OpenAICompatibleTransport:
         return normalized
 
 
+class AnthropicMessagesTransport:
+    """Direct transport for Anthropic's native Messages API."""
+
+    def __init__(self, base_url: str, *, api_key: str, timeout: int = 300):
+        base = str(base_url or "").strip()
+        if not base:
+            raise ValueError("Anthropic base URL is required")
+        self.base_url = base.rstrip("/")
+        self.api_key = str(api_key or "")
+        self.timeout = max(10, min(300, int(timeout)))
+        self._active_response_lock = threading.Lock()
+        self._active_responses: dict[str, Any] = {}
+
+    @property
+    def endpoint(self) -> str:
+        if self.base_url.endswith("/messages"):
+            return self.base_url
+        return urljoin(self.base_url + "/", "messages")
+
+    def cancel_current_request(self, request_id: str | None = None) -> bool:
+        with self._active_response_lock:
+            if request_id:
+                responses = [self._active_responses.pop(str(request_id), None)]
+            elif len(self._active_responses) == 1:
+                key, response = next(iter(self._active_responses.items()))
+                self._active_responses.pop(key, None)
+                responses = [response]
+            else:
+                responses = list(self._active_responses.values())
+                self._active_responses.clear()
+        closed = False
+        for response in responses:
+            if response is None:
+                continue
+            close = getattr(response, "close", None)
+            if callable(close):
+                try:
+                    close(); closed = True
+                except Exception:
+                    pass
+        return closed
+
+    def _post_json(self, payload: dict[str, Any], *, request_id: str | None = None) -> dict[str, Any]:
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": USER_AGENT,
+            "x-api-key": self.api_key,
+            "anthropic-version": "2023-06-01",
+        }
+        if request_id:
+            headers["X-AICoder-Request-ID"] = request_id
+        request = Request(
+            self.endpoint,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        context = ssl.create_default_context()
+        try:
+            response = urlopen(request, timeout=self.timeout, context=context)
+            active_key = str(request_id or f"thread-{threading.get_ident()}")
+            with self._active_response_lock:
+                self._active_responses[active_key] = response
+            try:
+                raw = response.read().decode("utf-8", errors="replace")
+            finally:
+                with self._active_response_lock:
+                    if self._active_responses.get(active_key) is response:
+                        self._active_responses.pop(active_key, None)
+                try:
+                    response.close()
+                except Exception:
+                    pass
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:2000]
+            raise ClientError(f"Anthropic HTTP {exc.code}: {detail}") from exc
+        except (URLError, TimeoutError, OSError) as exc:
+            raise ClientError(f"Anthropic request failed: {exc}") from exc
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ClientError("Anthropic endpoint returned invalid JSON") from exc
+        if not isinstance(data, dict):
+            raise ClientError("Anthropic endpoint returned a non-object response")
+        return data
+
+    @staticmethod
+    def _anthropic_tools(tools: list[dict] | None) -> list[dict]:
+        converted: list[dict] = []
+        for tool in tools or []:
+            if not isinstance(tool, dict):
+                continue
+            if tool.get("type") == "function" and isinstance(tool.get("function"), dict):
+                fn = tool["function"]
+                name = str(fn.get("name") or "").strip()
+                description = str(fn.get("description") or "")
+                schema = fn.get("parameters")
+            else:
+                name = str(tool.get("name") or "").strip()
+                description = str(tool.get("description") or "")
+                schema = tool.get("inputSchema") or tool.get("parameters")
+            if not name:
+                continue
+            if not isinstance(schema, dict):
+                schema = {"type": "object", "properties": {}}
+            converted.append({"name": name, "description": description, "input_schema": schema})
+        return converted
+
+    def chat(
+        self,
+        message: str = "",
+        model: str | None = None,
+        system_prompt: str | None = None,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        fallback_model: str | None = None,
+        messages: list | None = None,
+        tools: list | None = None,
+        tool_choice: Any = "auto",
+        request_id: str | None = None,
+        reasoning_effort: str | None = None,
+    ) -> dict[str, Any]:
+        requested_model = str(model or "").strip()
+        provider = provider_for_model(requested_model)
+        transport_model = transport_model_id(requested_model, provider or "anthropic")
+        if not transport_model:
+            raise ClientError("Direct Anthropic transport requires a model id")
+
+        request_messages: list[dict[str, Any]] = []
+        system_parts: list[str] = []
+        if system_prompt:
+            system_parts.append(str(system_prompt))
+        for item in messages or []:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "")
+            content = item.get("content", "")
+            if role == "system":
+                if content:
+                    system_parts.append(str(content))
+                continue
+            if role in {"user", "assistant"}:
+                request_messages.append({"role": role, "content": content})
+        if not request_messages:
+            request_messages.append({"role": "user", "content": message})
+
+        payload: dict[str, Any] = {
+            "model": transport_model,
+            "messages": request_messages,
+            "max_tokens": int(max_tokens),
+            "temperature": float(temperature),
+        }
+        if system_parts:
+            payload["system"] = "\n\n".join(system_parts)
+        converted_tools = self._anthropic_tools(tools)
+        if converted_tools:
+            payload["tools"] = converted_tools
+            if tool_choice == "required":
+                payload["tool_choice"] = {"type": "any"}
+            elif tool_choice not in {None, "none"}:
+                payload["tool_choice"] = {"type": "auto"}
+
+        started = time.monotonic()
+        normalized = dict(_normalize_chat_response(self._post_json(payload, request_id=request_id)))
+        normalized.setdefault("model", requested_model or transport_model)
+        normalized.setdefault("backend", "anthropic-direct")
+        elapsed_s = time.monotonic() - started
+        normalized.setdefault("latency_ms", int(elapsed_s * 1000))
+        normalized.setdefault("_transport_telemetry", {
+            "transport": "anthropic-direct",
+            "streaming": False,
+            "timeout_semantics": "blocking-request",
+            "elapsed_s": round(elapsed_s, 3),
+            "keepalive_chunks": 0,
+            "payload_chunks": 1,
+            "request_id": request_id or "",
+        })
+        return normalized
+
+
 class ProviderRoutingTransport:
     """Route individual model calls through a user's secure provider credential.
 
@@ -240,7 +421,7 @@ class ProviderRoutingTransport:
     def __init__(self, default: ModelTransport):
         self.default = default
         self.timeout = int(getattr(default, "timeout", 300))
-        self._direct: dict[str, OpenAICompatibleTransport] = {}
+        self._direct: dict[str, ModelTransport] = {}
 
     def _transport_for_model(self, model: str | None) -> ModelTransport:
         provider = provider_for_model(model)
@@ -255,8 +436,12 @@ class ProviderRoutingTransport:
         if not api_key or source != "keyring":
             return self.default
         cached = self._direct.get(provider)
-        if cached is None or cached.api_key != api_key:
-            cached = OpenAICompatibleTransport(spec.base_url, api_key=api_key, timeout=self.timeout)
+        cached_key = str(getattr(cached, "api_key", "")) if cached is not None else ""
+        if cached is None or cached_key != api_key:
+            if provider == "anthropic":
+                cached = AnthropicMessagesTransport(spec.base_url, api_key=api_key, timeout=self.timeout)
+            else:
+                cached = OpenAICompatibleTransport(spec.base_url, api_key=api_key, timeout=self.timeout)
             self._direct[provider] = cached
         return cached
 

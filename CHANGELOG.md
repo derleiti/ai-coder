@@ -1,3 +1,10 @@
+## v1.2.2 (2026-09-04)
+
+- Complete BYOK routing across `ask`, `chat`, `task`/`review`, agent, GUI and team runtimes.
+- Add native Anthropic Messages API transport for securely stored Anthropic keys.
+- Add CLI OS-keyring management with `aicoder credentials set|delete <provider>`.
+- Keep provider secrets out of state, history and logs; preserve TriForce fallback when no direct key is configured.
+
 ## v1.2.1 (2026-09-04)
 
 - Fix missing typing import detected by release CI.

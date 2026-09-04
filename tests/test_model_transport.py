@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 from aicoder.client import ClientError
 from aicoder.executor import LOCAL_FILE_READ_SCHEMA
 from aicoder.model_transport import (
+    AnthropicMessagesTransport,
     OpenAICompatibleTransport,
     ProviderRoutingTransport,
     _openai_tools,
@@ -126,6 +127,36 @@ class OpenAICompatibleTransportTests(unittest.TestCase):
                 self.assertEqual(post.call_args.args[0]["model"], expected)
                 self.assertEqual(result["response"], "ok")
 
+
+
+    def test_anthropic_transport_uses_native_messages_shape(self):
+        transport = AnthropicMessagesTransport("https://api.anthropic.com/v1", api_key="secret", timeout=30)
+        with patch.object(transport, "_post_json", return_value={
+            "id": "msg_1", "model": "claude-sonnet-test",
+            "content": [{"type": "text", "text": "OK"}],
+        }) as post:
+            result = transport.chat(
+                message="hello", model="anthropic/claude-sonnet-test",
+                system_prompt="system", max_tokens=123,
+            )
+        payload = post.call_args.args[0]
+        self.assertEqual(payload["model"], "claude-sonnet-test")
+        self.assertEqual(payload["system"], "system")
+        self.assertEqual(payload["messages"], [{"role": "user", "content": "hello"}])
+        self.assertEqual(payload["max_tokens"], 123)
+        self.assertEqual(result["response"], "OK")
+        self.assertEqual(result["backend"], "anthropic-direct")
+
+    @patch("aicoder.model_transport.provider_api_key", return_value=("stored-key", "keyring"))
+    def test_provider_router_routes_anthropic_directly(self, key_lookup):
+        default = MagicMock(); default.timeout = 55
+        router = ProviderRoutingTransport(default)
+        with patch.object(AnthropicMessagesTransport, "chat", return_value={"response": "OK"}) as direct_chat:
+            result = router.chat(message="x", model="anthropic/claude-sonnet-test")
+        self.assertEqual(result["response"], "OK")
+        default.chat.assert_not_called()
+        self.assertIsInstance(router._direct["anthropic"], AnthropicMessagesTransport)
+        direct_chat.assert_called_once()
 
     @patch("aicoder.model_transport.provider_api_key", return_value=("stored-key", "keyring"))
     def test_provider_router_routes_matching_model_directly(self, key_lookup):

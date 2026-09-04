@@ -1,6 +1,6 @@
 # Maintainer: Markus Leitermann <admin@ailinux.me>
 pkgname=aicoder
-pkgver=1.2.1
+pkgver=1.2.2
 pkgrel=1
 pkgdesc="Agentic coding workstation for AILinux/TriForce with GUI, MCP registry and local OS tools"
 arch=('x86_64')

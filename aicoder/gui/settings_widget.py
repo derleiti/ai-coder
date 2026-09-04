@@ -259,7 +259,7 @@ class SettingsWidget(QWidget):
             "Keys werden ausschließlich über den OS-Keyring (z. B. KWallet/Secret Service) gespeichert, "
             "nie in state.json, Logs oder Chat-History. Ein gespeicherter Key routet passende Modell-IDs "
             "direkt zum Provider; ohne Key bleibt der bisherige TriForce-Weg unverändert. "
-            "Anthropic wird sicher gespeichert, benötigt für Direktaufrufe aber noch einen nativen Messages-Adapter."
+            "Anthropic wird über den nativen Messages-Adapter direkt geroutet."
         )
         credential_note.setWordWrap(True)
         credential_note.setStyleSheet("color: #888; font-size: 11px;")
@@ -611,8 +611,6 @@ class SettingsWidget(QWidget):
                         text, color = "Konfiguriert", "#00ff88"
                 else:
                     text, color = "Nicht gesetzt", "#888"
-                if provider == "anthropic" and summary.get("configured"):
-                    text += " · Direktadapter folgt"
                 label.setText(text)
                 label.setStyleSheet(f"color: {color}; font-size: 11px;")
             except Exception:

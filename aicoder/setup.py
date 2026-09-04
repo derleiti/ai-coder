@@ -584,6 +584,9 @@ def _repl_settings_ai(request: str) -> int:
         state = get_state()
         model = str(state.get("selected_model") or "").strip()
         client = TriForceClient(session.base_url, token=session.token, timeout=int(state.get("request_timeout", 300)))
+        from .model_transport import native_model_transport_from_env
+        client, configured_model = native_model_transport_from_env(client, default_model=model or None)
+        model = str(configured_model or model or "").strip()
         schema_rows = []
         for key, spec in sorted(settings_core.REGISTRY.items()):
             if spec.sensitive or not spec.mutable:
