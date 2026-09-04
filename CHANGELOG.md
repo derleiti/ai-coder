@@ -1,3 +1,9 @@
+## v1.2.1 (2026-09-04)
+
+- Fix missing typing import detected by release CI.
+- Restore audit redaction import in team debug logging to prevent a runtime NameError while sanitizing string diagnostics.
+- Add regression coverage for inline secret redaction.
+
 ## v1.2.0 (2026-09-04)
 
 - Add transactional RAM workspace backend and staged multi-agent team runtime.
