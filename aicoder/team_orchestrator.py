@@ -17,6 +17,7 @@ import subprocess
 import time
 from typing import Any, Callable
 
+from . import audit
 from .agent_runtime import AgentRunResult, NativeLightRuntime
 from .executor import build_system_prompt, load_tools
 from .model_transport import ModelTransport

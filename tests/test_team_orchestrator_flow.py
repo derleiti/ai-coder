@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from aicoder.agent_runtime import AgentRunResult
-from aicoder.team_orchestrator import AgentStageResult, CandidateResult, run_team
+from aicoder.team_orchestrator import AgentStageResult, CandidateResult, _redact_debug_value, run_team
 from aicoder.team_runtime import config_from_state
 from aicoder.workspace_backend import RamWorkspace
 
@@ -47,6 +47,10 @@ class FakeIntegrationRuntime:
 
 
 class TeamOrchestratorFlowTests(unittest.TestCase):
+    def test_debug_redaction_masks_inline_secrets(self):
+        rendered = _redact_debug_value({"message": "token=super-secret-value"})
+        self.assertEqual(rendered["message"], "token=[REDACTED]")
+
     def test_pipeline_selects_candidate_merges_finalizes_and_persists(self):
         FakeIntegrationRuntime.calls = 0
         with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as ram_dir:
