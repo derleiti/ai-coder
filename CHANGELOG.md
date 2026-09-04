@@ -1,3 +1,10 @@
+## v1.2.3 (2026-09-04)
+
+- Fix Debian/Ubuntu upgrades where a stale `~/.local/bin/aicoder` pip launcher shadows the packaged `/usr/bin/aicoder`; the package now backs up and removes only a known broken legacy launcher.
+- Include package metadata in PyInstaller builds so standalone Linux/Windows binaries report the real release version instead of `0+unknown`.
+- Fix checked-in AUR `.SRCINFO` release source metadata.
+- Add release verification for packaged version reporting.
+
 ## v1.2.2 (2026-09-04)
 
 - Complete BYOK routing across `ask`, `chat`, `task`/`review`, agent, GUI and team runtimes.

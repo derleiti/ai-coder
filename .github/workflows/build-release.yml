@@ -102,6 +102,7 @@ jobs:
             --clean \
             --strip \
             --collect-submodules=aicoder \
+            --copy-metadata=aicoder \
             --collect-submodules=keyring \
             --hidden-import=PyQt6.QtWidgets \
             --hidden-import=PyQt6.QtGui \
@@ -118,15 +119,20 @@ jobs:
           echo "Binary size: $(du -h dist/aicoder | cut -f1)"
 
       - name: Verify binary
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
         run: |
           dist/aicoder --help
           dist/aicoder agent --help
+          test "$(dist/aicoder --version)" = "aicoder ${VERSION}"
 
       - name: Build .deb package
         env:
           VERSION: ${{ needs.metadata.outputs.version }}
         run: |
           mkdir -p pkg/usr/bin pkg/DEBIAN
+          cp packaging/debian/aicoder/DEBIAN/postinst pkg/DEBIAN/postinst
+          chmod 755 pkg/DEBIAN/postinst
           mkdir -p pkg/usr/share/applications pkg/usr/share/man/man1
           cp dist/aicoder pkg/usr/bin/aicoder
           chmod 755 pkg/usr/bin/aicoder
