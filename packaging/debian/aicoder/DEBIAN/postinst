@@ -9,8 +9,7 @@ for home in /home/*; do
     wrapper="$home/.local/bin/aicoder"
     [ -f "$wrapper" ] || continue
     if grep -q "from aicoder.cli import main" "$wrapper" 2>/dev/null; then
-        user=$(basename "$home")
-        if ! su -s /bin/sh -c '"$1" --version >/dev/null 2>&1' sh "$wrapper" "$user" 2>/dev/null; then
+        if ! HOME="$home" PYTHONUSERBASE="$home/.local" "$wrapper" --version >/dev/null 2>&1; then
             backup="$wrapper.pre-system-package.bak"
             if [ ! -e "$backup" ]; then cp -p "$wrapper" "$backup"; fi
             rm -f "$wrapper"
