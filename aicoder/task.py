@@ -96,6 +96,9 @@ def run_task(
     state = get_state()
 
     effective_model = model or state.get("selected_model") or None
+    from .model_transport import native_model_transport_from_env
+    client, configured_model = native_model_transport_from_env(client, default_model=effective_model)
+    effective_model = configured_model or effective_model
     workspace = str(active_workspace(state.get("workspace_root")))
 
     # System prompt: AGENTS.md + task instructions

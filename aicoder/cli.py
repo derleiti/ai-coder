@@ -358,10 +358,41 @@ def cmd_providers(args: argparse.Namespace) -> int:
 
 
 def cmd_credentials(args: argparse.Namespace) -> int:
-    from .providers import credential_status
-    rows=credential_status()
-    _print_provider_rows(rows,json_output=bool(getattr(args,"json",False)))
-    return 0
+    action = getattr(args, "credentials_action", None) or "status"
+    if action == "status":
+        from .providers import credential_status
+        rows = credential_status()
+        _print_provider_rows(rows, json_output=bool(getattr(args, "json", False)))
+        return 0
+
+    from .provider_credentials import (
+        CredentialStoreError, canonical_provider, delete_provider_key, set_provider_key,
+    )
+    from .providers import PROVIDERS
+    provider = canonical_provider(str(getattr(args, "provider", "") or ""))
+    known = {spec.id for spec in PROVIDERS}
+    if provider not in known:
+        print(f"Error: unknown provider: {provider or '?'}", file=sys.stderr)
+        return 2
+    try:
+        if action == "set":
+            import getpass
+            secret = getpass.getpass(f"{provider} API key: ").strip()
+            if not secret:
+                print("Error: empty API key; nothing stored.", file=sys.stderr)
+                return 2
+            set_provider_key(provider, secret)
+            print(f"{provider}: API key stored in OS keyring")
+            return 0
+        if action == "delete":
+            removed = delete_provider_key(provider)
+            print(f"{provider}: {'credential deleted' if removed else 'no stored credential'}")
+            return 0
+    except CredentialStoreError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    print(f"Error: unsupported credentials action: {action}", file=sys.stderr)
+    return 2
 
 def cmd_optimize(args: argparse.Namespace) -> int:
     from .optimizer import (
@@ -1001,6 +1032,9 @@ def cmd_ask(args: argparse.Namespace) -> int:
     client = TriForceClient(session.base_url, token=session.token, timeout=_timeout)
     state = get_state()
     model = _resolve_model(state, getattr(args, "model", None))
+    from .model_transport import native_model_transport_from_env
+    client, configured_model = native_model_transport_from_env(client, default_model=model)
+    model = configured_model or model
 
     # Collect prompt: args.prompt (joined) or stdin
     if args.prompt:
@@ -1058,6 +1092,9 @@ def cmd_chat(args: argparse.Namespace) -> int:
     client = TriForceClient(session.base_url, token=session.token, timeout=120)
     state = get_state()
     model = _resolve_model(state, getattr(args, "model", None))
+    from .model_transport import native_model_transport_from_env
+    client, configured_model = native_model_transport_from_env(client, default_model=model)
+    model = configured_model or model
 
     workspace = str(active_workspace(state.get("workspace_root")))
     system_prompt = None
@@ -1551,6 +1588,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_credentials, credentials_action="status")
     sp = credentials_sub.add_parser("status", help="Show credential variable names/presence only")
     sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_credentials)
+    sp = credentials_sub.add_parser("set", help="Store one provider API key securely in the OS keyring")
+    sp.add_argument("provider")
+    sp.set_defaults(func=cmd_credentials)
+    sp = credentials_sub.add_parser("delete", help="Delete one provider API key from the OS keyring")
+    sp.add_argument("provider")
     sp.set_defaults(func=cmd_credentials)
 
     p = sub.add_parser("optimize", help="Evidence-first local system inspection and optimization planning")

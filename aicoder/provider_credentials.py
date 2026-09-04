@@ -36,9 +36,8 @@ class DirectProviderSpec:
     direct_supported: bool = True
 
 
-# These endpoints implement the OpenAI Chat Completions request shape used by
-# AICoder's existing direct transport. Anthropic is intentionally storage-only
-# until a native Messages adapter exists; we do not pretend it is compatible.
+# Most endpoints below implement the OpenAI Chat Completions request shape.
+# Anthropic is routed through the native Messages adapter in model_transport.py.
 DIRECT_PROVIDERS: tuple[DirectProviderSpec, ...] = (
     DirectProviderSpec("openai", (), "https://api.openai.com/v1"),
     DirectProviderSpec("google", ("gemini",), "https://generativelanguage.googleapis.com/v1beta/openai"),
@@ -47,7 +46,7 @@ DIRECT_PROVIDERS: tuple[DirectProviderSpec, ...] = (
     DirectProviderSpec("groq", (), "https://api.groq.com/openai/v1"),
     DirectProviderSpec("cerebras", (), "https://api.cerebras.ai/v1"),
     DirectProviderSpec("nvidia", (), "https://integrate.api.nvidia.com/v1"),
-    DirectProviderSpec("anthropic", (), None, direct_supported=False),
+    DirectProviderSpec("anthropic", (), "https://api.anthropic.com/v1"),
 )
 
 

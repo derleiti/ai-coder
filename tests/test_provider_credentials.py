@@ -65,3 +65,15 @@ class ProviderCredentialTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class ProviderCredentialDirectSupportTests(unittest.TestCase):
+    def test_anthropic_is_direct_supported(self):
+        from aicoder.provider_credentials import credential_summary, direct_provider_spec
+        spec = direct_provider_spec("anthropic")
+        self.assertIsNotNone(spec)
+        self.assertTrue(spec.direct_supported)
+        self.assertEqual(spec.base_url, "https://api.anthropic.com/v1")
+        with patch("aicoder.provider_credentials.get_stored_provider_key", return_value="secret"):
+            summary = credential_summary("anthropic", environ={})
+        self.assertTrue(summary["direct_supported"])
+        self.assertNotIn("secret", repr(summary))
