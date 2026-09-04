@@ -1,3 +1,12 @@
+## v1.2.0 (2026-09-04)
+
+- Add transactional RAM workspace backend and staged multi-agent team runtime.
+- Add team orchestration, blind merge handoffs, candidate recovery, and fresh-test evidence gates.
+- Add runtime performance telemetry and stronger diagnostics for long-running agent workflows.
+- Harden merger behavior, model/tool compatibility, unlimited scheduling, cleanup, and auto-resume handling.
+- Add secure per-provider API credential storage and direct-provider transport groundwork.
+- Expand regression coverage for team runtime, workspace isolation, provider credentials, performance, and recovery.
+
 ## v1.0.1 (2026-08-24)
 
 ### Release infrastructure
