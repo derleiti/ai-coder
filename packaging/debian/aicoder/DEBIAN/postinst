@@ -1,4 +1,25 @@
 #!/bin/sh
 set -e
+
+# Migrate one known legacy pip-generated launcher that can shadow /usr/bin/aicoder.
+# Only touch the file if it matches the old setuptools/pip console wrapper signature
+# and can no longer start successfully. Preserve a backup before removal.
+for home in /home/*; do
+    [ -d "$home/.local/bin" ] || continue
+    wrapper="$home/.local/bin/aicoder"
+    [ -f "$wrapper" ] || continue
+    if grep -q "from aicoder.cli import main" "$wrapper" 2>/dev/null; then
+        user=$(basename "$home")
+        if ! su -s /bin/sh -c '"$1" --version >/dev/null 2>&1' sh "$wrapper" "$user" 2>/dev/null; then
+            backup="$wrapper.pre-system-package.bak"
+            if [ ! -e "$backup" ]; then cp -p "$wrapper" "$backup"; fi
+            rm -f "$wrapper"
+            echo "aicoder: removed stale user launcher $wrapper (backup: $backup)"
+        else
+            echo "aicoder: retained working user launcher $wrapper"
+        fi
+    fi
+done
+
 echo "aicoder installed. Run: aicoder --help"
 echo "First time setup: aicoder  (no args)"
