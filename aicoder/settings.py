@@ -185,6 +185,11 @@ _register(SettingSpec(
     description="Experimental team runtime: off, auto for complex coding tasks, or on for every action task.",
 ))
 _register(SettingSpec(
+    key="team_brainstorm_rounds", type="int", default=2, minimum=1, maximum=5,
+    group="team", aliases=("brainstorm_rounds",),
+    description="Brainstorm rounds between research and implementation planning (1-5).",
+))
+_register(SettingSpec(
     key="team_research_model_1", type="model", default="@primary", group="team",
     description="Research 1: Primary Sources. @primary reuses the base model; empty/off disables this slot.",
 ))

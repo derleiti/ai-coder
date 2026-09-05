@@ -44,6 +44,13 @@ class TeamConfigurationTests(unittest.TestCase):
         self.assertEqual(config.planner_model, "provider/base")
         self.assertEqual(config.coders[0].model, "provider/base")
 
+    def test_brainstorm_round_setting_defaults_to_two(self):
+        from aicoder.settings import REGISTRY
+        spec = REGISTRY["team_brainstorm_rounds"]
+        self.assertEqual(spec.default, 2)
+        self.assertEqual(spec.minimum, 1)
+        self.assertEqual(spec.maximum, 5)
+
     def test_auto_team_only_triggers_for_substantive_coding_work(self):
         self.assertFalse(should_use_team("Hallo", "auto"))
         self.assertFalse(should_use_team("Erkläre mir Python Listen.", "auto"))

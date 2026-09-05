@@ -23,12 +23,15 @@ from .executor import build_system_prompt, load_tools
 from .model_transport import ModelTransport
 from .performance import RuntimePerformance
 from .team_runtime import (
+    BRAINSTORM_EVOLUTION_SYSTEM_PROMPT, BRAINSTORM_OPERATOR_SYSTEM_PROMPT,
+    BRAINSTORM_PERSPECTIVES, BRAINSTORM_SYNTHESIS_SYSTEM_PROMPT, BRAINSTORM_SYSTEM_PROMPT,
     CODER_SYSTEM_TEMPLATE, MERGE_PLANNER_SYSTEM_PROMPT, MERGE_SYSTEM_PROMPT,
     PLANNER_SYSTEM_PROMPT, RESEARCH_INSTRUCTIONS, RESEARCH_OUTPUT_CONTRACT,
     RESEARCH_PLANNER_SYSTEM_PROMPT, TEST_PLANNER_SYSTEM_PROMPT, TeamConfig,
 )
 from .team_handoff import (
-    CODE_PLAN_SECTIONS, MERGE_PLAN_SECTIONS, RESEARCH_SECTIONS, HandoffEnvelope, make_handoff,
+    BRAINSTORM_SECTIONS, CODE_PLAN_SECTIONS, MERGE_PLAN_SECTIONS, RESEARCH_SECTIONS,
+    HandoffEnvelope, make_handoff,
 )
 from .team_pipeline import (
     StageLedger, TeamStage, blind_candidate_id, configured_project_python, execute_verification_plan,
@@ -445,6 +448,111 @@ def _repository_context(source_workspace: str) -> str:
     except Exception:
         pass
     return "\n".join(rows)
+
+
+def _brainstorm_rounds(state: dict[str, Any]) -> int:
+    try:
+        return max(1, min(5, int(state.get("team_brainstorm_rounds") or 2)))
+    except (TypeError, ValueError):
+        return 2
+
+
+def _brainstorm_participants(config: TeamConfig, limit: int = 6) -> list[tuple[str, str, str]]:
+    rows: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+
+    def add(label: str, model: str | None, perspective: str) -> None:
+        value = str(model or "").strip()
+        if not value or value in seen or len(rows) >= max(1, int(limit)):
+            return
+        seen.add(value)
+        rows.append((label, value, perspective))
+
+    for slot in config.research:
+        add(f"research:{slot.role}", slot.model, BRAINSTORM_PERSPECTIVES.get(slot.role, "novel engineering opportunities"))
+    coder_perspectives = {
+        "conservative/minimal-change": "feasibility, compatibility, low-risk changes and simplicity",
+        "architecture-first": "architecture boundaries, extensibility and long-term coherence",
+        "performance/efficiency": "latency, resource efficiency, throughput and developer productivity",
+        "robustness/security": "security hardening, resilience, recovery, observability and abuse resistance",
+    }
+    for slot in config.coders:
+        add(f"coder:{slot.strategy}", slot.model, coder_perspectives.get(slot.strategy, "implementation opportunities"))
+    add("planner", config.planner_model, "requirements, product coherence and testable outcomes")
+    add("coordinator", config.coordinator_model, "cross-team synthesis, dependency risks and missing acceptance criteria")
+    add("merge", config.merge_model, "integration safety, composability and conflict reduction")
+    add("test_planner", config.test_planner_model, "testability, failure injection and regression prevention")
+    return rows
+
+
+def _brainstorm_research_handoff(research: list[AgentStageResult]) -> str:
+    rows: list[str] = []
+    for item in research:
+        handoff = make_handoff(
+            f"{item.role}-report", item.response or item.error or "(no report)",
+            max_chars=3000, section_labels=RESEARCH_SECTIONS,
+        )
+        evidence = item.evidence or {}
+        rows.append(
+            f"### {item.role} · status={item.status} · externally_verified={bool(evidence.get('externally_verified'))}\n"
+            + handoff.render()
+        )
+    return "\n\n".join(rows) or "(no research reports)"
+
+
+def _build_brainstorm_prompt(
+    task: str, repo_context: str, research_handoff: str, perspective: str,
+    *, round_index: int, brainstorm_state: str,
+) -> str:
+    return (
+        f"ORIGINAL USER TASK:\n{_task_handoff(task).render()}\n\n"
+        f"REPOSITORY CONTEXT:\n{make_handoff('repository-context', repo_context, max_chars=4500).render()}\n\n"
+        f"RESEARCH EVIDENCE HANDOFFS:\n{research_handoff}\n\n"
+        f"BRAINSTORM ROUND: {round_index}\n"
+        f"YOUR PERSPECTIVE: {perspective}\n\n"
+        f"CURRENT ANONYMIZED BRAINSTORM STATE:\n{brainstorm_state or '(none - create independent ideas)'}"
+    )
+
+
+def _anonymized_brainstorm_round(results: list[AgentStageResult]) -> str:
+    rows: list[str] = []
+    usable = sorted(results, key=lambda item: (item.role, item.response or item.error))
+    for index, item in enumerate(usable, start=1):
+        handoff = make_handoff(
+            f"brainstorm-proposal-{index}", item.response or item.error or "(empty)",
+            max_chars=3500, section_labels=BRAINSTORM_SECTIONS,
+        )
+        rows.append(f"### proposal-{index:02d} · status={item.status}\n{handoff.render()}")
+    return "\n\n".join(rows) or "(no usable proposals)"
+
+
+def _build_brainstorm_operator_prompt(
+    task: str, round_index: int, results: list[AgentStageResult], previous_state: str,
+) -> str:
+    previous = make_handoff(
+        "brainstorm-state", previous_state or "(none)", max_chars=7000, section_labels=BRAINSTORM_SECTIONS,
+    )
+    return (
+        f"ORIGINAL USER TASK:\n{_task_handoff(task).render()}\n\n"
+        f"ROUND: {round_index}\n\n"
+        f"PREVIOUS STATE:\n{previous.render()}\n\n"
+        f"ANONYMIZED ROUND PROPOSALS:\n{_anonymized_brainstorm_round(results)}"
+    )
+
+
+def _build_brainstorm_synthesis_prompt(task: str, state: str, results: list[AgentStageResult]) -> str:
+    state_handoff = make_handoff(
+        "brainstorm-state-final", state or "(none)", max_chars=8000, section_labels=BRAINSTORM_SECTIONS,
+    )
+    return (
+        f"ORIGINAL USER TASK:\n{_task_handoff(task).render()}\n\n"
+        f"FINAL EVOLVED STATE:\n{state_handoff.render()}\n\n"
+        f"ANONYMIZED CONTRIBUTIONS:\n{_anonymized_brainstorm_round(results)}"
+    )
+
+
+def _brainstorm_handoff(text: str) -> HandoffEnvelope:
+    return make_handoff("brainstorm-synthesis", text, max_chars=8000, section_labels=BRAINSTORM_SECTIONS)
 
 
 def _build_planner_prompt(task: str, repo_context: str, research: list[AgentStageResult]) -> str:
@@ -888,13 +996,110 @@ def run_team(
         }
     _stage_complete(ledger, TeamStage.RESEARCH, event_fn)
 
-    # 3) plan_code
+    # 3) brainstorm -- divergent multi-model reasoning after research, before implementation planning.
+    _stage_start(ledger, TeamStage.BRAINSTORM, event_fn)
+    brainstorm_results: list[AgentStageResult] = []
+    brainstorm_state = ""
+    brainstorm_participants = _brainstorm_participants(config)
+    configured_rounds = _brainstorm_rounds(state)
+    repo_context = _repository_context(source_workspace)
+    research_handoff_text = _brainstorm_research_handoff(research_results)
+    synthesis_model = config.coordinator_model or config.planner_model or ""
+    _emit(
+        event_fn, "team_brainstorm_config", rounds=configured_rounds,
+        participants=len(brainstorm_participants),
+    )
+    for round_index in range(1, configured_rounds + 1):
+        if not brainstorm_participants:
+            break
+        _emit(event_fn, "team_brainstorm_round", round=round_index, status="started", total_rounds=configured_rounds)
+        system_prompt = BRAINSTORM_SYSTEM_PROMPT if round_index == 1 else BRAINSTORM_EVOLUTION_SYSTEM_PROMPT
+        round_results: list[AgentStageResult] = []
+        with ThreadPoolExecutor(max_workers=len(brainstorm_participants), thread_name_prefix=f"aicoder-brainstorm-r{round_index}") as pool:
+            futures = {
+                pool.submit(
+                    _call_advisor, model_client, model=model, system=system_prompt,
+                    prompt=_build_brainstorm_prompt(
+                        task, repo_context, research_handoff_text, perspective,
+                        round_index=round_index, brainstorm_state=brainstorm_state,
+                    ),
+                    max_tokens=4000,
+                ): (label, model)
+                for label, model, perspective in brainstorm_participants
+            }
+            for future in as_completed(futures):
+                label, model = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = AgentStageResult(
+                        f"brainstorm:r{round_index}:{label}", model, "failed", "", 0,
+                        f"{type(exc).__name__}: {exc}",
+                    )
+                result.role = f"brainstorm:r{round_index}:{label}"
+                round_results.append(result)
+                brainstorm_results.append(result)
+                stages.append(result)
+                _emit(
+                    event_fn, "team_stage", role=result.role, status=result.status, model=result.model,
+                    elapsed_ms=result.elapsed_ms, error=result.error, evidence=result.evidence,
+                )
+        usable = [item for item in round_results if item.status == "completed" and item.response.strip()]
+        if not usable:
+            _emit(event_fn, "team_brainstorm_round", round=round_index, status="empty", total_rounds=configured_rounds)
+            break
+        operator = _call_advisor(
+            model_client, model=synthesis_model, system=BRAINSTORM_OPERATOR_SYSTEM_PROMPT,
+            prompt=_build_brainstorm_operator_prompt(task, round_index, usable, brainstorm_state),
+            max_tokens=5000,
+        )
+        operator.role = f"brainstorm_state:r{round_index}"
+        stages.append(operator)
+        if operator.status != "completed" or not operator.response.strip():
+            _emit(event_fn, "team_brainstorm_round", round=round_index, status="operator_failed", total_rounds=configured_rounds)
+            break
+        brainstorm_state = operator.response
+        _emit(
+            event_fn, "team_brainstorm_round", round=round_index, status="completed",
+            proposals=len(usable), total_rounds=configured_rounds,
+        )
+
+    if brainstorm_results:
+        brainstorm_synthesis = _call_advisor(
+            model_client, model=synthesis_model, system=BRAINSTORM_SYNTHESIS_SYSTEM_PROMPT,
+            prompt=_build_brainstorm_synthesis_prompt(task, brainstorm_state, brainstorm_results),
+            max_tokens=6000,
+        )
+        brainstorm_synthesis.role = "brainstorm_synthesis"
+        stages.append(brainstorm_synthesis)
+        if brainstorm_synthesis.status != "completed":
+            return TeamRunResult(
+                "failed", "", brainstorm_synthesis.model, stages, [],
+                {"ledger": ledger.as_dict()}, brainstorm_synthesis.error,
+            )
+        brainstorm_contract_handoff = _brainstorm_handoff(brainstorm_synthesis.response)
+    else:
+        brainstorm_synthesis = AgentStageResult(
+            "brainstorm_synthesis", synthesis_model or "deterministic", "completed",
+            "No distinct brainstorm participants were available; proceed using research evidence only.", 0,
+        )
+        stages.append(brainstorm_synthesis)
+        brainstorm_contract_handoff = _brainstorm_handoff(brainstorm_synthesis.response)
+    handoff_metrics.append(brainstorm_contract_handoff.metrics())
+    handoff_archive[brainstorm_contract_handoff.handoff_id] = {
+        "kind": brainstorm_contract_handoff.kind, "raw": brainstorm_contract_handoff.raw,
+        "compact": brainstorm_contract_handoff.compact,
+    }
+    _stage_complete(ledger, TeamStage.BRAINSTORM, event_fn)
+
+    # 4) plan_code
     _stage_start(ledger, TeamStage.PLAN_CODE, event_fn)
     code_plan = _call_advisor(
         model_client, model=config.planner_model or "", system=PLANNER_SYSTEM_PROMPT,
-        prompt=_build_planner_prompt(task, _repository_context(source_workspace), research_results)
-        + "\n\nRESEARCH CONTRACT:\n" + research_contract_handoff.render(),
-        max_tokens=5000,
+        prompt=_build_planner_prompt(task, repo_context, research_results)
+        + "\n\nRESEARCH CONTRACT:\n" + research_contract_handoff.render()
+        + "\n\nBRAINSTORM SYNTHESIS (creative decision support, not evidence):\n" + brainstorm_contract_handoff.render(),
+        max_tokens=6500,
     )
     code_plan.role = "plan_code"; stages.append(code_plan)
     if code_plan.status == "completed":
@@ -910,7 +1115,7 @@ def run_team(
         return TeamRunResult("failed", "", code_plan.model, stages, [], {"ledger": ledger.as_dict()}, code_plan.error)
     _stage_complete(ledger, TeamStage.PLAN_CODE, event_fn)
 
-    # 4) code — isolated parallel candidates with one fair global backing mode.
+    # 5) code — isolated parallel candidates with one fair global backing mode.
     workspace_plan = team_workspace_plan(
         source_workspace, len(config.coders), str(state.get("workspace_mode") or "auto")
     )

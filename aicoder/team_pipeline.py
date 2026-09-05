@@ -16,6 +16,7 @@ from typing import Any, Iterable
 class TeamStage(str, Enum):
     PLAN_RESEARCH = "plan_research"
     RESEARCH = "research"
+    BRAINSTORM = "brainstorm"
     PLAN_CODE = "plan_code"
     CODE = "code"
     MERGE_PLAN = "merge_plan"

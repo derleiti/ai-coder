@@ -285,6 +285,13 @@ class SettingsWidget(QWidget):
         self.team_runtime_combo.setToolTip(settings_core.REGISTRY["team_runtime_mode"].description)
         team_form.addRow("Team-Runtime:", self.team_runtime_combo)
 
+        brainstorm_spec = settings_core.REGISTRY["team_brainstorm_rounds"]
+        self.team_brainstorm_rounds_spin = QSpinBox()
+        self.team_brainstorm_rounds_spin.setRange(int(brainstorm_spec.minimum or 1), int(brainstorm_spec.maximum or 5))
+        self.team_brainstorm_rounds_spin.setValue(int(brainstorm_spec.default))
+        self.team_brainstorm_rounds_spin.setToolTip(brainstorm_spec.description)
+        team_form.addRow("Brainstorm-Runden:", self.team_brainstorm_rounds_spin)
+
         team_labels = [
             ("team_research_model_1", "Recherche 1 · Primärquellen / aktuelle Docs"),
             ("team_research_model_2", "Recherche 2 · Best Practices / bewährte Architektur"),
@@ -574,6 +581,9 @@ class SettingsWidget(QWidget):
             team_idx = self.team_runtime_combo.findData(state.get("team_runtime_mode", settings_core.REGISTRY["team_runtime_mode"].default))
             if team_idx >= 0:
                 self.team_runtime_combo.setCurrentIndex(team_idx)
+            self.team_brainstorm_rounds_spin.setValue(
+                int(state.get("team_brainstorm_rounds", settings_core.REGISTRY["team_brainstorm_rounds"].default))
+            )
             for key, combo in self._team_model_combos.items():
                 value = str(state.get(key, settings_core.REGISTRY[key].default) or "")
                 combo.setCurrentText(value or "off")
@@ -851,7 +861,10 @@ class SettingsWidget(QWidget):
     def _save_team_config(self):
         if self._loading_settings:
             return
-        proposed = {"team_runtime_mode": self.team_runtime_combo.currentData() or "auto"}
+        proposed = {
+            "team_runtime_mode": self.team_runtime_combo.currentData() or "auto",
+            "team_brainstorm_rounds": self.team_brainstorm_rounds_spin.value(),
+        }
         for key, combo in self._team_model_combos.items():
             text = combo.currentText().strip()
             proposed[key] = "" if text.lower() in {"off", "none", "disabled"} else text

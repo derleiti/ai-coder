@@ -128,6 +128,36 @@ Specify: facts that must be verified, freshness/version questions, primary-sourc
 security/reliability questions, comparable architectures to inspect, and explicit evidence gaps that researchers must
 report instead of guessing. Keep researcher scopes complementary and avoid duplicate work. Return a compact contract (target <= 4500 characters)."""
 
+BRAINSTORM_SYSTEM_PROMPT = """You are a read-only brainstorming participant in an AICoder team run.
+Research is already complete. Generate technically plausible implementation directions grounded in the supplied task,
+repository context and research evidence. Explore meaningful alternatives rather than rephrasing the same plan. Explicitly
+state trade-offs, risks and assumptions. Do not edit files, call tools, invent evidence or produce the final implementation plan.
+Return compact structured output with headings: DIRECTIONS, IDEAS, TRADEOFFS, RISKS, OPEN QUESTIONS, RECOMMENDATIONS."""
+
+BRAINSTORM_EVOLUTION_SYSTEM_PROMPT = """You are a read-only brainstorming participant in a later AICoder brainstorm round.
+Use the prior anonymized brainstorm state as input, but do not merely agree with it. Improve, challenge, combine or replace
+ideas when justified by the task and research evidence. Seek overlooked failure modes, simpler approaches and higher-leverage
+solutions. Do not edit files or call tools. Return compact structured output with headings: DIRECTIONS, IDEAS, TRADEOFFS,
+RISKS, OPEN QUESTIONS, RECOMMENDATIONS."""
+
+BRAINSTORM_OPERATOR_SYSTEM_PROMPT = """You are the neutral brainstorm operator for an AICoder team run.
+You receive anonymized proposals from one round. Merge duplicate ideas, preserve genuinely distinct options, highlight conflicts,
+and discard unsupported speculation. Do not choose a final implementation plan yet. Produce a compact evolving brainstorm state
+with headings: DIRECTIONS, IDEAS, TRADEOFFS, RISKS, OPEN QUESTIONS, RECOMMENDATIONS. Do not edit files or call tools."""
+
+BRAINSTORM_SYNTHESIS_SYSTEM_PROMPT = """You are the final brainstorm synthesizer for an AICoder team run.
+Convert the multi-round brainstorm into a compact decision-support handoff for the implementation planner. Preserve the strongest
+evidence-grounded alternatives, important trade-offs, failure modes and unresolved questions. Do not implement and do not pretend
+that brainstorming is evidence. Clearly distinguish creative proposals from research-backed constraints. Return headings: DIRECTIONS,
+IDEAS, TRADEOFFS, RISKS, OPEN QUESTIONS, RECOMMENDATIONS."""
+
+BRAINSTORM_PERSPECTIVES = {
+    "primary_sources": "compatibility with authoritative APIs, versions and upstream constraints",
+    "best_practices": "proven engineering patterns, maintainability and pragmatic simplicity",
+    "security_reliability": "failure containment, abuse resistance, recovery, observability and concurrency",
+    "alternative_architectures": "alternative architectures, simplification opportunities and unconventional but viable options",
+}
+
 MERGE_PLANNER_SYSTEM_PROMPT = """You are the blind merge-planning stage. Candidate identities are anonymized.
 You receive the shared implementation contract plus deterministic candidate evidence. Never infer or request model,
 provider or slot identity. Tests and objective measurements outrank prose. Candidate evidence explicitly classifies

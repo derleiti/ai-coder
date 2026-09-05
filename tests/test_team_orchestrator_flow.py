@@ -129,7 +129,7 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
             self.assertEqual(result.status, "completed", result.error)
             self.assertEqual(result.performance["winner_candidate_id"], "cand-2")
             self.assertEqual(result.performance["ledger"]["completed"], [
-                "plan_research", "research", "plan_code", "code", "merge_plan", "merge",
+                "plan_research", "research", "brainstorm", "plan_code", "code", "merge_plan", "merge",
                 "plan_tests", "tests_function_ok", "atomic_disk_write",
             ])
             self.assertEqual((source / "app.py").read_text(encoding="utf-8"), "value = 2\n")
