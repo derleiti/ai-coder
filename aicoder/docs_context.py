@@ -54,11 +54,19 @@ def read_agents_md(project_root: Optional[str] = None) -> Optional[str]:
     Read AGENTS.md content if present. Used as system_prompt for LLM calls.
     Returns None if not found.
     """
-    root = find_project_root(project_root)
-    p = root / "AGENTS.md"
-    if p.exists() and p.is_file():
+    start = Path(project_root or os.getcwd()).resolve()
+    root = find_project_root(str(start))
+    # An explicitly selected workspace is authoritative.  Falling straight to
+    # an ancestor Git root can load unrelated instructions (for example when a
+    # temporary workspace happens to live below another repository).
+    candidates = [start / "AGENTS.md"]
+    if root != start:
+        candidates.append(root / "AGENTS.md")
+    for p in candidates:
+        if p.is_symlink() or not p.is_file():
+            continue
         try:
             return p.read_text(encoding="utf-8").strip()
         except Exception:
-            return None
+            continue
     return None

@@ -29,6 +29,17 @@ Zusätzlich gilt eine feste Richtungsgrenze: TriForce darf als Modell-/Search-/M
 
 Besonders sensible Aktionen wie Secrets/Vault, Mailversand, Notifications oder Account-/Identity-Änderungen sollen nur für einen konkreten Benutzerauftrag verwendet werden und müssen entsprechend ihrer Wirkung als Mutation/Security-Änderung klassifiziert werden.
 
+## Dateisystem-Commitgrenze
+
+Der transaktionale Team-Commit validiert nicht nur lexikalische relative Pfade,
+sondern auch die tatsächlich aufgelöste Elternkette jedes Ziels. Dadurch kann ein
+vorhandener oder während des Laufs ausgetauschter Verzeichnis-Symlink keinen Write
+aus dem Workspace heraus umleiten. Neue bzw. geänderte Symlinks dürfen ebenfalls
+nur auf Ziele innerhalb des Workspaces zeigen. Vor dem Commit werden betroffene
+Quelldateien gesichert; bei einem Teilfehler oder Benutzerabbruch wird der gesamte
+betroffene Satz aus dieser Sicherung wiederhergestellt. Persistierte Einträge
+werden anschließend gegen den verifizierten Kandidaten-Fingerprint zurückgelesen.
+
 ## PrivilegeBroker
 
 Der PrivilegeBroker ist die zentrale lokale Sicherheitsgrenze für Mutationen und Elevation:

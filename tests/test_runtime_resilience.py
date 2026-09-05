@@ -48,6 +48,7 @@ class RuntimeResilienceTests(unittest.TestCase):
         client = MagicMock()
         client.timeout = 30
         client.chat.side_effect = ClientError("HTTP 401: Unauthorized")
+        events = []
         runtime = NativeLightRuntime(
             client=client,
             initial_prompt="Inspect workspace",
@@ -57,10 +58,35 @@ class RuntimeResilienceTests(unittest.TestCase):
             tools=[],
             load_tools_on_start=False,
             persistent_plan=False,
+            event_fn=lambda kind, payload: events.append((kind, payload)),
         )
         result = runtime.run()
         self.assertEqual(result.status, "failed")
         self.assertIn("HTTP 401", result.error)
+        self.assertEqual(events[-1][0], "run_terminal")
+        self.assertEqual(events[-1][1]["status"], "failed")
+        self.assertTrue(events[-1][1]["run_id"].startswith("run-"))
+
+    def test_success_emits_final_then_completed_terminal_event(self):
+        client = MagicMock()
+        client.timeout = 30
+        client.chat.return_value = {"response": "DONE: complete", "model": "test/model"}
+        events = []
+        runtime = NativeLightRuntime(
+            client=client, initial_prompt="Summarize the workspace", model="test/model",
+            fallback_model=None, workspace_root=".", tools=[], load_tools_on_start=False,
+            persistent_plan=False,
+            event_fn=lambda kind, payload: events.append((kind, payload)),
+        )
+
+        result = runtime.run()
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(events[-2][0], "final")
+        self.assertEqual(events[-1][0], "run_terminal")
+        self.assertEqual(events[-1][1]["status"], "completed")
+        self.assertEqual(events[-1][1]["progress"], 100)
+        self.assertFalse(events[-1][1]["resumable"])
 
     def test_client_retries_429_once_before_returning_success(self):
         client = TriForceClient("http://example.invalid", timeout=1)

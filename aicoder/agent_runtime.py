@@ -296,10 +296,17 @@ class NativeLightRuntime:
     _tool_capability_warned: bool = False
     _tool_catalog: list[dict] = field(default_factory=list, init=False, repr=False)
     _expansion_rounds: int = field(default=0, init=False, repr=False)
+    _run_id: str = field(default="", init=False, repr=False)
 
     def _emit(self, event_kind: str, **payload: Any) -> None:
         if self.event_fn is not None:
-            self.event_fn(event_kind, payload)
+            enriched = {"run_id": self._run_id, **payload} if self._run_id else payload
+            try:
+                self.event_fn(event_kind, enriched)
+            except Exception:
+                # Observers are diagnostic/UI adapters and must not change the
+                # outcome or prevent cleanup of the run they are observing.
+                pass
 
     def _stopped(self) -> bool:
         return bool(self.stop_requested and self.stop_requested())
@@ -721,6 +728,32 @@ class NativeLightRuntime:
         self._save_plan(plan)
 
     def run(self) -> AgentRunResult:
+        """Execute one run and publish exactly one invocation-terminal event."""
+        self._run_id = f"run-{uuid.uuid4().hex[:16]}"
+        started = time.monotonic()
+        try:
+            result = self._run_impl()
+        except BaseException as exc:
+            self._emit(
+                "run_terminal",
+                status="cancelled" if isinstance(exc, KeyboardInterrupt) else "failed",
+                progress=None,
+                resumable=False,
+                elapsed_ms=int((time.monotonic() - started) * 1000),
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+        self._emit(
+            "run_terminal", status=result.status,
+            progress=100 if result.status == "completed" else None,
+            resumable=result.status == "paused",
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            error=result.error,
+            plan_id=result.plan_id,
+        )
+        return result
+
+    def _run_impl(self) -> AgentRunResult:
         performance = RuntimePerformance()
         model_latency_warned = False
         filesystem_latency_warned = False

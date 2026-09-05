@@ -349,6 +349,41 @@ def _safe_tar_member(name: str) -> bool:
     return bool(name) and not pure.is_absolute() and ".." not in pure.parts
 
 
+def _target_in_root(root: Path, relative_path: str) -> Path:
+    """Return a lexical child whose existing parent chain stays inside ``root``.
+
+    Resolving the complete target would follow the leaf symlink that a commit may
+    legitimately replace.  Resolving only its parent prevents writes through a
+    pre-existing directory symlink without rejecting replacement of the symlink
+    itself.
+    """
+    rel = PurePosixPath(str(relative_path))
+    if not rel.parts or rel.is_absolute() or ".." in rel.parts:
+        raise WorkspaceError(f"unsafe workspace path: {relative_path}")
+    root_resolved = root.resolve(strict=True)
+    target = root.joinpath(*rel.parts)
+    try:
+        target.parent.resolve(strict=False).relative_to(root_resolved)
+    except ValueError as exc:
+        raise WorkspaceError(f"workspace path escapes through a symlink: {relative_path}") from exc
+    return target
+
+
+def _fsync_directory(path: Path) -> None:
+    """Best-effort durability barrier for an atomic directory entry update."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 class RamWorkspace(WorkspaceBackend):
     """Isolated RAM-backed working tree with checkpoint and verified commit."""
 
@@ -481,11 +516,31 @@ class RamWorkspace(WorkspaceBackend):
         deleted = set(self._baseline).difference(current)
         return current, changed, deleted
 
-    def _assert_source_unchanged(self, affected: set[str]) -> None:
+    def _assert_source_unchanged(
+        self, affected: set[str], current: dict[str, _Entry]
+    ) -> None:
         conflicts: list[str] = []
-        for rel in sorted(affected):
+        inspected = set(affected)
+        for rel in affected:
+            pure = PurePosixPath(rel)
+            inspected.update(str(parent) for parent in pure.parents if str(parent) != ".")
+        for rel in sorted(inspected):
+            parents = [str(parent) for parent in PurePosixPath(rel).parents if str(parent) != "."]
+            # A candidate may intentionally replace a source symlink/file with a
+            # real directory.  Its future children are unreachable safely until
+            # that ancestor has been replaced; checking the ancestor itself is
+            # sufficient for the optimistic-concurrency gate.
+            if any(
+                parent in affected
+                and (self._baseline.get(parent) is not None)
+                and self._baseline[parent].kind != "dir"
+                and (current.get(parent) is not None)
+                and current[parent].kind == "dir"
+                for parent in parents
+            ):
+                continue
             expected = self._baseline.get(rel)
-            actual = _fingerprint(self._source / rel)
+            actual = _fingerprint(_target_in_root(self._source, rel))
             if expected is None:
                 if actual is not None:
                     conflicts.append(rel)
@@ -506,19 +561,28 @@ class RamWorkspace(WorkspaceBackend):
             shutil.rmtree(path)
 
     @staticmethod
-    def _atomic_install(source: Path, target: Path) -> None:
+    def _atomic_install(source: Path, target: Path, *, root: Path | None = None) -> None:
+        if root is not None:
+            try:
+                rel = target.relative_to(root).as_posix()
+            except ValueError as exc:
+                raise WorkspaceError(f"commit target is outside the workspace: {target}") from exc
+            target = _target_in_root(root, rel)
         target.parent.mkdir(parents=True, exist_ok=True)
         source_entry = _fingerprint(source)
         if source_entry is None:
             raise WorkspaceError(f"RAM source disappeared before commit: {source}")
         if source_entry.kind == "dir":
-            if target.exists() and not target.is_dir():
+            # Path.is_dir() follows symlinks.  A symlink to an external directory
+            # must be removed before mkdir, otherwise later children escape.
+            if target.is_symlink() or (target.exists() and not target.is_dir()):
                 RamWorkspace._remove_path(target)
             target.mkdir(parents=True, exist_ok=True)
             try:
                 os.chmod(target, source_entry.mode)
             except OSError:
                 pass
+            _fsync_directory(target.parent)
             return
         if target.exists() and target.is_dir() and not target.is_symlink():
             RamWorkspace._remove_path(target)
@@ -526,12 +590,24 @@ class RamWorkspace(WorkspaceBackend):
         temp = target.parent / token
         try:
             if source_entry.kind == "symlink":
-                os.symlink(os.readlink(source), temp)
+                link = os.readlink(source)
+                if root is not None:
+                    destination = Path(link) if Path(link).is_absolute() else target.parent / link
+                    try:
+                        destination.resolve(strict=False).relative_to(root.resolve(strict=True))
+                    except ValueError as exc:
+                        raise WorkspaceError(
+                            f"refusing to persist symlink outside the workspace: {target} -> {link}"
+                        ) from exc
+                os.symlink(link, temp)
             elif source_entry.kind == "file":
                 shutil.copy2(source, temp, follow_symlinks=False)
+                with temp.open("rb") as handle:
+                    os.fsync(handle.fileno())
             else:
                 raise WorkspaceError(f"unsupported workspace entry type: {source}")
             os.replace(temp, target)
+            _fsync_directory(target.parent)
         finally:
             if temp.exists() or temp.is_symlink():
                 RamWorkspace._remove_path(temp)
@@ -562,13 +638,39 @@ class RamWorkspace(WorkspaceBackend):
     def _rollback(self, affected: set[str], backup: Path) -> None:
         # Remove partial committed state first, deepest paths first.
         for rel in sorted(affected, key=lambda item: (item.count("/"), item), reverse=True):
-            self._remove_path(self._source / rel)
+            try:
+                target = _target_in_root(self._source, rel)
+            except WorkspaceError:
+                parents = {
+                    str(parent) for parent in PurePosixPath(rel).parents
+                    if str(parent) != "."
+                }
+                if parents.intersection(affected):
+                    # An affected ancestor still occupies this path (typically a
+                    # restored/original symlink). Removing the ancestor below is
+                    # both sufficient and the only confined operation.
+                    continue
+                raise
+            self._remove_path(target)
         # Restore directories first and files afterwards.
         if not backup.exists():
             return
         for path, rel in sorted(_iter_tree(backup, include_git=True), key=lambda item: item[1].count("/")):
-            target = self._source / rel
-            self._atomic_install(path, target)
+            target = _target_in_root(self._source, rel)
+            self._atomic_install(path, target, root=self._source)
+
+    def _assert_committed(self, current: dict[str, _Entry], changed: set[str], deleted: set[str]) -> None:
+        mismatches: list[str] = []
+        for rel in sorted(changed):
+            if _fingerprint(_target_in_root(self._source, rel)) != current.get(rel):
+                mismatches.append(rel)
+        for rel in sorted(deleted):
+            if _fingerprint(_target_in_root(self._source, rel)) is not None:
+                mismatches.append(rel)
+        if mismatches:
+            raise WorkspaceError(
+                "post-commit verification failed for: " + ", ".join(mismatches[:12])
+            )
 
     def finalize(self, *, verified: bool) -> None:
         if not verified:
@@ -579,7 +681,7 @@ class RamWorkspace(WorkspaceBackend):
         if not affected:
             self.abort()
             return
-        self._assert_source_unchanged(affected)
+        self._assert_source_unchanged(affected, current)
 
         txn = self._source.parent / f".aicoder-txn-{uuid.uuid4().hex}"
         backup = txn / "backup"
@@ -589,19 +691,29 @@ class RamWorkspace(WorkspaceBackend):
             # Create/replace directories shallow-first, then files/symlinks.
             changed_dirs = [rel for rel in changed if current.get(rel) and current[rel].kind == "dir"]
             for rel in sorted(changed_dirs, key=lambda item: item.count("/")):
-                self._atomic_install(self._execution / rel, self._source / rel)
+                self._atomic_install(
+                    self._execution / rel, _target_in_root(self._source, rel), root=self._source
+                )
             for rel in sorted(changed.difference(changed_dirs)):
-                self._atomic_install(self._execution / rel, self._source / rel)
+                self._atomic_install(
+                    self._execution / rel, _target_in_root(self._source, rel), root=self._source
+                )
             # Delete absent entries deepest-first so directories become empty last.
             for rel in sorted(deleted, key=lambda item: (item.count("/"), item), reverse=True):
-                self._remove_path(self._source / rel)
-        except Exception as exc:
+                self._remove_path(_target_in_root(self._source, rel))
+            self._assert_committed(current, changed, deleted)
+        except BaseException as exc:
             try:
                 self._rollback(affected, backup)
             except Exception as rollback_exc:
                 raise WorkspaceError(
                     f"RAM commit failed ({exc}); rollback also failed ({rollback_exc}). Backup kept at {txn}"
                 ) from exc
+            shutil.rmtree(txn, ignore_errors=True)
+            if not isinstance(exc, Exception):
+                # Cancellation/SystemExit must retain their control-flow meaning,
+                # but only after the persistent workspace is back at baseline.
+                raise
             raise WorkspaceError(f"RAM commit failed and was rolled back: {exc}") from exc
         else:
             shutil.rmtree(txn, ignore_errors=True)

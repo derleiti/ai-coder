@@ -112,6 +112,7 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
             def create_backend(root, mode, **kwargs):
                 return RamWorkspace(root, ram_root=ram_dir)
 
+            events = []
             with (
                 patch("aicoder.team_orchestrator.load_tools", return_value=[]),
                 patch("aicoder.team_orchestrator._run_researcher", side_effect=researcher),
@@ -124,6 +125,7 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
                 result = run_team(
                     task="Implement feature", state=state, config=config, client=MagicMock(),
                     model_client=MagicMock(), source_workspace=str(source),
+                    event_fn=lambda kind, payload: events.append((kind, payload)),
                 )
 
             self.assertEqual(result.status, "completed", result.error)
@@ -138,6 +140,15 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
                 (source / "candidate_one.py").read_text(encoding="utf-8"),
                 "from_non_winner = True\n",
             )
+            self.assertEqual(result.performance["change_manifest"], {
+                "created": ["candidate_one.py", "integrated.txt"],
+                "modified": ["app.py"],
+                "deleted": [],
+            })
+            self.assertEqual(events[-1][0], "team_terminal")
+            self.assertEqual(events[-1][1]["status"], "completed")
+            self.assertEqual(events[-1][1]["progress"], 100)
+            self.assertTrue(events[-1][1]["run_id"].startswith("team-"))
             self.assertFalse((source / ".aicoder-team").exists())
 
     def test_all_coder_failure_releases_candidate_workspaces(self):
@@ -256,6 +267,23 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
             self.assertIn("merge exhausted", result.error)
             self.assertTrue(candidate_paths and integration_paths)
             self.assertTrue(all(not path.exists() for path in candidate_paths + integration_paths))
+
+    def test_keyboard_interrupt_returns_cancelled_terminal_state(self):
+        events = []
+        with patch(
+            "aicoder.team_orchestrator._run_team_pipeline", side_effect=KeyboardInterrupt
+        ):
+            result = run_team(
+                task="task", state={}, config=MagicMock(), client=MagicMock(),
+                model_client=MagicMock(), source_workspace=".",
+                event_fn=lambda kind, payload: events.append((kind, payload)),
+            )
+
+        self.assertEqual(result.status, "cancelled")
+        self.assertIn("cancelled by user", result.error)
+        self.assertEqual(events[-1][0], "team_terminal")
+        self.assertEqual(events[-1][1]["status"], "cancelled")
+        self.assertIsNone(events[-1][1]["progress"])
 
 
 if __name__ == "__main__":

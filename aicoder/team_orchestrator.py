@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import time
 from typing import Any, Callable
+import uuid
 
 from . import audit
 from .agent_runtime import AgentRunResult, NativeLightRuntime
@@ -246,9 +247,10 @@ class _TeamDebugLog:
 
 def _event_with_debug(fn: EventFn | None, debug_log: _TeamDebugLog) -> EventFn:
     def sink(kind: str, payload: dict[str, Any]) -> None:
-        debug_log.write(kind, payload)
+        enriched = {"run_id": debug_log.run_id, **payload}
+        debug_log.write(kind, enriched)
         if fn is not None:
-            fn(kind, payload)
+            fn(kind, enriched)
     return sink
 
 
@@ -815,6 +817,42 @@ def run_team(
     model_client: ModelTransport, source_workspace: str,
     event_fn: EventFn | None = None, stop_requested: StopFn | None = None,
 ) -> TeamRunResult:
+    """Run the team pipeline and always publish one post-cleanup terminal event."""
+    run_id = f"team-{uuid.uuid4().hex[:16]}"
+    run_started = time.monotonic()
+    events = _event_with_debug(event_fn, _TeamDebugLog(run_id))
+    try:
+        result = _run_team_pipeline(
+            task=task, state=state, config=config, client=client,
+            model_client=model_client, source_workspace=source_workspace,
+            event_fn=events, stop_requested=stop_requested,
+        )
+        if result.status != "completed" and stop_requested is not None and stop_requested():
+            result.status = "cancelled"
+            result.error = result.error or "team run cancelled by user"
+    except KeyboardInterrupt:
+        result = TeamRunResult(
+            "cancelled", "", "", [], [], {}, "team run cancelled by user"
+        )
+    except Exception as exc:
+        result = TeamRunResult(
+            "failed", "", "", [], [], {}, f"{type(exc).__name__}: {exc}"
+        )
+    elapsed_ms = int((time.monotonic() - run_started) * 1000)
+    ledger = result.performance.get("ledger", {}) if isinstance(result.performance, dict) else {}
+    _emit(
+        events, "team_terminal", status=result.status,
+        progress=100 if result.status == "completed" else None,
+        elapsed_ms=elapsed_ms, error=result.error, ledger=ledger,
+    )
+    return result
+
+
+def _run_team_pipeline(
+    *, task: str, state: dict[str, Any], config: TeamConfig, client,
+    model_client: ModelTransport, source_workspace: str,
+    event_fn: EventFn | None = None, stop_requested: StopFn | None = None,
+) -> TeamRunResult:
     errors = config.validate()
     if errors:
         return TeamRunResult("failed", "", "", [], [], {}, "; ".join(errors))
@@ -1069,6 +1107,13 @@ def run_team(
 
         # 9) atomic_disk_write — the only persistent mutation stage.
         _stage_start(ledger, TeamStage.ATOMIC_DISK_WRITE, event_fn)
+        final_delta = integration.delta_summary()
+        change_manifest = {
+            "created": list(final_delta.get("added_files") or []),
+            "modified": list(final_delta.get("modified_files") or []),
+            "deleted": list(final_delta.get("deleted_files") or []),
+        }
+        _emit(event_fn, "team_change_manifest", **change_manifest)
         integration.finalize(verified=True)
         _stage_complete(ledger, TeamStage.ATOMIC_DISK_WRITE, event_fn)
 
@@ -1095,6 +1140,7 @@ def run_team(
                 int((stage.evidence or {}).get("response_chars") or 0) for stage in stages
             ),
             "ledger": ledger.as_dict(), "verification": verification_payload,
+            "change_manifest": change_manifest,
             "stage_timings": [
                 {"role": stage.role, "model": stage.model, "status": stage.status, "elapsed_ms": stage.elapsed_ms}
                 for stage in stages

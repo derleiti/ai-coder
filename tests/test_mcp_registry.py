@@ -161,7 +161,10 @@ class _HTTPHandler(BaseHTTPRequestHandler):
 class MCPStreamableHTTPTests(unittest.TestCase):
     def test_http_initialize_session_tools_auth_env_and_call(self):
         _HTTPHandler.seen_session=False; _HTTPHandler.seen_auth=""
-        server=ThreadingHTTPServer(("127.0.0.1",0),_HTTPHandler)
+        try:
+            server=ThreadingHTTPServer(("127.0.0.1",0),_HTTPHandler)
+        except PermissionError:
+            self.skipTest("loopback sockets are unavailable in this test environment")
         thread=threading.Thread(target=server.serve_forever,daemon=True); thread.start()
         try:
             config=MCPServerConfig(

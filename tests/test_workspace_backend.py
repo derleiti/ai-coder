@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from aicoder.workspace_backend import (
-    DiskWorkspace, RamWorkspace, WorkspaceConflict,
+    DiskWorkspace, RamWorkspace, WorkspaceConflict, WorkspaceError,
     create_workspace_backend, open_workspace_for_run,
 )
 
@@ -49,6 +49,112 @@ class RamWorkspaceTests(unittest.TestCase):
             self.assertEqual((root / "app.py").read_text(), "new\n")
             self.assertEqual((root / "created.txt").read_text(), "created\n")
             self.assertFalse(execution.exists())
+
+    def test_nested_new_file_survives_the_complete_commit(self):
+        with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as ram:
+            root = Path(temp)
+            backend = RamWorkspace(root, ram_root=ram)
+            execution = backend.prepare()
+            nested = execution / "src" / "feature" / "generated.py"
+            nested.parent.mkdir(parents=True)
+            nested.write_text("CREATED = True\n", encoding="utf-8")
+
+            backend.finalize(verified=True)
+
+            committed = root / "src" / "feature" / "generated.py"
+            self.assertTrue(committed.is_file())
+            self.assertEqual(committed.read_text(encoding="utf-8"), "CREATED = True\n")
+
+    def test_directory_replacing_external_symlink_cannot_escape_workspace(self):
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            tempfile.TemporaryDirectory() as ram,
+            tempfile.TemporaryDirectory() as outside_temp,
+        ):
+            root = Path(temp)
+            outside = Path(outside_temp)
+            (root / "pkg").symlink_to(outside, target_is_directory=True)
+            backend = RamWorkspace(root, ram_root=ram)
+            execution = backend.prepare()
+            (execution / "pkg").unlink()
+            (execution / "pkg").mkdir()
+            (execution / "pkg" / "generated.py").write_text("SAFE = True\n", encoding="utf-8")
+
+            backend.finalize(verified=True)
+
+            self.assertFalse((root / "pkg").is_symlink())
+            self.assertEqual((root / "pkg" / "generated.py").read_text(), "SAFE = True\n")
+            self.assertFalse((outside / "generated.py").exists())
+
+    def test_new_symlink_outside_workspace_is_rejected_and_rolled_back(self):
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            tempfile.TemporaryDirectory() as ram,
+            tempfile.TemporaryDirectory() as outside_temp,
+        ):
+            root = Path(temp)
+            backend = RamWorkspace(root, ram_root=ram)
+            execution = backend.prepare()
+            (execution / "escape").symlink_to(Path(outside_temp), target_is_directory=True)
+
+            with self.assertRaisesRegex(WorkspaceError, "symlink outside the workspace"):
+                backend.finalize(verified=True)
+
+            self.assertFalse((root / "escape").exists())
+            self.assertFalse((root / "escape").is_symlink())
+            backend.abort()
+
+    def test_failed_atomic_commit_restores_all_files_and_cleans_transaction(self):
+        with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as ram:
+            parent = Path(temp)
+            root = parent / "source"
+            root.mkdir()
+            (root / "existing.txt").write_text("original\n", encoding="utf-8")
+            backend = RamWorkspace(root, ram_root=ram)
+            execution = backend.prepare()
+            (execution / "existing.txt").write_text("changed\n", encoding="utf-8")
+            (execution / "new.txt").write_text("new\n", encoding="utf-8")
+            original_install = RamWorkspace._atomic_install
+
+            def fail_new_candidate(source, target, *, root=None):
+                if Path(source).is_relative_to(execution) and Path(target).name == "new.txt":
+                    raise OSError("simulated atomic install failure")
+                return original_install(source, target, root=root)
+
+            with patch.object(RamWorkspace, "_atomic_install", side_effect=fail_new_candidate):
+                with self.assertRaisesRegex(WorkspaceError, "was rolled back"):
+                    backend.finalize(verified=True)
+
+            self.assertEqual((root / "existing.txt").read_text(), "original\n")
+            self.assertFalse((root / "new.txt").exists())
+            self.assertEqual(list(parent.glob(".aicoder-txn-*")), [])
+            backend.abort()
+
+    def test_cancelled_atomic_commit_rolls_back_and_cleans_transaction(self):
+        with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as ram:
+            parent = Path(temp)
+            root = parent / "source"
+            root.mkdir()
+            (root / "a.txt").write_text("original\n", encoding="utf-8")
+            backend = RamWorkspace(root, ram_root=ram)
+            execution = backend.prepare()
+            (execution / "a.txt").write_text("changed\n", encoding="utf-8")
+            (execution / "z.txt").write_text("new\n", encoding="utf-8")
+            original_install = RamWorkspace._atomic_install
+
+            def cancel_second_install(source, target, *, root=None):
+                if Path(source).is_relative_to(execution) and Path(target).name == "z.txt":
+                    raise KeyboardInterrupt
+                return original_install(source, target, root=root)
+
+            with patch.object(RamWorkspace, "_atomic_install", side_effect=cancel_second_install):
+                with self.assertRaises(KeyboardInterrupt):
+                    backend.finalize(verified=True)
+
+            self.assertEqual((root / "a.txt").read_text(), "original\n")
+            self.assertFalse((root / "z.txt").exists())
+            self.assertEqual(list(parent.glob(".aicoder-txn-*")), [])
+            backend.abort()
 
     def test_ram_workspace_excludes_backups_and_transient_caches(self):
         with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as ram:

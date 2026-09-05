@@ -35,6 +35,7 @@ class ActiveWorkspaceTests(unittest.TestCase):
                 patch.dict(os.environ, {}, clear=False),
                 patch.object(cli, "set_workspace") as save,
                 patch.object(cli, "print_json") as output,
+                patch("aicoder.workspace.detect_git_root", return_value=None),
             ):
                 os.environ.pop(ACTIVE_WORKSPACE_ENV, None)
                 rc = cli.cmd_workspace(type("Args", (), {"path": str(root)})())

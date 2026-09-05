@@ -104,3 +104,29 @@ Read-only-Aufrufe dürfen im Executor einmal wiederholt werden; mutierende Aufru
 nie, solange das Backend keinen Idempotency-Key-Vertrag bereitstellt. JSON-RPC
 `error`, MCP `isError`, mehrere Textblöcke und `structuredContent` werden
 normalisiert ausgewertet.
+
+## Transaktionale Team-Commits
+
+Team-Coder arbeiten in voneinander isolierten RAM- oder Disk-Kandidaten. Nach
+Merge und deterministischer Verifikation ist `atomic_disk_write` die einzige
+Stage, die den persistenten Quell-Workspace verändert. Der Commit:
+
+- klassifiziert neue, geänderte und gelöschte Dateien in einem Change-Manifest,
+- prüft den Quellzustand samt betroffener Elternpfade auf konkurrierende Änderungen,
+- sichert alle betroffenen vorhandenen Einträge vor der ersten Ersetzung,
+- ersetzt Dateien innerhalb ihres Zielverzeichnisses atomar und führt einen
+  Read-back über Inhaltstyp, Hash, Modus und Größe aus,
+- verhindert Writes durch Verzeichnis-Symlinks und persistiert keine neuen oder
+  geänderten Symlinks, deren Ziel den Workspace verlässt,
+- rollt den gesamten betroffenen Satz bei einem Fehler oder Prozessabbruch
+  (`KeyboardInterrupt`) zurück und entfernt das Transaktionsverzeichnis nach
+  erfolgreichem Rollback.
+
+Jeder Agent- und Team-Lauf besitzt eine `run_id`. Einzelagent-Aufrufe enden mit
+genau einem `run_terminal`-Event; `paused` ist dabei explizit als resumierbarer
+Zustand markiert. Nach dem Team-Workspace-Cleanup wird genau ein
+`team_terminal`-Event mit `completed`, `failed` oder `cancelled` ausgegeben. Bei
+Erfolg enthalten die Terminal-Events `progress=100`; `team_change_manifest` und
+das `performance.change_manifest` des Team-Resultats nennen die persistent
+angelegten, geänderten und gelöschten Dateien. Fehler in reinen UI-/Diagnose-
+Event-Callbacks verändern den Runtime-Ausgang nicht.

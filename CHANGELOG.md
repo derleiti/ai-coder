@@ -1,3 +1,14 @@
+## Unreleased
+
+- Prevent transactional RAM commits from following a replaced directory symlink
+  outside the source workspace; reject newly persisted external symlinks.
+- Add durable atomic file installation, post-commit fingerprint verification and
+  complete cleanup after rollback, including cancellation during commit.
+- Add agent/team run IDs, deterministic terminal events, post-cleanup team
+  completion reporting and a machine-readable final change manifest.
+- Prefer an explicitly selected workspace's `AGENTS.md` over unrelated ancestor
+  repository instructions.
+
 ## v1.2.3 (2026-09-04)
 
 - Fix Debian/Ubuntu upgrades where a stale `~/.local/bin/aicoder` pip launcher shadows the packaged `/usr/bin/aicoder`; the package now backs up and removes only a known broken legacy launcher.
