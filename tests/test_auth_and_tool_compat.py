@@ -636,6 +636,20 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class TransientEnvelopeRecoveryTests(unittest.TestCase):
+    def test_transport_telemetry_only_response_is_retryable(self):
+        with self.assertRaises(ClientError) as ctx:
+            _normalize_chat_response({"_transport_telemetry": {"chunks": 2}})
+        self.assertTrue(ctx.exception.retryable)
+        self.assertIn("Transient incomplete chat response", str(ctx.exception))
+
+    def test_unknown_malformed_response_is_not_implicitly_retryable(self):
+        with self.assertRaises(ClientError) as ctx:
+            _normalize_chat_response({"unexpected": {"x": 1}})
+        self.assertFalse(bool(ctx.exception.retryable))
+
+
+
 class ToolSecurityHardeningTests(unittest.TestCase):
     def test_namespaced_mutating_tool_requires_approval(self):
         for name in ("mcp.code_edit", "server/code_patch", "plugin:memory_clear"):

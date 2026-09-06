@@ -469,14 +469,22 @@ def _run_researcher(
         if result.status != "paused" or (stop_requested and stop_requested()) or attempt >= 4:
             break
         reason = str(result.response or result.error or "research worker paused")
-        conversation = _candidate_conversation(result)
-        current_prompt = (
-            f"AUTONOMOUS RESEARCH RESUME {attempt + 1}/4\n\nPrevious pause reason:\n{reason[:1600]}\n\n"
-            "Continue the same read-only research assignment from existing evidence. Do not restart or modify state. "
-            "Resolve the blocker, gather only missing evidence, then return the required compact research report."
-        )
+        if _is_incomplete_envelope_reason(reason):
+            conversation = []
+            current_prompt = _fresh_worker_recovery_prompt(result, reason, attempt + 1, label=f"research:{role}") + (
+                "\n\nContinue read-only, gather only missing evidence, then return the required compact research report."
+            )
+            recovery_status = "fresh_chat"
+        else:
+            conversation = _candidate_conversation(result)
+            current_prompt = (
+                f"AUTONOMOUS RESEARCH RESUME {attempt + 1}/4\n\nPrevious pause reason:\n{reason[:1600]}\n\n"
+                "Continue the same read-only research assignment from existing evidence. Do not restart or modify state. "
+                "Resolve the blocker, gather only missing evidence, then return the required compact research report."
+            )
+            recovery_status = "resuming"
         _emit(event_fn, "team_worker_event", role=f"research:{role}", event="runtime_status",
-              category="recovery", status="resuming", phase="research_resume",
+              category="recovery", status=recovery_status, phase="research_resume",
               message=f"automatic research resume {attempt + 1}/4: {reason[:500]}")
     assert result is not None
     research_tool_names = {
@@ -752,6 +760,43 @@ def _candidate_resume_prompt(run: AgentRunResult, delta: dict[str, Any], attempt
     )
 
 
+def _is_incomplete_envelope_reason(reason: str) -> bool:
+    text = str(reason or "").lower()
+    return (
+        "transient incomplete chat response" in text
+        or "no recognized assistant response envelope" in text
+        or "_transport_telemetry" in text
+    )
+
+
+def _fresh_worker_recovery_prompt(run: AgentRunResult, reason: str, attempt: int, *, label: str) -> str:
+    """Create a bounded clean-chat handoff after a malformed provider response."""
+    rows: list[str] = []
+    for message in _candidate_conversation(run):
+        role = str(message.get("role") or "unknown").upper()
+        content = message.get("content")
+        if isinstance(content, str):
+            text = content.strip()
+        else:
+            try:
+                text = json.dumps(content, ensure_ascii=False, default=str)
+            except Exception:
+                text = str(content or "")
+        if text:
+            rows.append(f"[{role}]\n{text}")
+    evidence = "\n\n".join(rows)
+    if len(evidence) > 12000:
+        evidence = evidence[:4000] + "\n\n[... bounded recovery handoff ...]\n\n" + evidence[-8000:]
+    return (
+        f"FRESH {label.upper()} RECOVERY CHAT {attempt}\n\n"
+        "The previous provider response contained no usable assistant envelope. This is a NEW provider chat, "
+        "but the same isolated workspace remains authoritative. Do not restart completed work. Reuse the bounded "
+        "evidence below and continue the unfinished assignment.\n\n"
+        f"RECOVERY REASON:\n{reason[:2000]}\n\n"
+        f"PRIOR CONTEXT/EVIDENCE:\n{evidence or '(none)'}"
+    )
+
+
 def _candidate_conversation(run: AgentRunResult) -> list[dict[str, Any]]:
     """Carry the model/tool history forward without duplicating the old system prompt."""
     return [
@@ -874,9 +919,17 @@ def _run_candidate(
             if auto_resumes >= _TEAM_CANDIDATE_MAX_AUTO_RESUMES:
                 break
             auto_resumes += 1
-            conversation = _candidate_conversation(run)
+            reason = str(run.response or run.error or "")
             delta = backend.delta_summary()
-            prompt = _candidate_resume_prompt(run, delta, auto_resumes)
+            if _is_incomplete_envelope_reason(reason):
+                prompt = _fresh_worker_recovery_prompt(run, reason, auto_resumes, label=worker_role)
+                conversation = []
+                _emit(event_fn, "team_worker_event", role=worker_role, event="runtime_status",
+                      category="recovery", status="fresh_chat", phase="candidate_resume",
+                      message=f"starting fresh provider chat after incomplete response envelope ({auto_resumes}/{_TEAM_CANDIDATE_MAX_AUTO_RESUMES})")
+            else:
+                conversation = _candidate_conversation(run)
+                prompt = _candidate_resume_prompt(run, delta, auto_resumes)
 
         assert run is not None
         if hasattr(run, "performance") and isinstance(run.performance, dict):
@@ -1492,12 +1545,20 @@ def _run_team_pipeline(
                 if merge_auto_resumes >= _TEAM_MERGE_MAX_AUTO_RESUMES:
                     break
                 merge_auto_resumes += 1
+                merge_pause_reason = str(merge_run.response or merge_run.error or "merge paused")
                 _emit(
                     event_fn, "team_merge_resume", attempt=merge_auto_resumes,
-                    reason=str(merge_run.response or merge_run.error or "merge paused")[:2000],
+                    reason=merge_pause_reason[:2000],
                 )
-                merge_conversation = _candidate_conversation(merge_run)
-                merge_prompt = _merge_resume_prompt(merge_run, merge_auto_resumes)
+                if _is_incomplete_envelope_reason(merge_pause_reason):
+                    merge_conversation = []
+                    merge_prompt = _fresh_worker_recovery_prompt(merge_run, merge_pause_reason, merge_auto_resumes, label="merge")
+                    _emit(event_fn, "team_worker_event", role="merge", event="runtime_status",
+                          category="recovery", status="fresh_chat", phase="merge_resume",
+                          message=f"starting fresh provider chat after incomplete response envelope ({merge_auto_resumes}/{_TEAM_MERGE_MAX_AUTO_RESUMES})")
+                else:
+                    merge_conversation = _candidate_conversation(merge_run)
+                    merge_prompt = _merge_resume_prompt(merge_run, merge_auto_resumes)
 
             assert merge_run is not None
             merge_elapsed = int((time.monotonic() - merge_started) * 1000)

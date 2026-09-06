@@ -213,7 +213,16 @@ def _normalize_chat_response(data: Any) -> Dict[str, Any]:
             normalized["tool_calls"] = message["tool_calls"]
         return normalized
 
-    raise ClientError("Chat backend response contains no recognized response envelope")
+    keys = sorted(str(key) for key in data.keys())[:40]
+    types = {key: type(data.get(key)).__name__ for key in keys}
+    metadata_only = bool(data) and all(
+        key in {"_transport_telemetry", "usage", "reasoning", "reasoning_content", "finish_reason"}
+        for key in data
+    )
+    raise ClientError(
+        "Transient incomplete chat response: no recognized assistant response envelope; "
+        f"keys={keys}; types={types}", payload=data, retryable=metadata_only,
+    )
 
 
 def model_identifier(value: Any) -> str:
