@@ -21,6 +21,12 @@ class StageGateTests(unittest.TestCase):
             ledger.complete(stage)
         self.assertEqual(ledger.completed, [stage.value for stage in STAGE_ORDER])
 
+    def test_brainstorm_is_between_research_and_plan_code(self):
+        self.assertEqual(
+            [stage.value for stage in STAGE_ORDER[:4]],
+            ["plan_research", "research", "brainstorm", "plan_code"],
+        )
+
     def test_pipeline_cannot_skip_tests_to_disk_write(self):
         ledger = StageLedger()
         ledger.start(TeamStage.PLAN_RESEARCH); ledger.complete(TeamStage.PLAN_RESEARCH)
