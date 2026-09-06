@@ -120,7 +120,14 @@ def set_swarm(mode: str) -> None:
 
 
 def set_workspace(path: Optional[str]) -> None:
-    _apply(workspace_root=path)
+    from .workspace import sync_active_workspace
+
+    resolved = None
+    if path is not None and str(path).strip():
+        resolved = str(sync_active_workspace(path))
+    else:
+        sync_active_workspace(None)
+    _apply(workspace_root=resolved)
 
 
 def set_workspace_mode(mode: str) -> None:

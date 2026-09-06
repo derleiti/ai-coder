@@ -6,12 +6,39 @@ from typing import Any, Dict
 IGNORE_DIRS = {".git", ".venv", "__pycache__", "node_modules", ".mypy_cache", ".pytest_cache"}
 
 ACTIVE_WORKSPACE_ENV = "AICODER_ACTIVE_WORKSPACE"
+DEFAULT_PROJECTS_ROOT = Path.home() / "workspace"
+
+
+def projects_root(configured: str | Path | None = None) -> Path:
+    """Return the project-container directory; it is not itself an active project."""
+    raw = configured or DEFAULT_PROJECTS_ROOT
+    return Path(raw).expanduser().resolve(strict=False)
 
 
 def active_workspace(configured: str | None = None) -> Path:
-    """Return the process-local workspace, preferring the directory AICoder started in."""
+    """Return the active project, preferring the process-local selected workspace."""
     raw = os.environ.get(ACTIVE_WORKSPACE_ENV) or configured or os.getcwd()
     return Path(raw).expanduser().resolve(strict=False)
+
+
+def validate_project_workspace(path: str | Path, configured_projects_root: str | Path | None = None) -> Path:
+    """Reject the projects container when a concrete project workspace is required."""
+    root = Path(path).expanduser().resolve(strict=False)
+    container = projects_root(configured_projects_root)
+    if root == container:
+        raise ValueError(
+            f"active workspace points to projects container {container}; "
+            "select or create a concrete project before starting a coding team run"
+        )
+    return root
+
+
+def sync_active_workspace(path: str | Path | None) -> Path:
+    """Synchronize the process-local workspace cache with a persisted selection."""
+    if path is None or not str(path).strip():
+        os.environ.pop(ACTIVE_WORKSPACE_ENV, None)
+        return active_workspace()
+    return activate_workspace(path)
 
 
 def activate_workspace(path: str | Path | None = None) -> Path:

@@ -1,5 +1,8 @@
 ## Unreleased
 
+- Fix active project selection so GUI workspace changes take effect without restart; distinguish `projects_root` (default `~/workspace`) from the concrete `workspace_root`.
+- Prevent Team Runtime from treating the projects container as a project and make fallback verification safe for fresh non-Git projects.
+
 - Prevent transactional RAM commits from following a replaced directory symlink
   outside the source workspace; reject newly persisted external symlinks.
 - Add durable atomic file installation, post-commit fingerprint verification and

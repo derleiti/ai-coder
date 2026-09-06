@@ -179,9 +179,19 @@ def project_verification_plan(root: str | Path) -> list[VerificationCommand]:
     if (root / "Makefile").exists() and not commands:
         commands.append(VerificationCommand("make", ("make", "-j2"), 300))
 
-    # A repository with no known metadata still gets a content-level sanity gate.
+    # A project with no known metadata still gets a deterministic sanity gate.
+    # Git-backed projects can use git's whitespace/error check. Fresh non-Git
+    # projects must not fail merely because their parent projects container is
+    # not a repository.
     if not commands:
-        commands.append(VerificationCommand("git-diff-check", ("git", "diff", "--check"), 60))
+        if (root / ".git").exists():
+            commands.append(VerificationCommand("git-diff-check", ("git", "diff", "--check"), 60))
+        else:
+            script = (
+                "from pathlib import Path; import sys; "
+                "sys.exit(0 if any(p.is_file() for p in Path('.').rglob('*')) else 1)"
+            )
+            commands.append(VerificationCommand("workspace-content", (python, "-c", script), 60))
     return commands
 
 

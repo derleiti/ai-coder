@@ -112,9 +112,14 @@ _register(SettingSpec(
     description="Multi-model swarm behaviour: off, auto (on demand), on (always), review (second opinion only).",
 ))
 _register(SettingSpec(
+    key="projects_root", type="path", default=str(Path.home() / "workspace"),
+    group="workspace", aliases=("projects", "project_root"),
+    description="Container directory for projects. Team runs must target a concrete project below this root.",
+))
+_register(SettingSpec(
     key="workspace_root", type="path", default=None, nullable=True,
     group="workspace", aliases=("workspace",),
-    description="Active workspace directory. All file tools are scoped to this root.",
+    description="Active concrete project directory. All file tools and team workspaces are scoped to this root.",
 ))
 _register(SettingSpec(
     key="workspace_mode", type="enum", default="auto", choices=frozenset(WORKSPACE_MODES),

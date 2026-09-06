@@ -109,6 +109,21 @@ class ProjectPythonRuntimeTests(unittest.TestCase):
 
 
 class ProjectPlanTests(unittest.TestCase):
+    def test_fresh_non_git_project_uses_content_gate_instead_of_git_diff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "README.txt").write_text("fresh project\n", encoding="utf-8")
+            plan = project_verification_plan(root)
+            self.assertEqual([item.name for item in plan], ["workspace-content"])
+            self.assertNotIn("git", plan[0].argv[0].lower())
+
+    def test_git_project_without_metadata_keeps_git_diff_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".git").mkdir()
+            plan = project_verification_plan(root)
+            self.assertEqual([item.name for item in plan], ["git-diff-check"])
+
     def test_python_project_gets_compile_and_test_gates(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

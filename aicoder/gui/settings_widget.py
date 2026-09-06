@@ -1,5 +1,6 @@
 """Settings tab — login, base model, team models, tools and runtime."""
 from __future__ import annotations
+from pathlib import Path
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLineEdit, QPushButton, QComboBox, QLabel, QGroupBox, QMessageBox,
@@ -16,6 +17,7 @@ from ..session_state import (
 from ..client import TriForceClient, model_identifier
 from .. import settings as settings_core
 from ..executor import load_tools
+from ..workspace import sync_active_workspace
 from ..provider_credentials import (
     CredentialStoreError, credential_summary, delete_provider_key, set_provider_key,
 )
@@ -526,6 +528,16 @@ class SettingsWidget(QWidget):
             return
 
         state = get_state()
+        workspace_changed = (
+            "workspace_root" in proposed
+            and state.get("workspace_root") != proposed.get("workspace_root")
+        )
+        workspace_can_activate = False
+        if workspace_changed and proposed.get("workspace_root"):
+            workspace = Path(str(proposed["workspace_root"])).expanduser().resolve(strict=False)
+            proposed["workspace_root"] = str(workspace)
+            workspace_can_activate = workspace.exists() and workspace.is_dir()
+
         security_changes = [
             key for key, value in proposed.items()
             if settings_core.REGISTRY[key].security_impact
@@ -551,6 +563,8 @@ class SettingsWidget(QWidget):
             self.schema_status.setText(f"Invalid setting: {exc}")
             self.schema_status.setStyleSheet("color: #ff6b6b; font-size: 11px;")
             return
+        if workspace_changed and (not proposed.get("workspace_root") or workspace_can_activate):
+            sync_active_workspace(proposed.get("workspace_root"))
         current = get_state()
         self._settings_snapshot = self._state_signature(current)
         self.schema_status.setText(f"Saved · {len(proposed)} settings")

@@ -256,6 +256,39 @@ class WorkspaceEscapeTests(unittest.TestCase):
             self.assertIn("binary file", result)
             self.assertNotIn("secret-binary-data", result)
 
+    def test_projects_container_is_not_a_valid_team_project(self):
+        from aicoder.workspace import validate_project_workspace
+
+        with tempfile.TemporaryDirectory() as temp:
+            projects = Path(temp) / "workspace"
+            project = projects / "demo"
+            project.mkdir(parents=True)
+            with self.assertRaisesRegex(ValueError, "projects container"):
+                validate_project_workspace(projects, projects)
+            self.assertEqual(validate_project_workspace(project, projects), project.resolve())
+
+    def test_set_workspace_synchronizes_process_workspace(self):
+        from aicoder import session_state
+        from aicoder.workspace import ACTIVE_WORKSPACE_ENV
+
+        with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as config:
+            state_file = Path(config) / "state.json"
+            previous = os.environ.pop(ACTIVE_WORKSPACE_ENV, None)
+            try:
+                with patch.object(session_state, "STATE_FILE", state_file):
+                    session_state._cache = None
+                    session_state._cache_stamp = None
+                    session_state.set_workspace(temp)
+                    self.assertEqual(session_state.get_state()["workspace_root"], str(Path(temp).resolve()))
+                    self.assertEqual(Path(os.environ[ACTIVE_WORKSPACE_ENV]), Path(temp).resolve())
+            finally:
+                session_state._cache = None
+                session_state._cache_stamp = None
+                if previous is None:
+                    os.environ.pop(ACTIVE_WORKSPACE_ENV, None)
+                else:
+                    os.environ[ACTIVE_WORKSPACE_ENV] = previous
+
     def test_gui_startup_honors_persisted_workspace_instead_of_launcher_cwd(self):
         import os
         from aicoder import cli
