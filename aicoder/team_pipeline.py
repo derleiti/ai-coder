@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import tempfile
 import time
 import uuid
 from typing import Any, Iterable
@@ -217,19 +218,30 @@ def project_verification_plan(root: str | Path) -> list[VerificationCommand]:
 def execute_verification_plan(root: str | Path, commands: Iterable[VerificationCommand]) -> list[VerificationResult]:
     root = Path(root)
     results: list[VerificationResult] = []
-    for command in commands:
-        started = time.monotonic()
-        try:
-            proc = subprocess.run(list(command.argv), cwd=str(root), capture_output=True, text=True, timeout=command.timeout)
-            results.append(VerificationResult(
-                command.name, list(command.argv), proc.returncode == 0, proc.returncode,
-                int((time.monotonic() - started) * 1000), (proc.stdout + "\n" + proc.stderr)[-12000:], command.required,
-            ))
-        except (OSError, subprocess.SubprocessError) as exc:
-            results.append(VerificationResult(
-                command.name, list(command.argv), False, -1, int((time.monotonic() - started) * 1000),
-                f"{type(exc).__name__}: {exc}", command.required,
-            ))
+    # Candidate verification can run repeatedly within the same second after a
+    # same-size Python edit. CPython's timestamp/size pyc invalidation can then
+    # reuse stale bytecode from an earlier verification turn. Redirect bytecode
+    # to a fresh cache tree for every deterministic verification pass so checks
+    # always execute the current candidate files without mutating project caches.
+    with tempfile.TemporaryDirectory(prefix="aicoder-verify-pycache-") as pycache_dir:
+        verification_env = os.environ.copy()
+        verification_env["PYTHONPYCACHEPREFIX"] = pycache_dir
+        for command in commands:
+            started = time.monotonic()
+            try:
+                proc = subprocess.run(
+                    list(command.argv), cwd=str(root), capture_output=True, text=True,
+                    timeout=command.timeout, env=verification_env,
+                )
+                results.append(VerificationResult(
+                    command.name, list(command.argv), proc.returncode == 0, proc.returncode,
+                    int((time.monotonic() - started) * 1000), (proc.stdout + "\n" + proc.stderr)[-12000:], command.required,
+                ))
+            except (OSError, subprocess.SubprocessError) as exc:
+                results.append(VerificationResult(
+                    command.name, list(command.argv), False, -1, int((time.monotonic() - started) * 1000),
+                    f"{type(exc).__name__}: {exc}", command.required,
+                ))
     return results
 
 

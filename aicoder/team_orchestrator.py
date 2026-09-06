@@ -762,7 +762,7 @@ def _candidate_resume_prompt(run: AgentRunResult, delta: dict[str, Any], attempt
 
 
 def _candidate_verification_repair_prompt(evaluation: dict[str, Any], attempt: int) -> str:
-    """Return a focused repair turn for a completed candidate that failed team verification."""
+    """Return a focused repair turn for a candidate workspace rejected by team verification."""
     checks = evaluation.get("checks") or {}
     failed_rows: list[str] = []
     for name, row in checks.items():
@@ -780,7 +780,7 @@ def _candidate_verification_repair_prompt(evaluation: dict[str, Any], attempt: i
     failures = "\n".join(failed_rows) or "- candidate verification did not pass; inspect the project verification plan and repair it"
     return (
         f"AUTONOMOUS CANDIDATE VERIFICATION REPAIR {attempt}/{_TEAM_CANDIDATE_MAX_VERIFICATION_REPAIRS}\n\n"
-        "Your implementation reached DONE, but deterministic team evaluation rejected the candidate. "
+        "Your candidate workspace contains implementation work, but deterministic team evaluation did not accept it. "
         "Continue in the SAME isolated RAM workspace. Preserve the implementation, repair the failed verification "
         "requirements below, and rerun the relevant checks. Do not merely explain the failure.\n\n"
         f"FAILED TEAM VERIFICATION:\n{failures}\n\n"
@@ -996,7 +996,33 @@ def _run_candidate(
             if not _candidate_pause_is_resumable(run, stop_requested):
                 break
             if auto_resumes >= _TEAM_CANDIDATE_MAX_AUTO_RESUMES:
-                break
+                # A provider can keep pausing after it has already produced useful code.
+                # Do not discard that workspace blindly: run deterministic evaluation and
+                # give the coder a bounded, evidence-backed repair/finalization turn.
+                exhausted_delta = backend.delta_summary()
+                has_exhausted_delta = bool(
+                    int(exhausted_delta.get("changed_count") or 0)
+                    or int(exhausted_delta.get("deleted_count") or 0)
+                )
+                if not has_exhausted_delta or verification_repairs >= _TEAM_CANDIDATE_MAX_VERIFICATION_REPAIRS:
+                    break
+                probe = CandidateResult(
+                    slot=slot, model=model, strategy=strategy, workspace=backend, run=run,
+                )
+                verification = evaluate_candidate(probe)
+                verification_repairs += 1
+                conversation = _candidate_conversation(run)
+                prompt = _candidate_verification_repair_prompt(verification, verification_repairs)
+                _emit(
+                    event_fn, "team_worker_event", role=worker_role, event="runtime_status",
+                    category="verification", status="repairing", phase="candidate_verification",
+                    message=(
+                        "candidate remained paused after autonomous resumes; "
+                        f"starting deterministic verification repair {verification_repairs}/"
+                        f"{_TEAM_CANDIDATE_MAX_VERIFICATION_REPAIRS}"
+                    ),
+                )
+                continue
             auto_resumes += 1
             reason = str(run.response or run.error or "")
             delta = backend.delta_summary()

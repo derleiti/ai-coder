@@ -9,7 +9,7 @@ from pathlib import Path
 
 from aicoder.team_pipeline import (
     STAGE_ORDER, StageLedger, TeamStage, blind_candidate_id, content_fingerprint, objective_rank_key,
-    configured_project_python, normalize_project_test_argv, project_verification_plan,
+    configured_project_python, execute_verification_plan, normalize_project_test_argv, project_verification_plan,
 )
 
 
@@ -132,6 +132,32 @@ class ProjectPlanTests(unittest.TestCase):
             (root / ".git").mkdir()
             plan = project_verification_plan(root)
             self.assertEqual([item.name for item in plan], ["git-diff-check"])
+
+    def test_python_verification_ignores_stale_same_size_pyc(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "pyproject.toml").write_text('[project]\nname="x"\nversion="0.1"\n', encoding="utf-8")
+            (root / "app.py").write_text("value = 0\n", encoding="utf-8")
+            tests = root / "tests"
+            tests.mkdir()
+            test_file = tests / "test_app.py"
+            passing = (
+                "import unittest\nimport app\nclass T(unittest.TestCase):\n"
+                "    def test_value(self): self.assertEqual(app.value, 0)\n"
+            )
+            failing = passing.replace("app.value, 0", "app.value, 1")
+            self.assertEqual(len(passing), len(failing))
+            test_file.write_text(passing, encoding="utf-8")
+            original_stat = test_file.stat()
+            plan = project_verification_plan(root)
+            first = execute_verification_plan(root, plan)
+            self.assertTrue(all(row.ok for row in first if row.required), first)
+
+            test_file.write_text(failing, encoding="utf-8")
+            os.utime(test_file, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            second = execute_verification_plan(root, plan)
+            python_tests = next(row for row in second if row.name == "python-tests")
+            self.assertFalse(python_tests.ok, python_tests.output)
 
     def test_python_project_gets_compile_and_test_gates(self):
         with tempfile.TemporaryDirectory() as tmp:
