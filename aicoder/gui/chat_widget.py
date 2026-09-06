@@ -326,6 +326,10 @@ class _AgentWorker(QThread):
                 self.activity.emit(f"Team · {stage} · {status}")
                 if status == "started":
                     self.msg.emit("system", f"Pipeline · {stage}", "stage")
+            elif kind == "team_project_workspace":
+                path = str(payload.get("path") or "?")
+                reason = str(payload.get("reason") or "auto")
+                self.msg.emit("system", "Projekt-Workspace", f"{path} · {reason}")
             elif kind == "team_workspace_plan":
                 mode = str(payload.get("backend_mode") or "?")
                 count = int(payload.get("candidate_count") or 0)

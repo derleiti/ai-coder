@@ -38,7 +38,7 @@ from .team_pipeline import (
     StageLedger, TeamStage, blind_candidate_id, configured_project_python, execute_verification_plan,
     objective_rank_key, project_verification_plan, verification_passed,
 )
-from .workspace import validate_project_workspace
+from .workspace import resolve_or_create_project_workspace
 from .workspace_backend import (
     RamWorkspace, WorkspaceBackend, WorkspaceError, create_isolated_team_workspace,
     team_workspace_plan,
@@ -991,9 +991,21 @@ def _run_team_pipeline(
     if errors:
         return TeamRunResult("failed", "", "", [], [], {}, "; ".join(errors))
     try:
-        source_workspace = str(validate_project_workspace(source_workspace, state.get("projects_root")))
-    except ValueError as exc:
-        return TeamRunResult("failed", "", "", [], [], {}, str(exc))
+        resolved_workspace, auto_selected, workspace_reason = resolve_or_create_project_workspace(
+            source_workspace, task, state.get("projects_root")
+        )
+        source_workspace = str(resolved_workspace)
+        if auto_selected:
+            from .session_state import set_workspace
+
+            set_workspace(source_workspace)
+            state["workspace_root"] = source_workspace
+            _emit(
+                event_fn, "team_project_workspace", path=source_workspace,
+                auto_selected=True, reason=workspace_reason,
+            )
+    except (OSError, ValueError) as exc:
+        return TeamRunResult("failed", "", "", [], [], {}, f"project workspace setup failed: {exc}")
 
     started = time.monotonic()
     ledger = StageLedger()

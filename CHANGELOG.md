@@ -1,5 +1,6 @@
 ## Unreleased
 
+- Let Team Runtime create/select a concrete child project automatically when only `projects_root` is active; prefer a task-specified path and otherwise generate a safe project root.
 - Make Team merge pauses diagnosable and autonomously resumable in the same integration workspace; preserve the real pause/failure reason instead of collapsing it to `merge failed`.
 - Fix active project selection so GUI workspace changes take effect without restart; distinguish `projects_root` (default `~/workspace`) from the concrete `workspace_root`.
 - Prevent Team Runtime from treating the projects container as a project and make fallback verification safe for fresh non-Git projects.

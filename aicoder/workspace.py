@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, subprocess
+import hashlib, os, re, subprocess, time
 from pathlib import Path
 from typing import Any, Dict
 
@@ -31,6 +31,50 @@ def validate_project_workspace(path: str | Path, configured_projects_root: str |
             "select or create a concrete project before starting a coding team run"
         )
     return root
+
+
+def _task_project_path(task: str, container: Path) -> Path | None:
+    """Find an explicit path in the task that stays below projects_root."""
+    for raw in re.findall(r"(?:~|/)[^\s`\"'<>|]+", str(task or "")):
+        candidate = Path(raw.rstrip(".,;:!?)]}")).expanduser().resolve(strict=False)
+        try:
+            relative = candidate.relative_to(container)
+        except ValueError:
+            continue
+        if candidate != container and relative.parts:
+            return candidate
+    return None
+
+
+def resolve_or_create_project_workspace(
+    path: str | Path, task: str, configured_projects_root: str | Path | None = None,
+) -> tuple[Path, bool, str]:
+    """Use a concrete project; create one automatically when only projects_root is active."""
+    current = Path(path).expanduser().resolve(strict=False)
+    container = projects_root(configured_projects_root)
+    if current != container:
+        return validate_project_workspace(current, container), False, "selected-project"
+
+    container.mkdir(parents=True, exist_ok=True)
+    target = _task_project_path(task, container)
+    reason = "task-project-path"
+    if target is None:
+        digest = hashlib.sha256(str(task or "").encode("utf-8", errors="ignore")).hexdigest()[:8]
+        base = f"aicoder-project-{time.strftime('%Y%m%d-%H%M%S')}-{digest}"
+        target = container / base
+        reason = "generated-project-root"
+        suffix = 2
+        while target.exists() and any(target.iterdir()):
+            target = container / f"{base}-{suffix}"
+            suffix += 1
+
+    target = target.expanduser().resolve(strict=False)
+    try:
+        target.relative_to(container)
+    except ValueError as exc:
+        raise ValueError(f"resolved project workspace escapes projects root {container}: {target}") from exc
+    target.mkdir(parents=True, exist_ok=True)
+    return target, True, reason
 
 
 def sync_active_workspace(path: str | Path | None) -> Path:

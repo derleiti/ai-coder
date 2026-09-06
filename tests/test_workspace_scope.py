@@ -256,6 +256,36 @@ class WorkspaceEscapeTests(unittest.TestCase):
             self.assertIn("binary file", result)
             self.assertNotIn("secret-binary-data", result)
 
+    def test_projects_container_uses_task_path_and_creates_missing_project(self):
+        from aicoder.workspace import resolve_or_create_project_workspace
+
+        with tempfile.TemporaryDirectory() as temp:
+            projects = Path(temp) / "workspace"
+            projects.mkdir()
+            target = projects / "workspace-inspector"
+            resolved, auto, reason = resolve_or_create_project_workspace(
+                projects, f"Create project at {target}", projects
+            )
+            self.assertEqual(resolved, target.resolve())
+            self.assertTrue(auto)
+            self.assertEqual(reason, "task-project-path")
+            self.assertTrue(target.is_dir())
+
+    def test_projects_container_generates_project_when_task_has_no_path(self):
+        from aicoder.workspace import resolve_or_create_project_workspace
+
+        with tempfile.TemporaryDirectory() as temp:
+            projects = Path(temp) / "workspace"
+            projects.mkdir()
+            resolved, auto, reason = resolve_or_create_project_workspace(
+                projects, "Build a small Python CLI", projects
+            )
+            self.assertTrue(auto)
+            self.assertEqual(reason, "generated-project-root")
+            self.assertEqual(resolved.parent, projects.resolve())
+            self.assertNotEqual(resolved, projects.resolve())
+            self.assertTrue(resolved.is_dir())
+
     def test_projects_container_is_not_a_valid_team_project(self):
         from aicoder.workspace import validate_project_workspace
 

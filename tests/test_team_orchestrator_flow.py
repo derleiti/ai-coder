@@ -51,6 +51,52 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
         rendered = _redact_debug_value({"message": "token=super-secret-value"})
         self.assertEqual(rendered["message"], "token=[REDACTED]")
 
+    def test_team_container_workspace_creates_and_persists_task_project_root(self):
+        with tempfile.TemporaryDirectory() as temp:
+            projects = Path(temp) / "workspace"
+            projects.mkdir()
+            target = projects / "new-project"
+            state = {
+                "projects_root": str(projects),
+                "workspace_root": str(projects),
+                "selected_model": "test/model",
+                "team_runtime_mode": "on",
+                "workspace_mode": "ram",
+                "team_research_model_1": "test/model",
+                "team_research_model_2": "",
+                "team_research_model_3": "",
+                "team_research_model_4": "",
+                "team_planner_model": "test/model",
+                "team_coordinator_model": "",
+                "team_coder_model_1": "test/model",
+                "team_coder_model_2": "",
+                "team_coder_model_3": "",
+                "team_coder_model_4": "",
+                "team_merge_model": "",
+                "team_test_planner_model": "",
+            }
+            config = config_from_state(state)
+            events = []
+            with (
+                patch("aicoder.session_state.set_workspace") as persist,
+                patch("aicoder.team_orchestrator.load_tools", side_effect=RuntimeError("stop-after-workspace")),
+            ):
+                result = run_team(
+                    task=f"Create project at {target}",
+                    state=state, config=config, client=MagicMock(), model_client=MagicMock(),
+                    source_workspace=str(projects),
+                    event_fn=lambda kind, payload: events.append((kind, payload)),
+                )
+
+            self.assertEqual(result.status, "failed")
+            self.assertIn("stop-after-workspace", result.error)
+            self.assertTrue(target.is_dir())
+            persist.assert_called_once_with(str(target.resolve()))
+            self.assertEqual(state["workspace_root"], str(target.resolve()))
+            project_events = [payload for kind, payload in events if kind == "team_project_workspace"]
+            self.assertEqual(project_events[-1]["path"], str(target.resolve()))
+            self.assertEqual(project_events[-1]["reason"], "task-project-path")
+
     def test_pipeline_selects_candidate_merges_finalizes_and_persists(self):
         FakeIntegrationRuntime.calls = 0
         with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as ram_dir:
