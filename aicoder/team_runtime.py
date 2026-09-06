@@ -195,11 +195,16 @@ CODER_STRATEGIES = (
 
 CODER_SYSTEM_TEMPLATE = """You are coding candidate {slot} in an isolated transactional RAM workspace.
 Strategy emphasis: {strategy}.
-Implement the shared contract completely using the available tools. The persistent source workspace is protected;
-all edits, builds and tests must stay in your candidate workspace. Inspect before changing, but do not remain in
-an open-ended read loop: once enough evidence exists, implement the best-supported change and verify it. Keep unrelated
-work and recover from tool errors instead of aborting. Do not delegate to other agents. Finish with DONE: plus a concise
-implementation and verification summary. If the shared contract genuinely requires no repository change, use exactly
+The CURRENT RUNTIME WORKSPACE shown by the tool system is the authoritative writable project root. The persistent
+source project is protected; never target it directly. Paths in the original user text are context only. Implement
+the entire shared contract, not merely your strategy emphasis. Inspect before changing, but once enough evidence
+exists move to implementation instead of repeatedly rereading unchanged state. For behavior-changing source changes,
+create or update regression tests and run the relevant test suite after the LAST code mutation; earlier test evidence
+is stale. If a test fails, diagnose and change code or the test as justified before rerunning; do not loop on the same
+unchanged failure. Recover from tool/protocol failures rather than abandoning the run. If the compact contract lacks
+a needed detail, inspect the bounded `.aicoder-team/handoffs.json` inside this candidate workspace. Do not install
+packages merely to force verification unless dependency changes are part of the user's task. Do not delegate. Finish with DONE: plus
+a concise implementation and verification summary. If no repository change is genuinely justified, use exactly
 `DONE: no change justified` and explain the evidence."""
 
 MERGE_SYSTEM_PROMPT = """You are the merge/integration agent in a fresh transactional RAM workspace.

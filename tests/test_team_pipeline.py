@@ -109,6 +109,15 @@ class ProjectPythonRuntimeTests(unittest.TestCase):
 
 
 class ProjectPlanTests(unittest.TestCase):
+    def test_behavior_change_requires_test_change_evidence(self):
+        from aicoder.team_pipeline import test_change_evidence as change_evidence
+
+        missing = change_evidence({"changed": ["aicoder/runtime.py"], "deleted": []})
+        self.assertTrue(missing["behavior_change"])
+        self.assertFalse(missing["coverage_evidence_ok"])
+        covered = change_evidence({"changed": ["aicoder/runtime.py", "tests/test_runtime.py"], "deleted": []})
+        self.assertTrue(covered["coverage_evidence_ok"])
+
     def test_fresh_non_git_project_uses_content_gate_instead_of_git_diff(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

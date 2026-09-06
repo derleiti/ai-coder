@@ -302,6 +302,17 @@ class TeamWorkspaceBudgetTests(unittest.TestCase):
                 plan = team_workspace_plan(root, 4, "auto")
             self.assertEqual(plan.backend_mode, "disk-isolated")
             self.assertTrue(plan.reason)
+    def test_ram_delta_diff_includes_new_files_without_git(self):
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as ram_dir:
+            source = Path(source_dir)
+            workspace = RamWorkspace(source, ram_root=ram_dir)
+            workspace.prepare()
+            (workspace.info.execution_root / "new.py").write_text("value = 1\n", encoding="utf-8")
+            diff = workspace.delta_diff()
+            self.assertIn("+++ b/new.py", diff)
+            self.assertIn("+value = 1", diff)
+            workspace.abort()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
+import difflib
 import hashlib
 import json
 import os
@@ -475,6 +476,59 @@ class RamWorkspace(WorkspaceBackend):
             "modified_files": modified_files,
             "deleted_files": deleted_files,
         }
+
+    def delta_diff(self, *, max_chars: int = 100_000) -> str:
+        """Return a deterministic source-vs-candidate diff without requiring Git metadata."""
+        current, changed, deleted = self._delta()
+        affected = set(changed) | set(deleted)
+        self._assert_source_unchanged(affected, current)
+        chunks: list[str] = []
+        limit = max(1000, int(max_chars))
+        used = 0
+
+        def text_lines(path: Path) -> list[str] | None:
+            try:
+                if not path.is_file() or path.is_symlink() or path.stat().st_size > 500_000:
+                    return None
+                raw = path.read_bytes()
+                if b"\x00" in raw:
+                    return None
+                return raw.decode("utf-8").splitlines(keepends=True)
+            except (OSError, UnicodeDecodeError):
+                return None
+
+        for rel in sorted(affected):
+            before = self._source / rel
+            after = self._execution / rel
+            before_lines = text_lines(before) if rel in self._baseline else []
+            after_lines = text_lines(after) if rel not in deleted else []
+            if before_lines is not None and after_lines is not None:
+                chunk = "".join(difflib.unified_diff(
+                    before_lines, after_lines,
+                    fromfile=(f"a/{rel}" if rel in self._baseline else "/dev/null"),
+                    tofile=(f"b/{rel}" if rel not in deleted else "/dev/null"),
+                ))
+            else:
+                old = self._baseline.get(rel)
+                new = _fingerprint(after) if rel not in deleted else None
+                chunk = (
+                    f"--- a/{rel}\n+++ b/{rel}\n"
+                    f"@@ binary-or-nontext @@ old={old.as_dict() if old else None} "
+                    f"new={new.as_dict() if new else None}\n"
+                )
+            if chunk:
+                remaining = limit - used
+                if remaining <= 0:
+                    break
+                chunks.append(chunk[:remaining])
+                used += min(len(chunk), remaining)
+            if used >= limit:
+                break
+        text = "".join(chunks)
+        if len(text) >= limit and affected:
+            text = text[:limit] + "\n... [workspace diff truncated]\n"
+        return text
+
 
     def seed_from(self, other_root: str | Path) -> None:
         """Replace RAM working-tree content from another candidate, keeping private .git metadata."""

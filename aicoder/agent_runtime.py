@@ -287,6 +287,7 @@ class NativeLightRuntime:
     tools_unavailable_reason: str = ""
     max_iterations: int = MAX_ITERATIONS
     require_mutation_or_explicit_no_change: bool = False
+    require_test_verification: bool = False
     allow_completion_signal: bool = False
     progressive_tool_disclosure: bool = True
     native_openrouter_tool_calling: bool = False
@@ -851,6 +852,7 @@ class NativeLightRuntime:
         tool_was_called = False
         tool_nudge_sent = False
         mutation_seen, verification_seen = plan.progress_flags() if resumed and plan else (False, False)
+        test_verification_seen = False
         verification_nudge_sent = False
         implementation_nudge_sent = False
         no_change_nudge_sent = False
@@ -974,6 +976,9 @@ class NativeLightRuntime:
             except (ClientError, RuntimeError) as exc:
                 reason = str(exc)
                 category, _signature, retryable = FailureTracker.classify(reason)
+                typed_retryable = bool(getattr(exc, "retryable", False))
+                if typed_retryable and category != "transient":
+                    category = "transient"; retryable = True
                 if retryable and category == "transient":
                     retry_after = getattr(exc, "retry_after", None)
                     wait_hint = (
@@ -1118,10 +1123,13 @@ class NativeLightRuntime:
                             fallback_used=fallback_used, plan_id=plan.id if plan else "",
                         )
 
-                if mutation_seen and not verification_seen:
+                verification_ready = verification_seen and (not self.require_test_verification or test_verification_seen)
+                if mutation_seen and not verification_ready:
                     messages.append({"role": "assistant", "content": response})
                     if not verification_nudge_sent:
                         current_input = _VERIFICATION_REQUIRED_PROMPT
+                        if self.require_test_verification:
+                            current_input += " Run the relevant regression suite with the `test` tool after the last code mutation."
                         verification_nudge_sent = True
                         self._emit("verification_required", iteration=i + 1)
                         self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
@@ -1273,9 +1281,13 @@ class NativeLightRuntime:
                     elif self.require_mutation_or_explicit_no_change and not mutation_seen and not no_change_justified:
                         accepted = False
                         reject_reason = "runtime completion rejected: no repository mutation was observed and no_change_justified was not set"
-                    elif mutation_seen and not verification_seen:
+                    elif mutation_seen and not (verification_seen and (not self.require_test_verification or test_verification_seen)):
                         accepted = False
-                        reject_reason = "runtime completion rejected: repository state changed but successful post-change verification is still missing"
+                        reject_reason = (
+                            "runtime completion rejected: repository state changed but fresh post-change test verification is still missing"
+                            if self.require_test_verification else
+                            "runtime completion rejected: repository state changed but successful post-change verification is still missing"
+                        )
                     elif (
                         mutation_seen and tool_was_called and not completion_audit_sent
                         and _needs_completion_audit(self.initial_prompt)
@@ -1617,7 +1629,15 @@ class NativeLightRuntime:
                 mutation_seen, verified_now = self._record_tool_progress(
                     plan, name, args, tool_result, is_error, mutation_seen,
                 )
-                verification_seen = verification_seen or verified_now
+                mutation_effect = (not is_error and _has_mutation_effect(name, args) and not _is_behavior_verification_call(name, args))
+                if mutation_effect:
+                    verification_seen = verified_now
+                    test_verification_seen = False
+                    verification_nudge_sent = False
+                else:
+                    verification_seen = verification_seen or verified_now
+                if not is_error and name == "test" and verified_now and mutation_before_tool:
+                    test_verification_seen = True
                 if mutation_seen and not mutation_before_tool:
                     pre_mutation_inspection_count = 0
                 elif (
@@ -1773,15 +1793,18 @@ class NativeLightRuntime:
             self._save_journal(plan, messages, tool_batches=journal_batches)
 
             if response.strip().upper().startswith("DONE:"):
-                if mutation_seen and not verification_seen:
+                verification_ready = verification_seen and (not self.require_test_verification or test_verification_seen)
+                if mutation_seen and not verification_ready:
                     if not verification_nudge_sent:
                         current_input += "\n\n" + _VERIFICATION_REQUIRED_PROMPT
+                        if self.require_test_verification:
+                            current_input += " Run the relevant regression suite with the `test` tool after the last code mutation."
                         verification_nudge_sent = True
                         self._emit("verification_required", iteration=i + 1)
                         continue
                     reason = (
                         "Agent paused: state changed successfully, but DONE was requested "
-                        "without a successful post-change verification."
+                        "without the required fresh post-change verification."
                     )
                     self._pause_plan(plan, reason, visible or response)
                     self._save_journal(plan, messages, tool_batches=journal_batches)

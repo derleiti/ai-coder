@@ -130,7 +130,7 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
                     response=f"evidence {kwargs['role']}", elapsed_ms=1,
                 )
 
-            def advisor(_model_client, *, model, system, prompt, max_tokens=0):
+            def advisor(_model_client, *, model, system, prompt, max_tokens=0, **kwargs):
                 return AgentStageResult("advisor", model, "completed", "shared plan", 1)
 
             candidates = []
@@ -216,7 +216,7 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
             def researcher(**kwargs):
                 return AgentStageResult(f"research:{kwargs['role']}", kwargs["model"], "completed", "evidence", 1)
 
-            def advisor(_model_client, *, model, system, prompt, max_tokens=0):
+            def advisor(_model_client, *, model, system, prompt, max_tokens=0, **kwargs):
                 return AgentStageResult("advisor", model, "completed", "shared plan", 1)
 
             def candidate(**kwargs):
@@ -242,7 +242,7 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
                 )
 
             self.assertEqual(result.status, "failed")
-            self.assertIn("no coding candidate completed", result.error)
+            self.assertIn("no verified coding candidate completed", result.error)
             self.assertTrue(created)
             self.assertTrue(all(not path.exists() for path in created))
 
@@ -273,7 +273,7 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
             def researcher(**kwargs):
                 return AgentStageResult(f"research:{kwargs['role']}", kwargs["model"], "completed", "evidence", 1)
 
-            def advisor(_model_client, *, model, system, prompt, max_tokens=0):
+            def advisor(_model_client, *, model, system, prompt, max_tokens=0, **kwargs):
                 return AgentStageResult("advisor", model, "completed", "shared plan", 1)
 
             def candidate(**kwargs):
@@ -361,7 +361,7 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
             def researcher(**kwargs):
                 return AgentStageResult(f"research:{kwargs['role']}", kwargs["model"], "completed", "evidence", 1)
 
-            def advisor(_model_client, *, model, system, prompt, max_tokens=0):
+            def advisor(_model_client, *, model, system, prompt, max_tokens=0, **kwargs):
                 return AgentStageResult("advisor", model, "completed", "shared plan", 1)
 
             def candidate(**kwargs):

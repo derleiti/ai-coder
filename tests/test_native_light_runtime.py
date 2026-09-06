@@ -261,6 +261,31 @@ class NativeLightPlanTests(unittest.TestCase):
                 "in_progress",
             )
 
+    def test_team_mode_requires_test_after_last_mutation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp)
+            client = MagicMock(); client.timeout = 30
+            client.chat.side_effect = [
+                {"response": '<tool_call>{"name":"file_edit","arguments":{"path":"x.py","operation":"write","content":"x=1"}}</tool_call>', "model": "test/model"},
+                {"response": '<tool_call>{"name":"lint","arguments":{}}</tool_call>', "model": "test/model"},
+                {"response": "DONE: linted", "model": "test/model"},
+                {"response": '<tool_call>{"name":"test","arguments":{}}</tool_call>', "model": "test/model"},
+                {"response": "DONE: tested", "model": "test/model"},
+            ]
+            runtime = NativeLightRuntime(
+                client=client, initial_prompt="Change x.py", model="test/model", fallback_model=None,
+                workspace_root=str(workspace), tools=[LOCAL_FILE_EDIT_SCHEMA, LOCAL_TEST_SCHEMA, {"name":"lint","inputSchema":{"type":"object"}}],
+                load_tools_on_start=True, approval_fn=lambda *_: True, persistent_plan=False, base_timeout=30,
+                require_mutation_or_explicit_no_change=True, require_test_verification=True,
+            )
+            def fake_run_tool(_client, name, args, **kwargs):
+                return ("ok", False)
+            with patch("aicoder.agent_runtime.run_tool", side_effect=fake_run_tool):
+                result = runtime.run()
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(result.response, "DONE: tested")
+            self.assertEqual(client.chat.call_count, 5)
+
     def test_complete_json_in_unclosed_tool_tag_is_not_executed(self):
         with tempfile.TemporaryDirectory() as temp:
             workspace = Path(temp)

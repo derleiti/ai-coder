@@ -2170,7 +2170,8 @@ def _run_tool_impl(
     if risk.needs_approval or needs_scope_approval:
         if approval_fn is not None:
             if not approval_fn(name, approval_args):
-                result = f"{name}: aborted by user"
+                autonomous_policy = bool(getattr(approval_fn, "_aicoder_autonomous_policy", False))
+                result = (f"{name}: blocked by autonomous policy" if autonomous_policy else f"{name}: aborted by user")
                 audit.log_tool(
                     tool_name=name, arguments=args, result=result, duration_s=0,
                     is_error=True, model=model, iteration=iteration,

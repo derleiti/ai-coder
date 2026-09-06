@@ -20,13 +20,14 @@ import uuid
 
 from . import audit
 from .agent_runtime import AgentRunResult, NativeLightRuntime
+from .failure_tracking import FailureTracker
 from .executor import build_system_prompt, load_tools
 from .model_transport import ModelTransport
 from .performance import RuntimePerformance
 from .team_runtime import (
     BRAINSTORM_EVOLUTION_SYSTEM_PROMPT, BRAINSTORM_OPERATOR_SYSTEM_PROMPT,
     BRAINSTORM_PERSPECTIVES, BRAINSTORM_SYNTHESIS_SYSTEM_PROMPT, BRAINSTORM_SYSTEM_PROMPT,
-    CODER_SYSTEM_TEMPLATE, MERGE_PLANNER_SYSTEM_PROMPT, MERGE_SYSTEM_PROMPT,
+    CODER_SYSTEM_TEMPLATE, COORDINATOR_SYSTEM_PROMPT, MERGE_PLANNER_SYSTEM_PROMPT, MERGE_SYSTEM_PROMPT,
     PLANNER_SYSTEM_PROMPT, RESEARCH_INSTRUCTIONS, RESEARCH_OUTPUT_CONTRACT,
     RESEARCH_PLANNER_SYSTEM_PROMPT, TEST_PLANNER_SYSTEM_PROMPT, TeamConfig,
 )
@@ -36,7 +37,7 @@ from .team_handoff import (
 )
 from .team_pipeline import (
     StageLedger, TeamStage, blind_candidate_id, configured_project_python, execute_verification_plan,
-    objective_rank_key, project_verification_plan, verification_passed,
+    objective_rank_key, project_verification_plan, test_change_evidence, verification_passed,
 )
 from .workspace import resolve_or_create_project_workspace
 from .workspace_backend import (
@@ -267,6 +268,31 @@ def _emit(fn: EventFn | None, kind: str, **payload: Any) -> None:
         pass
 
 
+def _worker_event_forwarder(fn: EventFn | None, role: str) -> EventFn:
+    """Forward useful worker-runtime telemetry without exposing model/provider identity to peers."""
+    allowed = {
+        "model_start", "model_response", "thought", "tool_call", "tool_result",
+        "error", "paused", "performance_warning", "performance_summary", "final",
+        "verification_required", "completion_audit", "runtime_status", "final_response_repair",
+        "loop_prevented", "completion_signal",
+    }
+    def forward(kind: str, payload: dict[str, Any]) -> None:
+        if kind not in allowed:
+            return
+        forwarded = dict(payload)
+        for key in ("role", "event", "kind"):
+            forwarded.pop(key, None)
+        _emit(fn, "team_worker_event", role=role, event=kind, **forwarded)
+    return forward
+
+
+def _advisor_retryable(reason: str, exc: Exception | None = None) -> bool:
+    if exc is not None and bool(getattr(exc, "retryable", False)):
+        return True
+    category, _signature, retryable = FailureTracker.classify(reason)
+    return category == "transient" and retryable
+
+
 def _call_advisor(
     model_client: ModelTransport,
     *,
@@ -274,29 +300,47 @@ def _call_advisor(
     system: str,
     prompt: str,
     max_tokens: int = 6000,
+    event_fn: EventFn | None = None,
+    role: str = "advisor",
+    stop_requested: StopFn | None = None,
 ) -> AgentStageResult:
+    """Run a stateless advisor with bounded recovery for empty/transient provider failures."""
     started = time.monotonic()
-    try:
-        result = model_client.chat(
-            message=prompt, model=model, system_prompt=system, temperature=0.2,
-            max_tokens=max_tokens, fallback_model=None, tools=None, tool_choice="none",
-        )
-        response = str(result.get("response") or "").strip() if isinstance(result, dict) else ""
-        prompt_metrics = {"prompt_chars": len(prompt), "response_chars": len(response)}
-        if not response:
-            return AgentStageResult(
-                "advisor", model, "failed", "", int((time.monotonic()-started)*1000),
-                "empty response", evidence=prompt_metrics,
+    attempt = 0
+    while True:
+        if stop_requested and stop_requested():
+            return AgentStageResult(role, model, "failed", "", int((time.monotonic()-started)*1000), "advisor stopped by user")
+        attempt += 1
+        try:
+            result = model_client.chat(
+                message=prompt, model=model, system_prompt=system, temperature=0.2,
+                max_tokens=max_tokens, fallback_model=None, tools=None, tool_choice="none",
             )
-        return AgentStageResult(
-            "advisor", str(result.get("model") or model), "completed", response,
-            int((time.monotonic()-started)*1000), evidence=prompt_metrics,
-        )
-    except Exception as exc:
-        return AgentStageResult(
-            "advisor", model, "failed", "", int((time.monotonic()-started)*1000),
-            f"{type(exc).__name__}: {exc}", evidence={"prompt_chars": len(prompt), "response_chars": 0},
-        )
+            response = str(result.get("response") or "").strip() if isinstance(result, dict) else ""
+            metrics = {"prompt_chars": len(prompt), "response_chars": len(response), "attempts": attempt}
+            if response:
+                return AgentStageResult(
+                    role, str(result.get("model") or model), "completed", response,
+                    int((time.monotonic()-started)*1000), evidence=metrics,
+                )
+            reason = "empty response"
+            retryable = True
+        except Exception as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+            retryable = _advisor_retryable(str(exc), exc)
+        if not retryable or attempt >= 4:
+            return AgentStageResult(
+                role, model, "failed", "", int((time.monotonic()-started)*1000), reason,
+                evidence={"prompt_chars": len(prompt), "response_chars": 0, "attempts": attempt},
+            )
+        delay = min(8.0, float(2 ** (attempt - 1)))
+        _emit(event_fn, "team_worker_event", role=role, event="runtime_status", category="recovery",
+              status="backoff", phase="advisor_retry", message=f"advisor retry {attempt}/4 in {delay:.0f}s: {reason[:500]}")
+        deadline=time.monotonic()+delay
+        while time.monotonic() < deadline:
+            if stop_requested and stop_requested():
+                return AgentStageResult(role, model, "failed", "", int((time.monotonic()-started)*1000), "advisor stopped by user")
+            time.sleep(min(0.25, max(0.0, deadline-time.monotonic())))
 
 
 def _filtered_tools(catalogue: list[dict], names: frozenset[str]) -> list[dict]:
@@ -373,10 +417,17 @@ def _compact_candidate_evidence(evidence: list[dict[str, Any]]) -> list[dict[str
     return compact
 
 
+def _research_approval(_tool_name: str, _args: dict) -> bool:
+    return False
+
+_research_approval._aicoder_autonomous_policy = True
+
+
 def _run_researcher(
     *, client, model_client: ModelTransport, model: str, role: str, task: str,
     source_workspace: str, tools: list[dict], stop_requested: StopFn | None,
-    research_plan: str = "",
+    research_plan: str = "", native_openrouter_tool_calling: bool = False, event_fn: EventFn | None = None,
+    request_timeout: int = 300,
 ) -> AgentStageResult:
     task_handoff = _task_handoff(task)
     research_handoff = _research_plan_handoff(research_plan or "(none)")
@@ -392,21 +443,42 @@ def _run_researcher(
     started = time.monotonic()
     evidence_events: list[dict[str, Any]] = []
 
+    forward = _worker_event_forwarder(event_fn, f"research:{role}")
     def research_event(kind: str, payload: dict[str, Any]) -> None:
         if kind in {"tool_call", "tool_result"}:
             row = {"kind": kind, **dict(payload)}
             evidence_events.append(row)
+        forward(kind, payload)
 
-    runtime = NativeLightRuntime(
-        client=client, model_client=model_client, initial_prompt=prompt,
-        model=model, fallback_model=None, workspace_root=source_workspace,
-        plan_workspace_root=source_workspace, protected_workspace_root=source_workspace,
-        tools=tools, system_prompt=system, load_tools_on_start=True,
-        quick_chat=False, persistent_plan=False, approval_fn=lambda *_: False,
-        max_iterations=10, max_output_tokens=6000, stop_requested=stop_requested,
-        event_fn=research_event,
-    )
-    result = runtime.run()
+    conversation: list[dict[str, Any]] = []
+    current_prompt = prompt
+    result: AgentRunResult | None = None
+    for attempt in range(0, 5):
+        runtime = NativeLightRuntime(
+            client=client, model_client=model_client, initial_prompt=current_prompt,
+            model=model, fallback_model=None, workspace_root=source_workspace,
+            plan_workspace_root=source_workspace, protected_workspace_root=source_workspace,
+            tools=tools, system_prompt=system, load_tools_on_start=True,
+            quick_chat=False, persistent_plan=False, approval_fn=_research_approval,
+            max_iterations=10, max_output_tokens=6000, stop_requested=stop_requested,
+            base_timeout=max(10, min(300, int(request_timeout))), event_fn=research_event,
+            native_openrouter_tool_calling=bool(native_openrouter_tool_calling),
+            conversation=conversation,
+        )
+        result = runtime.run()
+        if result.status != "paused" or (stop_requested and stop_requested()) or attempt >= 4:
+            break
+        reason = str(result.response or result.error or "research worker paused")
+        conversation = _candidate_conversation(result)
+        current_prompt = (
+            f"AUTONOMOUS RESEARCH RESUME {attempt + 1}/4\n\nPrevious pause reason:\n{reason[:1600]}\n\n"
+            "Continue the same read-only research assignment from existing evidence. Do not restart or modify state. "
+            "Resolve the blocker, gather only missing evidence, then return the required compact research report."
+        )
+        _emit(event_fn, "team_worker_event", role=f"research:{role}", event="runtime_status",
+              category="recovery", status="resuming", phase="research_resume",
+              message=f"automatic research resume {attempt + 1}/4: {reason[:500]}")
+    assert result is not None
     research_tool_names = {
         str(item.get("name") or "") for item in evidence_events
         if item.get("kind") == "tool_result" and not bool(item.get("is_error"))
@@ -603,6 +675,9 @@ def _candidate_approval(tool_name: str, args: dict) -> bool:
     return bool(risk.mutation) or not risk.needs_approval
 
 
+# Distinguish autonomous safety denial from explicit operator rejection.
+_candidate_approval._aicoder_autonomous_policy = True
+
 _TEAM_CANDIDATE_MAX_AUTO_RESUMES = 4
 _TEAM_MERGE_MAX_AUTO_RESUMES = 4
 
@@ -685,6 +760,19 @@ def _candidate_conversation(run: AgentRunResult) -> list[dict[str, Any]]:
     ]
 
 
+_MERGE_INCOMPLETE_MARKERS = (
+    "merge could not be executed", "merge konnte nicht ausgeführt werden",
+    "integration was not performed", "integration not performed",
+    "verification was not performed", "verification not performed",
+    "required verification failed", "verification: incomplete",
+    "recovery_required", "recovery required", "persistence: blocked", "persistenz: blockiert",
+)
+
+def _merge_completion_contradiction(response: str) -> bool:
+    lowered = str(response or "").lower()
+    return any(marker in lowered for marker in _MERGE_INCOMPLETE_MARKERS)
+
+
 def _merge_resume_prompt(run: AgentRunResult, attempt: int) -> str:
     """Continue a paused merge in the same integration workspace without losing evidence."""
     reason = str(run.response or run.error or "merge paused without a specific reason").strip()
@@ -712,7 +800,9 @@ def _merge_resume_prompt(run: AgentRunResult, attempt: int) -> str:
 def _run_candidate(
     *, client, model_client: ModelTransport, source_workspace: str, backend_mode: str,
     slot: int, model: str, strategy: str, task: str, plan: str, coordinator: str,
-    tools: list[dict], stop_requested: StopFn | None,
+    tools: list[dict], stop_requested: StopFn | None, native_openrouter_tool_calling: bool = False,
+    request_timeout: int = 300, event_fn: EventFn | None = None, liveness_timeout_s: int = 1200,
+    stage_handoffs: dict[str, Any] | None = None,
 ) -> CandidateResult:
     backend = create_isolated_team_workspace(source_workspace, backend_mode)
     try:
@@ -737,7 +827,19 @@ def _run_candidate(
             + test_runtime_note
         )
         started = time.monotonic()
+        liveness_deadline = started + max(60, int(liveness_timeout_s))
+        worker_role = f"coder:{slot}"
+        backend.write_candidate_artifact(
+            ".aicoder-team/coder-handoff.json",
+            json.dumps({"task": task, "implementation_contract": plan, "strategy": strategy}, ensure_ascii=False, indent=2),
+        )
+        if stage_handoffs:
+            backend.write_candidate_artifact(
+                ".aicoder-team/handoffs.json",
+                json.dumps(stage_handoffs, ensure_ascii=False, indent=2),
+            )
         prompt = _candidate_prompt(task, plan, coordinator, strategy)
+        forward = _worker_event_forwarder(event_fn, worker_role)
         conversation: list[dict[str, Any]] = []
         run: AgentRunResult | None = None
         auto_resumes = 0
@@ -754,12 +856,19 @@ def _run_candidate(
                 plan_workspace_root=source_workspace, protected_workspace_root=source_workspace,
                 tools=tools, system_prompt=system, load_tools_on_start=True,
                 quick_chat=False, persistent_plan=False, approval_fn=_candidate_approval,
-                max_iterations=18, max_output_tokens=12000, stop_requested=stop_requested,
-                conversation=conversation,
+                max_iterations=None, max_output_tokens=12000,
+                stop_requested=lambda: bool((stop_requested and stop_requested()) or time.monotonic() >= liveness_deadline),
+                base_timeout=max(10, min(300, int(request_timeout))), event_fn=forward, conversation=conversation,
                 require_mutation_or_explicit_no_change=not has_existing_delta,
-                allow_completion_signal=True,
+                require_test_verification=True, allow_completion_signal=True,
+                native_openrouter_tool_calling=bool(native_openrouter_tool_calling),
             )
             run = runtime.run()
+            if time.monotonic() >= liveness_deadline and not (stop_requested and stop_requested()) and run.status != "completed":
+                reason = f"candidate liveness timeout after {int(liveness_timeout_s)}s without terminal completion"
+                run.status = "failed"; run.response = reason; run.error = reason
+                _emit(event_fn, "team_worker_event", role=worker_role, event="runtime_status", category="liveness",
+                      status="failed", phase="candidate_timeout", message=reason)
             if not _candidate_pause_is_resumable(run, stop_requested):
                 break
             if auto_resumes >= _TEAM_CANDIDATE_MAX_AUTO_RESUMES:
@@ -825,12 +934,26 @@ def evaluate_candidate(candidate: CandidateResult) -> dict[str, Any]:
         score += 10
     if candidate.run.error:
         score -= 20
-    diff = _git_diff(root)
+    diff = candidate.workspace.delta_diff() if isinstance(candidate.workspace, RamWorkspace) else _git_diff(root)
+    coverage = test_change_evidence(delta)
+    deterministic_ok = verification_passed(results)
+    coverage_ok = bool(coverage.get("coverage_evidence_ok"))
+    if not coverage_ok:
+        score -= 120
+        checks["test-change-evidence"] = {
+            "name": "test-change-evidence", "ok": False, "required": True,
+            "output": "behavior-changing source code requires a changed or newly created regression test",
+            **coverage,
+        }
     return {
         "score": score, "delta": delta, "checks": checks, "diff": diff,
-        "candidate_id": blind_candidate_id(diff),
-        "verification_passed": verification_passed(results),
+        "test_evidence": coverage, "candidate_id": blind_candidate_id(diff),
+        "verification_passed": deterministic_ok and coverage_ok,
     }
+
+
+def _candidate_is_mergeable(candidate: CandidateResult) -> bool:
+    return candidate.run.status == "completed" and bool(candidate.evaluation.get("verification_passed"))
 
 
 def _evaluation_prompt(candidates: list[CandidateResult]) -> str:
@@ -1007,6 +1130,10 @@ def _run_team_pipeline(
     except (OSError, ValueError) as exc:
         return TeamRunResult("failed", "", "", [], [], {}, f"project workspace setup failed: {exc}")
 
+    try:
+        request_timeout = max(10, min(300, int(state.get("request_timeout") or 300)))
+    except (TypeError, ValueError):
+        request_timeout = 300
     started = time.monotonic()
     ledger = StageLedger()
     stages: list[AgentStageResult] = []
@@ -1027,7 +1154,7 @@ def _run_team_pipeline(
             f"USER TASK:\n{_task_handoff(task).render()}\n\n"
             f"REPOSITORY CONTEXT:\n{make_handoff('repository-context', _repository_context(source_workspace), max_chars=5000).render()}"
         ),
-        max_tokens=3000,
+        max_tokens=3000, event_fn=event_fn, role="plan_research", stop_requested=stop_requested,
     )
     research_plan.role = "plan_research"; stages.append(research_plan)
     if research_plan.status != "completed":
@@ -1051,6 +1178,8 @@ def _run_team_pipeline(
                     role=slot.role, task=task, source_workspace=source_workspace,
                     tools=research_tools, stop_requested=stop_requested,
                     research_plan=research_contract_handoff.compact,
+                    native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)), event_fn=event_fn,
+                    request_timeout=request_timeout,
                 ): slot for slot in config.research
             }
             for future in as_completed(futures):
@@ -1103,7 +1232,7 @@ def _run_team_pipeline(
                         task, repo_context, research_handoff_text, perspective,
                         round_index=round_index, brainstorm_state=brainstorm_state,
                     ),
-                    max_tokens=4000,
+                    max_tokens=4000, event_fn=event_fn, role=f"brainstorm:r{round_index}:{label}", stop_requested=stop_requested,
                 ): (label, model)
                 for label, model, perspective in brainstorm_participants
             }
@@ -1131,7 +1260,7 @@ def _run_team_pipeline(
         operator = _call_advisor(
             model_client, model=synthesis_model, system=BRAINSTORM_OPERATOR_SYSTEM_PROMPT,
             prompt=_build_brainstorm_operator_prompt(task, round_index, usable, brainstorm_state),
-            max_tokens=5000,
+            max_tokens=5000, event_fn=event_fn, role=f"brainstorm_state:r{round_index}", stop_requested=stop_requested,
         )
         operator.role = f"brainstorm_state:r{round_index}"
         stages.append(operator)
@@ -1148,16 +1277,19 @@ def _run_team_pipeline(
         brainstorm_synthesis = _call_advisor(
             model_client, model=synthesis_model, system=BRAINSTORM_SYNTHESIS_SYSTEM_PROMPT,
             prompt=_build_brainstorm_synthesis_prompt(task, brainstorm_state, brainstorm_results),
-            max_tokens=6000,
+            max_tokens=6000, event_fn=event_fn, role="brainstorm_synthesis", stop_requested=stop_requested,
         )
         brainstorm_synthesis.role = "brainstorm_synthesis"
         stages.append(brainstorm_synthesis)
         if brainstorm_synthesis.status != "completed":
-            return TeamRunResult(
-                "failed", "", brainstorm_synthesis.model, stages, [],
-                {"ledger": ledger.as_dict()}, brainstorm_synthesis.error,
+            _emit(event_fn, "team_worker_event", role="brainstorm_synthesis", event="runtime_status",
+                  category="brainstorm", status="warning", phase="synthesis",
+                  message=f"brainstorm synthesis unavailable; planner continues from research evidence: {brainstorm_synthesis.error[:500]}")
+            brainstorm_contract_handoff = _brainstorm_handoff(
+                "Brainstorm synthesis unavailable. Treat creative ideas as unavailable and plan strictly from the research evidence and user task."
             )
-        brainstorm_contract_handoff = _brainstorm_handoff(brainstorm_synthesis.response)
+        else:
+            brainstorm_contract_handoff = _brainstorm_handoff(brainstorm_synthesis.response)
     else:
         brainstorm_synthesis = AgentStageResult(
             "brainstorm_synthesis", synthesis_model or "deterministic", "completed",
@@ -1179,9 +1311,10 @@ def _run_team_pipeline(
         prompt=_build_planner_prompt(task, repo_context, research_results)
         + "\n\nRESEARCH CONTRACT:\n" + research_contract_handoff.render()
         + "\n\nBRAINSTORM SYNTHESIS (creative decision support, not evidence):\n" + brainstorm_contract_handoff.render(),
-        max_tokens=6500,
+        max_tokens=6500, event_fn=event_fn, role="plan_code", stop_requested=stop_requested,
     )
-    code_plan.role = "plan_code"; stages.append(code_plan)
+    code_plan.role = "plan_code"
+    stages.append(code_plan)
     if code_plan.status == "completed":
         code_contract_handoff = _code_plan_handoff(code_plan.response)
         handoff_metrics.append(code_contract_handoff.metrics())
@@ -1194,6 +1327,36 @@ def _run_team_pipeline(
     if code_plan.status != "completed":
         return TeamRunResult("failed", "", code_plan.model, stages, [], {"ledger": ledger.as_dict()}, code_plan.error)
     _stage_complete(ledger, TeamStage.PLAN_CODE, event_fn)
+
+    coordination_notes = ""
+    if config.coordinator_model:
+        coordinator_result = _call_advisor(
+            model_client, model=config.coordinator_model, system=COORDINATOR_SYSTEM_PROMPT,
+            prompt=(
+                f"USER TASK:\n{_task_handoff(task).render()}\n\n"
+                f"SHARED IMPLEMENTATION CONTRACT:\n{code_contract_handoff.render()}\n\n"
+                "Review only for ambiguity, missing acceptance criteria, unsafe assumptions, and candidate execution hazards. "
+                "Return concise coordination notes; do not redesign or implement."
+            ),
+            max_tokens=2500, event_fn=event_fn, role="coordinator", stop_requested=stop_requested,
+        )
+        coordinator_result.role = "coordinator"
+        stages.append(coordinator_result)
+        _emit(event_fn, "team_stage", role="coordinator", status=coordinator_result.status,
+              model=coordinator_result.model, elapsed_ms=coordinator_result.elapsed_ms, error=coordinator_result.error,
+              evidence=coordinator_result.evidence)
+        if coordinator_result.status == "completed":
+            coordination_notes = coordinator_result.response
+        else:
+            _emit(event_fn, "team_worker_event", role="coordinator", event="runtime_status", category="coordination",
+                  status="warning", phase="pre_code", message="coordinator unavailable; candidates continue with shared contract")
+
+    candidate_handoffs = {
+        "research_contract": research_contract_handoff.compact,
+        "brainstorm_synthesis": brainstorm_contract_handoff.compact,
+        "code_contract": code_contract_handoff.compact,
+        "coordination_notes": coordination_notes,
+    }
 
     # 5) code — isolated parallel candidates with one fair global backing mode.
     workspace_plan = team_workspace_plan(
@@ -1209,8 +1372,12 @@ def _run_team_pipeline(
                 pool.submit(
                     _run_candidate, client=client, model_client=model_client, source_workspace=source_workspace,
                     backend_mode=workspace_plan.backend_mode, slot=slot.slot, model=slot.model,
-                    strategy=slot.strategy, task=task, plan=code_contract_handoff.compact, coordinator="",
+                    strategy=slot.strategy, task=task, plan=code_contract_handoff.compact, coordinator=coordination_notes,
                     tools=coder_tools, stop_requested=stop_requested,
+                    native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
+                    request_timeout=request_timeout, event_fn=event_fn,
+                    liveness_timeout_s=int(state.get("team_candidate_liveness_timeout_seconds") or 1200),
+                    stage_handoffs=candidate_handoffs,
                 ): slot for slot in config.coders
             }
             for future in as_completed(futures):
@@ -1223,17 +1390,23 @@ def _run_team_pipeline(
                     candidate.evaluation_ms = int((time.monotonic() - evaluation_started) * 1000)
                     candidate.score = int(candidate.evaluation.get("score") or 0)
                     candidates.append(candidate)
+                    failed_checks = [name for name, row in (candidate.evaluation.get("checks") or {}).items() if isinstance(row, dict) and row.get("required", True) and not row.get("ok")]
+                    delta = candidate.evaluation.get("delta") or {}
                     _emit(event_fn, "team_candidate", candidate_id=candidate.evaluation.get("candidate_id"),
-                          status=candidate.run.status, score=candidate.score,
+                          slot=slot.slot, model=candidate.run.model or slot.model, strategy=slot.strategy,
+                          status=candidate.run.status, score=candidate.score, error=candidate.run.error,
+                          iterations=candidate.run.iterations, verification_passed=bool(candidate.evaluation.get("verification_passed")),
+                          failed_checks=failed_checks, changed_count=int(delta.get("changed_count") or 0),
+                          deleted_count=int(delta.get("deleted_count") or 0),
                           elapsed_ms=candidate.elapsed_ms, evaluation_ms=candidate.evaluation_ms)
                 except Exception as exc:
                     if candidate is not None:
                         candidate.workspace.abort()
                     _emit(event_fn, "team_candidate", candidate_id="failed", status="failed", score=-999,
                           error=f"{type(exc).__name__}: {exc}")
-        viable = [candidate for candidate in candidates if candidate.run.status == "completed"]
+        viable = [candidate for candidate in candidates if _candidate_is_mergeable(candidate)]
         if not viable:
-            return TeamRunResult("failed", "", "", stages, candidates, {"ledger": ledger.as_dict()}, "no coding candidate completed")
+            return TeamRunResult("failed", "", "", stages, candidates, {"ledger": ledger.as_dict()}, "no verified coding candidate completed")
         winner = max(viable, key=lambda item: objective_rank_key(item.evaluation))
         _stage_complete(ledger, TeamStage.CODE, event_fn)
 
@@ -1247,7 +1420,7 @@ def _run_team_pipeline(
             fallback_reason=integration.info.fallback_reason,
         )
         integration.seed_from(winner.workspace.info.execution_root)
-        blind_evidence = _attach_blind_candidate_snapshots(integration, candidates)
+        blind_evidence = _attach_blind_candidate_snapshots(integration, viable)
         integration.write_candidate_artifact(
             ".aicoder-team/handoffs.json",
             json.dumps(handoff_archive, ensure_ascii=False, indent=2),
@@ -1261,7 +1434,7 @@ def _run_team_pipeline(
             model_client, model=merge_planner_model, system=MERGE_PLANNER_SYSTEM_PROMPT,
             prompt=_blind_merge_prompt(task, code_contract_handoff.compact, blind_evidence)
             + f"\n\nDETERMINISTIC BASE CANDIDATE: {winner_id}",
-            max_tokens=4000,
+            max_tokens=4000, event_fn=event_fn, role="merge_plan", stop_requested=stop_requested,
         )
         merge_plan.role = "merge_plan"; stages.append(merge_plan)
         if merge_plan.status == "completed":
@@ -1306,9 +1479,14 @@ def _run_team_pipeline(
                     tools=coder_tools, system_prompt=merge_system,
                     load_tools_on_start=True, quick_chat=False, persistent_plan=False,
                     approval_fn=_candidate_approval, max_iterations=14, max_output_tokens=10000, stop_requested=stop_requested,
-                    conversation=merge_conversation, allow_completion_signal=True, event_fn=event_fn,
+                    base_timeout=request_timeout, conversation=merge_conversation, allow_completion_signal=True,
+                    event_fn=_worker_event_forwarder(event_fn, "merge"),
+                    native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
                 )
                 merge_run = merge_runtime.run()
+                if merge_run.status == "completed" and _merge_completion_contradiction(merge_run.response):
+                    reason = "merge self-reported incomplete integration or verification; continue the same integration workspace"
+                    merge_run.status = "paused"; merge_run.response = reason; merge_run.error = reason
                 if not _candidate_pause_is_resumable(merge_run, stop_requested):
                     break
                 if merge_auto_resumes >= _TEAM_MERGE_MAX_AUTO_RESUMES:
@@ -1363,12 +1541,15 @@ def _run_team_pipeline(
                     f"MERGE CONTRACT:\n{merge_contract_handoff.render()}\n\n"
                     f"DETERMINISTIC REPOSITORY CHECKS (authoritative):\n{make_handoff('deterministic-checks', test_plan_text, max_chars=6000).render()}"
                 ),
-                max_tokens=3000,
+                max_tokens=3000, event_fn=event_fn, role="plan_tests", stop_requested=stop_requested,
             )
             test_plan.role = "plan_tests"; stages.append(test_plan)
             if test_plan.status != "completed":
-                    return TeamRunResult("failed", "", test_plan.model, stages, candidates, {"ledger": ledger.as_dict()}, test_plan.error)
-            integration.write_candidate_artifact(".aicoder-team/test-plan.txt", test_plan.response)
+                _emit(event_fn, "team_worker_event", role="plan_tests", event="runtime_status",
+                      category="test_planner", status="warning", phase="plan_tests",
+                      message=f"test planner unavailable; deterministic verification remains authoritative: {test_plan.error[:500]}")
+            else:
+                integration.write_candidate_artifact(".aicoder-team/test-plan.txt", test_plan.response)
         else:
             stages.append(AgentStageResult("plan_tests", "deterministic", "completed", test_plan_text, 0))
         _stage_complete(ledger, TeamStage.PLAN_TESTS, event_fn)

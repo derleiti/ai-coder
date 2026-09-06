@@ -124,6 +124,25 @@ def normalize_project_test_argv(argv: list[str], root: str | Path) -> list[str]:
     return list(argv)
 
 
+_TEST_DIR_NAMES = {"test", "tests", "spec", "specs", "__tests__"}
+_SOURCE_SUFFIXES = {".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java", ".kt", ".kts", ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".cs", ".rb", ".php", ".swift", ".scala", ".sh"}
+
+def _is_test_path(path: str) -> bool:
+    p = Path(path)
+    parts = {part.lower() for part in p.parts}
+    name = p.name.lower(); stem = p.stem.lower()
+    return bool(parts & _TEST_DIR_NAMES or name.startswith("test_") or stem.endswith("_test") or ".test." in name or ".spec." in name)
+
+def test_change_evidence(delta: dict[str, Any]) -> dict[str, Any]:
+    paths = sorted({str(path) for path in (delta.get("changed") or []) + (delta.get("deleted") or [])})
+    test_paths = [path for path in paths if _is_test_path(path)]
+    source_paths = [path for path in paths if not _is_test_path(path) and Path(path).suffix.lower() in _SOURCE_SUFFIXES]
+    return {
+        "source_paths": source_paths, "test_paths": test_paths,
+        "behavior_change": bool(source_paths), "tests_changed": bool(test_paths),
+        "coverage_evidence_ok": (not source_paths) or bool(test_paths),
+    }
+
 def project_verification_plan(root: str | Path) -> list[VerificationCommand]:
     """Infer deterministic checks from repository-native metadata, without an LLM vote."""
     root = Path(root)
