@@ -817,6 +817,8 @@ def _is_incomplete_envelope_reason(reason: str) -> bool:
     return (
         "transient incomplete chat response" in text
         or "no recognized assistant response envelope" in text
+        or "no usable final response" in text
+        or "final-response repair request" in text
         or "_transport_telemetry" in text
     )
 

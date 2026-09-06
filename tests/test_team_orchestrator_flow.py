@@ -8,7 +8,10 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from aicoder.agent_runtime import AgentRunResult
-from aicoder.team_orchestrator import AgentStageResult, CandidateResult, _redact_debug_value, _run_candidate, evaluate_candidate, run_team
+from aicoder.team_orchestrator import (
+    AgentStageResult, CandidateResult, _is_incomplete_envelope_reason, _redact_debug_value,
+    _run_candidate, _run_researcher, evaluate_candidate, run_team,
+)
 from aicoder.team_runtime import config_from_state
 from aicoder.workspace_backend import RamWorkspace
 
@@ -17,6 +20,65 @@ def _result(text: str, model: str = "test/model") -> AgentRunResult:
     return AgentRunResult(
         status="completed", response=text, model=model, messages=[], tools=[], system_prompt="",
     )
+
+
+class FreshResearchRecoveryTests(unittest.TestCase):
+    def test_no_usable_final_response_is_incomplete_envelope(self):
+        reason = (
+            "Agent paused because the model returned no usable final response after "
+            "a final-response repair request. Existing tool results and plan state were preserved for resume."
+        )
+        self.assertTrue(_is_incomplete_envelope_reason(reason))
+
+    def test_researcher_restarts_with_fresh_chat_and_bounded_handoff(self):
+        reason = (
+            "Agent paused because the model returned no usable final response after "
+            "a final-response repair request. Existing tool results and plan state were preserved for resume."
+        )
+        calls = []
+
+        class Runtime:
+            def __init__(self, **kwargs):
+                calls.append(kwargs)
+
+            def run(self):
+                if len(calls) == 1:
+                    return AgentRunResult(
+                        "paused", reason, "test/model",
+                        [
+                            {"role": "system", "content": "old system"},
+                            {"role": "user", "content": "research the task"},
+                            {"role": "assistant", "content": "evidence gathered before malformed final"},
+                        ],
+                        [], "system",
+                    )
+                return AgentRunResult(
+                    "completed", "RESEARCH REPORT: recovered", "test/model",
+                    [{"role": "assistant", "content": "RESEARCH REPORT: recovered"}], [], "system",
+                )
+
+        events = []
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "aicoder.team_orchestrator.NativeLightRuntime", Runtime
+        ):
+            result = _run_researcher(
+                client=MagicMock(), model_client=MagicMock(), model="test/model",
+                role="primary_sources", task="research task", source_workspace=tmp, tools=[],
+                stop_requested=None, research_plan="find evidence",
+                event_fn=lambda kind, payload: events.append((kind, payload)),
+            )
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1]["conversation"], [])
+        self.assertIn("FRESH RESEARCH:PRIMARY_SOURCES RECOVERY CHAT 1", calls[1]["initial_prompt"])
+        self.assertIn("evidence gathered before malformed final", calls[1]["initial_prompt"])
+        recovery = [
+            payload for kind, payload in events
+            if kind == "team_worker_event" and payload.get("category") == "recovery"
+        ]
+        self.assertTrue(recovery)
+        self.assertEqual(recovery[-1].get("status"), "fresh_chat")
 
 
 class FakeIntegrationRuntime:
@@ -228,7 +290,7 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
 
             self.assertEqual(candidate.run.status, "completed")
             self.assertEqual(PausedRepairRuntime.calls, 6)
-            self.assertIn("AUTONOMOUS TEAM RESUME 4/4", PausedRepairRuntime.prompts[4])
+            self.assertIn("FRESH CODER:1 RECOVERY CHAT 4", PausedRepairRuntime.prompts[4])
             self.assertIn("AUTONOMOUS CANDIDATE VERIFICATION REPAIR 1/2", PausedRepairRuntime.prompts[5])
             self.assertIn("python-tests", PausedRepairRuntime.prompts[5])
             self.assertIn("regression-test-evidence", PausedRepairRuntime.prompts[5])
