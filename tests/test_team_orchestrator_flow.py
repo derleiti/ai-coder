@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from aicoder.agent_runtime import AgentRunResult
-from aicoder.team_orchestrator import AgentStageResult, CandidateResult, _redact_debug_value, run_team
+from aicoder.team_orchestrator import AgentStageResult, CandidateResult, _redact_debug_value, evaluate_candidate, run_team
 from aicoder.team_runtime import config_from_state
 from aicoder.workspace_backend import RamWorkspace
 
@@ -96,6 +96,23 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
             project_events = [payload for kind, payload in events if kind == "team_project_workspace"]
             self.assertEqual(project_events[-1]["path"], str(target.resolve()))
             self.assertEqual(project_events[-1]["reason"], "task-project-path")
+
+    def test_failed_candidate_cannot_score_from_unchanged_passing_workspace(self):
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as ram_dir:
+            source = Path(source_dir)
+            (source / "app.py").write_text("value = 0\n", encoding="utf-8")
+            backend = RamWorkspace(source, ram_root=ram_dir)
+            backend.prepare()
+            run = AgentRunResult(
+                "failed", "", "test/model", [], [], "system",
+                error='400 "message content must be a string or content-block list"',
+            )
+            candidate = CandidateResult(1, "test/model", "conservative/minimal-change", backend, run)
+            result = evaluate_candidate(candidate)
+            self.assertEqual(result["score"], 0)
+            self.assertFalse(result["verification_passed"])
+            self.assertEqual(result["delta"].get("changed_count", 0), 0)
+            backend.abort()
 
     def test_pipeline_selects_candidate_merges_finalizes_and_persists(self):
         FakeIntegrationRuntime.calls = 0

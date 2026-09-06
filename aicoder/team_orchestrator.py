@@ -982,16 +982,22 @@ def evaluate_candidate(candidate: CandidateResult) -> dict[str, Any]:
     checks = {row.name: row.as_dict() for row in results}
     passed = sum(1 for row in results if row.ok and row.required)
     failed = sum(1 for row in results if (not row.ok) and row.required)
-    score = (40 if candidate.run.status == "completed" else 0) + passed * 25 - failed * 60
-    if delta.get("changed_count", 0) or delta.get("deleted_count", 0):
-        score += 10
-    if candidate.run.error:
-        score -= 20
+    run_completed = candidate.run.status == "completed"
+    if run_completed:
+        score = 40 + passed * 25 - failed * 60
+        if delta.get("changed_count", 0) or delta.get("deleted_count", 0):
+            score += 10
+        if candidate.run.error:
+            score -= 20
+    else:
+        # Failed/paused runs are never candidates, even when the unchanged
+        # workspace happens to satisfy the project's verification plan.
+        score = 0
     diff = candidate.workspace.delta_diff() if isinstance(candidate.workspace, RamWorkspace) else _git_diff(root)
     coverage = test_change_evidence(delta)
     deterministic_ok = verification_passed(results)
     coverage_ok = bool(coverage.get("coverage_evidence_ok"))
-    if not coverage_ok:
+    if run_completed and not coverage_ok:
         score -= 120
         checks["test-change-evidence"] = {
             "name": "test-change-evidence", "ok": False, "required": True,
@@ -1001,7 +1007,7 @@ def evaluate_candidate(candidate: CandidateResult) -> dict[str, Any]:
     return {
         "score": score, "delta": delta, "checks": checks, "diff": diff,
         "test_evidence": coverage, "candidate_id": blind_candidate_id(diff),
-        "verification_passed": deterministic_ok and coverage_ok,
+        "verification_passed": run_completed and deterministic_ok and coverage_ok,
     }
 
 

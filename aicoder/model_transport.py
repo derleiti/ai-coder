@@ -28,6 +28,29 @@ class ModelTransport(Protocol):
     def chat(self, **kwargs: Any) -> dict[str, Any]: ...
 
 
+def _normalize_openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Normalize and validate messages at the OpenAI-compatible provider boundary.
+
+    Tool-only assistant turns commonly have no textual response. Internally we
+    represent those turns with an empty string because several OpenAI-compatible
+    providers reject ``content: null`` even when ``tool_calls`` is present.
+    """
+    normalized: list[dict[str, Any]] = []
+    for raw in messages:
+        message = dict(raw)
+        role = str(message.get("role") or "").strip()
+        content = message.get("content")
+        if content is None and role == "assistant" and message.get("tool_calls"):
+            message["content"] = ""
+        elif not isinstance(content, (str, list)):
+            raise ClientError(
+                f"Invalid message content for role={role or '?'}: "
+                f"expected string or content-block list, got {type(content).__name__}"
+            )
+        normalized.append(message)
+    return normalized
+
+
 def _openai_tools(tools: list[dict] | None) -> list[dict]:
     """Convert AICoder/MCP tool schemas to OpenAI-compatible function tools."""
     converted: list[dict] = []
@@ -181,6 +204,7 @@ class OpenAICompatibleTransport:
             if system_prompt:
                 request_messages.append({"role": "system", "content": system_prompt})
             request_messages.append({"role": "user", "content": message})
+        request_messages = _normalize_openai_messages(request_messages)
         requested_model = str(model or "").strip()
         transport_model = requested_model
         base_lower = self.base_url.lower()

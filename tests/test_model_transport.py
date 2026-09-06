@@ -25,6 +25,34 @@ class OpenAICompatibleTransportTests(unittest.TestCase):
             LOCAL_FILE_READ_SCHEMA["inputSchema"],
         )
 
+    def test_tool_only_assistant_message_normalizes_null_content(self):
+        transport = OpenAICompatibleTransport("https://example.invalid/v1", api_key="x")
+        with patch.object(transport, "_post_json", return_value={
+            "choices": [{"message": {"content": "ok"}}]
+        }) as post:
+            transport.chat(
+                model="openrouter/test-model",
+                messages=[{
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "file_read", "arguments": "{}"},
+                    }],
+                }],
+            )
+        payload = post.call_args.args[0]
+        self.assertEqual(payload["messages"][0]["content"], "")
+
+    def test_invalid_message_content_fails_locally(self):
+        transport = OpenAICompatibleTransport("https://example.invalid/v1", api_key="x")
+        with self.assertRaisesRegex(ClientError, "expected string or content-block list"):
+            transport.chat(
+                model="openrouter/test-model",
+                messages=[{"role": "user", "content": {"bad": "shape"}}],
+            )
+
     def test_chat_preserves_openai_tool_call_id(self):
         transport = OpenAICompatibleTransport("http://127.0.0.1:11434/v1", timeout=30)
         transport._post_json = MagicMock(return_value={

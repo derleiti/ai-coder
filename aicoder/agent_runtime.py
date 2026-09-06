@@ -1321,7 +1321,7 @@ class NativeLightRuntime:
                     if accepted:
                         if native_mode:
                             messages.append({
-                                "role": "assistant", "content": response or None,
+                                "role": "assistant", "content": response or "",
                                 "tool_calls": [{
                                     "id": str(call.get("id") or ""), "type": "function",
                                     "function": {
@@ -1601,7 +1601,7 @@ class NativeLightRuntime:
                     if native_mode:
                         processed_calls = calls[:len(native_tool_messages)]
                         messages.append({
-                            "role": "assistant", "content": response or None,
+                            "role": "assistant", "content": response or "",
                             "tool_calls": [
                                 {
                                     "id": str(item.get("id") or ""), "type": "function",
@@ -1737,7 +1737,7 @@ class NativeLightRuntime:
                 )
                 if native_mode:
                     messages.append({
-                        "role": "assistant", "content": response or None,
+                        "role": "assistant", "content": response or "",
                         "tool_calls": [
                             {
                                 "id": str(item.get("id") or ""), "type": "function",
@@ -1781,7 +1781,7 @@ class NativeLightRuntime:
                 ]
                 messages.append({
                     "role": "assistant",
-                    "content": response or None,
+                    "content": response or "",
                     "tool_calls": assistant_tool_calls,
                 })
                 messages.extend(native_tool_messages)
