@@ -160,15 +160,32 @@ class RamWorkspaceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as ram:
             root = Path(temp)
             (root / "app.py").write_text("ok\n", encoding="utf-8")
-            for name in (".backups", ".pytest_cache", ".ruff_cache", "__pycache__"):
+            for name in (".backups", ".pytest_cache", ".ruff_cache", "__pycache__", ".venv", "venv", ".benchmarks", "demo.egg-info"):
                 directory = root / name
                 directory.mkdir()
                 (directory / "heavy.bin").write_bytes(b"x" * 1024)
             backend = RamWorkspace(root, ram_root=ram)
             execution = backend.prepare()
             self.assertTrue((execution / "app.py").exists())
-            for name in (".backups", ".pytest_cache", ".ruff_cache", "__pycache__"):
+            for name in (".backups", ".pytest_cache", ".ruff_cache", "__pycache__", ".venv", "venv", ".benchmarks", "demo.egg-info"):
                 self.assertFalse((execution / name).exists(), name)
+            backend.abort()
+
+    def test_delta_summary_ignores_generated_test_environments(self):
+        with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as ram:
+            root = Path(temp)
+            (root / "app.py").write_text("old\n", encoding="utf-8")
+            backend = RamWorkspace(root, ram_root=ram)
+            execution = backend.prepare()
+            (execution / "app.py").write_text("new\n", encoding="utf-8")
+            for name in ("venv", ".venv", ".benchmarks", "workspace_inspector.egg-info"):
+                directory = execution / name
+                directory.mkdir()
+                for index in range(20):
+                    (directory / f"generated-{index}.txt").write_text("generated\n", encoding="utf-8")
+            delta = backend.delta_summary()
+            self.assertEqual(delta["changed_count"], 1, delta)
+            self.assertEqual(delta["changed"], ["app.py"])
             backend.abort()
 
     def test_delta_summary_classifies_added_modified_and_deleted_files(self):

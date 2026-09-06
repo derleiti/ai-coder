@@ -27,7 +27,7 @@ from .config import CONFIG_DIR
 WORKSPACE_MODES = frozenset({"auto", "ram", "disk"})
 _MANIFEST_FILE = ".aicoder-checkpoint.json"
 _INTERNAL_NAMES = frozenset({_MANIFEST_FILE, ".aicoder-team"})
-_TRANSIENT_DIRS = frozenset({"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".nox", ".backups"})
+_TRANSIENT_DIRS = frozenset({"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".nox", ".backups", ".venv", "venv", ".benchmarks"})
 _MIN_RAM_RESERVE = 512 * 1024 * 1024
 _RAM_OVERHEAD = 64 * 1024 * 1024
 
@@ -224,7 +224,12 @@ def _iter_tree(root: Path, *, include_git: bool = False) -> Iterable[tuple[Path,
         for entry in entries:
             rel = Path(entry.path).relative_to(root).as_posix()
             top = rel.split("/", 1)[0]
-            if (not include_git and top == ".git") or top in _INTERNAL_NAMES or entry.name in _TRANSIENT_DIRS:
+            if (
+                (not include_git and top == ".git")
+                or top in _INTERNAL_NAMES
+                or entry.name in _TRANSIENT_DIRS
+                or entry.name.endswith(".egg-info")
+            ):
                 continue
             path = Path(entry.path)
             yield path, rel
@@ -309,7 +314,7 @@ def _copy_working_tree(source: Path, destination: Path, *, git_workspace: bool) 
             raise WorkspaceError(f"RAM Git isolation failed: {proc.stderr.strip() or proc.stdout.strip()}")
         shutil.copytree(
             source, destination, dirs_exist_ok=True, symlinks=True,
-            ignore=shutil.ignore_patterns(".git", *_TRANSIENT_DIRS),
+            ignore=shutil.ignore_patterns(".git", *_TRANSIENT_DIRS, "*.egg-info"),
         )
         # Populate the private index from HEAD without touching copied files.
         subprocess.run(
@@ -319,7 +324,7 @@ def _copy_working_tree(source: Path, destination: Path, *, git_workspace: bool) 
         return
     shutil.copytree(
         source, destination, dirs_exist_ok=True, symlinks=True,
-        ignore=shutil.ignore_patterns(*_TRANSIENT_DIRS),
+        ignore=shutil.ignore_patterns(*_TRANSIENT_DIRS, "*.egg-info"),
     )
 
 
@@ -544,7 +549,7 @@ class RamWorkspace(WorkspaceBackend):
             self._remove_path(path)
         shutil.copytree(
             source, self._execution, dirs_exist_ok=True, symlinks=True,
-            ignore=shutil.ignore_patterns(".git", *_INTERNAL_NAMES, *_TRANSIENT_DIRS),
+            ignore=shutil.ignore_patterns(".git", *_INTERNAL_NAMES, *_TRANSIENT_DIRS, "*.egg-info"),
         )
 
     def write_candidate_artifact(self, relative_path: str, content: str) -> Path:

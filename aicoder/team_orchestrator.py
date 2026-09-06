@@ -924,7 +924,7 @@ def _run_candidate(
             + test_runtime_note
         )
         started = time.monotonic()
-        liveness_deadline = started + max(60, int(liveness_timeout_s))
+        last_progress_at = [started]
         worker_role = f"coder:{slot}"
         backend.write_candidate_artifact(
             ".aicoder-team/coder-handoff.json",
@@ -937,10 +937,20 @@ def _run_candidate(
             )
         prompt = _candidate_prompt(task, plan, coordinator, strategy)
         forward = _worker_event_forwarder(event_fn, worker_role)
+
+        def candidate_event(kind: str, payload: dict[str, Any]) -> None:
+            # Liveness is progress/activity based, not a hard wall-clock cap.
+            # A candidate actively editing/testing must not be killed just because
+            # the model is slow and the task legitimately exceeds 20 minutes.
+            if kind in {"model_response", "tool_result", "completion_signal"}:
+                last_progress_at[0] = time.monotonic()
+            forward(kind, payload)
+
         conversation: list[dict[str, Any]] = []
         run: AgentRunResult | None = None
         auto_resumes = 0
         verification_repairs = 0
+        cached_verification: dict[str, Any] = {}
 
         while True:
             delta = backend.delta_summary()
@@ -955,15 +965,22 @@ def _run_candidate(
                 tools=tools, system_prompt=system, load_tools_on_start=True,
                 quick_chat=False, persistent_plan=False, approval_fn=_candidate_approval,
                 max_iterations=None, max_output_tokens=12000,
-                stop_requested=lambda: bool((stop_requested and stop_requested()) or time.monotonic() >= liveness_deadline),
-                base_timeout=max(10, min(300, int(request_timeout))), event_fn=forward, conversation=conversation,
+                stop_requested=lambda: bool(
+                    (stop_requested and stop_requested())
+                    or (time.monotonic() - last_progress_at[0]) >= max(60, int(liveness_timeout_s))
+                ),
+                base_timeout=max(10, min(300, int(request_timeout))), event_fn=candidate_event, conversation=conversation,
                 require_mutation_or_explicit_no_change=not has_existing_delta,
                 require_test_verification=True, allow_completion_signal=True,
                 native_openrouter_tool_calling=bool(native_openrouter_tool_calling),
             )
             run = runtime.run()
-            if time.monotonic() >= liveness_deadline and not (stop_requested and stop_requested()) and run.status != "completed":
-                reason = f"candidate liveness timeout after {int(liveness_timeout_s)}s without terminal completion"
+            if (
+                (time.monotonic() - last_progress_at[0]) >= max(60, int(liveness_timeout_s))
+                and not (stop_requested and stop_requested())
+                and run.status != "completed"
+            ):
+                reason = f"candidate liveness timeout after {int(liveness_timeout_s)}s without progress"
                 run.status = "failed"; run.response = reason; run.error = reason
                 _emit(event_fn, "team_worker_event", role=worker_role, event="runtime_status", category="liveness",
                       status="failed", phase="candidate_timeout", message=reason)
@@ -972,6 +989,7 @@ def _run_candidate(
                     slot=slot, model=model, strategy=strategy, workspace=backend, run=run,
                 )
                 verification = evaluate_candidate(probe)
+                cached_verification = verification
                 if bool(verification.get("verification_passed")):
                     break
                 if verification_repairs >= _TEAM_CANDIDATE_MAX_VERIFICATION_REPAIRS:
@@ -1010,6 +1028,7 @@ def _run_candidate(
                     slot=slot, model=model, strategy=strategy, workspace=backend, run=run,
                 )
                 verification = evaluate_candidate(probe)
+                cached_verification = verification
                 verification_repairs += 1
                 conversation = _candidate_conversation(run)
                 prompt = _candidate_verification_repair_prompt(verification, verification_repairs)
@@ -1042,6 +1061,7 @@ def _run_candidate(
             run.performance.setdefault("team_verification_repairs", verification_repairs)
         return CandidateResult(
             slot=slot, model=model, strategy=strategy, workspace=backend, run=run,
+            evaluation=cached_verification,
             elapsed_ms=int((time.monotonic() - started) * 1000),
         )
     except Exception:
@@ -1551,7 +1571,8 @@ def _run_team_pipeline(
                 try:
                     candidate = future.result()
                     evaluation_started = time.monotonic()
-                    candidate.evaluation = evaluate_candidate(candidate)
+                    if not candidate.evaluation:
+                        candidate.evaluation = evaluate_candidate(candidate)
                     candidate.evaluation_ms = int((time.monotonic() - evaluation_started) * 1000)
                     candidate.score = int(candidate.evaluation.get("score") or 0)
                     candidates.append(candidate)

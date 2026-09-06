@@ -75,6 +75,51 @@ class TeamCandidateAutoResumeTests(unittest.TestCase):
             ],
         )
 
+    def test_liveness_timeout_tracks_inactivity_not_total_wall_time(self):
+        backend = self._backend()
+        backend.delta_summary.return_value = {"changed_count": 1, "deleted_count": 0}
+        clock = [0.0]
+        calls = []
+
+        def fake_monotonic():
+            return clock[0]
+
+        def runtime_factory(**kwargs):
+            calls.append(kwargs)
+            runtime = MagicMock()
+            if len(calls) == 1:
+                def first_run():
+                    clock[0] = 700.0
+                    kwargs["event_fn"]("model_response", {"response": "still working"})
+                    clock[0] = 1400.0
+                    return _result("paused", "needs continuation")
+                runtime.run.side_effect = first_run
+            else:
+                def second_run():
+                    clock[0] = 1450.0
+                    kwargs["event_fn"]("model_response", {"response": "done"})
+                    return _result("completed", "DONE: candidate")
+                runtime.run.side_effect = second_run
+            return runtime
+
+        with (
+            patch("aicoder.team_orchestrator.create_isolated_team_workspace", return_value=backend),
+            patch("aicoder.team_orchestrator.configured_project_python", return_value=None),
+            patch("aicoder.team_orchestrator.NativeLightRuntime", side_effect=runtime_factory),
+            patch("aicoder.team_orchestrator.evaluate_candidate", return_value={"verification_passed": True}),
+            patch("aicoder.team_orchestrator.time.monotonic", side_effect=fake_monotonic),
+        ):
+            result = _run_candidate(
+                client=_NoopClient(), model_client=_NoopClient(), source_workspace="/tmp/source",
+                backend_mode="ram", slot=1, model="test/model", strategy="conservative",
+                task="fix bug", plan="shared plan", coordinator="", tools=[], stop_requested=None,
+                liveness_timeout_s=1200,
+            )
+
+        self.assertEqual(result.run.status, "completed")
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("liveness timeout", result.run.error.lower())
+
     def test_explicit_user_stop_is_not_auto_resumed(self):
         backend = self._backend()
         backend.delta_summary.return_value = {"changed_count": 0, "deleted_count": 0}
