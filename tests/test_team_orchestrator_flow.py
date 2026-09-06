@@ -268,6 +268,98 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
             self.assertTrue(candidate_paths and integration_paths)
             self.assertTrue(all(not path.exists() for path in candidate_paths + integration_paths))
 
+
+    def test_merge_pause_auto_resumes_in_same_integration_workspace(self):
+        class PausingMergeRuntime:
+            calls = 0
+            roots = []
+            prompts = []
+
+            def __init__(self, *, workspace_root: str, model: str, initial_prompt: str, **kwargs):
+                self.workspace_root = Path(workspace_root)
+                self.model = model
+                self.initial_prompt = initial_prompt
+                self.conversation = kwargs.get("conversation") or []
+
+            def run(self):
+                PausingMergeRuntime.calls += 1
+                PausingMergeRuntime.roots.append(self.workspace_root)
+                PausingMergeRuntime.prompts.append(self.initial_prompt)
+                marker = self.workspace_root / "integrated.txt"
+                if PausingMergeRuntime.calls == 1:
+                    marker.write_text("partial\n", encoding="utf-8")
+                    return AgentRunResult(
+                        "paused", "Agent paused: state changed successfully, but verification is still required.",
+                        self.model, [{"role": "assistant", "content": "partial merge"}], [], "system",
+                    )
+                marker.write_text("complete\n", encoding="utf-8")
+                return _result("DONE: merge complete", self.model)
+
+        PausingMergeRuntime.calls = 0
+        PausingMergeRuntime.roots = []
+        PausingMergeRuntime.prompts = []
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as ram_dir:
+            source = Path(source_dir)
+            (source / "app.py").write_text("value = 0\n", encoding="utf-8")
+            state = {
+                "selected_model": "test/model", "team_runtime_mode": "on", "workspace_mode": "ram",
+                "team_research_model_1": "test/model", "team_research_model_2": "",
+                "team_research_model_3": "", "team_research_model_4": "",
+                "team_planner_model": "test/model", "team_coordinator_model": "",
+                "team_coder_model_1": "test/model", "team_coder_model_2": "",
+                "team_coder_model_3": "", "team_coder_model_4": "",
+                "team_merge_model": "test/model", "team_test_planner_model": "",
+            }
+            config = config_from_state(state)
+
+            def researcher(**kwargs):
+                return AgentStageResult(f"research:{kwargs['role']}", kwargs["model"], "completed", "evidence", 1)
+
+            def advisor(_model_client, *, model, system, prompt, max_tokens=0):
+                return AgentStageResult("advisor", model, "completed", "shared plan", 1)
+
+            def candidate(**kwargs):
+                backend = RamWorkspace(source, ram_root=ram_dir)
+                backend.prepare()
+                (backend.info.execution_root / "app.py").write_text("value = 1\n", encoding="utf-8")
+                return CandidateResult(
+                    kwargs["slot"], kwargs["model"], kwargs["strategy"], backend,
+                    AgentRunResult("completed", "DONE", kwargs["model"], [], [], "system"),
+                )
+
+            def create_backend(root, mode, **kwargs):
+                return RamWorkspace(root, ram_root=ram_dir)
+
+            events = []
+            with (
+                patch("aicoder.team_orchestrator.load_tools", return_value=[]),
+                patch("aicoder.team_orchestrator._run_researcher", side_effect=researcher),
+                patch("aicoder.team_orchestrator._call_advisor", side_effect=advisor),
+                patch("aicoder.team_orchestrator._run_candidate", side_effect=candidate),
+                patch("aicoder.team_orchestrator.evaluate_candidate", return_value={
+                    "score": 100, "delta": {"changed_count": 1, "deleted_count": 0},
+                    "checks": {}, "diff": "diff", "candidate_id": "cand-good", "verification_passed": True,
+                }),
+                patch("aicoder.team_orchestrator.create_isolated_team_workspace", side_effect=create_backend),
+                patch("aicoder.team_orchestrator._attach_blind_candidate_snapshots", return_value=[]),
+                patch("aicoder.team_orchestrator.NativeLightRuntime", PausingMergeRuntime),
+            ):
+                result = run_team(
+                    task="task", state=state, config=config, client=MagicMock(),
+                    model_client=MagicMock(), source_workspace=str(source),
+                    event_fn=lambda kind, payload: events.append((kind, payload)),
+                )
+
+            self.assertEqual(result.status, "completed", result.error)
+            self.assertEqual(PausingMergeRuntime.calls, 2)
+            self.assertEqual(PausingMergeRuntime.roots[0], PausingMergeRuntime.roots[1])
+            self.assertIn("AUTONOMOUS MERGE RESUME 1/4", PausingMergeRuntime.prompts[1])
+            self.assertTrue(any(kind == "team_merge_resume" for kind, _ in events))
+            merge_results = [payload for kind, payload in events if kind == "team_merge_result"]
+            self.assertEqual(merge_results[-1]["status"], "completed")
+            self.assertEqual(merge_results[-1]["auto_resumes"], 1)
+            self.assertEqual((source / "integrated.txt").read_text(encoding="utf-8"), "complete\n")
+
     def test_keyboard_interrupt_returns_cancelled_terminal_state(self):
         events = []
         with patch(

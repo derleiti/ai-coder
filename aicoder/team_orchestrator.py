@@ -604,6 +604,7 @@ def _candidate_approval(tool_name: str, args: dict) -> bool:
 
 
 _TEAM_CANDIDATE_MAX_AUTO_RESUMES = 4
+_TEAM_MERGE_MAX_AUTO_RESUMES = 4
 
 
 def _candidate_pause_is_resumable(run: AgentRunResult, stop_requested: StopFn | None) -> bool:
@@ -682,6 +683,30 @@ def _candidate_conversation(run: AgentRunResult) -> list[dict[str, Any]]:
         dict(message) for message in (run.messages or [])
         if isinstance(message, dict) and str(message.get("role") or "") != "system"
     ]
+
+
+def _merge_resume_prompt(run: AgentRunResult, attempt: int) -> str:
+    """Continue a paused merge in the same integration workspace without losing evidence."""
+    reason = str(run.response or run.error or "merge paused without a specific reason").strip()
+    lower = reason.lower()
+    if "verification" in lower or "verify" in lower:
+        action = "Run the missing post-merge verification, fix any failures, then complete the integration."
+    elif "same tool" in lower or "repeating" in lower or "without progress" in lower:
+        action = "Do not repeat the blocked tool call. Use existing evidence and take the next concrete integration or verification step."
+    elif "transient" in lower or "backend" in lower or "provider" in lower:
+        action = "Continue the same merge after the transient interruption without restarting the analysis."
+    elif "final response" in lower or "usable final" in lower:
+        action = "Produce a valid completion only after the selected integration work and verification are actually finished."
+    else:
+        action = "Continue the unfinished merge from the preserved integration workspace and complete the remaining work."
+    return (
+        f"AUTONOMOUS MERGE RESUME {attempt}/{_TEAM_MERGE_MAX_AUTO_RESUMES}\n\n"
+        f"Previous pause reason:\n{reason[:1800]}\n\n"
+        f"{action}\n\n"
+        "Stay in this same integration workspace. Preserve existing merged changes and candidate evidence. "
+        "Do not ask for human confirmation, do not restart from scratch, and do not write to the protected source workspace. "
+        "Finish with a concise DONE: summary only when the integrated result is ready for deterministic final verification."
+    )
 
 
 def _run_candidate(
@@ -1249,25 +1274,59 @@ def _run_team_pipeline(
         _stage_start(ledger, TeamStage.MERGE, event_fn)
         merge_model = config.merge_model
         if merge_model:
-            merge_runtime = NativeLightRuntime(
-                client=client, model_client=model_client,
-                initial_prompt=(
-                    f"USER TASK:\n{_task_handoff(task).render()}\n\n"
-                    f"CODE CONTRACT:\n{code_contract_handoff.render()}\n\n"
-                    f"BLIND MERGE CONTRACT:\n{merge_contract_handoff.render()}\n\n"
-                    "Candidate snapshots are under .aicoder-team/candidates/. Integrate only evidence-backed improvements."
-                ),
-                model=merge_model, fallback_model=None, workspace_root=str(integration.info.execution_root),
-                plan_workspace_root=source_workspace, protected_workspace_root=source_workspace,
-                tools=coder_tools, system_prompt=build_system_prompt(coder_tools, str(integration.info.execution_root)).rstrip()+"\n\n"+MERGE_SYSTEM_PROMPT,
-                load_tools_on_start=True, quick_chat=False, persistent_plan=False,
-                approval_fn=_candidate_approval, max_iterations=14, max_output_tokens=10000, stop_requested=stop_requested,
+            merge_prompt = (
+                f"USER TASK:\n{_task_handoff(task).render()}\n\n"
+                f"CODE CONTRACT:\n{code_contract_handoff.render()}\n\n"
+                f"BLIND MERGE CONTRACT:\n{merge_contract_handoff.render()}\n\n"
+                "Candidate snapshots are under .aicoder-team/candidates/. Integrate only evidence-backed improvements."
             )
-            merge_started = time.monotonic(); merge_run = merge_runtime.run()
+            merge_system = build_system_prompt(coder_tools, str(integration.info.execution_root)).rstrip()+"\n\n"+MERGE_SYSTEM_PROMPT
+            merge_conversation: list[dict[str, Any]] = []
+            merge_auto_resumes = 0
+            merge_run: AgentRunResult | None = None
+            merge_started = time.monotonic()
+            while True:
+                merge_runtime = NativeLightRuntime(
+                    client=client, model_client=model_client,
+                    initial_prompt=merge_prompt,
+                    model=merge_model, fallback_model=None, workspace_root=str(integration.info.execution_root),
+                    plan_workspace_root=source_workspace, protected_workspace_root=source_workspace,
+                    tools=coder_tools, system_prompt=merge_system,
+                    load_tools_on_start=True, quick_chat=False, persistent_plan=False,
+                    approval_fn=_candidate_approval, max_iterations=14, max_output_tokens=10000, stop_requested=stop_requested,
+                    conversation=merge_conversation, allow_completion_signal=True, event_fn=event_fn,
+                )
+                merge_run = merge_runtime.run()
+                if not _candidate_pause_is_resumable(merge_run, stop_requested):
+                    break
+                if merge_auto_resumes >= _TEAM_MERGE_MAX_AUTO_RESUMES:
+                    break
+                merge_auto_resumes += 1
+                _emit(
+                    event_fn, "team_merge_resume", attempt=merge_auto_resumes,
+                    reason=str(merge_run.response or merge_run.error or "merge paused")[:2000],
+                )
+                merge_conversation = _candidate_conversation(merge_run)
+                merge_prompt = _merge_resume_prompt(merge_run, merge_auto_resumes)
+
+            assert merge_run is not None
             merge_elapsed = int((time.monotonic() - merge_started) * 1000)
-            stages.append(AgentStageResult("merge", merge_run.model or merge_model, merge_run.status, merge_run.response, merge_elapsed, merge_run.error))
+            merge_reason = str(merge_run.error or merge_run.response or "merge failed").strip()
+            _emit(
+                event_fn, "team_merge_result", status=merge_run.status, model=merge_run.model or merge_model,
+                elapsed_ms=merge_elapsed, auto_resumes=merge_auto_resumes,
+                reason=(merge_reason[:4000] if merge_run.status != "completed" else ""),
+            )
+            stages.append(AgentStageResult(
+                "merge", merge_run.model or merge_model, merge_run.status, merge_run.response,
+                merge_elapsed, (merge_reason if merge_run.status != "completed" else merge_run.error),
+                evidence={"auto_resumes": merge_auto_resumes},
+            ))
             if merge_run.status != "completed":
-                    return TeamRunResult("failed", "", merge_run.model, stages, candidates, {"ledger": ledger.as_dict()}, merge_run.error or "merge failed")
+                return TeamRunResult(
+                    "failed", "", merge_run.model, stages, candidates, {"ledger": ledger.as_dict()},
+                    merge_reason or "merge failed",
+                )
             final_response = merge_run.response
             result_model = merge_run.model or merge_model
         else:
