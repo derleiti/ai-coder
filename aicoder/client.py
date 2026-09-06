@@ -244,6 +244,7 @@ class TriForceClient:
         self.timeout = timeout
         self._active_response_lock = threading.Lock()
         self._active_responses: dict[str, Any] = {}
+        self._token_refresh_lock = threading.Lock()
 
     def _set_active_response(self, response: Any, request_id: str | None = None) -> str:
         key = str(request_id or f"thread-{threading.get_ident()}")
@@ -318,6 +319,50 @@ class TriForceClient:
             return f"valid ({hours}h)"
         return f"valid ({int(remaining/60)}min)"
 
+    def refresh_token(self) -> str:
+        """Renew a still-valid TriForce JWT and persist it for future sessions."""
+        if not self.token:
+            raise ClientError("Kein Token vorhanden. Erst einloggen.")
+        old_token = self.token
+        result = self._request(
+            "POST", "/v1/auth/refresh", require_auth=False, _label="token-refresh",
+            _retries=0, _extra_headers={"Authorization": f"Bearer {old_token}"},
+        )
+        token = str(result.get("token") or "").strip()
+        if not token:
+            raise ClientError("Token refresh returned no token")
+        self.token = token
+        try:
+            from .config import load_session, save_session
+            session = load_session()
+            if session.base_url.rstrip("/") == self.base_url:
+                session.token = token
+                save_session(session)
+        except Exception:
+            # The in-memory token keeps the active run alive even if persistent
+            # session storage is temporarily unavailable.
+            pass
+        return token
+
+    def _ensure_token_fresh(self, threshold_seconds: int = 3600) -> None:
+        """Refresh once per process before a long run crosses JWT expiry."""
+        if not self.token:
+            raise ClientError("Kein Token vorhanden. Erst einloggen.")
+        remaining = self.token_expires_in()
+        if remaining is None:
+            return
+        if remaining < 30:
+            raise TokenExpiredError("Token expired. Please re-login: aicoder setup")
+        if remaining > max(30, int(threshold_seconds)):
+            return
+        with self._token_refresh_lock:
+            remaining = self.token_expires_in()
+            if remaining is None or remaining > max(30, int(threshold_seconds)):
+                return
+            if remaining < 30:
+                raise TokenExpiredError("Token expired. Please re-login: aicoder setup")
+            self.refresh_token()
+
     def _request(
         self,
         method: str,
@@ -339,12 +384,7 @@ class TriForceClient:
         if _extra_headers:
             headers.update({str(k): str(v) for k, v in _extra_headers.items()})
         if require_auth:
-            if not self.token:
-                raise ClientError("Kein Token vorhanden. Erst einloggen.")
-            if self.is_token_expired():
-                raise TokenExpiredError(
-                    "Token expired. Please re-login: aicoder setup"
-                )
+            self._ensure_token_fresh()
             headers["Authorization"] = f"Bearer {self.token}"
         if payload is not None:
             data = json.dumps(payload).encode("utf-8")

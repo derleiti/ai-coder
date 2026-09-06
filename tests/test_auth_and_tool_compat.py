@@ -44,6 +44,46 @@ class AuthCompatibilityTests(unittest.TestCase):
     def test_valid_session_is_not_expired(self):
         self.assertFalse(_is_token_expired(_unsigned_token(int(time.time()) + 3600)))
 
+    def test_authenticated_request_refreshes_token_before_expiry(self):
+        old_token = _unsigned_token(int(time.time()) + 1800)
+        new_token = _unsigned_token(int(time.time()) + 86400)
+        client = TriForceClient("https://api.ailinux.me", token=old_token)
+        calls = []
+
+        def fake_do_request(method, url, headers, data, label):
+            calls.append((method, url, dict(headers), label))
+            if url.endswith("/v1/auth/refresh"):
+                self.assertEqual(headers.get("Authorization"), f"Bearer {old_token}")
+                return {"token": new_token, "expires_in": 86400}
+            self.assertEqual(headers.get("Authorization"), f"Bearer {new_token}")
+            return {"valid": True}
+
+        session = Session(
+            base_url="https://api.ailinux.me", token=old_token, client_id="client",
+            user_id="user@example.com", tier="registered", account_role="desktop",
+        )
+        with (
+            patch.object(client, "_do_request", side_effect=fake_do_request),
+            patch("aicoder.config.load_session", return_value=session),
+            patch("aicoder.config.save_session") as persist,
+        ):
+            result = client.verify()
+
+        # refresh_token updates the persisted Session object in-place.
+        self.assertTrue(result["valid"])
+        self.assertEqual(client.token, new_token)
+        self.assertEqual(len(calls), 2)
+        persist.assert_called_once()
+        self.assertEqual(persist.call_args.args[0].token, new_token)
+
+    def test_authenticated_request_does_not_refresh_long_lived_token(self):
+        token = _unsigned_token(int(time.time()) + 7200)
+        client = TriForceClient("https://api.ailinux.me", token=token)
+        with patch.object(client, "_do_request", return_value={"valid": True}) as request:
+            self.assertTrue(client.verify()["valid"])
+        self.assertEqual(request.call_count, 1)
+        self.assertNotIn("/refresh", request.call_args.args[1])
+
     def test_setup_reauthenticates_an_expired_session(self):
         previous = Session(
             base_url="https://api.ailinux.me",
