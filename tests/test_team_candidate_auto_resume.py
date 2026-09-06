@@ -52,6 +52,7 @@ class TeamCandidateAutoResumeTests(unittest.TestCase):
             patch("aicoder.team_orchestrator.create_isolated_team_workspace", return_value=backend),
             patch("aicoder.team_orchestrator.configured_project_python", return_value=None),
             patch("aicoder.team_orchestrator.NativeLightRuntime", side_effect=runtime_factory),
+            patch("aicoder.team_orchestrator.evaluate_candidate", return_value={"verification_passed": True}),
         ):
             result = _run_candidate(
                 client=_NoopClient(), model_client=_NoopClient(), source_workspace="/tmp/source",

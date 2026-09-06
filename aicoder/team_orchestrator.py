@@ -687,6 +687,7 @@ def _candidate_approval(tool_name: str, args: dict) -> bool:
 _candidate_approval._aicoder_autonomous_policy = True
 
 _TEAM_CANDIDATE_MAX_AUTO_RESUMES = 4
+_TEAM_CANDIDATE_MAX_VERIFICATION_REPAIRS = 2
 _TEAM_MERGE_MAX_AUTO_RESUMES = 4
 
 
@@ -758,6 +759,57 @@ def _candidate_resume_prompt(run: AgentRunResult, delta: dict[str, Any], attempt
         "Finish only when the shared implementation contract is complete and the result is ready for deterministic "
         "candidate evaluation. Use `DONE:` for a genuine completion."
     )
+
+
+def _candidate_verification_repair_prompt(evaluation: dict[str, Any], attempt: int) -> str:
+    """Return a focused repair turn for a completed candidate that failed team verification."""
+    checks = evaluation.get("checks") or {}
+    failed_rows: list[str] = []
+    for name, row in checks.items():
+        if not isinstance(row, dict) or row.get("ok") is not False:
+            continue
+        output = str(row.get("output") or "").strip().replace("\x00", "")
+        failed_rows.append(f"- {name}: {output[:1800] or 'failed'}")
+    evidence = evaluation.get("test_evidence") or {}
+    if evidence.get("behavior_change") and not evidence.get("coverage_evidence_ok"):
+        sources = ", ".join(str(path) for path in (evidence.get("source_paths") or [])[:12]) or "(unknown source paths)"
+        failed_rows.append(
+            "- regression-test-evidence: source code changed without a changed/new test. "
+            f"Affected source paths: {sources}"
+        )
+    failures = "\n".join(failed_rows) or "- candidate verification did not pass; inspect the project verification plan and repair it"
+    return (
+        f"AUTONOMOUS CANDIDATE VERIFICATION REPAIR {attempt}/{_TEAM_CANDIDATE_MAX_VERIFICATION_REPAIRS}\n\n"
+        "Your implementation reached DONE, but deterministic team evaluation rejected the candidate. "
+        "Continue in the SAME isolated RAM workspace. Preserve the implementation, repair the failed verification "
+        "requirements below, and rerun the relevant checks. Do not merely explain the failure.\n\n"
+        f"FAILED TEAM VERIFICATION:\n{failures}\n\n"
+        "If behavior-changing source code was modified, add or update a focused regression test that exercises the "
+        "changed behavior. Fix genuine test/lint/compile failures rather than weakening tests. Finish with DONE: only "
+        "after the repaired candidate is ready for deterministic reevaluation."
+    )
+
+
+def _candidate_rejection_reason(candidate: CandidateResult) -> str:
+    evaluation = candidate.evaluation or {}
+    checks = evaluation.get("checks") or {}
+    failed_checks = [
+        str(name) for name, row in checks.items()
+        if isinstance(row, dict) and row.get("required", True) and row.get("ok") is False
+    ]
+    parts = [f"slot {candidate.slot} ({candidate.run.model or candidate.model}) status={candidate.run.status}"]
+    if candidate.run.error:
+        parts.append(f"error={str(candidate.run.error)[:500]}")
+    if failed_checks:
+        parts.append("failed_checks=" + ",".join(failed_checks[:8]))
+    evidence = evaluation.get("test_evidence") or {}
+    if evidence.get("behavior_change") and not evidence.get("coverage_evidence_ok"):
+        parts.append("missing regression-test change")
+    delta = evaluation.get("delta") or {}
+    parts.append(
+        f"changed={int(delta.get('changed_count') or 0)} deleted={int(delta.get('deleted_count') or 0)}"
+    )
+    return " ".join(parts)
 
 
 def _is_incomplete_envelope_reason(reason: str) -> bool:
@@ -888,6 +940,7 @@ def _run_candidate(
         conversation: list[dict[str, Any]] = []
         run: AgentRunResult | None = None
         auto_resumes = 0
+        verification_repairs = 0
 
         while True:
             delta = backend.delta_summary()
@@ -914,6 +967,32 @@ def _run_candidate(
                 run.status = "failed"; run.response = reason; run.error = reason
                 _emit(event_fn, "team_worker_event", role=worker_role, event="runtime_status", category="liveness",
                       status="failed", phase="candidate_timeout", message=reason)
+            if run.status == "completed":
+                probe = CandidateResult(
+                    slot=slot, model=model, strategy=strategy, workspace=backend, run=run,
+                )
+                verification = evaluate_candidate(probe)
+                if bool(verification.get("verification_passed")):
+                    break
+                if verification_repairs >= _TEAM_CANDIDATE_MAX_VERIFICATION_REPAIRS:
+                    _emit(
+                        event_fn, "team_worker_event", role=worker_role, event="runtime_status",
+                        category="verification", status="failed", phase="candidate_verification",
+                        message="candidate exhausted automatic deterministic verification repairs",
+                    )
+                    break
+                verification_repairs += 1
+                conversation = _candidate_conversation(run)
+                prompt = _candidate_verification_repair_prompt(verification, verification_repairs)
+                _emit(
+                    event_fn, "team_worker_event", role=worker_role, event="runtime_status",
+                    category="verification", status="repairing", phase="candidate_verification",
+                    message=(
+                        f"automatic candidate verification repair {verification_repairs}/"
+                        f"{_TEAM_CANDIDATE_MAX_VERIFICATION_REPAIRS}"
+                    ),
+                )
+                continue
             if not _candidate_pause_is_resumable(run, stop_requested):
                 break
             if auto_resumes >= _TEAM_CANDIDATE_MAX_AUTO_RESUMES:
@@ -934,6 +1013,7 @@ def _run_candidate(
         assert run is not None
         if hasattr(run, "performance") and isinstance(run.performance, dict):
             run.performance.setdefault("team_auto_resumes", auto_resumes)
+            run.performance.setdefault("team_verification_repairs", verification_repairs)
         return CandidateResult(
             slot=slot, model=model, strategy=strategy, workspace=backend, run=run,
             elapsed_ms=int((time.monotonic() - started) * 1000),
@@ -1465,7 +1545,9 @@ def _run_team_pipeline(
                           error=f"{type(exc).__name__}: {exc}")
         viable = [candidate for candidate in candidates if _candidate_is_mergeable(candidate)]
         if not viable:
-            return TeamRunResult("failed", "", "", stages, candidates, {"ledger": ledger.as_dict()}, "no verified coding candidate completed")
+            details = "; ".join(_candidate_rejection_reason(candidate) for candidate in candidates[:8])
+            error = "no verified coding candidate completed" + (f": {details}" if details else "")
+            return TeamRunResult("failed", "", "", stages, candidates, {"ledger": ledger.as_dict()}, error)
         winner = max(viable, key=lambda item: objective_rank_key(item.evaluation))
         _stage_complete(ledger, TeamStage.CODE, event_fn)
 

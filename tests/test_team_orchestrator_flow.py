@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from aicoder.agent_runtime import AgentRunResult
-from aicoder.team_orchestrator import AgentStageResult, CandidateResult, _redact_debug_value, evaluate_candidate, run_team
+from aicoder.team_orchestrator import AgentStageResult, CandidateResult, _redact_debug_value, _run_candidate, evaluate_candidate, run_team
 from aicoder.team_runtime import config_from_state
 from aicoder.workspace_backend import RamWorkspace
 
@@ -96,6 +96,72 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
             project_events = [payload for kind, payload in events if kind == "team_project_workspace"]
             self.assertEqual(project_events[-1]["path"], str(target.resolve()))
             self.assertEqual(project_events[-1]["reason"], "task-project-path")
+
+    def test_completed_candidate_gets_automatic_verification_repair(self):
+        class RepairRuntime:
+            calls = 0
+            prompts = []
+
+            def __init__(self, *, workspace_root: str, initial_prompt: str, model: str, **kwargs):
+                self.workspace_root = Path(workspace_root)
+                self.initial_prompt = initial_prompt
+                self.model = model
+
+            def run(self):
+                type(self).calls += 1
+                type(self).prompts.append(self.initial_prompt)
+                if type(self).calls == 1:
+                    (self.workspace_root / "app.py").write_text("value = 1\n", encoding="utf-8")
+                else:
+                    (self.workspace_root / "tests" / "test_app.py").write_text(
+                        "import unittest\nimport app\nclass T(unittest.TestCase):\n"
+                        "    def test_value(self): self.assertEqual(app.value, 1)\n",
+                        encoding="utf-8",
+                    )
+                result = AgentRunResult(
+                    "completed", "DONE: candidate", self.model,
+                    [{"role": "assistant", "content": "DONE: candidate"}], [], "system",
+                )
+                result.performance = {}
+                return result
+
+        RepairRuntime.calls = 0
+        RepairRuntime.prompts = []
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as ram_dir:
+            source = Path(source_dir)
+            (source / "app.py").write_text("value = 0\n", encoding="utf-8")
+            (source / "pyproject.toml").write_text(
+                '[project]\nname="demo"\nversion="0.1.0"\n', encoding="utf-8"
+            )
+            (source / "tests").mkdir()
+            (source / "tests" / "test_app.py").write_text(
+                "import unittest\nimport app\nclass T(unittest.TestCase):\n"
+                "    def test_value(self): self.assertGreaterEqual(app.value, 0)\n",
+                encoding="utf-8",
+            )
+
+            def create_backend(root, mode, **kwargs):
+                return RamWorkspace(root, ram_root=ram_dir)
+
+            with (
+                patch("aicoder.team_orchestrator.NativeLightRuntime", RepairRuntime),
+                patch("aicoder.team_orchestrator.create_isolated_team_workspace", side_effect=create_backend),
+            ):
+                candidate = _run_candidate(
+                    client=MagicMock(), model_client=MagicMock(), source_workspace=str(source),
+                    backend_mode="ram", slot=1, model="test/model", strategy="minimal",
+                    task="change value", plan="implement and test", coordinator="", tools=[],
+                    stop_requested=None,
+                )
+
+            self.assertEqual(candidate.run.status, "completed")
+            self.assertEqual(RepairRuntime.calls, 2)
+            self.assertIn("AUTONOMOUS CANDIDATE VERIFICATION REPAIR 1/2", RepairRuntime.prompts[1])
+            self.assertIn("regression-test-evidence", RepairRuntime.prompts[1])
+            final = evaluate_candidate(candidate)
+            self.assertTrue(final["verification_passed"], final)
+            self.assertEqual(candidate.run.performance.get("team_verification_repairs"), 1)
+            candidate.workspace.abort()
 
     def test_failed_candidate_cannot_score_from_unchanged_passing_workspace(self):
         with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as ram_dir:
