@@ -22,11 +22,10 @@ class TeamCandidateAutoResumeTests(unittest.TestCase):
         backend.info.execution_root = Path("/tmp/fake-team-candidate")
         return backend
 
-    def test_paused_candidate_is_reprompted_in_same_workspace_with_history(self):
+    def test_paused_candidate_with_verified_workspace_is_accepted_without_resume(self):
         backend = self._backend()
         backend.delta_summary.side_effect = [
             {"changed_count": 0, "deleted_count": 0},
-            {"changed_count": 1, "deleted_count": 0},
             {"changed_count": 1, "deleted_count": 0},
         ]
         first = _result(
@@ -38,9 +37,8 @@ class TeamCandidateAutoResumeTests(unittest.TestCase):
                 {"role": "user", "content": "Tool result: edit ok"},
             ],
         )
-        second = _result("completed", "DONE: verified candidate")
         calls = []
-        results = iter([first, second])
+        results = iter([first])
 
         def runtime_factory(**kwargs):
             calls.append(kwargs)
@@ -60,20 +58,10 @@ class TeamCandidateAutoResumeTests(unittest.TestCase):
                 task="fix bug", plan="shared plan", coordinator="", tools=[], stop_requested=None,
             )
 
-        self.assertEqual(result.run.status, "completed")
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[0]["workspace_root"], calls[1]["workspace_root"])
+        self.assertEqual(result.run.status, "paused")
+        self.assertEqual(len(calls), 1)
         self.assertTrue(calls[0]["require_mutation_or_explicit_no_change"])
-        self.assertFalse(calls[1]["require_mutation_or_explicit_no_change"])
-        self.assertIn("AUTONOMOUS TEAM RESUME 1/4", calls[1]["initial_prompt"])
-        self.assertIn("verification", calls[1]["initial_prompt"].lower())
-        self.assertEqual(
-            calls[1]["conversation"],
-            [
-                {"role": "assistant", "content": "I changed app.py"},
-                {"role": "user", "content": "Tool result: edit ok"},
-            ],
-        )
+        self.assertTrue(result.evaluation.get("verification_passed"))
 
     def test_liveness_timeout_tracks_inactivity_not_total_wall_time(self):
         backend = self._backend()
@@ -106,7 +94,10 @@ class TeamCandidateAutoResumeTests(unittest.TestCase):
             patch("aicoder.team_orchestrator.create_isolated_team_workspace", return_value=backend),
             patch("aicoder.team_orchestrator.configured_project_python", return_value=None),
             patch("aicoder.team_orchestrator.NativeLightRuntime", side_effect=runtime_factory),
-            patch("aicoder.team_orchestrator.evaluate_candidate", return_value={"verification_passed": True}),
+            patch("aicoder.team_orchestrator.evaluate_candidate", side_effect=[
+                {"verification_passed": False, "checks": {"tests": {"ok": False, "output": "failed"}}, "test_evidence": {}},
+                {"verification_passed": True},
+            ]),
             patch("aicoder.team_orchestrator.time.monotonic", side_effect=fake_monotonic),
         ):
             result = _run_candidate(
@@ -169,7 +160,7 @@ class TeamCandidateAutoResumeTests(unittest.TestCase):
             )
 
         self.assertEqual(result.run.status, "paused")
-        self.assertEqual(len(calls), 5)  # initial run + four autonomous resumes
+        self.assertEqual(len(calls), 3)  # initial run + two bounded autonomous resumes
 
     def test_candidate_exception_releases_private_workspace(self):
         from aicoder.team_orchestrator import _run_candidate

@@ -240,7 +240,7 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
                 type(self).prompts.append(self.initial_prompt)
                 if type(self).calls == 1:
                     (self.workspace_root / "app.py").write_text("value = 1\n", encoding="utf-8")
-                if type(self).calls <= 5:
+                if type(self).calls == 1:
                     result = AgentRunResult(
                         "paused",
                         "Agent paused because the model returned no usable final response after a final-response repair request.",
@@ -289,16 +289,41 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
                 )
 
             self.assertEqual(candidate.run.status, "completed")
-            self.assertEqual(PausedRepairRuntime.calls, 6)
-            self.assertIn("FRESH CODER:1 RECOVERY CHAT 4", PausedRepairRuntime.prompts[4])
-            self.assertIn("AUTONOMOUS CANDIDATE VERIFICATION REPAIR 1/2", PausedRepairRuntime.prompts[5])
-            self.assertIn("python-tests", PausedRepairRuntime.prompts[5])
-            self.assertIn("regression-test-evidence", PausedRepairRuntime.prompts[5])
+            self.assertEqual(PausedRepairRuntime.calls, 2)
+            self.assertIn("AUTONOMOUS CANDIDATE VERIFICATION REPAIR 1/2", PausedRepairRuntime.prompts[1])
+            self.assertIn("python-tests", PausedRepairRuntime.prompts[1])
+            self.assertIn("regression-test-evidence", PausedRepairRuntime.prompts[1])
             final = evaluate_candidate(candidate)
             self.assertTrue(final["verification_passed"], final)
-            self.assertEqual(candidate.run.performance.get("team_auto_resumes"), 4)
+            self.assertEqual(candidate.run.performance.get("team_auto_resumes"), 0)
             self.assertEqual(candidate.run.performance.get("team_verification_repairs"), 1)
             candidate.workspace.abort()
+
+    def test_paused_candidate_with_real_changes_can_pass_deterministic_verification(self):
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as ram_dir:
+            source = Path(source_dir)
+            (source / "app.py").write_text("value = 0\n", encoding="utf-8")
+            (source / "pyproject.toml").write_text('[project]\nname="demo"\nversion="0.1.0"\n', encoding="utf-8")
+            (source / "tests").mkdir()
+            (source / "tests" / "test_app.py").write_text(
+                "import unittest\nimport app\nclass T(unittest.TestCase):\n    def test_value(self): self.assertEqual(app.value, 0)\n",
+                encoding="utf-8",
+            )
+            backend = RamWorkspace(source, ram_root=ram_dir)
+            execution = backend.prepare()
+            (execution / "app.py").write_text("value = 1\n", encoding="utf-8")
+            (execution / "tests" / "test_app.py").write_text(
+                "import unittest\nimport app\nclass T(unittest.TestCase):\n    def test_value(self): self.assertEqual(app.value, 1)\n",
+                encoding="utf-8",
+            )
+            run = AgentRunResult(
+                "paused", "no usable final response", "test/model", [], [], "system"
+            )
+            candidate = CandidateResult(1, "test/model", "minimal", backend, run)
+            result = evaluate_candidate(candidate)
+            self.assertTrue(result["verification_passed"], result)
+            self.assertGreater(result["score"], 0)
+            backend.abort()
 
     def test_failed_candidate_cannot_score_from_unchanged_passing_workspace(self):
         with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as ram_dir:

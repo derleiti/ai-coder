@@ -686,7 +686,7 @@ def _candidate_approval(tool_name: str, args: dict) -> bool:
 # Distinguish autonomous safety denial from explicit operator rejection.
 _candidate_approval._aicoder_autonomous_policy = True
 
-_TEAM_CANDIDATE_MAX_AUTO_RESUMES = 4
+_TEAM_CANDIDATE_MAX_AUTO_RESUMES = 2
 _TEAM_CANDIDATE_MAX_VERIFICATION_REPAIRS = 2
 _TEAM_MERGE_MAX_AUTO_RESUMES = 4
 
@@ -780,13 +780,16 @@ def _candidate_verification_repair_prompt(evaluation: dict[str, Any], attempt: i
     failures = "\n".join(failed_rows) or "- candidate verification did not pass; inspect the project verification plan and repair it"
     return (
         f"AUTONOMOUS CANDIDATE VERIFICATION REPAIR {attempt}/{_TEAM_CANDIDATE_MAX_VERIFICATION_REPAIRS}\n\n"
-        "Your candidate workspace contains implementation work, but deterministic team evaluation did not accept it. "
-        "Continue in the SAME isolated RAM workspace. Preserve the implementation, repair the failed verification "
-        "requirements below, and rerun the relevant checks. Do not merely explain the failure.\n\n"
+        "This is a FRESH repair chat. The current isolated RAM workspace is the authoritative state. "
+        "Do not rely on filenames, commands, or assumptions from any previous assistant conversation. "
+        "Inspect the current workspace first. If task context is needed, read `.aicoder-team/coder-handoff.json`. "
+        "Preserve correct implementation work and repair only the concrete deterministic failures below.\n\n"
         f"FAILED TEAM VERIFICATION:\n{failures}\n\n"
+        "Use repository-native test configuration and the provided test tool. Do not invent test paths or unsupported "
+        "pytest flags, and do not create virtual environments or install packages just to make verification run. "
         "If behavior-changing source code was modified, add or update a focused regression test that exercises the "
-        "changed behavior. Fix genuine test/lint/compile failures rather than weakening tests. Finish with DONE: only "
-        "after the repaired candidate is ready for deterministic reevaluation."
+        "changed behavior. Fix genuine failures rather than weakening tests. Finish with DONE: only after the repaired "
+        "candidate is ready for deterministic reevaluation."
     )
 
 
@@ -1002,7 +1005,7 @@ def _run_candidate(
                     )
                     break
                 verification_repairs += 1
-                conversation = _candidate_conversation(run)
+                conversation = []
                 prompt = _candidate_verification_repair_prompt(verification, verification_repairs)
                 _emit(
                     event_fn, "team_worker_event", role=worker_role, event="runtime_status",
@@ -1015,38 +1018,49 @@ def _run_candidate(
                 continue
             if not _candidate_pause_is_resumable(run, stop_requested):
                 break
-            if auto_resumes >= _TEAM_CANDIDATE_MAX_AUTO_RESUMES:
-                # A provider can keep pausing after it has already produced useful code.
-                # Do not discard that workspace blindly: run deterministic evaluation and
-                # give the coder a bounded, evidence-backed repair/finalization turn.
-                exhausted_delta = backend.delta_summary()
-                has_exhausted_delta = bool(
-                    int(exhausted_delta.get("changed_count") or 0)
-                    or int(exhausted_delta.get("deleted_count") or 0)
-                )
-                if not has_exhausted_delta or verification_repairs >= _TEAM_CANDIDATE_MAX_VERIFICATION_REPAIRS:
-                    break
+
+            # Once a coder has produced workspace changes, the filesystem and deterministic
+            # checks are more trustworthy than another long free-form continuation. Evaluate
+            # immediately: accept objectively good paused work, otherwise launch a clean,
+            # failure-focused repair chat with no inherited assistant conversation.
+            paused_delta = backend.delta_summary()
+            has_paused_delta = bool(
+                int(paused_delta.get("changed_count") or 0)
+                or int(paused_delta.get("deleted_count") or 0)
+            )
+            if has_paused_delta:
                 probe = CandidateResult(
                     slot=slot, model=model, strategy=strategy, workspace=backend, run=run,
                 )
                 verification = evaluate_candidate(probe)
                 cached_verification = verification
+                if bool(verification.get("verification_passed")):
+                    _emit(
+                        event_fn, "team_worker_event", role=worker_role, event="runtime_status",
+                        category="verification", status="accepted", phase="candidate_verification",
+                        message="paused candidate accepted from deterministic workspace verification",
+                    )
+                    break
+                if verification_repairs >= _TEAM_CANDIDATE_MAX_VERIFICATION_REPAIRS:
+                    break
                 verification_repairs += 1
-                conversation = _candidate_conversation(run)
+                conversation = []
                 prompt = _candidate_verification_repair_prompt(verification, verification_repairs)
                 _emit(
                     event_fn, "team_worker_event", role=worker_role, event="runtime_status",
                     category="verification", status="repairing", phase="candidate_verification",
                     message=(
-                        "candidate remained paused after autonomous resumes; "
-                        f"starting deterministic verification repair {verification_repairs}/"
-                        f"{_TEAM_CANDIDATE_MAX_VERIFICATION_REPAIRS}"
+                        "paused candidate has workspace changes; starting fresh deterministic verification repair "
+                        f"{verification_repairs}/{_TEAM_CANDIDATE_MAX_VERIFICATION_REPAIRS}"
                     ),
                 )
                 continue
+
+            if auto_resumes >= _TEAM_CANDIDATE_MAX_AUTO_RESUMES:
+                break
             auto_resumes += 1
             reason = str(run.response or run.error or "")
-            delta = backend.delta_summary()
+            delta = paused_delta
             if _is_incomplete_envelope_reason(reason):
                 prompt = _fresh_worker_recovery_prompt(run, reason, auto_resumes, label=worker_role)
                 conversation = []
@@ -1110,22 +1124,22 @@ def evaluate_candidate(candidate: CandidateResult) -> dict[str, Any]:
     checks = {row.name: row.as_dict() for row in results}
     passed = sum(1 for row in results if row.ok and row.required)
     failed = sum(1 for row in results if (not row.ok) and row.required)
-    run_completed = candidate.run.status == "completed"
-    if run_completed:
-        score = 40 + passed * 25 - failed * 60
-        if delta.get("changed_count", 0) or delta.get("deleted_count", 0):
-            score += 10
+    run_eligible = candidate.run.status in {"completed", "paused"}
+    has_delta = bool(delta.get("changed_count", 0) or delta.get("deleted_count", 0))
+    if run_eligible and has_delta:
+        score = 40 + passed * 25 - failed * 60 + 10
         if candidate.run.error:
             score -= 20
     else:
-        # Failed/paused runs are never candidates, even when the unchanged
-        # workspace happens to satisfy the project's verification plan.
+        # Failed runs and unchanged workspaces are never candidates. A paused run
+        # with real changes may still be objectively complete; deterministic gates
+        # below decide that rather than requiring a cosmetic DONE envelope.
         score = 0
     diff = candidate.workspace.delta_diff() if isinstance(candidate.workspace, RamWorkspace) else _git_diff(root)
     coverage = test_change_evidence(delta)
     deterministic_ok = verification_passed(results)
     coverage_ok = bool(coverage.get("coverage_evidence_ok"))
-    if run_completed and not coverage_ok:
+    if run_eligible and has_delta and not coverage_ok:
         score -= 120
         checks["test-change-evidence"] = {
             "name": "test-change-evidence", "ok": False, "required": True,
@@ -1135,12 +1149,12 @@ def evaluate_candidate(candidate: CandidateResult) -> dict[str, Any]:
     return {
         "score": score, "delta": delta, "checks": checks, "diff": diff,
         "test_evidence": coverage, "candidate_id": blind_candidate_id(diff),
-        "verification_passed": run_completed and deterministic_ok and coverage_ok,
+        "verification_passed": run_eligible and has_delta and deterministic_ok and coverage_ok,
     }
 
 
 def _candidate_is_mergeable(candidate: CandidateResult) -> bool:
-    return candidate.run.status == "completed" and bool(candidate.evaluation.get("verification_passed"))
+    return candidate.run.status in {"completed", "paused"} and bool(candidate.evaluation.get("verification_passed"))
 
 
 def _evaluation_prompt(candidates: list[CandidateResult]) -> str:
