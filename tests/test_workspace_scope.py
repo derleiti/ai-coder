@@ -340,6 +340,30 @@ class WorkspaceEscapeTests(unittest.TestCase):
                 else:
                     os.environ[ACTIVE_WORKSPACE_ENV] = previous
 
+    def test_gui_startup_recovers_from_missing_persisted_project_to_projects_root(self):
+        import os
+        from aicoder import cli
+        from aicoder.workspace import ACTIVE_WORKSPACE_ENV
+
+        with tempfile.TemporaryDirectory() as projects, tempfile.TemporaryDirectory() as launcher:
+            missing = str(Path(projects) / "deleted-auto-project")
+            previous = os.environ.pop(ACTIVE_WORKSPACE_ENV, None)
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(launcher)
+                with patch("aicoder.cli.get_state", return_value={
+                    "workspace_root": missing, "projects_root": projects,
+                }):
+                    root = cli._activate_startup_workspace(["aicoder", "gui"])
+                self.assertEqual(root, Path(projects).resolve())
+                self.assertEqual(Path(os.environ[ACTIVE_WORKSPACE_ENV]), Path(projects).resolve())
+            finally:
+                os.chdir(old_cwd)
+                if previous is None:
+                    os.environ.pop(ACTIVE_WORKSPACE_ENV, None)
+                else:
+                    os.environ[ACTIVE_WORKSPACE_ENV] = previous
+
     def test_cli_startup_keeps_explicit_launch_cwd(self):
         import os
         from aicoder import cli

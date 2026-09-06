@@ -1950,11 +1950,26 @@ def _run_gui() -> int:
 
 
 def _activate_startup_workspace(argv: list[str] | None = None) -> Path:
-    """Choose startup workspace without letting a GUI launcher cwd override settings."""
+    """Choose a usable startup workspace without letting a GUI launcher cwd override settings.
+
+    A previously auto-created project may no longer exist after a failed/aborted run.
+    GUI startup must recover to the configured projects container instead of crashing
+    before the user can choose or create the next concrete project.
+    """
     args = list(sys.argv if argv is None else argv)
     if len(args) > 1 and args[1] == "gui":
-        configured = str(get_state().get("workspace_root") or "").strip()
-        return activate_workspace(configured or os.getcwd())
+        state = get_state()
+        configured = str(state.get("workspace_root") or "").strip()
+        if configured:
+            configured_path = Path(configured).expanduser().resolve(strict=False)
+            if configured_path.is_dir():
+                return activate_workspace(configured_path)
+        projects = str(state.get("projects_root") or "").strip()
+        if projects:
+            projects_path = Path(projects).expanduser().resolve(strict=False)
+            if projects_path.is_dir():
+                return activate_workspace(projects_path)
+        return activate_workspace(os.getcwd())
     return activate_workspace()
 
 
