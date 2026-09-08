@@ -74,6 +74,28 @@ class NativeContextTrimTests(unittest.TestCase):
         self.assertEqual(trimmed[1]["role"], "assistant")
         self.assertEqual(trimmed[2]["role"], "tool")
 
+    def test_runtime_context_cap_overrides_large_model_window(self):
+        class Transport:
+            timeout = 300
+            def chat(self, **kwargs):
+                messages = kwargs["messages"]
+                total_chars = sum(len(str(m.get("content") or "")) for m in messages)
+                self.total_chars = total_chars
+                return {"response": "DONE: compact", "model": "openrouter/test/huge"}
+
+        transport = Transport()
+        runtime = NativeLightRuntime(
+            client=MagicMock(), model_client=transport, initial_prompt="finish",
+            model="openrouter/test/huge", fallback_model=None, workspace_root=".",
+            tools=[], load_tools_on_start=False, persistent_plan=False,
+            conversation=[{"role":"user","content":"x" * 20000} for _ in range(8)],
+            max_context_chars=24000, max_iterations=1,
+        )
+        with patch("aicoder.agent_runtime.model_context_window", return_value=1_000_000):
+            result = runtime.run()
+        self.assertEqual(result.status, "completed")
+        self.assertLessEqual(transport.total_chars, 30000)
+
 
 class NativeOpenRouterMessageTests(unittest.TestCase):
     def test_native_tool_result_uses_assistant_tool_calls_and_role_tool(self):

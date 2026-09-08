@@ -44,6 +44,22 @@ class RuntimeResilienceTests(unittest.TestCase):
             self.assertIsNotNone(journal)
             self.assertIn("Inspect and debug failing tests", journal.pending_input)
 
+
+    def test_transient_pause_preserves_retry_metadata_for_team_orchestrator(self):
+        client = MagicMock()
+        client.timeout = 30
+        client.chat.side_effect = ClientError(
+            "HTTP 503: overloaded", status_code=503, retryable=True, retry_after=120
+        )
+        runtime = NativeLightRuntime(
+            client=client, initial_prompt="inspect", model="test/model", fallback_model=None,
+            workspace_root=".", tools=[], load_tools_on_start=False, persistent_plan=False,
+        )
+        result = runtime.run()
+        self.assertEqual(result.status, "paused")
+        self.assertEqual(result.failure_category, "transient")
+        self.assertEqual(result.retry_after, 120)
+
     def test_permanent_client_error_still_fails(self):
         client = MagicMock()
         client.timeout = 30
@@ -268,3 +284,216 @@ class RuntimeResilienceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_observational_runtime_allows_tool_protocol_example_as_final_text():
+    from unittest.mock import MagicMock
+    from aicoder.agent_runtime import NativeLightRuntime
+
+    class Transport:
+        timeout = 300
+        def chat(self, **kwargs):
+            return {
+                "response": "# STAGE SUMMARY\nExample only:\nTOOL_CALL file_read\n{not-json}\nEND_TOOL_CALL\n\n# NEXT STAGE INSTRUCTIONS\nContinue.",
+                "model": "openrouter/test/model",
+            }
+
+    runtime = NativeLightRuntime(
+        client=MagicMock(), model_client=Transport(), initial_prompt="produce handoff",
+        model="openrouter/test/model", fallback_model=None, workspace_root=".",
+        tools=[], load_tools_on_start=False, persistent_plan=False, max_iterations=1,
+        allow_mixed_tool_protocol_final=True,
+    )
+    with patch("aicoder.agent_runtime.is_action_request", return_value=True):
+        result = runtime.run()
+    assert result.status == "completed"
+    assert "TOOL_CALL file_read" in result.response
+
+
+def test_default_runtime_still_rejects_mixed_tool_protocol_final():
+    from unittest.mock import MagicMock
+    from aicoder.agent_runtime import NativeLightRuntime
+
+    class Transport:
+        timeout = 300
+        def __init__(self): self.calls = 0
+        def chat(self, **kwargs):
+            self.calls += 1
+            return {
+                "response": "analysis\nTOOL_CALL file_read\n{not-json}\nEND_TOOL_CALL",
+                "model": "openrouter/test/model",
+            }
+
+    transport=Transport()
+    runtime = NativeLightRuntime(
+        client=MagicMock(), model_client=transport, initial_prompt="Read x.txt using the available file_read tool and report the result.",
+        model="openrouter/test/model", fallback_model=None, workspace_root=".",
+        tools=[{"name":"file_read","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}],
+        load_tools_on_start=False, persistent_plan=False, max_iterations=2,
+    )
+    with patch("aicoder.agent_runtime.is_action_request", return_value=True):
+        result = runtime.run()
+    assert result.status == "paused"
+    assert result.failure_category == "transient"
+
+
+def test_carried_tool_history_prevents_redundant_tool_nudge_after_provider_resume():
+    from unittest.mock import MagicMock, patch
+    from aicoder.agent_runtime import NativeLightRuntime
+
+    class Transport:
+        timeout = 300
+        def __init__(self): self.calls = []
+        def chat(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"response": "DONE: preserved evidence is sufficient", "model": "openrouter/test/model"}
+
+    transport = Transport()
+    runtime = NativeLightRuntime(
+        client=MagicMock(), model_client=transport,
+        initial_prompt="Continue the same stage and finish the contract.",
+        model="openrouter/test/model", fallback_model=None, workspace_root=".",
+        tools=[{"name":"file_tree","inputSchema":{"type":"object","properties":{}}}],
+        load_tools_on_start=False, persistent_plan=False, max_iterations=2,
+        conversation=[
+            {"role":"assistant","content":"", "tool_calls":[{"id":"c1","type":"function","function":{"name":"file_tree","arguments":"{}"}}]},
+            {"role":"tool","tool_call_id":"c1","name":"file_tree","content":"(empty directory)"},
+        ],
+    )
+    with patch("aicoder.agent_runtime.is_action_request", return_value=True):
+        result = runtime.run()
+    assert result.status == "completed"
+    assert len(transport.calls) == 1
+    assert result.iterations == 1
+
+
+def test_native_tool_diagnostics_identifies_malformed_arguments_without_values():
+    from aicoder.agent_runtime import _native_tool_call_diagnostics
+
+    result = {
+        "tool_calls": [{
+            "id": "call-1", "type": "function",
+            "function": {"name": "file_tree", "arguments": "{not-json}"},
+        }]
+    }
+    rows = _native_tool_call_diagnostics(result)
+    assert rows == [{
+        "name": "file_tree",
+        "argument_type": "str",
+        "arguments_json_object": False,
+        "has_id": True,
+        "raw_type": "function",
+    }]
+    assert "not-json" not in str(rows)
+
+
+def test_malformed_native_tool_call_is_not_reported_as_empty_response():
+    from unittest.mock import MagicMock, patch
+    from aicoder.agent_runtime import NativeLightRuntime
+
+    class Transport:
+        timeout = 300
+        def chat(self, **kwargs):
+            return {
+                "response": "", "model": "openrouter/test/model",
+                "tool_calls": [{
+                    "id": "call-1", "type": "function",
+                    "function": {"name": "file_tree", "arguments": "{not-json}"},
+                }],
+                "finish_reason": "error",
+            }
+
+    events = []
+    runtime = NativeLightRuntime(
+        client=MagicMock(), model_client=Transport(), initial_prompt="Inspect using file_tree.",
+        model="openrouter/test/model", fallback_model=None, workspace_root=".",
+        tools=[{"name":"file_tree","inputSchema":{"type":"object","properties":{}}}],
+        load_tools_on_start=False, persistent_plan=False, max_iterations=2,
+        native_openrouter_tool_calling=True,
+        event_fn=lambda kind, payload: events.append((kind, payload)),
+    )
+    with patch("aicoder.agent_runtime.is_action_request", return_value=True):
+        result = runtime.run()
+    assert result.status == "paused"
+    repairs = [p for k,p in events if k == "final_response_repair"]
+    assert repairs and repairs[0]["reason"] == "malformed_native_tool_call"
+    assert repairs[0]["diagnostics"]["native_tool_calls"][0]["arguments_json_object"] is False
+
+
+def test_observational_runtime_does_not_require_verification_after_disposable_mutation(tmp_path):
+    from unittest.mock import MagicMock, patch
+    from aicoder.agent_runtime import NativeLightRuntime
+
+    class Transport:
+        timeout = 300
+        def __init__(self): self.calls = 0
+        def chat(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "response": "", "model": "openrouter/test/model",
+                    "tool_calls": [{
+                        "id": "call-1", "type": "function",
+                        "function": {"name": "directory_create", "arguments": '{"path":"scratch"}'},
+                    }],
+                    "finish_reason": "tool_calls",
+                }
+            return {"response": "SECTION:\nobservational handoff complete", "model": "openrouter/test/model", "finish_reason": "stop"}
+
+    transport = Transport()
+    runtime = NativeLightRuntime(
+        client=MagicMock(), model_client=transport, initial_prompt="Inspect and produce SECTION handoff.",
+        model="openrouter/test/model", fallback_model=None, workspace_root=str(tmp_path),
+        tools=[{"name":"directory_create","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}],
+        load_tools_on_start=False, persistent_plan=False, max_iterations=3,
+        native_openrouter_tool_calling=True,
+        enforce_post_mutation_verification=False,
+    )
+    with patch("aicoder.agent_runtime.is_action_request", return_value=True):
+        result = runtime.run()
+    assert result.status == "completed"
+    assert result.response == "SECTION:\nobservational handoff complete"
+    assert transport.calls == 2
+
+
+def test_git_status_on_new_workspace_is_not_an_error(tmp_path):
+    from unittest.mock import patch
+    from aicoder.executor import run_git_read
+
+    with patch("aicoder.executor._workspace_root", return_value=tmp_path.resolve()):
+        result, is_error = run_git_read({"action": "status", "cwd": str(tmp_path)})
+    assert is_error is False
+    assert '"status": "not_git_repository"' in result
+    assert "no Git repository yet" in result
+
+
+def test_runtime_limits_tool_calls_per_turn(tmp_path):
+    from aicoder.agent_runtime import NativeLightRuntime
+
+    class Model:
+        def __init__(self): self.calls = 0
+        def chat(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                blocks = "\n".join(
+                    f'TOOL_CALL file_tree\n{{"path":".","max_depth":{i+1}}}\nEND_TOOL_CALL'
+                    for i in range(6)
+                )
+                return {"response": blocks, "tool_calls": [], "finish_reason": "stop"}
+            return {"response": "DONE", "tool_calls": [], "finish_reason": "stop"}
+
+    events = []
+    runtime = NativeLightRuntime(
+        client=object(), model_client=Model(), initial_prompt="Inspect the workspace and report.",
+        model="test/model", fallback_model=None, workspace_root=str(tmp_path),
+        plan_workspace_root=str(tmp_path), protected_workspace_root=None,
+        tools=[{"name":"file_tree","description":"tree","input_schema":{"type":"object","properties":{}}}],
+        persistent_plan=False, progressive_tool_disclosure=False, max_iterations=3,
+        max_tool_calls_per_turn=2, event_fn=lambda kind, payload: events.append((kind,payload)),
+    )
+    result = runtime.run()
+    assert result.status == "completed"
+    tool_calls = [payload for kind,payload in events if kind == "tool_call"]
+    assert len(tool_calls) == 2
+    limited = [payload for kind,payload in events if kind == "tool_batch_limited"]
+    assert limited and limited[0]["requested"] == 6 and limited[0]["executed"] == 2

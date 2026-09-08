@@ -36,6 +36,42 @@ from ..executor import (
 )
 
 
+def _runtime_error_code(text: str, *, event: str = "", category: str = "") -> str:
+    """Stable diagnostic code for user-visible runtime/team failures."""
+    value = str(text or "").lower()
+    event_l = str(event or "").lower()
+    category_l = str(category or "").lower()
+    if "liveness timeout" in value or category_l == "liveness":
+        return "E_LIVENESS_TIMEOUT"
+    if "empty_ollama_response" in value or "empty response" in value or "no assistant content" in value:
+        return "E_EMPTY_MODEL_RESPONSE"
+    if "readtimeout" in value or "timed out" in value or "timeout" in value:
+        return "E_PROVIDER_TIMEOUT"
+    if "overloaded" in value or "service temporarily overloaded" in value or "http 503" in value:
+        return "E_PROVIDER_OVERLOADED"
+    if "http 429" in value or "rate limit" in value or "rate_limit" in value:
+        return "E_PROVIDER_RATE_LIMIT"
+    if any(token in value for token in (
+        "no recognized assistant response envelope", "malformed", "tool-call protocol",
+        "tool call protocol", "invalid response envelope",
+    )):
+        return "E_MODEL_PROTOCOL"
+    if event_l == "tool_result" or category_l == "tool":
+        return "E_TOOL_EXECUTION"
+    if category_l == "verification" or "verification" in value:
+        return "E_VERIFICATION"
+    if category_l == "transient":
+        return "E_PROVIDER_TRANSIENT"
+    return "E_RUNTIME"
+
+
+def _full_json(value) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, indent=2, default=str)
+    except Exception:
+        return repr(value)
+
+
 class _AgentWorker(QThread):
     """Background thread: agent loop with approval support and stop."""
     msg = pyqtSignal(str, str, str)          # (role, text, meta)
@@ -218,7 +254,7 @@ class _AgentWorker(QThread):
                 name = str(payload.get("name") or "?")
                 self.activity.emit(f"Running tool · {name}")
                 args = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
-                self.msg.emit("tool", f">> {name}({json.dumps(args, ensure_ascii=False)[:200]})", "")
+                self.msg.emit("tool", f">> {name}({_full_json(args)})", "")
             elif kind == "tool_result":
                 name = str(payload.get("name") or "?")
                 result = str(payload.get("result") or "")
@@ -235,7 +271,7 @@ class _AgentWorker(QThread):
                         pass
                 status = f"{'ERROR' if is_error else 'OK'} ({float(payload.get('elapsed') or 0.0):.1f}s)"
                 self.activity.emit(f"Tool completed · {name} · {'ERROR' if is_error else 'OK'}")
-                self.msg.emit("tool_result", result[:2000], f"{name} {status}")
+                self.msg.emit("tool_result", result, f"{name} {status}")
             elif kind == "loop_prevented":
                 self.activity.emit("Duplicate tool call blocked · waiting for corrected model action")
                 self.msg.emit(
@@ -341,15 +377,151 @@ class _AgentWorker(QThread):
                 status = str(payload.get("status") or "?")
                 model = str(payload.get("model") or "?")
                 elapsed = int(payload.get("elapsed_ms") or 0) / 1000.0
+                error = str(payload.get("error") or "")
                 self.activity.emit(f"Team · {role} · {status}")
-                self.msg.emit("system", f"{role} · {status} · {elapsed:.1f}s", model)
-            elif kind == "team_candidate":
-                cid = str(payload.get("candidate_id") or "candidate")
+                if status == "failed" or error:
+                    code = _runtime_error_code(error, category="runtime")
+                    self.msg.emit(
+                        "error",
+                        f"[{code}] TEAM_STAGE {role} · {status} · {elapsed:.1f}s\n"
+                        f"model={model}\nerror={error}\n\nFULL_EVENT:\n{_full_json(payload)}",
+                        model,
+                    )
+                else:
+                    self.msg.emit(
+                        "system", f"TEAM_STAGE {role} · {status} · {elapsed:.1f}s\n{_full_json(payload)}", model
+                    )
+            elif kind == "team_worker_event":
+                role = str(payload.get("role") or "worker")
+                event = str(payload.get("event") or "runtime_event")
+                model = str(payload.get("model") or payload.get("requested") or "")
+                iteration = int(payload.get("iteration") or 0)
+                request_id = str(payload.get("request_id") or "")
+                meta_parts = [role]
+                if model:
+                    meta_parts.append(model)
+                if iteration:
+                    meta_parts.append(f"step {iteration}")
+                if request_id:
+                    meta_parts.append(f"req {request_id}")
+                meta = " · ".join(meta_parts)
+                if event == "model_start":
+                    self.msg.emit(
+                        "system",
+                        "MODEL_START\n"
+                        f"phase={payload.get('phase') or '?'}\n"
+                        f"timeout={payload.get('timeout') or '?'}s\n"
+                        f"model={model or '?'}\n"
+                        f"request_id={request_id or '?'}",
+                        meta,
+                    )
+                elif event == "model_response":
+                    telemetry = payload.get("transport_telemetry") or {}
+                    self.msg.emit(
+                        "system",
+                        "MODEL_RESPONSE\n"
+                        f"elapsed_ms={payload.get('elapsed_ms') or 0}\n"
+                        f"requested={payload.get('requested') or model or '?'}\n"
+                        f"used={payload.get('model') or model or '?'}\n"
+                        f"request_id={request_id or '?'}\n"
+                        f"transport_telemetry={_full_json(telemetry)}",
+                        meta,
+                    )
+                elif event == "thought":
+                    self.msg.emit("thought", str(payload.get("text") or ""), meta)
+                elif event == "tool_call":
+                    name = str(payload.get("name") or "?")
+                    self.activity.emit(f"Team · {role} · running tool · {name}")
+                    self.msg.emit("tool", f">> {role}:{name}({_full_json(payload.get('arguments') or {})})", meta)
+                elif event == "tool_result":
+                    name = str(payload.get("name") or "?")
+                    result_text = str(payload.get("result") or "")
+                    is_error = bool(payload.get("is_error"))
+                    if is_error:
+                        code = _runtime_error_code(result_text, event=event, category="tool")
+                        self.msg.emit(
+                            "error",
+                            f"[{code}] {role} · tool {name} failed\n{result_text}\n\n"
+                            f"elapsed={payload.get('elapsed') or 0}s\nrequest_id={request_id or '?'}",
+                            meta,
+                        )
+                    else:
+                        self.msg.emit("tool_result", result_text, f"{meta} · {name} OK")
+                elif event in {"paused", "error"}:
+                    reason = str(payload.get("reason") or payload.get("message") or payload.get("error") or "runtime failure")
+                    category = str(payload.get("failure_category") or payload.get("category") or "")
+                    code = _runtime_error_code(reason, event=event, category=category)
+                    self.msg.emit(
+                        "error",
+                        f"[{code}] {role} · {event.upper()}\n{reason}\n\n"
+                        f"failure_category={category or '?'}\n"
+                        f"resumable={payload.get('resumable', '?')}\n"
+                        f"retry_after={payload.get('retry_after', '?')}\n"
+                        f"model={model or '?'}\nrequest_id={request_id or '?'}",
+                        meta,
+                    )
+                elif event == "runtime_status":
+                    category = str(payload.get("category") or "runtime")
+                    status = str(payload.get("status") or "?")
+                    phase = str(payload.get("phase") or "?")
+                    message = str(payload.get("message") or "")
+                    label = "RECOVERY_BACKOFF" if status == "backoff" else (
+                        "RECOVERY_RESUME" if status in {"resuming", "fresh_chat", "repairing"} else "RUNTIME_STATUS"
+                    )
+                    role_kind = "error" if status == "failed" else "system"
+                    if status == "failed":
+                        label = _runtime_error_code(message, event=event, category=category)
+                    self.msg.emit(
+                        role_kind,
+                        f"[{label}] {role}\nstatus={status}\nphase={phase}\ncategory={category}\n"
+                        f"message={message}\nretry_after={payload.get('retry_after', '?')}",
+                        meta,
+                    )
+                elif event == "performance_warning":
+                    self.msg.emit(
+                        "system",
+                        "PERFORMANCE_WARNING\n" + _full_json(payload),
+                        meta,
+                    )
+                elif event == "final_response_repair":
+                    self.msg.emit(
+                        "system",
+                        "[RECOVERY_RESPONSE_REPAIR]\n" + _full_json(payload),
+                        meta,
+                    )
+                elif event in {"verification_required", "completion_audit", "completion_signal", "loop_prevented", "final"}:
+                    self.msg.emit("system", f"{event.upper()}\n{_full_json(payload)}", meta)
+                else:
+                    self.msg.emit("system", f"TEAM_WORKER_EVENT {event}\n{_full_json(payload)}", meta)
+            elif kind == "team_stageoff":
                 self.msg.emit(
                     "system",
-                    f"{cid} · {payload.get('status')} · score {payload.get('score')}",
+                    "STAGEOFF_UPDATE\n" + _full_json(payload),
+                    f"stage={payload.get('stage') or '?'} · handoff={payload.get('handoff_id') or '?'}",
+                )
+            elif kind == "team_stage_handoff":
+                self.msg.emit(
+                    "system",
+                    "STAGEOFF_HANDOFF\n" + _full_json(payload),
+                    f"{payload.get('source_stage') or '?'} → {payload.get('next_stage') or '?'}",
+                )
+            elif kind == "team_candidate":
+                cid = str(payload.get("candidate_id") or "candidate")
+                status = str(payload.get("status") or "?")
+                role_kind = "error" if status == "failed" else "system"
+                self.msg.emit(
+                    role_kind,
+                    f"{cid} · {status} · score {payload.get('score')}\n{_full_json(payload)}",
                     "anonymized candidate",
                 )
+            elif kind == "team_merge_result":
+                status = str(payload.get("status") or "?")
+                role_kind = "error" if status != "completed" else "system"
+                reason = str(payload.get("reason") or "")
+                text = f"MERGE_RESULT\n{_full_json(payload)}"
+                if status != "completed":
+                    text = f"[{_runtime_error_code(reason, category='verification')}]\n" + text
+                self.msg.emit(role_kind, text, str(payload.get("model") or "merge"))
             elif kind == "team_complete":
                 self.msg.emit(
                     "system",
@@ -497,10 +669,9 @@ class ChatWidget(QWidget):
         msgs = chat_history.load_messages(session_id)
         for m in msgs:
             role = m["role"]
-            if role == "system":
-                continue
             self._append_msg(role, m["content"], m.get("meta", ""))
-            self._messages.append({"role": role, "content": m["content"]})
+            if role in {"user", "assistant"}:
+                self._messages.append({"role": role, "content": m["content"]})
         self._update_status_idle("Session geladen")
 
     def _build_ui(self):
@@ -870,6 +1041,10 @@ class ChatWidget(QWidget):
 
     def _on_agent_msg(self, role: str, text: str, meta: str):
         self._append_msg(role, text, meta)
+        # Runtime/team diagnostics are part of the user's chat log. Persist the
+        # complete text without truncation, but keep them out of model context.
+        if self._session_id and role not in {"user", "assistant"}:
+            chat_history.save_message(self._session_id, role, text, meta)
 
     def _on_response(self, text: str, model_used: str):
         self._stop_activity()
@@ -893,7 +1068,11 @@ class ChatWidget(QWidget):
 
     def _on_error(self, err: str):
         self._stop_activity()
-        self._append_msg("error", err)
+        code = _runtime_error_code(err)
+        rendered = err if str(err).lstrip().startswith("[") else f"[{code}] {err}"
+        self._append_msg("error", rendered)
+        if self._session_id:
+            chat_history.save_message(self._session_id, "error", rendered)
         self.send_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self._update_status_idle("Error")

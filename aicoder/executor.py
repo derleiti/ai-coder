@@ -765,9 +765,25 @@ RECOVERY_TOOLS: list[dict] = [
 
 _OBFUSCATION_PATTERNS = [
     "base64 -d", "base64 --decode", "eval ", "eval(",
-    "exec(", "exec (", "python -c", "python3 -c",
+    "exec(", "exec (",
     "perl -e", "ruby -e", "bash -c", "sh -c", "zsh -c",
 ]
+
+_PYTHON_INLINE_DANGEROUS_RE = re.compile(
+    r"(?:^|[;\n])\s*(?:import\s+(?:os|subprocess|socket|requests|urllib)|"
+    r"from\s+(?:os|subprocess|socket|requests|urllib)\s+import|"
+    r"(?:open|pathlib\.Path)\s*\([^)]*[,)]\s*[\"'](?:w|a|x|\+)|"
+    r"(?:os\.(?:remove|unlink|rename|replace|system)|shutil\.(?:rmtree|move)|subprocess\.|"
+    r"exec\s*\(|eval\s*\(|compile\s*\())",
+    re.IGNORECASE,
+)
+
+def _python_inline_is_dangerous(command: str) -> bool:
+    """Conservatively detect dangerous Python -c payloads without blocking read-only inspection."""
+    match = re.search(r"\bpython(?:3)?\s+-c\s+([\"'])(.*?)\1", str(command or ""), re.IGNORECASE | re.DOTALL)
+    if not match:
+        return False
+    return bool(_PYTHON_INLINE_DANGEROUS_RE.search(match.group(2)))
 
 def _has_unquoted_pipe(command: str) -> bool:
     """Return True only for shell-pipe characters outside balanced quotes.
@@ -806,7 +822,15 @@ def is_destructive(cmd: str) -> bool:
         return True
     if any(pat in cmd_lower for pat in _OBFUSCATION_PATTERNS):
         return True
-    if _has_unquoted_pipe(cmd) and any(sh in cmd_lower for sh in ("bash", "sh", "python", "perl", "ruby")):
+    if _python_inline_is_dangerous(cmd):
+        return True
+    # Treat pipe-into-interpreter as destructive/remote-exec risk, but do not
+    # flag harmless commands merely because an interpreter appears before a
+    # pipe (for example: `python -m pytest ... | head -100`).
+    if _has_unquoted_pipe(cmd) and re.search(
+        r"(?:^|[|;]\s*)[^|\n]*\|\s*(?:sudo\s+)?(?:env\s+)?(?:bash|sh|zsh|python(?:3)?|perl|ruby)(?:\s|$)",
+        cmd_lower,
+    ):
         return True
     return False
 
@@ -1428,8 +1452,16 @@ def run_file_read(args: dict) -> Tuple[str, bool]:
         if not isinstance(args.get("path"), str) or not args.get("path"):
             return "file_read error: path is required", True
         path = _workspace_path(args.get("path"), allow_outside=bool(args.get("_workspace_escape_approved")))
+        if path.is_dir():
+            tree, tree_error = run_file_tree({
+                "path": str(path),
+                "max_depth": args.get("max_depth") or 3,
+                "max_entries": args.get("max_entries") or 300,
+                "_workspace_escape_approved": args.get("_workspace_escape_approved"),
+            })
+            return "file_read notice: path is a directory; returning directory tree instead.\n" + tree, tree_error
         if not path.is_file():
-            return f"file_read error: not a file: {path}", True
+            return f"file_read error: path does not exist or is not a readable file: {path}", True
         sample = path.read_bytes()[:4096]
         if b"\x00" in sample:
             return f"file_read error: binary file; textual read not supported: {path}", True
@@ -1766,6 +1798,20 @@ def run_git_read(args: dict) -> Tuple[str, bool]:
                 return f"git error: no repository found for blame target: {file_path}", True
             raw_args = [str(file_path.relative_to(repo))]
             cwd = repo
+        # A brand-new workspace is a valid read-only Git state. Treat repository
+        # inspection as an empty/new-project result instead of surfacing Git's
+        # fatal "not a git repository" as a tool failure. This keeps planning
+        # stages from wasting recovery turns before a repository is initialized.
+        if action in {"status", "diff", "log", "show", "branch"}:
+            probe = cwd if cwd.is_dir() else cwd.parent
+            has_git_marker = any((parent / ".git").exists() for parent in (probe, *probe.parents))
+            if not has_git_marker:
+                return json.dumps({
+                    "status": "not_git_repository",
+                    "cwd": _display_workspace_path(cwd),
+                    "message": "workspace has no Git repository yet",
+                }, ensure_ascii=False), False
+
         # Normalize accidental leading slashes in Git pathspecs only when the
         # absolute path is absent and the workspace-relative file really exists.
         normalized_args: list[str] = []
@@ -1799,6 +1845,24 @@ def run_git_read(args: dict) -> Tuple[str, bool]:
         return f"git error: {exc}", True
 
 
+def _runtime_subprocess_environment() -> dict[str, str]:
+    """Return a subprocess environment that preserves the AICoder interpreter context.
+
+    Headless/team runs are commonly launched from AICoder's virtualenv while the service
+    PATH still resolves `python` to /usr/bin/python. Prepending the directory containing
+    sys.executable keeps shell/binary/test commands consistent with the running AICoder
+    process without discarding the user's remaining PATH.
+    """
+    env = dict(os.environ)
+    executable = Path(sys.executable)
+    bin_dir = executable.parent
+    venv_root = bin_dir.parent if bin_dir.name.lower() in {"bin", "scripts"} else None
+    if venv_root is not None and (venv_root / "pyvenv.cfg").is_file():
+        env["VIRTUAL_ENV"] = str(venv_root)
+        env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
+    return env
+
+
 def _disk_backed_project_environment(cwd: Path, argv: list[str]) -> tuple[list[str], dict[str, str]]:
     """Reuse heavy dependency environments from the protected source tree read-only.
 
@@ -1807,7 +1871,7 @@ def _disk_backed_project_environment(cwd: Path, argv: list[str]) -> tuple[list[s
     while keeping imports and cwd pointed at the isolated candidate. No dependency tree is
     linked into the candidate and package-install commands are not introduced here.
     """
-    env = dict(os.environ)
+    env = _runtime_subprocess_environment()
     source = _protected_root()
     candidate = _workspace_root().resolve(strict=False)
     if source is None:
@@ -1821,14 +1885,15 @@ def _disk_backed_project_environment(cwd: Path, argv: list[str]) -> tuple[list[s
         (source / name for name in (".venv", "venv", "env") if (source / name / "bin" / "python").is_file()),
         None,
     )
-    if python_env is not None and adjusted:
+    if python_env is not None:
         bin_dir = python_env / "bin"
-        executable = Path(adjusted[0]).name
-        candidate_exe = bin_dir / executable
-        if executable in {"python", "python3"}:
-            adjusted[0] = str(bin_dir / "python")
-        elif candidate_exe.is_file():
-            adjusted[0] = str(candidate_exe)
+        if adjusted:
+            executable = Path(adjusted[0]).name
+            candidate_exe = bin_dir / executable
+            if executable in {"python", "python3"}:
+                adjusted[0] = str(bin_dir / "python")
+            elif candidate_exe.is_file():
+                adjusted[0] = str(candidate_exe)
         env["VIRTUAL_ENV"] = str(python_env)
         env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
         prior_pythonpath = env.get("PYTHONPATH", "")
@@ -1875,7 +1940,11 @@ def run_checked_project_command(tool_name: str, args: dict) -> Tuple[str, bool]:
         if tool_name == "test":
             from .team_pipeline import normalize_project_test_argv
             argv = normalize_project_test_argv(argv, cwd)
-        completed = subprocess.run(argv, shell=False, cwd=str(cwd), capture_output=True, text=True, timeout=120)
+        argv, env = _disk_backed_project_environment(cwd, argv)
+        completed = subprocess.run(
+            argv, shell=False, cwd=str(cwd), env=env,
+            capture_output=True, text=True, timeout=120,
+        )
         output = (completed.stdout or "") + (completed.stderr or "")
         return output[:12000] or "(no output)", completed.returncode != 0
     except Exception as exc:
@@ -1924,8 +1993,9 @@ def run_local_shell(args: dict, *, task_runner: bool = False) -> Tuple[str, bool
             allow_outside=bool(args.get("_workspace_escape_approved")),
         )
         timeout = _bounded_timeout(args, 120 if task_runner else 60, 300 if task_runner else 120)
+        _, env = _disk_backed_project_environment(cwd, [])
         completed = subprocess.run(
-            command, shell=True, executable="/bin/bash", cwd=str(cwd),
+            ["/bin/bash", "-o", "pipefail", "-c", command], cwd=str(cwd), env=env,
             capture_output=True, text=True, timeout=timeout,
         )
         return _format_process_result(completed), completed.returncode != 0
@@ -1948,8 +2018,9 @@ def run_local_binary(args: dict) -> Tuple[str, bool]:
             allow_outside=bool(args.get("_workspace_escape_approved")),
         )
         timeout = _bounded_timeout(args, 60, 120)
+        argv, env = _disk_backed_project_environment(cwd, [program, *arguments])
         completed = subprocess.run(
-            [program, *arguments], shell=False, cwd=str(cwd),
+            argv, shell=False, cwd=str(cwd), env=env,
             input=args.get("stdin_data") if isinstance(args.get("stdin_data"), str) else None,
             capture_output=True, text=True, timeout=timeout,
         )
@@ -2171,6 +2242,17 @@ def _run_tool_impl(
         if approval_fn is not None:
             if not approval_fn(name, approval_args):
                 autonomous_policy = bool(getattr(approval_fn, "_aicoder_autonomous_policy", False))
+                policy_denial_is_error = bool(getattr(approval_fn, "_aicoder_policy_denial_is_error", True))
+                if autonomous_policy and not policy_denial_is_error:
+                    result = (
+                        f"{name}: stage_policy_denied — this observational stage is read-only; "
+                        "use read/search/verification tools or finish the stage contract instead"
+                    )
+                    audit.log_tool(
+                        tool_name=name, arguments=args, result=result, duration_s=0,
+                        is_error=False, model=model, iteration=iteration,
+                    )
+                    return result, False
                 result = (f"{name}: blocked by autonomous policy" if autonomous_policy else f"{name}: aborted by user")
                 audit.log_tool(
                     tool_name=name, arguments=args, result=result, duration_s=0,

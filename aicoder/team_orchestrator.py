@@ -21,7 +21,7 @@ import uuid
 from . import audit
 from .agent_runtime import AgentRunResult, NativeLightRuntime
 from .failure_tracking import FailureTracker
-from .executor import build_system_prompt, load_tools
+from .executor import MAX_ITERATIONS, atomic_write_text, build_system_prompt, load_tools, trim_messages
 from .model_transport import ModelTransport
 from .performance import RuntimePerformance
 from .team_runtime import (
@@ -48,16 +48,39 @@ from .workspace_backend import (
 EventFn = Callable[[str, dict[str, Any]], None]
 StopFn = Callable[[], bool]
 
-_RESEARCH_TOOL_NAMES = frozenset({
-    "search", "crawl", "web_fetch_local", "web_search_local", "doc_read", "doc_search",
-    "file_read", "file_tree", "code_read", "code_tree", "code_search", "code_grep",
-    "git", "skill_read",
-})
-_CODER_TOOL_NAMES = frozenset({
-    "file_read", "file_edit", "file_tree", "directory_create", "code_read", "code_tree",
-    "code_search", "code_grep", "git", "lint", "test", "binary_exec", "skill_read",
-    "doc_read", "doc_search",
-})
+# Team observational stages should not consume an entire frontier-model context
+# just because one is advertised. StageOff is the durable cross-stage memory; a
+# bounded local conversation keeps free/provider endpoints responsive while still
+# retaining the newest evidence.
+_TEAM_OBSERVATIONAL_CONTEXT_CHARS = 48_000
+_TEAM_RECOVERY_CONTEXT_CHARS = 48_000
+_OBSERVATIONAL_STAGE_DISCIPLINE = (
+    "\n\n## OBSERVATIONAL STAGE DISCIPLINE\n"
+    "- StageOff/final structured output is the authoritative handoff. Do not create SESSION_MEMORY.md, "
+    "handoff scratch files, or other workspace notes merely to remember this stage.\n"
+    "- This stage is observational only: NEVER call mutation tools such as file_edit, file_write, atomic_write, "
+    "directory_create, package installers, git mutation commands, or shell commands that modify files. Inspect only.\n"
+    "- Gather only evidence needed for the requested contract. Do not repeat searches/fetches or re-read "
+    "large content already present in the current conversation.\n"
+    "- Keep the final stage contract concise and information-dense; prefer explicit decisions and source facts "
+    "over reproducing raw tool output.\n"
+    "- FINAL CONTRACT BUDGET: target <= 2200 output tokens and <= 9000 characters. Every required section must "
+    "still be present; use short bullets/tables instead of essays. Do not spend output budget restating the full user task."
+)
+
+_BOOTSTRAP_SECTIONS = (
+    "SESSION MEMORY", "RESEARCH PLAN", "R1 PRIMARY SOURCES", "R2 BEST PRACTICES",
+    "R3 SECURITY RELIABILITY", "R4 ALTERNATIVE ARCHITECTURES", "EVIDENCE GAPS",
+    "NEXT STAGE INSTRUCTIONS",
+)
+_STAGEOFF_COORDINATOR_SECTIONS = (
+    "STAGE SUMMARY", "NEW FACTS", "REQUIRED CHANGES", "COMPLETED ITEMS",
+    "OPEN ITEMS", "RISKS", "NEXT STAGE INSTRUCTIONS",
+)
+_TEST_PLAN_SECTIONS = (
+    "VERIFICATION OBJECTIVE", "REQUIRED CHECKS", "ACCEPTANCE ASSERTIONS",
+    "MISSING TOOLS", "RISKS", "NEXT STAGE INSTRUCTIONS",
+)
 
 
 @dataclass
@@ -311,12 +334,27 @@ def _call_advisor(
         if stop_requested and stop_requested():
             return AgentStageResult(role, model, "failed", "", int((time.monotonic()-started)*1000), "advisor stopped by user")
         attempt += 1
+        retry_after = None
+        request_id = f"advisor-{role}-{uuid.uuid4().hex[:10]}"
+        _emit(
+            event_fn, "team_worker_event", role=role, event="model_start", category="advisor",
+            phase="advisor_call", model=model, request_id=request_id, attempt=attempt,
+            timeout=getattr(model_client, "timeout", None), prompt_chars=len(prompt), max_tokens=max_tokens,
+        )
         try:
             result = model_client.chat(
                 message=prompt, model=model, system_prompt=system, temperature=0.2,
                 max_tokens=max_tokens, fallback_model=None, tools=None, tool_choice="none",
+                request_id=request_id,
             )
             response = str(result.get("response") or "").strip() if isinstance(result, dict) else ""
+            _emit(
+                event_fn, "team_worker_event", role=role, event="model_response", category="advisor",
+                phase="advisor_call", model=str(result.get("model") or model) if isinstance(result, dict) else model,
+                request_id=request_id, attempt=attempt, response_chars=len(response),
+                latency_ms=(result.get("latency_ms") if isinstance(result, dict) else None),
+                transport=(result.get("_transport_telemetry") if isinstance(result, dict) else None),
+            )
             metrics = {"prompt_chars": len(prompt), "response_chars": len(response), "attempts": attempt}
             if response:
                 return AgentStageResult(
@@ -328,14 +366,19 @@ def _call_advisor(
         except Exception as exc:
             reason = f"{type(exc).__name__}: {exc}"
             retryable = _advisor_retryable(str(exc), exc)
-        if not retryable or attempt >= 4:
+            retry_after = getattr(exc, "retry_after", None)
+        if not retryable:
             return AgentStageResult(
                 role, model, "failed", "", int((time.monotonic()-started)*1000), reason,
                 evidence={"prompt_chars": len(prompt), "response_chars": 0, "attempts": attempt},
             )
-        delay = min(8.0, float(2 ** (attempt - 1)))
+        delay = (
+            float(min(300, retry_after))
+            if isinstance(retry_after, int) and retry_after > 0
+            else min(8.0, float(2 ** (attempt - 1)))
+        )
         _emit(event_fn, "team_worker_event", role=role, event="runtime_status", category="recovery",
-              status="backoff", phase="advisor_retry", message=f"advisor retry {attempt}/4 in {delay:.0f}s: {reason[:500]}")
+              status="backoff", phase="advisor_retry", message=f"advisor provider retry {attempt} (unlimited) in {delay:.0f}s: {reason[:500]}")
         deadline=time.monotonic()+delay
         while time.monotonic() < deadline:
             if stop_requested and stop_requested():
@@ -343,8 +386,237 @@ def _call_advisor(
             time.sleep(min(0.25, max(0.0, deadline-time.monotonic())))
 
 
-def _filtered_tools(catalogue: list[dict], names: frozenset[str]) -> list[dict]:
-    return [dict(tool) for tool in catalogue if str(tool.get("name") or "") in names]
+def _extract_contract_sections(text: str, labels: tuple[str, ...]) -> dict[str, str]:
+    """Extract required stage-contract sections without trusting model prose shape."""
+    value = str(text or "").strip()
+    found: dict[str, str] = {}
+    if not value or not labels:
+        return found
+    escaped = "|".join(re.escape(label) for label in sorted(labels, key=len, reverse=True))
+    # Accept both strict LABEL: contracts and natural Markdown headings emitted by
+    # models, including descriptive suffixes such as
+    # `## R1 PRIMARY SOURCES — Authoritative References Needed` and
+    # `# EVIDENCE GAPS (Must Be Resolved)`.  A heading must still start with an
+    # exact required label, so ordinary prose mentioning a label is not treated
+    # as a section boundary.
+    pattern = re.compile(
+        rf"(?im)^[ \t]*(?:#{{1,6}}[ \t]*)?(?:\*\*)?({escaped})"
+        rf"(?:[ \t]*:[ \t]*|[ \t]*(?:[-–—(][^\n]*)?[ \t]*(?:\*\*)?[ \t]*(?:\n|$))"
+    )
+    matches = list(pattern.finditer(value))
+
+    def heading_level(match: re.Match[str]) -> int:
+        full = match.group(0).lstrip()
+        marker = re.match(r"(#{1,6})[ \t]*", full)
+        return len(marker.group(1)) if marker else 0
+
+    for index, match in enumerate(matches):
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(value)
+        body = value[start:end].strip()
+        if not body and index + 1 < len(matches):
+            # Markdown parent sections often contain only required child headings,
+            # e.g. `# RESEARCH PLAN` immediately followed by `## R1 ...`. Treat
+            # that parent as substantively populated by its nested contract
+            # sections, while an empty peer heading remains invalid.
+            current_level = heading_level(match)
+            next_level = heading_level(matches[index + 1])
+            if current_level > 0 and next_level > current_level:
+                body = "[nested required sections follow]"
+        found[match.group(1).upper()] = body
+    return found
+
+
+def _contract_issues(text: str, required_sections: tuple[str, ...]) -> list[str]:
+    """Return deterministic reasons why a model stage output is not a usable contract."""
+    value = str(text or "").strip()
+    if not value:
+        return ["empty output"]
+    sections = _extract_contract_sections(value, required_sections)
+    issues = [f"missing section: {label}" for label in required_sections if not sections.get(label.upper())]
+    if required_sections and len(sections) == 0:
+        # A common failure mode with text-tool protocol is returning tool JSON as the final answer.
+        json_lines = []
+        for line in value.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                parsed = json.loads(line)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict) and ("tool" in parsed or ("name" in parsed and "arguments" in parsed)):
+                json_lines.append(parsed)
+        if json_lines or "TOOL_CALL " in value:
+            issues.append("final output contains tool-call syntax instead of the required stage contract")
+    return issues
+
+
+def _call_stage_agent(
+    *, client, model_client: ModelTransport, model: str, system: str, prompt: str,
+    tools: list[dict], workspace_root: str, event_fn: EventFn | None, role: str,
+    stop_requested: StopFn | None, approval_fn: Callable[[str, dict], bool] | None,
+    required_sections: tuple[str, ...] = (), max_tokens: int = 6000,
+    max_iterations: int = 40, request_timeout: int = 300,
+    native_openrouter_tool_calling: bool = False,
+) -> AgentStageResult:
+    """Run an observational team stage inside a disposable isolated snapshot.
+
+    Planning/coordinator stages keep the complete authenticated tool catalogue, but any
+    accidental mutation is confined to the snapshot and discarded. This preserves the
+    low-friction tool policy without allowing a planning model to alter the source tree.
+    Paths are translated back to the canonical source root in the returned handoff.
+    """
+    backend = create_isolated_team_workspace(workspace_root, "ram")
+    execution_root = str(backend.prepare())
+    source_root = str(Path(workspace_root).expanduser().resolve(strict=False))
+
+    def _to_snapshot(value: str) -> str:
+        return str(value or "").replace(source_root, execution_root)
+
+    def _to_source(value: str) -> str:
+        return str(value or "").replace(execution_root, source_root)
+
+    _emit(
+        event_fn, "team_worker_event", role=role, event="runtime_status",
+        category="workspace", status="isolated", phase="observational_stage",
+        message="observational stage running in disposable isolated workspace; mutations cannot reach source",
+        source_workspace=source_root, execution_workspace=execution_root,
+    )
+    try:
+        result = _call_stage_agent_core(
+            client=client, model_client=model_client, model=model, system=_to_snapshot(system),
+            prompt=_to_snapshot(prompt), tools=tools, workspace_root=execution_root,
+            event_fn=event_fn, role=role, stop_requested=stop_requested, approval_fn=approval_fn,
+            required_sections=required_sections, max_tokens=max_tokens, max_iterations=max_iterations,
+            request_timeout=request_timeout,
+            native_openrouter_tool_calling=native_openrouter_tool_calling,
+        )
+        result.response = _to_source(result.response)
+        result.error = _to_source(result.error)
+        result.evidence = dict(result.evidence or {})
+        result.evidence["isolated_observational_workspace"] = True
+        return result
+    finally:
+        backend.abort()
+
+
+def _call_stage_agent_core(
+    *, client, model_client: ModelTransport, model: str, system: str, prompt: str,
+    tools: list[dict], workspace_root: str, event_fn: EventFn | None, role: str,
+    stop_requested: StopFn | None, approval_fn: Callable[[str, dict], bool] | None,
+    required_sections: tuple[str, ...] = (), max_tokens: int = 6000,
+    max_iterations: int = 40, request_timeout: int = 300,
+    native_openrouter_tool_calling: bool = False,
+) -> AgentStageResult:
+    """Run a fresh tool-capable stage with bounded provider recovery and contract repair.
+
+    All authenticated tools are visible. Stage policy decides which actions are permitted;
+    capability hiding is not used as a substitute for runtime safety.
+    """
+    started = time.monotonic()
+    base_prompt = str(prompt)
+    current_prompt = base_prompt
+    conversation: list[dict[str, Any]] = []
+    repair_attempts = 0
+    provider_resumes = 0
+    last_error = ""
+    stage_system = (
+        build_system_prompt(tools, workspace_root).rstrip()
+        + "\n\n## CURRENT TEAM STAGE\n" + system.strip()
+        + _OBSERVATIONAL_STAGE_DISCIPLINE
+    )
+
+    while True:
+        active_prompt = current_prompt
+        runtime = NativeLightRuntime(
+            client=client, model_client=model_client, initial_prompt=current_prompt,
+            model=model, fallback_model=None, workspace_root=workspace_root,
+            plan_workspace_root=workspace_root, protected_workspace_root=None,
+            tools=[dict(tool) for tool in tools], system_prompt=stage_system,
+            conversation=conversation, load_tools_on_start=True, quick_chat=False,
+            persistent_plan=False, approval_fn=approval_fn,
+            max_iterations=max(1, min(MAX_ITERATIONS, int(max_iterations))),
+            max_output_tokens=max_tokens, max_tool_calls_per_turn=4,
+            max_context_chars=_TEAM_OBSERVATIONAL_CONTEXT_CHARS,
+            stop_requested=stop_requested,
+            base_timeout=max(10, min(300, int(request_timeout))),
+            event_fn=_worker_event_forwarder(event_fn, role),
+            progressive_tool_disclosure=False,
+            native_openrouter_tool_calling=bool(native_openrouter_tool_calling),
+            allow_mixed_tool_protocol_final=True,
+            enforce_post_mutation_verification=False,
+        )
+        run = runtime.run()
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        response = str(run.response or "").strip()
+
+        if run.status == "completed":
+            issues = _contract_issues(response, required_sections)
+            if not issues:
+                return AgentStageResult(
+                    role, run.model or model, "completed", response, elapsed_ms,
+                    evidence={
+                        "iterations": run.iterations, "tool_count": len(tools),
+                        "contract_repairs": repair_attempts, "provider_resumes": provider_resumes,
+                    },
+                )
+            if repair_attempts >= 2:
+                return AgentStageResult(
+                    role, run.model or model, "failed", response, elapsed_ms,
+                    "stage output contract invalid after repair: " + "; ".join(issues),
+                    evidence={"contract_issues": issues, "tool_count": len(tools)},
+                )
+            repair_attempts += 1
+            _emit(
+                event_fn, "team_worker_event", role=role, event="runtime_status",
+                category="contract", status="repairing", phase="stage_contract",
+                message=f"contract repair {repair_attempts}/2: {'; '.join(issues)[:1200]}",
+            )
+            conversation = []
+            current_prompt = (
+                "CONTRACT REPAIR. Your previous final response was not a valid stage handoff. "
+                "Use tools again if needed, but the FINAL response must be the requested structured contract, "
+                "not tool-call syntax. Preserve valid evidence and fix every issue below.\n\n"
+                + "ISSUES:\n- " + "\n- ".join(issues)
+                + "\n\nORIGINAL STAGE TASK:\n" + base_prompt
+                + "\n\nINVALID PREVIOUS RESPONSE:\n" + response[:30000]
+            )
+            continue
+
+        last_error = str(run.error or run.response or "stage runtime failed")
+        transient = (
+            run.status == "paused"
+            and (getattr(run, "failure_category", "") == "transient" or _advisor_retryable(last_error))
+        )
+        if transient and not (stop_requested and stop_requested()):
+            provider_resumes += 1
+            if not _wait_before_resume(
+                run, provider_resumes, event_fn=event_fn, role=role,
+                phase="stage_provider_resume", stop_requested=stop_requested,
+            ):
+                break
+            conversation = (
+                _candidate_conversation(run, max_chars=_TEAM_RECOVERY_CONTEXT_CHARS)
+                if not _is_incomplete_envelope_reason(last_error) else []
+            )
+            current_prompt = (
+                f"AUTONOMOUS STAGE PROVIDER RESUME {provider_resumes} (unlimited). Continue the SAME stage from preserved evidence.\n"
+                f"Previous transient failure: {last_error[:1600]}\n\n"
+                "Do not restart completed tool work. Finish the required stage contract.\n\n"
+                "AUTHORITATIVE ACTIVE CONTINUATION/REPAIR TASK (highest priority):\n"
+                + active_prompt[:30000]
+                + "\n\nAUTHORITATIVE ORIGINAL STAGE TASK (always retained across provider recovery):\n"
+                + base_prompt[:30000]
+            )
+            continue
+        break
+
+    return AgentStageResult(
+        role, model, "failed", "", int((time.monotonic() - started) * 1000),
+        last_error or "stage runtime failed",
+        evidence={"tool_count": len(tools), "provider_resumes": provider_resumes},
+    )
 
 
 def _task_handoff(task: str) -> HandoffEnvelope:
@@ -361,6 +633,95 @@ def _code_plan_handoff(text: str) -> HandoffEnvelope:
 
 def _merge_plan_handoff(text: str) -> HandoffEnvelope:
     return make_handoff("merge-contract", text, max_chars=6000, section_labels=MERGE_PLAN_SECTIONS)
+
+
+
+
+def _emit_stage_handoff(event_fn: EventFn | None, handoff: HandoffEnvelope, *, next_stage: TeamStage | str) -> None:
+    target = next_stage.value if isinstance(next_stage, TeamStage) else str(next_stage)
+    _emit(
+        event_fn, "team_stage_handoff", source_stage=handoff.source_stage, next_stage=target,
+        handoff_id=handoff.handoff_id, parent_handoff_id=handoff.parent_handoff_id,
+        original_chars=handoff.original_chars, compact_chars=handoff.compact_chars,
+        fresh_model_process=True,
+    )
+
+def _coordinate_stageoff(
+    *, current: dict[str, Any], stage: TeamStage | str, stage_payload: Any,
+    client, model_client: ModelTransport, coordinator_model: str | None, tools: list[dict],
+    workspace_root: str, event_fn: EventFn | None, stop_requested: StopFn | None,
+    request_timeout: int = 300, native_openrouter_tool_calling: bool = False,
+    stageoff_path: str | Path | None = None,
+) -> tuple[dict[str, Any], AgentStageResult | None, HandoffEnvelope]:
+    """Append one stage to the cumulative run StageOff and let a fresh coordinator curate it."""
+    stage_name = stage.value if isinstance(stage, TeamStage) else str(stage)
+    previous = json.loads(json.dumps(current, ensure_ascii=False, default=str))
+    stage_text = stage_payload if isinstance(stage_payload, str) else json.dumps(stage_payload, ensure_ascii=False, indent=2, default=str)
+    coordinator: AgentStageResult | None = None
+    review = ""
+    if coordinator_model:
+        coordinator = _call_stage_agent(
+            client=client, model_client=model_client, model=coordinator_model,
+            system=COORDINATOR_SYSTEM_PROMPT, tools=tools, workspace_root=workspace_root,
+            prompt=(
+                "You are the StageOff coordinator for a staged coding run. This is a FRESH model process. "
+                "Reconcile the new stage output with cumulative state. You may reorganize working-memory wording, "
+                "but never silently drop still-valid requirements, facts, failures, evidence gaps or acceptance criteria. "
+                "Use tools observationally when they help verify state.\n\n"
+                "CURRENT CUMULATIVE STAGEOFF:\n" + json.dumps(previous, ensure_ascii=False, indent=2, default=str)
+                + "\n\nNEW STAGE OUTPUT:\n" + stage_text
+            ),
+            required_sections=_STAGEOFF_COORDINATOR_SECTIONS, max_tokens=5000, max_iterations=40,
+            event_fn=event_fn, role=f"coordinator:{stage_name}", stop_requested=stop_requested,
+            approval_fn=_planning_approval, request_timeout=request_timeout,
+            native_openrouter_tool_calling=native_openrouter_tool_calling,
+        )
+        review = coordinator.response if coordinator.status == "completed" else (coordinator.error or coordinator.response)
+    entry = {
+        "stage": stage_name,
+        "sequence": len(previous.get("stages") or []) + 1,
+        "output": stage_payload,
+        "coordinator_review": review,
+        "coordinator_status": (coordinator.status if coordinator else "disabled"),
+    }
+    updated = previous
+    updated.setdefault("stages", []).append(entry)
+    updated["current_stage"] = stage_name
+    updated["latest_coordinator_review"] = review
+    if coordinator is not None and coordinator.status == "completed":
+        sections = _extract_contract_sections(review, _STAGEOFF_COORDINATOR_SECTIONS)
+        updated["working_memory"] = {
+            "stage_summary": sections.get("STAGE SUMMARY", ""),
+            "new_facts": sections.get("NEW FACTS", ""),
+            "required_changes": sections.get("REQUIRED CHANGES", ""),
+            "completed_items": sections.get("COMPLETED ITEMS", ""),
+            "open_items": sections.get("OPEN ITEMS", ""),
+            "risks": sections.get("RISKS", ""),
+            "next_stage_instructions": sections.get("NEXT STAGE INSTRUCTIONS", ""),
+        }
+    handoff = make_handoff(
+        "stageoff", json.dumps(updated, ensure_ascii=False, indent=2, default=str),
+        max_chars=120000, source_stage=stage_name,
+        parent_handoff_id=str(previous.get("handoff_id") or ""),
+    )
+    updated["handoff_id"] = handoff.handoff_id
+    persisted_stageoff = str(stageoff_path or "")
+    if stageoff_path is not None:
+        try:
+            target = Path(stageoff_path).expanduser().resolve(strict=False)
+            atomic_write_text(target, json.dumps(updated, ensure_ascii=False, indent=2, default=str) + "\n")
+            os.chmod(target, 0o600)
+            persisted_stageoff = str(target)
+        except OSError as exc:
+            _emit(event_fn, "team_worker_event", role=f"coordinator:{stage_name}", event="error",
+                  category="stageoff", message=f"stageoff persistence failed: {type(exc).__name__}: {exc}")
+    _emit(
+        event_fn, "team_stageoff", stage=stage_name, handoff_id=handoff.handoff_id,
+        parent_handoff_id=handoff.parent_handoff_id, entries=len(updated.get("stages") or []),
+        coordinator_status=(coordinator.status if coordinator else "disabled"), fresh_coordinator_process=bool(coordinator_model),
+        stageoff_path=persisted_stageoff, stageoff=updated,
+    )
+    return updated, coordinator, handoff
 
 
 def _compact_check_summary(checks: dict[str, Any]) -> dict[str, Any]:
@@ -417,28 +778,204 @@ def _compact_candidate_evidence(evidence: list[dict[str, Any]]) -> list[dict[str
     return compact
 
 
-def _research_approval(_tool_name: str, _args: dict) -> bool:
+def _observational_diagnostic_allowed(tool_name: str, args: dict) -> bool:
+    """Allow a narrow set of read-only diagnostics in observational team stages.
+
+    This does not relax the global privilege classifier. It only avoids treating
+    common environment introspection as a research mutation.
+    """
+    import ast
+    import re
+    import shlex
+
+    canonical = str(tool_name or "").strip().lower().rsplit(".", 1)[-1].rsplit(":", 1)[-1].rsplit("/", 1)[-1]
+
+    def python_script_ok(script: str) -> bool:
+        try:
+            tree = ast.parse(str(script or ""), mode="exec")
+        except SyntaxError:
+            return False
+        if not tree.body:
+            return False
+        for node in tree.body:
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                continue
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+                call = node.value
+                if isinstance(call.func, ast.Name) and call.func.id == "print":
+                    if any(isinstance(child, ast.Call) for arg in call.args for child in ast.walk(arg)):
+                        return False
+                    continue
+            return False
+        return True
+
+    def argv_ok(program: str, argv: list[str]) -> bool:
+        program = str(program or "").strip().lower().rsplit("/", 1)[-1]
+        if program in {"ls", "head", "tail", "which", "pwd", "cat", "grep", "find", "stat", "wc", "uname", "id"}:
+            return True
+        if program in {"python", "python3"}:
+            if argv[:1] in [["--version"], ["-V"]]:
+                return True
+            if argv == ["-m", "pytest", "--version"]:
+                return True
+            if len(argv) == 2 and argv[0] == "-c":
+                return python_script_ok(argv[1])
+            return False
+        if program in {"pip", "pip3"}:
+            return bool(argv) and argv[0] in {"list", "show", "freeze", "--version", "-V"}
+        return False
+
+    if canonical in {"crawl", "crawl_url"}:
+        # Web crawling is observational in team planning/research. It may populate
+        # provider-side caches internally, but it does not mutate the project/source state.
+        return True
+    if canonical == "binary_exec":
+        return argv_ok(str(args.get("program") or ""), [str(x) for x in (args.get("arguments") or [])])
+    if canonical == "shell":
+        command = str(args.get("command") or "").strip()
+        if not command:
+            return False
+        command = re.sub(r"(?:^|\s)2>(?:/dev/null|&1)(?=\s|$)", " ", command)
+        if re.search(r"(?<!2)[><]", command):
+            return False
+        for segment in re.split(r"(?:&&|\|\||;|\|)", command):
+            text = segment.strip()
+            if not text:
+                continue
+            try:
+                parts = shlex.split(text)
+            except ValueError:
+                return False
+            if not parts:
+                continue
+            if parts[0].lower().rsplit("/", 1)[-1] == "echo":
+                continue
+            if not argv_ok(parts[0], parts[1:]):
+                return False
+        return True
     return False
 
+
+def _research_approval(tool_name: str, args: dict) -> bool:
+    """Read-only autonomous policy for team research.
+
+    Research sees the full authenticated catalog for capability awareness, but the
+    runtime enforces the observational contract: no state mutation, elevation,
+    deletion, destructive command, security change, or workspace escape.
+    """
+    from .executor import is_destructive
+    from .privileges import assess_execution
+    risk = assess_execution(tool_name, args, destructive=is_destructive(str(args.get("command") or "")))
+    canonical = str(tool_name or "").strip().lower().rsplit(".", 1)[-1].rsplit(":", 1)[-1].rsplit("/", 1)[-1]
+    verification_only = canonical in {"test", "lint"}
+    diagnostic_only = _observational_diagnostic_allowed(tool_name, args)
+    return not bool(
+        args.get("_workspace_escape") or (risk.mutation and not verification_only and not diagnostic_only)
+        or risk.elevation or risk.deletion or risk.destructive or risk.security_change
+    )
+
 _research_approval._aicoder_autonomous_policy = True
+_research_approval._aicoder_policy_denial_is_error = False
+
+
+def _planning_approval(tool_name: str, args: dict) -> bool:
+    """Low-friction autonomous policy for coordinator/planning stages.
+
+    Unknown shell/binary commands are not blocked just because they are not on a
+    read-only whitelist. Hard boundaries remain: no workspace escape, elevation,
+    deletion, destructive command pattern, or security-boundary change.
+    """
+    from .executor import is_destructive
+    from .privileges import assess_execution
+    risk = assess_execution(tool_name, args, destructive=is_destructive(str(args.get("command") or "")))
+    canonical = str(tool_name or "").strip().lower().rsplit(".", 1)[-1].rsplit(":", 1)[-1].rsplit("/", 1)[-1]
+    verification_only = canonical in {"test", "lint"}
+    diagnostic_only = _observational_diagnostic_allowed(tool_name, args)
+    # Planning/coordinator stages must not fan out extra model subagents. The staged
+    # pipeline already launches dedicated research/coding workers immediately after
+    # planning; duplicate subagent delegation only increases provider pressure and
+    # repeats the same R1-R4 work.
+    duplicate_stage_fanout = canonical == "subagent_run"
+    return not bool(
+        duplicate_stage_fanout or args.get("_workspace_escape")
+        or (risk.mutation and not verification_only and not diagnostic_only)
+        or risk.elevation or risk.deletion or risk.destructive or risk.security_change
+    )
+
+
+_planning_approval._aicoder_autonomous_policy = True
+_planning_approval._aicoder_policy_denial_is_error = False
 
 
 def _run_researcher(
-    *, client, model_client: ModelTransport, model: str, role: str, task: str,
+    *, client, model_client: ModelTransport, model: str, role: str,
     source_workspace: str, tools: list[dict], stop_requested: StopFn | None,
-    research_plan: str = "", native_openrouter_tool_calling: bool = False, event_fn: EventFn | None = None,
+    stage_input: HandoffEnvelope | None = None, task: str = "", research_plan: str = "",
+    native_openrouter_tool_calling: bool = False, event_fn: EventFn | None = None,
     request_timeout: int = 300,
 ) -> AgentStageResult:
-    task_handoff = _task_handoff(task)
-    research_handoff = _research_plan_handoff(research_plan or "(none)")
+    """Run a researcher against a disposable snapshot and discard any accidental writes."""
+    backend = create_isolated_team_workspace(source_workspace, "ram")
+    execution_root = str(backend.prepare())
+    source_root = str(Path(source_workspace).expanduser().resolve(strict=False))
+
+    def _mapped_handoff(value: HandoffEnvelope | None) -> HandoffEnvelope | None:
+        if value is None:
+            return None
+        return HandoffEnvelope(
+            kind=value.kind, handoff_id=value.handoff_id,
+            raw=str(value.raw).replace(source_root, execution_root),
+            compact=str(value.compact).replace(source_root, execution_root),
+            source_stage=value.source_stage, parent_handoff_id=value.parent_handoff_id,
+        )
+
+    _emit(
+        event_fn, "team_worker_event", role=f"research:{role}", event="runtime_status",
+        category="workspace", status="isolated", phase="research",
+        message="research worker running in disposable isolated workspace; mutations cannot reach source",
+        source_workspace=source_root, execution_workspace=execution_root,
+    )
+    try:
+        result = _run_researcher_core(
+            client=client, model_client=model_client, model=model, role=role,
+            source_workspace=execution_root, tools=tools, stop_requested=stop_requested,
+            stage_input=_mapped_handoff(stage_input),
+            task=str(task or "").replace(source_root, execution_root),
+            research_plan=str(research_plan or "").replace(source_root, execution_root),
+            native_openrouter_tool_calling=native_openrouter_tool_calling, event_fn=event_fn,
+            request_timeout=request_timeout,
+        )
+        result.response = str(result.response or "").replace(execution_root, source_root)
+        result.error = str(result.error or "").replace(execution_root, source_root)
+        result.evidence = dict(result.evidence or {})
+        result.evidence["isolated_observational_workspace"] = True
+        return result
+    finally:
+        backend.abort()
+
+
+def _run_researcher_core(
+    *, client, model_client: ModelTransport, model: str, role: str,
+    source_workspace: str, tools: list[dict], stop_requested: StopFn | None,
+    stage_input: HandoffEnvelope | None = None, task: str = "", research_plan: str = "",
+    native_openrouter_tool_calling: bool = False, event_fn: EventFn | None = None,
+    request_timeout: int = 300,
+) -> AgentStageResult:
+    if stage_input is None:
+        legacy = {"user_task": task, "research_contract": research_plan}
+        stage_input = make_handoff(
+            "stageoff", json.dumps(legacy, ensure_ascii=False, indent=2),
+            max_chars=120000, source_stage="plan_research",
+        )
     prompt = (
-        f"USER TASK HANDOFF:\n{task_handoff.render()}\n\n"
+        "PREVIOUS STAGE OUTPUT (authoritative input; do not infer hidden prior conversation):\n"
+        f"{stage_input.render()}\n\n"
         f"Repository root for read-only inspection: {source_workspace}\n\n"
-        f"RESEARCH CONTRACT HANDOFF:\n{research_handoff.render()}\n\n"
         + RESEARCH_INSTRUCTIONS[role] + "\n\n" + RESEARCH_OUTPUT_CONTRACT
     )
     system = build_system_prompt(tools, source_workspace).rstrip() + (
         "\n\n## RESEARCH AGENT ROLE\n" + RESEARCH_INSTRUCTIONS[role] + "\n\n" + RESEARCH_OUTPUT_CONTRACT
+        + _OBSERVATIONAL_STAGE_DISCIPLINE
     )
     started = time.monotonic()
     evidence_events: list[dict[str, Any]] = []
@@ -453,43 +990,93 @@ def _run_researcher(
     conversation: list[dict[str, Any]] = []
     current_prompt = prompt
     result: AgentRunResult | None = None
-    for attempt in range(0, 5):
+    attempt = 0
+    contract_repairs = 0
+    non_provider_resumes = 0
+    while True:
+        attempt += 1
+        active_prompt = current_prompt
         runtime = NativeLightRuntime(
             client=client, model_client=model_client, initial_prompt=current_prompt,
             model=model, fallback_model=None, workspace_root=source_workspace,
-            plan_workspace_root=source_workspace, protected_workspace_root=source_workspace,
+            plan_workspace_root=source_workspace, protected_workspace_root=None,
             tools=tools, system_prompt=system, load_tools_on_start=True,
             quick_chat=False, persistent_plan=False, approval_fn=_research_approval,
-            max_iterations=10, max_output_tokens=6000, stop_requested=stop_requested,
+            max_iterations=60, max_output_tokens=1600, max_tool_calls_per_turn=4,
+            max_context_chars=_TEAM_OBSERVATIONAL_CONTEXT_CHARS, stop_requested=stop_requested,
+            progressive_tool_disclosure=False,
             base_timeout=max(10, min(300, int(request_timeout))), event_fn=research_event,
             native_openrouter_tool_calling=bool(native_openrouter_tool_calling),
+            allow_mixed_tool_protocol_final=True,
+            enforce_post_mutation_verification=False,
             conversation=conversation,
         )
         result = runtime.run()
-        if result.status != "paused" or (stop_requested and stop_requested()) or attempt >= 4:
+        if result.status == "completed":
+            contract_issues = _contract_issues(str(result.response or ""), RESEARCH_SECTIONS)
+            if contract_issues and contract_repairs < 4:
+                contract_repairs += 1
+                _emit(
+                    event_fn, "team_worker_event", role=f"research:{role}", event="runtime_status",
+                    category="contract", status="repairing", phase="research_contract",
+                    message=f"research contract repair {contract_repairs}/4: {'; '.join(contract_issues)[:1000]}",
+                )
+                conversation = []
+                current_prompt = (
+                    "RESEARCH CONTRACT REPAIR. Preserve all valid evidence already gathered. "
+                    "Use tools only for missing evidence. Your FINAL response must contain non-empty "
+                    "FINDINGS, SOURCES, APPLICABILITY, RISKS, RECOMMENDATIONS sections and must not be tool-call syntax.\n\n"
+                    "ISSUES:\n- " + "\n- ".join(contract_issues)
+                    + "\n\nORIGINAL ASSIGNMENT:\n" + prompt
+                    + "\n\nINVALID PREVIOUS RESPONSE:\n" + str(result.response or "")[:24000]
+                )
+                continue
+            if contract_issues:
+                result.status = "failed"
+                result.error = "research output contract invalid: " + "; ".join(contract_issues)
+        if result.status != "paused" or (stop_requested and stop_requested()):
             break
         reason = str(result.response or result.error or "research worker paused")
+        provider_retry = _provider_pause_is_retryable(result)
+        if not provider_retry:
+            if non_provider_resumes >= 4:
+                break
+            non_provider_resumes += 1
+        resume_number = attempt
+        if not _wait_before_resume(
+            result, resume_number, event_fn=event_fn, role=f"research:{role}",
+            phase="research_resume", stop_requested=stop_requested,
+        ):
+            break
         if _is_incomplete_envelope_reason(reason):
             conversation = []
-            current_prompt = _fresh_worker_recovery_prompt(result, reason, attempt + 1, label=f"research:{role}") + (
+            current_prompt = _fresh_worker_recovery_prompt(result, reason, resume_number, label=f"research:{role}") + (
                 "\n\nContinue read-only, gather only missing evidence, then return the required compact research report."
             )
             recovery_status = "fresh_chat"
         else:
-            conversation = _candidate_conversation(result)
+            conversation = _candidate_conversation(
+                result, max_chars=_TEAM_RECOVERY_CONTEXT_CHARS
+            )
             current_prompt = (
-                f"AUTONOMOUS RESEARCH RESUME {attempt + 1}/4\n\nPrevious pause reason:\n{reason[:1600]}\n\n"
+                f"AUTONOMOUS RESEARCH RESUME {resume_number}{' (unlimited provider recovery)' if provider_retry else '/4'}\n\nPrevious pause reason:\n{reason[:1600]}\n\n"
                 "Continue the same read-only research assignment from existing evidence. Do not restart or modify state. "
-                "Resolve the blocker, gather only missing evidence, then return the required compact research report."
+                "Resolve the blocker, gather only missing evidence, then return the required compact research report.\n\n"
+                "AUTHORITATIVE ACTIVE RESEARCH CONTINUATION/REPAIR TASK (highest priority):\n"
+                + active_prompt[:30000]
+                + "\n\nAUTHORITATIVE ORIGINAL RESEARCH ASSIGNMENT:\n"
+                + prompt[:30000]
             )
             recovery_status = "resuming"
         _emit(event_fn, "team_worker_event", role=f"research:{role}", event="runtime_status",
               category="recovery", status=recovery_status, phase="research_resume",
-              message=f"automatic research resume {attempt + 1}/4: {reason[:500]}")
+              message=f"automatic research resume {resume_number}{' (unlimited provider recovery)' if provider_retry else '/4'}: {reason[:500]}")
     assert result is not None
     research_tool_names = {
         str(item.get("name") or "") for item in evidence_events
-        if item.get("kind") == "tool_result" and not bool(item.get("is_error"))
+        if item.get("kind") == "tool_result"
+        and not bool(item.get("is_error"))
+        and "stage_policy_denied" not in str(item.get("result") or "")
     }
     external_tools = sorted(name for name in research_tool_names if name in {
         "search", "crawl", "web_fetch_local", "web_search_local", "doc_search", "doc_read",
@@ -661,15 +1248,12 @@ def _build_planner_prompt(task: str, repo_context: str, research: list[AgentStag
     )
 
 
-def _candidate_prompt(task: str, plan: str, coordinator: str, strategy: str) -> str:
-    task_handoff = _task_handoff(task)
-    plan_handoff = _code_plan_handoff(plan)
-    coordinator_handoff = make_handoff("coordination-notes", coordinator or "(none)", max_chars=2500)
+def _candidate_prompt(stage_input: HandoffEnvelope, strategy: str) -> str:
     return (
-        f"ORIGINAL USER TASK:\n{task_handoff.render()}\n\n"
-        f"SHARED IMPLEMENTATION CONTRACT:\n{plan_handoff.render()}\n\n"
-        f"COORDINATION NOTES:\n{coordinator_handoff.render()}\n\n"
-        f"Your strategy emphasis is {strategy}. Implement the complete shared contract, not only the strategy-specific parts."
+        "PREVIOUS STAGE OUTPUT (authoritative input; this is a fresh model process):\n"
+        f"{stage_input.render()}\n\n"
+        f"Your strategy emphasis is {strategy}. Implement the complete contract contained in the handoff, "
+        "not only the strategy-specific parts. Do not assume any conversation from an earlier stage."
     )
 
 
@@ -689,6 +1273,53 @@ _candidate_approval._aicoder_autonomous_policy = True
 _TEAM_CANDIDATE_MAX_AUTO_RESUMES = 2
 _TEAM_CANDIDATE_MAX_VERIFICATION_REPAIRS = 2
 _TEAM_MERGE_MAX_AUTO_RESUMES = 4
+
+
+def _resume_delay_seconds(run: AgentRunResult, attempt: int) -> float:
+    """Respect provider cooldown hints; otherwise use bounded exponential backoff."""
+    retry_after = getattr(run, "retry_after", None)
+    if isinstance(retry_after, int) and retry_after > 0:
+        return float(min(300, retry_after))
+    reason = str(run.response or run.error or "").lower()
+    if getattr(run, "failure_category", "") == "transient" or any(
+        marker in reason for marker in ("transient", "timeout", "readtimeout", "overloaded", "http 429", "http 5")
+    ):
+        return float(min(30, 2 ** max(0, attempt - 1)))
+    return 0.0
+
+
+def _wait_before_resume(
+    run: AgentRunResult, attempt: int, *, event_fn: EventFn | None, role: str,
+    phase: str, stop_requested: StopFn | None,
+) -> bool:
+    """Wait for provider recovery without losing cancellation responsiveness."""
+    delay = _resume_delay_seconds(run, attempt)
+    if delay <= 0:
+        return True
+    _emit(
+        event_fn, "team_worker_event", role=role, event="runtime_status", category="recovery",
+        status="backoff", phase=phase,
+        message=f"resume {attempt}: provider recovery backoff {int(delay)}s before continuing preserved state",
+        retry_after=int(delay),
+    )
+    deadline = time.monotonic() + delay
+    while time.monotonic() < deadline:
+        if stop_requested and stop_requested():
+            return False
+        time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+    return True
+
+
+def _provider_pause_is_retryable(run: AgentRunResult) -> bool:
+    """Return True for provider/transport/envelope pauses that must retry until stopped."""
+    if run.status != "paused":
+        return False
+    reason = str(run.response or run.error or "")
+    return bool(
+        getattr(run, "failure_category", "") == "transient"
+        or _is_incomplete_envelope_reason(reason)
+        or _advisor_retryable(reason)
+    )
 
 
 def _candidate_pause_is_resumable(run: AgentRunResult, stop_requested: StopFn | None) -> bool:
@@ -854,12 +1485,25 @@ def _fresh_worker_recovery_prompt(run: AgentRunResult, reason: str, attempt: int
     )
 
 
-def _candidate_conversation(run: AgentRunResult) -> list[dict[str, Any]]:
-    """Carry the model/tool history forward without duplicating the old system prompt."""
-    return [
+def _candidate_conversation(
+    run: AgentRunResult, *, max_chars: int | None = None,
+) -> list[dict[str, Any]]:
+    """Carry recent model/tool history forward without duplicating the old system prompt.
+
+    When a character cap is supplied, reuse the runtime's tool-pair-aware trimmer so
+    provider recovery cannot grow context indefinitely across fresh model processes.
+    """
+    rows = [
         dict(message) for message in (run.messages or [])
         if isinstance(message, dict) and str(message.get("role") or "") != "system"
     ]
+    if isinstance(max_chars, int) and max_chars > 0 and rows:
+        bounded = trim_messages(
+            [{"role": "system", "content": "recovery-context"}, *rows],
+            max_chars=max_chars,
+        )
+        rows = [dict(message) for message in bounded[1:]]
+    return rows
 
 
 _MERGE_INCOMPLETE_MARKERS = (
@@ -901,11 +1545,22 @@ def _merge_resume_prompt(run: AgentRunResult, attempt: int) -> str:
 
 def _run_candidate(
     *, client, model_client: ModelTransport, source_workspace: str, backend_mode: str,
-    slot: int, model: str, strategy: str, task: str, plan: str, coordinator: str,
+    slot: int, model: str, strategy: str, stage_input: HandoffEnvelope | None = None,
+    task: str = "", plan: str = "", coordinator: str = "",
     tools: list[dict], stop_requested: StopFn | None, native_openrouter_tool_calling: bool = False,
     request_timeout: int = 300, event_fn: EventFn | None = None, liveness_timeout_s: int = 1200,
     stage_handoffs: dict[str, Any] | None = None,
 ) -> CandidateResult:
+    if stage_input is None:
+        legacy_stageoff = {
+            "schema": "aicoder-stageoff-v1", "user_task": task,
+            "stages": [{"stage": "plan_code", "output": {"implementation_contract": plan},
+                        "coordinator_review": coordinator}],
+        }
+        stage_input = make_handoff(
+            "stageoff", json.dumps(legacy_stageoff, ensure_ascii=False, indent=2),
+            max_chars=120000, source_stage="plan_code",
+        )
     backend = create_isolated_team_workspace(source_workspace, backend_mode)
     try:
         backend.prepare()
@@ -933,14 +1588,22 @@ def _run_candidate(
         worker_role = f"coder:{slot}"
         backend.write_candidate_artifact(
             ".aicoder-team/coder-handoff.json",
-            json.dumps({"task": task, "implementation_contract": plan, "strategy": strategy}, ensure_ascii=False, indent=2),
+            json.dumps({
+                "stage_input": stage_input.render(), "handoff_id": stage_input.handoff_id,
+                "source_stage": stage_input.source_stage, "strategy": strategy,
+            }, ensure_ascii=False, indent=2),
         )
         if stage_handoffs:
             backend.write_candidate_artifact(
                 ".aicoder-team/handoffs.json",
                 json.dumps(stage_handoffs, ensure_ascii=False, indent=2),
             )
-        prompt = _candidate_prompt(task, plan, coordinator, strategy)
+            if isinstance(stage_handoffs.get("stageoff"), dict):
+                backend.write_candidate_artifact(
+                    ".aicoder-team/stageoff.json",
+                    json.dumps(stage_handoffs["stageoff"], ensure_ascii=False, indent=2),
+                )
+        prompt = _candidate_prompt(stage_input, strategy)
         forward = _worker_event_forwarder(event_fn, worker_role)
 
         def candidate_event(kind: str, payload: dict[str, Any]) -> None:
@@ -986,9 +1649,10 @@ def _run_candidate(
                 and run.status != "completed"
             ):
                 reason = f"candidate liveness timeout after {int(liveness_timeout_s)}s without progress"
-                run.status = "failed"; run.response = reason; run.error = reason
+                run.status = "paused"; run.response = reason; run.error = ""
+                run.failure_category = "transient"
                 _emit(event_fn, "team_worker_event", role=worker_role, event="runtime_status", category="liveness",
-                      status="failed", phase="candidate_timeout", message=reason)
+                      status="paused", phase="candidate_timeout", message=reason)
             if run.status == "completed":
                 probe = CandidateResult(
                     slot=slot, model=model, strategy=strategy, workspace=backend, run=run,
@@ -1017,6 +1681,12 @@ def _run_candidate(
                 )
                 continue
             if not _candidate_pause_is_resumable(run, stop_requested):
+                break
+
+            if not _wait_before_resume(
+                run, auto_resumes + 1, event_fn=event_fn, role=worker_role,
+                phase="candidate_resume", stop_requested=stop_requested,
+            ):
                 break
 
             # Once a coder has produced workspace changes, the filesystem and deterministic
@@ -1056,7 +1726,8 @@ def _run_candidate(
                 )
                 continue
 
-            if auto_resumes >= _TEAM_CANDIDATE_MAX_AUTO_RESUMES:
+            provider_retry = _provider_pause_is_retryable(run)
+            if not provider_retry and auto_resumes >= _TEAM_CANDIDATE_MAX_AUTO_RESUMES:
                 break
             auto_resumes += 1
             reason = str(run.response or run.error or "")
@@ -1066,7 +1737,7 @@ def _run_candidate(
                 conversation = []
                 _emit(event_fn, "team_worker_event", role=worker_role, event="runtime_status",
                       category="recovery", status="fresh_chat", phase="candidate_resume",
-                      message=f"starting fresh provider chat after incomplete response envelope ({auto_resumes}/{_TEAM_CANDIDATE_MAX_AUTO_RESUMES})")
+                      message=f"starting fresh provider chat after incomplete response envelope (retry {auto_resumes}, unlimited provider recovery)")
             else:
                 conversation = _candidate_conversation(run)
                 prompt = _candidate_resume_prompt(run, delta, auto_resumes)
@@ -1283,7 +1954,7 @@ def run_team(
         result = _run_team_pipeline(
             task=task, state=state, config=config, client=client,
             model_client=model_client, source_workspace=source_workspace,
-            event_fn=events, stop_requested=stop_requested,
+            event_fn=events, stop_requested=stop_requested, run_id=run_id,
         )
         if result.status != "completed" and stop_requested is not None and stop_requested():
             result.status = "cancelled"
@@ -1310,6 +1981,7 @@ def _run_team_pipeline(
     *, task: str, state: dict[str, Any], config: TeamConfig, client,
     model_client: ModelTransport, source_workspace: str,
     event_fn: EventFn | None = None, stop_requested: StopFn | None = None,
+    run_id: str = "",
 ) -> TeamRunResult:
     errors = config.validate()
     if errors:
@@ -1341,31 +2013,102 @@ def _run_team_pipeline(
     candidates: list[CandidateResult] = []
     handoff_metrics: list[dict[str, int | str]] = []
     handoff_archive: dict[str, dict[str, Any]] = {}
+    stageoff: dict[str, Any] = {
+        "schema": "aicoder-stageoff-v1",
+        "user_task": task,
+        "repository_context": _repository_context(source_workspace),
+        "current_stage": "run_start",
+        "handoff_id": "",
+        "stages": [],
+        "latest_coordinator_review": "",
+    }
+    stageoff_handoff = make_handoff(
+        "stageoff", json.dumps(stageoff, ensure_ascii=False, indent=2), max_chars=120000, source_stage="run_start"
+    )
+    stageoff_file = Path("/tmp") / f"aicoder-stageoff-{run_id or uuid.uuid4().hex[:16]}.json"
+    atomic_write_text(stageoff_file, json.dumps(stageoff, ensure_ascii=False, indent=2) + "\n")
+    try:
+        os.chmod(stageoff_file, 0o600)
+    except OSError:
+        pass
     all_tools = load_tools(client)
-    research_tools = _filtered_tools(all_tools, _RESEARCH_TOOL_NAMES)
-    coder_tools = _filtered_tools(all_tools, _CODER_TOOL_NAMES)
+    # Every team worker sees the same authenticated runtime tool catalogue.
+    # Role prompts and execution-risk policy control HOW tools are used; we do not
+    # hide capabilities per role because that causes inconsistent model behavior.
+    research_tools = [dict(tool) for tool in all_tools]
+    coder_tools = [dict(tool) for tool in all_tools]
     _emit(event_fn, "team_start", agents=config.active_count, research=len(config.research), coders=len(config.coders))
 
-    # 1) plan_research
+    # 1) plan_research -- coordinator bootstraps cumulative Session Memory / StageOff and research assignments.
     _stage_start(ledger, TeamStage.PLAN_RESEARCH, event_fn)
     research_planner_model = config.coordinator_model or config.planner_model or ""
-    research_plan = _call_advisor(
-        model_client, model=research_planner_model, system=RESEARCH_PLANNER_SYSTEM_PROMPT,
+    research_plan = _call_stage_agent(
+        client=client, model_client=model_client, model=research_planner_model,
+        system=RESEARCH_PLANNER_SYSTEM_PROMPT, tools=all_tools, workspace_root=source_workspace,
         prompt=(
+            "BOOTSTRAP SESSION MEMORY / STAGEOFF FROM THIS RUN.\n\n"
             f"USER TASK:\n{_task_handoff(task).render()}\n\n"
-            f"REPOSITORY CONTEXT:\n{make_handoff('repository-context', _repository_context(source_workspace), max_chars=5000).render()}"
+            f"REPOSITORY CONTEXT:\n{make_handoff('repository-context', _repository_context(source_workspace), max_chars=5000).render()}\n\n"
+            "Create a task-specific research plan for all four researcher roles. Inspect the actual project with tools where useful. "
+            "The resulting Session Memory becomes the authoritative cumulative working state for the next stage."
         ),
-        max_tokens=3000, event_fn=event_fn, role="plan_research", stop_requested=stop_requested,
+        required_sections=_BOOTSTRAP_SECTIONS, max_tokens=5000, max_iterations=50,
+        event_fn=event_fn, role="coordinator:plan_research", stop_requested=stop_requested,
+        approval_fn=_planning_approval, request_timeout=request_timeout,
+        native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
     )
-    research_plan.role = "plan_research"; stages.append(research_plan)
+    research_plan.role = "coordinator:plan_research"; stages.append(research_plan)
     if research_plan.status != "completed":
-        return TeamRunResult("failed", "", research_plan.model, stages, [], {"ledger": ledger.as_dict()}, research_plan.error)
+        return TeamRunResult("failed", "", research_plan.model, stages, [], {"ledger": ledger.as_dict(), "stageoff": stageoff}, research_plan.error)
+
     research_contract_handoff = _research_plan_handoff(research_plan.response)
     handoff_metrics.append(research_contract_handoff.metrics())
     handoff_archive[research_contract_handoff.handoff_id] = {
         "kind": research_contract_handoff.kind, "raw": research_contract_handoff.raw,
         "compact": research_contract_handoff.compact,
     }
+
+    # The coordinator may replace/reorganize working memory at bootstrap; AICoder keeps immutable run identity separately.
+    stageoff = {
+        "schema": "aicoder-stageoff-v1",
+        "user_task": task,
+        "repository_context": _repository_context(source_workspace),
+        "current_stage": TeamStage.PLAN_RESEARCH.value,
+        "handoff_id": "",
+        "session_memory": research_plan.response,
+        "research_plan": research_plan.response,
+        "latest_coordinator_review": research_plan.response,
+        "working_memory": {
+            "session_memory": _extract_contract_sections(research_plan.response, _BOOTSTRAP_SECTIONS).get("SESSION MEMORY", ""),
+            "research_plan": _extract_contract_sections(research_plan.response, _BOOTSTRAP_SECTIONS).get("RESEARCH PLAN", ""),
+            "evidence_gaps": _extract_contract_sections(research_plan.response, _BOOTSTRAP_SECTIONS).get("EVIDENCE GAPS", ""),
+            "next_stage_instructions": _extract_contract_sections(research_plan.response, _BOOTSTRAP_SECTIONS).get("NEXT STAGE INSTRUCTIONS", ""),
+        },
+        "stages": [{
+            "stage": TeamStage.PLAN_RESEARCH.value,
+            "sequence": 1,
+            "output": {"research_contract": research_plan.response},
+            "coordinator_review": research_plan.response,
+            "coordinator_status": "completed",
+        }],
+    }
+    stageoff_handoff = make_handoff(
+        "stageoff", json.dumps(stageoff, ensure_ascii=False, indent=2), max_chars=120000,
+        source_stage=TeamStage.PLAN_RESEARCH.value,
+    )
+    stageoff["handoff_id"] = stageoff_handoff.handoff_id
+    atomic_write_text(stageoff_file, json.dumps(stageoff, ensure_ascii=False, indent=2) + "\n")
+    handoff_metrics.append(stageoff_handoff.metrics())
+    handoff_archive[stageoff_handoff.handoff_id] = {
+        "kind": stageoff_handoff.kind, "raw": stageoff_handoff.raw, "compact": stageoff_handoff.compact,
+        "source_stage": stageoff_handoff.source_stage, "parent_handoff_id": stageoff_handoff.parent_handoff_id,
+    }
+    _emit(
+        event_fn, "team_stageoff", stage=TeamStage.PLAN_RESEARCH.value, handoff_id=stageoff_handoff.handoff_id,
+        parent_handoff_id="", entries=1, coordinator_status="completed", fresh_coordinator_process=True,
+        stageoff_path=str(stageoff_file), stageoff=stageoff,
+    )
+    _emit_stage_handoff(event_fn, stageoff_handoff, next_stage=TeamStage.RESEARCH)
     _stage_complete(ledger, TeamStage.PLAN_RESEARCH, event_fn)
 
     # 2) research
@@ -1376,9 +2119,9 @@ def _run_team_pipeline(
             futures = {
                 pool.submit(
                     _run_researcher, client=client, model_client=model_client, model=slot.model,
-                    role=slot.role, task=task, source_workspace=source_workspace,
+                    role=slot.role, source_workspace=source_workspace,
                     tools=research_tools, stop_requested=stop_requested,
-                    research_plan=research_contract_handoff.compact,
+                    stage_input=stageoff_handoff,
                     native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)), event_fn=event_fn,
                     request_timeout=request_timeout,
                 ): slot for slot in config.research
@@ -1394,6 +2137,12 @@ def _run_team_pipeline(
                     event_fn, "team_stage", role=result.role, status=result.status, model=result.model,
                     elapsed_ms=result.elapsed_ms, error=result.error, evidence=result.evidence,
                 )
+    research_stage_payload = {
+        "user_task": task,
+        "repository_context": _repository_context(source_workspace),
+        "research_contract": research_plan.response,
+        "reports": [],
+    }
     for item in research_results:
         report_handoff = make_handoff(
             f"{item.role}-report", item.response or item.error or "(no report)",
@@ -1404,6 +2153,26 @@ def _run_team_pipeline(
             "kind": report_handoff.kind, "role": item.role, "status": item.status,
             "raw": report_handoff.raw, "compact": report_handoff.compact,
         }
+        research_stage_payload["reports"].append({
+            "role": item.role, "status": item.status, "report": report_handoff.compact,
+            "evidence": item.evidence, "error": item.error,
+        })
+    stageoff, coordinator_stage, stageoff_handoff = _coordinate_stageoff(
+        current=stageoff, stage=TeamStage.RESEARCH, stage_payload=research_stage_payload,
+        client=client, model_client=model_client, coordinator_model=config.coordinator_model,
+        tools=all_tools, workspace_root=source_workspace,
+        event_fn=event_fn, stop_requested=stop_requested, request_timeout=request_timeout,
+        native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
+        stageoff_path=stageoff_file,
+    )
+    if coordinator_stage is not None:
+        coordinator_stage.role = "coordinator:research"; stages.append(coordinator_stage)
+    handoff_metrics.append(stageoff_handoff.metrics())
+    handoff_archive[stageoff_handoff.handoff_id] = {
+        "kind": stageoff_handoff.kind, "raw": stageoff_handoff.raw, "compact": stageoff_handoff.compact,
+        "source_stage": stageoff_handoff.source_stage, "parent_handoff_id": stageoff_handoff.parent_handoff_id,
+    }
+    _emit_stage_handoff(event_fn, stageoff_handoff, next_stage=TeamStage.BRAINSTORM)
     _stage_complete(ledger, TeamStage.RESEARCH, event_fn)
 
     # 3) brainstorm -- divergent multi-model reasoning after research, before implementation planning.
@@ -1412,8 +2181,6 @@ def _run_team_pipeline(
     brainstorm_state = ""
     brainstorm_participants = _brainstorm_participants(config)
     configured_rounds = _brainstorm_rounds(state)
-    repo_context = _repository_context(source_workspace)
-    research_handoff_text = _brainstorm_research_handoff(research_results)
     synthesis_model = config.coordinator_model or config.planner_model or ""
     _emit(
         event_fn, "team_brainstorm_config", rounds=configured_rounds,
@@ -1428,12 +2195,18 @@ def _run_team_pipeline(
         with ThreadPoolExecutor(max_workers=len(brainstorm_participants), thread_name_prefix=f"aicoder-brainstorm-r{round_index}") as pool:
             futures = {
                 pool.submit(
-                    _call_advisor, model_client, model=model, system=system_prompt,
-                    prompt=_build_brainstorm_prompt(
-                        task, repo_context, research_handoff_text, perspective,
-                        round_index=round_index, brainstorm_state=brainstorm_state,
+                    _call_stage_agent, client=client, model_client=model_client, model=model, system=system_prompt,
+                    tools=all_tools, workspace_root=source_workspace,
+                    prompt=(
+                        "PREVIOUS STAGE OUTPUT (authoritative; fresh model process):\n"
+                        + stageoff_handoff.render()
+                        + f"\n\nBRAINSTORM ROUND: {round_index}\nYOUR PERSPECTIVE: {perspective}\n\n"
+                        + f"CURRENT ANONYMIZED BRAINSTORM STATE:\n{brainstorm_state or '(none - create independent ideas)'}"
                     ),
-                    max_tokens=4000, event_fn=event_fn, role=f"brainstorm:r{round_index}:{label}", stop_requested=stop_requested,
+                    required_sections=BRAINSTORM_SECTIONS, max_tokens=4000, max_iterations=35,
+                    event_fn=event_fn, role=f"brainstorm:r{round_index}:{label}", stop_requested=stop_requested,
+                    approval_fn=_research_approval, request_timeout=request_timeout,
+                    native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
                 ): (label, model)
                 for label, model, perspective in brainstorm_participants
             }
@@ -1458,10 +2231,14 @@ def _run_team_pipeline(
         if not usable:
             _emit(event_fn, "team_brainstorm_round", round=round_index, status="empty", total_rounds=configured_rounds)
             break
-        operator = _call_advisor(
-            model_client, model=synthesis_model, system=BRAINSTORM_OPERATOR_SYSTEM_PROMPT,
+        operator = _call_stage_agent(
+            client=client, model_client=model_client, model=synthesis_model, system=BRAINSTORM_OPERATOR_SYSTEM_PROMPT,
+            tools=all_tools, workspace_root=source_workspace,
             prompt=_build_brainstorm_operator_prompt(task, round_index, usable, brainstorm_state),
-            max_tokens=5000, event_fn=event_fn, role=f"brainstorm_state:r{round_index}", stop_requested=stop_requested,
+            required_sections=BRAINSTORM_SECTIONS, max_tokens=5000, max_iterations=30,
+            event_fn=event_fn, role=f"brainstorm_state:r{round_index}", stop_requested=stop_requested,
+            approval_fn=_research_approval, request_timeout=request_timeout,
+            native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
         )
         operator.role = f"brainstorm_state:r{round_index}"
         stages.append(operator)
@@ -1475,10 +2252,14 @@ def _run_team_pipeline(
         )
 
     if brainstorm_results:
-        brainstorm_synthesis = _call_advisor(
-            model_client, model=synthesis_model, system=BRAINSTORM_SYNTHESIS_SYSTEM_PROMPT,
+        brainstorm_synthesis = _call_stage_agent(
+            client=client, model_client=model_client, model=synthesis_model, system=BRAINSTORM_SYNTHESIS_SYSTEM_PROMPT,
+            tools=all_tools, workspace_root=source_workspace,
             prompt=_build_brainstorm_synthesis_prompt(task, brainstorm_state, brainstorm_results),
-            max_tokens=6000, event_fn=event_fn, role="brainstorm_synthesis", stop_requested=stop_requested,
+            required_sections=BRAINSTORM_SECTIONS, max_tokens=6000, max_iterations=30,
+            event_fn=event_fn, role="brainstorm_synthesis", stop_requested=stop_requested,
+            approval_fn=_research_approval, request_timeout=request_timeout,
+            native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
         )
         brainstorm_synthesis.role = "brainstorm_synthesis"
         stages.append(brainstorm_synthesis)
@@ -1503,16 +2284,42 @@ def _run_team_pipeline(
         "kind": brainstorm_contract_handoff.kind, "raw": brainstorm_contract_handoff.raw,
         "compact": brainstorm_contract_handoff.compact,
     }
+    stageoff, coordinator_stage, stageoff_handoff = _coordinate_stageoff(
+        current=stageoff, stage=TeamStage.BRAINSTORM,
+        stage_payload={
+            "brainstorm_synthesis": brainstorm_contract_handoff.compact,
+            "brainstorm_state": brainstorm_state,
+        },
+        client=client, model_client=model_client, coordinator_model=config.coordinator_model,
+        tools=all_tools, workspace_root=source_workspace,
+        event_fn=event_fn, stop_requested=stop_requested, request_timeout=request_timeout,
+        native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
+        stageoff_path=stageoff_file,
+    )
+    if coordinator_stage is not None:
+        coordinator_stage.role = "coordinator:brainstorm"; stages.append(coordinator_stage)
+    handoff_metrics.append(stageoff_handoff.metrics())
+    handoff_archive[stageoff_handoff.handoff_id] = {
+        "kind": stageoff_handoff.kind, "raw": stageoff_handoff.raw, "compact": stageoff_handoff.compact,
+        "source_stage": stageoff_handoff.source_stage, "parent_handoff_id": stageoff_handoff.parent_handoff_id,
+    }
+    _emit_stage_handoff(event_fn, stageoff_handoff, next_stage=TeamStage.PLAN_CODE)
     _stage_complete(ledger, TeamStage.BRAINSTORM, event_fn)
 
     # 4) plan_code
     _stage_start(ledger, TeamStage.PLAN_CODE, event_fn)
-    code_plan = _call_advisor(
-        model_client, model=config.planner_model or "", system=PLANNER_SYSTEM_PROMPT,
-        prompt=_build_planner_prompt(task, repo_context, research_results)
-        + "\n\nRESEARCH CONTRACT:\n" + research_contract_handoff.render()
-        + "\n\nBRAINSTORM SYNTHESIS (creative decision support, not evidence):\n" + brainstorm_contract_handoff.render(),
-        max_tokens=6500, event_fn=event_fn, role="plan_code", stop_requested=stop_requested,
+    code_plan = _call_stage_agent(
+        client=client, model_client=model_client, model=config.planner_model or "", system=PLANNER_SYSTEM_PROMPT,
+        tools=all_tools, workspace_root=source_workspace,
+        prompt=(
+            "PREVIOUS STAGE OUTPUT (authoritative; fresh model process):\n"
+            + stageoff_handoff.render()
+            + "\n\nCreate the implementation contract from this handoff only. Inspect the actual repository with tools where needed. "
+              "Do not assume prior-stage conversation."
+        ),
+        required_sections=CODE_PLAN_SECTIONS, max_tokens=6500, max_iterations=50,
+        event_fn=event_fn, role="plan_code", stop_requested=stop_requested, approval_fn=_planning_approval,
+        request_timeout=request_timeout, native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
     )
     code_plan.role = "plan_code"
     stages.append(code_plan)
@@ -1529,34 +2336,30 @@ def _run_team_pipeline(
         return TeamRunResult("failed", "", code_plan.model, stages, [], {"ledger": ledger.as_dict()}, code_plan.error)
     _stage_complete(ledger, TeamStage.PLAN_CODE, event_fn)
 
-    coordination_notes = ""
-    if config.coordinator_model:
-        coordinator_result = _call_advisor(
-            model_client, model=config.coordinator_model, system=COORDINATOR_SYSTEM_PROMPT,
-            prompt=(
-                f"USER TASK:\n{_task_handoff(task).render()}\n\n"
-                f"SHARED IMPLEMENTATION CONTRACT:\n{code_contract_handoff.render()}\n\n"
-                "Review only for ambiguity, missing acceptance criteria, unsafe assumptions, and candidate execution hazards. "
-                "Return concise coordination notes; do not redesign or implement."
-            ),
-            max_tokens=2500, event_fn=event_fn, role="coordinator", stop_requested=stop_requested,
-        )
-        coordinator_result.role = "coordinator"
-        stages.append(coordinator_result)
-        _emit(event_fn, "team_stage", role="coordinator", status=coordinator_result.status,
-              model=coordinator_result.model, elapsed_ms=coordinator_result.elapsed_ms, error=coordinator_result.error,
-              evidence=coordinator_result.evidence)
-        if coordinator_result.status == "completed":
-            coordination_notes = coordinator_result.response
-        else:
-            _emit(event_fn, "team_worker_event", role="coordinator", event="runtime_status", category="coordination",
-                  status="warning", phase="pre_code", message="coordinator unavailable; candidates continue with shared contract")
+    stageoff, coordinator_stage, stageoff_handoff = _coordinate_stageoff(
+        current=stageoff, stage=TeamStage.PLAN_CODE,
+        stage_payload={
+            "implementation_contract": code_plan.response,
+            "model": code_plan.model, "status": code_plan.status,
+        },
+        client=client, model_client=model_client, coordinator_model=config.coordinator_model,
+        tools=all_tools, workspace_root=source_workspace,
+        event_fn=event_fn, stop_requested=stop_requested, request_timeout=request_timeout,
+        native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
+        stageoff_path=stageoff_file,
+    )
+    if coordinator_stage is not None:
+        coordinator_stage.role = "coordinator:plan_code"; stages.append(coordinator_stage)
+    handoff_metrics.append(stageoff_handoff.metrics())
+    handoff_archive[stageoff_handoff.handoff_id] = {
+        "kind": stageoff_handoff.kind, "raw": stageoff_handoff.raw, "compact": stageoff_handoff.compact,
+        "source_stage": stageoff_handoff.source_stage, "parent_handoff_id": stageoff_handoff.parent_handoff_id,
+    }
+    _emit_stage_handoff(event_fn, stageoff_handoff, next_stage=TeamStage.CODE)
 
     candidate_handoffs = {
-        "research_contract": research_contract_handoff.compact,
-        "brainstorm_synthesis": brainstorm_contract_handoff.compact,
-        "code_contract": code_contract_handoff.compact,
-        "coordination_notes": coordination_notes,
+        "stageoff": stageoff,
+        "stageoff_handoff": stageoff_handoff.render(),
     }
 
     # 5) code — isolated parallel candidates with one fair global backing mode.
@@ -1573,7 +2376,7 @@ def _run_team_pipeline(
                 pool.submit(
                     _run_candidate, client=client, model_client=model_client, source_workspace=source_workspace,
                     backend_mode=workspace_plan.backend_mode, slot=slot.slot, model=slot.model,
-                    strategy=slot.strategy, task=task, plan=code_contract_handoff.compact, coordinator=coordination_notes,
+                    strategy=slot.strategy, stage_input=stageoff_handoff,
                     tools=coder_tools, stop_requested=stop_requested,
                     native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
                     request_timeout=request_timeout, event_fn=event_fn,
@@ -1612,6 +2415,30 @@ def _run_team_pipeline(
             error = "no verified coding candidate completed" + (f": {details}" if details else "")
             return TeamRunResult("failed", "", "", stages, candidates, {"ledger": ledger.as_dict()}, error)
         winner = max(viable, key=lambda item: objective_rank_key(item.evaluation))
+        code_stage_payload = {
+            "winner_candidate_id": str(winner.evaluation.get("candidate_id")),
+            "winner_score": winner.score,
+            "candidates": [
+                {
+                    "candidate_id": str(item.evaluation.get("candidate_id")),
+                    "status": item.run.status, "score": item.score,
+                    "evaluation": item.evaluation,
+                }
+                for item in candidates
+            ],
+        }
+        stageoff, coordinator_stage, stageoff_handoff = _coordinate_stageoff(
+            current=stageoff, stage=TeamStage.CODE, stage_payload=code_stage_payload,
+            client=client, model_client=model_client, coordinator_model=config.coordinator_model,
+            tools=all_tools, workspace_root=source_workspace,
+            event_fn=event_fn, stop_requested=stop_requested, request_timeout=request_timeout,
+            native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
+            stageoff_path=stageoff_file,
+        )
+        if coordinator_stage is not None:
+            coordinator_stage.role = "coordinator:code"; stages.append(coordinator_stage)
+        handoff_metrics.append(stageoff_handoff.metrics())
+        _emit_stage_handoff(event_fn, stageoff_handoff, next_stage=TeamStage.MERGE_PLAN)
         _stage_complete(ledger, TeamStage.CODE, event_fn)
 
         # Build fresh integration workspace and attach anonymized full snapshots.
@@ -1629,16 +2456,26 @@ def _run_team_pipeline(
             ".aicoder-team/handoffs.json",
             json.dumps(handoff_archive, ensure_ascii=False, indent=2),
         )
+        integration.write_candidate_artifact(
+            ".aicoder-team/stageoff.json", json.dumps(stageoff, ensure_ascii=False, indent=2)
+        )
         winner_id = str(winner.evaluation.get("candidate_id"))
 
         # 5) merge_plan — blind to model/provider/slot identity.
         _stage_start(ledger, TeamStage.MERGE_PLAN, event_fn)
         merge_planner_model = config.coordinator_model or config.planner_model or ""
-        merge_plan = _call_advisor(
-            model_client, model=merge_planner_model, system=MERGE_PLANNER_SYSTEM_PROMPT,
-            prompt=_blind_merge_prompt(task, code_contract_handoff.compact, blind_evidence)
-            + f"\n\nDETERMINISTIC BASE CANDIDATE: {winner_id}",
-            max_tokens=4000, event_fn=event_fn, role="merge_plan", stop_requested=stop_requested,
+        merge_plan = _call_stage_agent(
+            client=client, model_client=model_client, model=merge_planner_model, system=MERGE_PLANNER_SYSTEM_PROMPT,
+            tools=all_tools, workspace_root=str(integration.info.execution_root),
+            prompt=(
+                "PREVIOUS STAGEOFF (authoritative; fresh model process):\n" + stageoff_handoff.render()
+                + "\n\nANONYMIZED CANDIDATE EVIDENCE:\n"
+                + make_handoff("candidate-evidence", json.dumps(_compact_candidate_evidence(blind_evidence), ensure_ascii=False, indent=2), max_chars=30000).render()
+                + f"\n\nDETERMINISTIC BASE CANDIDATE: {winner_id}"
+            ),
+            required_sections=MERGE_PLAN_SECTIONS, max_tokens=4000, max_iterations=40,
+            event_fn=event_fn, role="merge_plan", stop_requested=stop_requested, approval_fn=_planning_approval,
+            request_timeout=request_timeout, native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
         )
         merge_plan.role = "merge_plan"; stages.append(merge_plan)
         if merge_plan.status == "completed":
@@ -1652,7 +2489,21 @@ def _run_team_pipeline(
             merge_contract_handoff = _merge_plan_handoff(merge_plan.response or merge_plan.error)
         if merge_plan.status != "completed":
             return TeamRunResult("failed", "", merge_plan.model, stages, candidates, {"ledger": ledger.as_dict()}, merge_plan.error)
+        stageoff, coordinator_stage, stageoff_handoff = _coordinate_stageoff(
+            current=stageoff, stage=TeamStage.MERGE_PLAN,
+            stage_payload={"merge_contract": merge_plan.response, "base_candidate": winner_id},
+            client=client, model_client=model_client, coordinator_model=config.coordinator_model,
+            tools=all_tools, workspace_root=source_workspace,
+            event_fn=event_fn, stop_requested=stop_requested, request_timeout=request_timeout,
+            native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
+            stageoff_path=stageoff_file,
+        )
+        if coordinator_stage is not None:
+            coordinator_stage.role = "coordinator:merge_plan"; stages.append(coordinator_stage)
+        handoff_metrics.append(stageoff_handoff.metrics())
+        _emit_stage_handoff(event_fn, stageoff_handoff, next_stage=TeamStage.MERGE)
         integration.write_candidate_artifact(".aicoder-team/merge-plan.txt", merge_plan.response)
+        integration.write_candidate_artifact(".aicoder-team/stageoff.json", json.dumps(stageoff, ensure_ascii=False, indent=2))
         integration.write_candidate_artifact(
             ".aicoder-team/handoffs.json",
             json.dumps(handoff_archive, ensure_ascii=False, indent=2),
@@ -1664,10 +2515,10 @@ def _run_team_pipeline(
         merge_model = config.merge_model
         if merge_model:
             merge_prompt = (
-                f"USER TASK:\n{_task_handoff(task).render()}\n\n"
-                f"CODE CONTRACT:\n{code_contract_handoff.render()}\n\n"
-                f"BLIND MERGE CONTRACT:\n{merge_contract_handoff.render()}\n\n"
-                "Candidate snapshots are under .aicoder-team/candidates/. Integrate only evidence-backed improvements."
+                "PREVIOUS STAGEOFF (authoritative; fresh model process):\n" + stageoff_handoff.render()
+                + "\n\nCandidate snapshots are under .aicoder-team/candidates/. "
+                "Integrate only evidence-backed improvements required by the cumulative StageOff. "
+                "Do not assume any prior model conversation."
             )
             merge_system = build_system_prompt(coder_tools, str(integration.info.execution_root)).rstrip()+"\n\n"+MERGE_SYSTEM_PROMPT
             merge_conversation: list[dict[str, Any]] = []
@@ -1693,7 +2544,13 @@ def _run_team_pipeline(
                     merge_run.status = "paused"; merge_run.response = reason; merge_run.error = reason
                 if not _candidate_pause_is_resumable(merge_run, stop_requested):
                     break
-                if merge_auto_resumes >= _TEAM_MERGE_MAX_AUTO_RESUMES:
+                provider_retry = _provider_pause_is_retryable(merge_run)
+                if not provider_retry and merge_auto_resumes >= _TEAM_MERGE_MAX_AUTO_RESUMES:
+                    break
+                if not _wait_before_resume(
+                    merge_run, merge_auto_resumes + 1, event_fn=event_fn, role="merge",
+                    phase="merge_resume", stop_requested=stop_requested,
+                ):
                     break
                 merge_auto_resumes += 1
                 merge_pause_reason = str(merge_run.response or merge_run.error or "merge paused")
@@ -1706,7 +2563,7 @@ def _run_team_pipeline(
                     merge_prompt = _fresh_worker_recovery_prompt(merge_run, merge_pause_reason, merge_auto_resumes, label="merge")
                     _emit(event_fn, "team_worker_event", role="merge", event="runtime_status",
                           category="recovery", status="fresh_chat", phase="merge_resume",
-                          message=f"starting fresh provider chat after incomplete response envelope ({merge_auto_resumes}/{_TEAM_MERGE_MAX_AUTO_RESUMES})")
+                          message=f"starting fresh provider chat after incomplete response envelope (retry {merge_auto_resumes}, unlimited provider recovery)")
                 else:
                     merge_conversation = _candidate_conversation(merge_run)
                     merge_prompt = _merge_resume_prompt(merge_run, merge_auto_resumes)
@@ -1735,6 +2592,23 @@ def _run_team_pipeline(
             stages.append(AgentStageResult("merge", "deterministic", "completed", f"Selected {winner_id} without LLM merge", 0))
             final_response = f"Selected verified base candidate {winner_id}."
             result_model = winner.run.model
+        stageoff, coordinator_stage, stageoff_handoff = _coordinate_stageoff(
+            current=stageoff, stage=TeamStage.MERGE,
+            stage_payload={
+                "merge_status": "completed", "merge_response": final_response,
+                "result_model": result_model, "workspace_delta": integration.delta_summary(),
+            },
+            client=client, model_client=model_client, coordinator_model=config.coordinator_model,
+            tools=all_tools, workspace_root=source_workspace,
+            event_fn=event_fn, stop_requested=stop_requested, request_timeout=request_timeout,
+            native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
+            stageoff_path=stageoff_file,
+        )
+        if coordinator_stage is not None:
+            coordinator_stage.role = "coordinator:merge"; stages.append(coordinator_stage)
+        handoff_metrics.append(stageoff_handoff.metrics())
+        integration.write_candidate_artifact(".aicoder-team/stageoff.json", json.dumps(stageoff, ensure_ascii=False, indent=2))
+        _emit_stage_handoff(event_fn, stageoff_handoff, next_stage=TeamStage.PLAN_TESTS)
         _stage_complete(ledger, TeamStage.MERGE, event_fn)
 
         # 7) plan_tests — model may explain/extend intent, deterministic commands remain authoritative.
@@ -1745,15 +2619,19 @@ def _run_team_pipeline(
             for item in deterministic_plan
         ], ensure_ascii=False, indent=2)
         if config.test_planner_model:
-            test_plan = _call_advisor(
-                model_client, model=config.test_planner_model, system=TEST_PLANNER_SYSTEM_PROMPT,
+            test_plan = _call_stage_agent(
+                client=client, model_client=model_client, model=config.test_planner_model, system=TEST_PLANNER_SYSTEM_PROMPT,
+                tools=all_tools, workspace_root=str(integration.info.execution_root),
                 prompt=(
-                    f"USER TASK:\n{_task_handoff(task).render()}\n\n"
-                    f"CODE CONTRACT:\n{code_contract_handoff.render()}\n\n"
-                    f"MERGE CONTRACT:\n{merge_contract_handoff.render()}\n\n"
-                    f"DETERMINISTIC REPOSITORY CHECKS (authoritative):\n{make_handoff('deterministic-checks', test_plan_text, max_chars=6000).render()}"
+                    "PREVIOUS STAGEOFF (authoritative; fresh model process):\n" + stageoff_handoff.render()
+                    + "\n\nDETERMINISTIC REPOSITORY CHECKS (authoritative):\n"
+                    + make_handoff("deterministic-checks", test_plan_text, max_chars=6000).render()
+                    + "\n\nPlan verification from this cumulative state only; inspect repository state with tools when needed. "
+                      "Do not assume prior conversation."
                 ),
-                max_tokens=3000, event_fn=event_fn, role="plan_tests", stop_requested=stop_requested,
+                required_sections=_TEST_PLAN_SECTIONS, max_tokens=3000, max_iterations=35,
+                event_fn=event_fn, role="plan_tests", stop_requested=stop_requested, approval_fn=_planning_approval,
+                request_timeout=request_timeout, native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
             )
             test_plan.role = "plan_tests"; stages.append(test_plan)
             if test_plan.status != "completed":
@@ -1764,6 +2642,23 @@ def _run_team_pipeline(
                 integration.write_candidate_artifact(".aicoder-team/test-plan.txt", test_plan.response)
         else:
             stages.append(AgentStageResult("plan_tests", "deterministic", "completed", test_plan_text, 0))
+        stageoff, coordinator_stage, stageoff_handoff = _coordinate_stageoff(
+            current=stageoff, stage=TeamStage.PLAN_TESTS,
+            stage_payload={
+                "deterministic_plan": json.loads(test_plan_text),
+                "model_plan": (test_plan.response if config.test_planner_model and test_plan.status == "completed" else ""),
+            },
+            client=client, model_client=model_client, coordinator_model=config.coordinator_model,
+            tools=all_tools, workspace_root=source_workspace,
+            event_fn=event_fn, stop_requested=stop_requested, request_timeout=request_timeout,
+            native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
+            stageoff_path=stageoff_file,
+        )
+        if coordinator_stage is not None:
+            coordinator_stage.role = "coordinator:plan_tests"; stages.append(coordinator_stage)
+        handoff_metrics.append(stageoff_handoff.metrics())
+        integration.write_candidate_artifact(".aicoder-team/stageoff.json", json.dumps(stageoff, ensure_ascii=False, indent=2))
+        _emit_stage_handoff(event_fn, stageoff_handoff, next_stage=TeamStage.TESTS_FUNCTION_OK)
         _stage_complete(ledger, TeamStage.PLAN_TESTS, event_fn)
 
         # 8) tests_function_ok — only executable evidence can open the disk-write gate.
@@ -1774,9 +2669,22 @@ def _run_team_pipeline(
         if not verification_passed(verification_results):
             return TeamRunResult(
                 "failed", "", result_model, stages, candidates,
-                {"ledger": ledger.as_dict(), "verification": verification_payload},
+                {"ledger": ledger.as_dict(), "verification": verification_payload, "stageoff": stageoff},
                 "tests_function_ok gate failed; persistent workspace was not modified",
             )
+        stageoff, coordinator_stage, stageoff_handoff = _coordinate_stageoff(
+            current=stageoff, stage=TeamStage.TESTS_FUNCTION_OK, stage_payload={"verification": verification_payload},
+            client=client, model_client=model_client, coordinator_model=config.coordinator_model,
+            tools=all_tools, workspace_root=source_workspace,
+            event_fn=event_fn, stop_requested=stop_requested, request_timeout=request_timeout,
+            native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
+            stageoff_path=stageoff_file,
+        )
+        if coordinator_stage is not None:
+            coordinator_stage.role = "coordinator:tests_function_ok"; stages.append(coordinator_stage)
+        handoff_metrics.append(stageoff_handoff.metrics())
+        integration.write_candidate_artifact(".aicoder-team/stageoff.json", json.dumps(stageoff, ensure_ascii=False, indent=2))
+        _emit_stage_handoff(event_fn, stageoff_handoff, next_stage=TeamStage.ATOMIC_DISK_WRITE)
         _stage_complete(ledger, TeamStage.TESTS_FUNCTION_OK, event_fn)
 
         # 9) atomic_disk_write — the only persistent mutation stage.
@@ -1788,6 +2696,19 @@ def _run_team_pipeline(
             "deleted": list(final_delta.get("deleted_files") or []),
         }
         _emit(event_fn, "team_change_manifest", **change_manifest)
+        stageoff, coordinator_stage, stageoff_handoff = _coordinate_stageoff(
+            current=stageoff, stage=TeamStage.ATOMIC_DISK_WRITE,
+            stage_payload={"change_manifest": change_manifest, "verification_passed": True},
+            client=client, model_client=model_client, coordinator_model=config.coordinator_model,
+            tools=all_tools, workspace_root=source_workspace,
+            event_fn=event_fn, stop_requested=stop_requested, request_timeout=request_timeout,
+            native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
+            stageoff_path=stageoff_file,
+        )
+        if coordinator_stage is not None:
+            coordinator_stage.role = "coordinator:atomic_disk_write"; stages.append(coordinator_stage)
+        handoff_metrics.append(stageoff_handoff.metrics())
+        integration.write_candidate_artifact(".aicoder-team/stageoff.json", json.dumps(stageoff, ensure_ascii=False, indent=2))
         integration.finalize(verified=True)
         _stage_complete(ledger, TeamStage.ATOMIC_DISK_WRITE, event_fn)
 
@@ -1814,7 +2735,7 @@ def _run_team_pipeline(
                 int((stage.evidence or {}).get("response_chars") or 0) for stage in stages
             ),
             "ledger": ledger.as_dict(), "verification": verification_payload,
-            "change_manifest": change_manifest,
+            "change_manifest": change_manifest, "stageoff": stageoff,
             "stage_timings": [
                 {"role": stage.role, "model": stage.model, "status": stage.status, "elapsed_ms": stage.elapsed_ms}
                 for stage in stages

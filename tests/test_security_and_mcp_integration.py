@@ -238,6 +238,17 @@ class LocalCapabilityTests(unittest.TestCase):
         self.assertTrue(error)
         self.assertIn("binary file", result)
 
+    def test_file_read_on_directory_returns_tree_without_error(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "src").mkdir()
+            (root / "src" / "main.py").write_text("print('ok')\n", encoding="utf-8")
+            with patch.object(executor, "get_state", return_value={"workspace_root": str(root)}):
+                result, error = executor.run_file_read({"path": "src"})
+        self.assertFalse(error)
+        self.assertIn("returning directory tree", result)
+        self.assertIn("main.py", result)
+
     def test_read_tool_no_longer_accepts_a_command_string(self):
         with tempfile.TemporaryDirectory() as temp:
             with patch.object(executor, "get_state", return_value={"workspace_root": temp}):

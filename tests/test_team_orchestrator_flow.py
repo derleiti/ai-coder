@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 from aicoder.agent_runtime import AgentRunResult
 from aicoder.team_orchestrator import (
     AgentStageResult, CandidateResult, _is_incomplete_envelope_reason, _redact_debug_value,
-    _run_candidate, _run_researcher, evaluate_candidate, run_team,
+    _call_stage_agent_core, _run_candidate, _run_researcher, evaluate_candidate, run_team,
 )
 from aicoder.team_runtime import config_from_state
 from aicoder.workspace_backend import RamWorkspace
@@ -53,8 +53,8 @@ class FreshResearchRecoveryTests(unittest.TestCase):
                         [], "system",
                     )
                 return AgentRunResult(
-                    "completed", "RESEARCH REPORT: recovered", "test/model",
-                    [{"role": "assistant", "content": "RESEARCH REPORT: recovered"}], [], "system",
+                    "completed", 'FINDINGS:\nrecovered fact\nSOURCES:\nsource-id\nAPPLICABILITY:\napplies\nRISKS:\nnone\nRECOMMENDATIONS:\ncontinue', "test/model",
+                    [{"role": "assistant", "content": 'FINDINGS:\nrecovered fact\nSOURCES:\nsource-id\nAPPLICABILITY:\napplies\nRISKS:\nnone\nRECOMMENDATIONS:\ncontinue'}], [], "system",
                 )
 
         events = []
@@ -79,6 +79,41 @@ class FreshResearchRecoveryTests(unittest.TestCase):
         ]
         self.assertTrue(recovery)
         self.assertEqual(recovery[-1].get("status"), "fresh_chat")
+
+
+class StageProviderResumeContextTests(unittest.TestCase):
+    def test_stage_provider_resume_repeats_authoritative_original_task(self):
+        calls = []
+        original = "ORIGINAL-STAGE-TASK-UNIQUE-9182"
+
+        class Runtime:
+            def __init__(self, **kwargs):
+                calls.append(kwargs)
+            def run(self):
+                if len(calls) == 1:
+                    return AgentRunResult(
+                        "paused", "provider temporary failure", "test/model",
+                        [{"role":"user","content":"partial context"}], [], "system",
+                        error="provider temporary failure", failure_category="transient",
+                    )
+                return AgentRunResult(
+                    "completed", "SECTION:\nfinished", "test/model",
+                    [{"role":"assistant","content":"SECTION:\nfinished"}], [], "system",
+                )
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "aicoder.team_orchestrator.NativeLightRuntime", Runtime
+        ), patch("aicoder.team_orchestrator._wait_before_resume", return_value=True):
+            result = _call_stage_agent_core(
+                client=MagicMock(), model_client=MagicMock(), model="test/model",
+                system="stage system", prompt=original, tools=[], workspace_root=tmp,
+                event_fn=None, role="coordinator:test", stop_requested=None, approval_fn=None,
+                required_sections=("SECTION",), max_iterations=4,
+            )
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(len(calls), 2)
+        self.assertIn("AUTHORITATIVE ORIGINAL STAGE TASK", calls[1]["initial_prompt"])
+        self.assertIn(original, calls[1]["initial_prompt"])
 
 
 class FakeIntegrationRuntime:
@@ -375,8 +410,10 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
                     response=f"evidence {kwargs['role']}", elapsed_ms=1,
                 )
 
-            def advisor(_model_client, *, model, system, prompt, max_tokens=0, **kwargs):
-                return AgentStageResult("advisor", model, "completed", "shared plan", 1)
+            def stage_agent(**kwargs):
+                labels = tuple(kwargs.get("required_sections") or ())
+                response = "\n".join(f"{label}:\nvalidated {label.lower()}" for label in labels) or "validated stage"
+                return AgentStageResult(str(kwargs.get("role") or "stage"), str(kwargs.get("model") or "test/model"), "completed", response, 1)
 
             candidates = []
             def candidate(**kwargs):
@@ -407,7 +444,7 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
             with (
                 patch("aicoder.team_orchestrator.load_tools", return_value=[]),
                 patch("aicoder.team_orchestrator._run_researcher", side_effect=researcher),
-                patch("aicoder.team_orchestrator._call_advisor", side_effect=advisor),
+                patch("aicoder.team_orchestrator._call_stage_agent", side_effect=stage_agent),
                 patch("aicoder.team_orchestrator._run_candidate", side_effect=candidate),
                 patch("aicoder.team_orchestrator.evaluate_candidate", side_effect=evaluate),
                 patch("aicoder.team_orchestrator.create_isolated_team_workspace", side_effect=create_backend),
@@ -461,8 +498,10 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
             def researcher(**kwargs):
                 return AgentStageResult(f"research:{kwargs['role']}", kwargs["model"], "completed", "evidence", 1)
 
-            def advisor(_model_client, *, model, system, prompt, max_tokens=0, **kwargs):
-                return AgentStageResult("advisor", model, "completed", "shared plan", 1)
+            def stage_agent(**kwargs):
+                labels = tuple(kwargs.get("required_sections") or ())
+                response = "\n".join(f"{label}:\nvalidated {label.lower()}" for label in labels) or "validated stage"
+                return AgentStageResult(str(kwargs.get("role") or "stage"), str(kwargs.get("model") or "test/model"), "completed", response, 1)
 
             def candidate(**kwargs):
                 backend = RamWorkspace(source, ram_root=ram_dir)
@@ -474,7 +513,7 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
             with (
                 patch("aicoder.team_orchestrator.load_tools", return_value=[]),
                 patch("aicoder.team_orchestrator._run_researcher", side_effect=researcher),
-                patch("aicoder.team_orchestrator._call_advisor", side_effect=advisor),
+                patch("aicoder.team_orchestrator._call_stage_agent", side_effect=stage_agent),
                 patch("aicoder.team_orchestrator._run_candidate", side_effect=candidate),
                 patch("aicoder.team_orchestrator.evaluate_candidate", return_value={
                     "score": 0, "delta": {}, "checks": {}, "diff": "", "candidate_id": "cand-fail",
@@ -518,8 +557,10 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
             def researcher(**kwargs):
                 return AgentStageResult(f"research:{kwargs['role']}", kwargs["model"], "completed", "evidence", 1)
 
-            def advisor(_model_client, *, model, system, prompt, max_tokens=0, **kwargs):
-                return AgentStageResult("advisor", model, "completed", "shared plan", 1)
+            def stage_agent(**kwargs):
+                labels = tuple(kwargs.get("required_sections") or ())
+                response = "\n".join(f"{label}:\nvalidated {label.lower()}" for label in labels) or "validated stage"
+                return AgentStageResult(str(kwargs.get("role") or "stage"), str(kwargs.get("model") or "test/model"), "completed", response, 1)
 
             def candidate(**kwargs):
                 backend = RamWorkspace(source, ram_root=ram_dir)
@@ -539,7 +580,7 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
             with (
                 patch("aicoder.team_orchestrator.load_tools", return_value=[]),
                 patch("aicoder.team_orchestrator._run_researcher", side_effect=researcher),
-                patch("aicoder.team_orchestrator._call_advisor", side_effect=advisor),
+                patch("aicoder.team_orchestrator._call_stage_agent", side_effect=stage_agent),
                 patch("aicoder.team_orchestrator._run_candidate", side_effect=candidate),
                 patch("aicoder.team_orchestrator.evaluate_candidate", return_value={
                     "score": 100, "delta": {"changed_count": 1, "deleted_count": 0},
@@ -606,8 +647,10 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
             def researcher(**kwargs):
                 return AgentStageResult(f"research:{kwargs['role']}", kwargs["model"], "completed", "evidence", 1)
 
-            def advisor(_model_client, *, model, system, prompt, max_tokens=0, **kwargs):
-                return AgentStageResult("advisor", model, "completed", "shared plan", 1)
+            def stage_agent(**kwargs):
+                labels = tuple(kwargs.get("required_sections") or ())
+                response = "\n".join(f"{label}:\nvalidated {label.lower()}" for label in labels) or "validated stage"
+                return AgentStageResult(str(kwargs.get("role") or "stage"), str(kwargs.get("model") or "test/model"), "completed", response, 1)
 
             def candidate(**kwargs):
                 backend = RamWorkspace(source, ram_root=ram_dir)
@@ -625,7 +668,7 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
             with (
                 patch("aicoder.team_orchestrator.load_tools", return_value=[]),
                 patch("aicoder.team_orchestrator._run_researcher", side_effect=researcher),
-                patch("aicoder.team_orchestrator._call_advisor", side_effect=advisor),
+                patch("aicoder.team_orchestrator._call_stage_agent", side_effect=stage_agent),
                 patch("aicoder.team_orchestrator._run_candidate", side_effect=candidate),
                 patch("aicoder.team_orchestrator.evaluate_candidate", return_value={
                     "score": 100, "delta": {"changed_count": 1, "deleted_count": 0},
@@ -671,3 +714,202 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class ObservationalWorkspaceIsolationTests(unittest.TestCase):
+    def test_stage_agent_discards_accidental_mutation(self):
+        from aicoder.team_orchestrator import AgentStageResult, _call_stage_agent
+
+        with tempfile.TemporaryDirectory() as source_dir:
+            source = Path(source_dir)
+            target = source / "state.txt"
+            target.write_text("original\n", encoding="utf-8")
+
+            def fake_core(**kwargs):
+                execution = Path(kwargs["workspace_root"])
+                (execution / "state.txt").write_text("mutated by planner\n", encoding="utf-8")
+                return AgentStageResult(
+                    "coordinator:test", "test/model", "completed",
+                    f"STAGE SUMMARY:\nread {execution / 'state.txt'}", 1,
+                )
+
+            with patch("aicoder.team_orchestrator._call_stage_agent_core", side_effect=fake_core):
+                result = _call_stage_agent(
+                    client=MagicMock(), model_client=MagicMock(), model="test/model",
+                    system="observe", prompt=f"inspect {source}", tools=[], workspace_root=str(source),
+                    event_fn=None, role="coordinator:test", stop_requested=None,
+                    approval_fn=None,
+                )
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "original\n")
+            self.assertIn(str(source / "state.txt"), result.response)
+            self.assertTrue(result.evidence.get("isolated_observational_workspace"))
+
+    def test_researcher_discards_accidental_mutation(self):
+        from aicoder.team_orchestrator import AgentStageResult, _run_researcher
+
+        with tempfile.TemporaryDirectory() as source_dir:
+            source = Path(source_dir)
+            target = source / "facts.txt"
+            target.write_text("original\n", encoding="utf-8")
+
+            def fake_core(**kwargs):
+                execution = Path(kwargs["source_workspace"])
+                (execution / "facts.txt").write_text("mutated by researcher\n", encoding="utf-8")
+                return AgentStageResult(
+                    "research:R1", "test/model", "completed",
+                    f"FINDINGS:\nread {execution / 'facts.txt'}", 1,
+                    evidence={},
+                )
+
+            with patch("aicoder.team_orchestrator._run_researcher_core", side_effect=fake_core):
+                result = _run_researcher(
+                    client=MagicMock(), model_client=MagicMock(), model="test/model", role="R1",
+                    source_workspace=str(source), tools=[], stop_requested=None,
+                )
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "original\n")
+            self.assertIn(str(source / "facts.txt"), result.response)
+            self.assertTrue(result.evidence.get("isolated_observational_workspace"))
+
+
+def test_candidate_conversation_can_be_bounded_without_orphaning_tool_result():
+    from aicoder.agent_runtime import AgentRunResult
+    from aicoder.team_orchestrator import _candidate_conversation
+    messages = [
+        {"role":"system","content":"sys"},
+        {"role":"user","content":"old" * 10000},
+        {"role":"assistant","content":"" ,"tool_calls":[{"id":"c1","type":"function","function":{"name":"file_read","arguments":"{}"}}]},
+        {"role":"tool","tool_call_id":"c1","name":"file_read","content":"latest-result"},
+        {"role":"user","content":"continue"},
+    ]
+    run = AgentRunResult("paused", "", "m", messages, [], "sys")
+    bounded = _candidate_conversation(run, max_chars=12000)
+    assert bounded[-1]["content"] == "continue"
+    tool_index = next(i for i,m in enumerate(bounded) if m.get("role") == "tool")
+    assert tool_index > 0
+    assert bounded[tool_index-1].get("role") == "assistant"
+    assert bounded[tool_index-1].get("tool_calls")
+
+
+def test_observational_approvals_block_mutations_but_allow_reads(tmp_path):
+    from aicoder.team_orchestrator import _planning_approval, _research_approval
+    for approval in (_planning_approval, _research_approval):
+        assert approval("file_tree", {"path": str(tmp_path)}) is True
+        assert approval("directory_create", {"path": str(tmp_path / "new")}) is False
+        assert approval("file_write", {"path": str(tmp_path / "x.txt"), "content": "x"}) is False
+        assert approval("binary_exec", {"program": "python3", "arguments": ["-m", "pytest", "--version"]}) is True
+        assert approval("binary_exec", {"program": "python3", "arguments": ["-c", "import sys; print(sys.version)"]}) is True
+        assert approval("binary_exec", {"program": "pip3", "arguments": ["list"]}) is True
+        assert approval("shell", {"command": "python3 --version && python3 -m pytest --version 2>&1"}) is True
+        assert approval("crawl", {"url": "https://docs.python.org/3/library/random.html"}) is True
+        assert approval("crawl_url", {"url": "https://docs.python.org/3/library/argparse.html"}) is True
+        assert approval("binary_exec", {"program": "python3", "arguments": ["-c", "open('x','w').write('y')"]}) is False
+
+
+def test_observational_policy_denials_are_non_error_hints(tmp_path):
+    from unittest.mock import MagicMock, patch
+    from aicoder.executor import run_tool
+    from aicoder.team_orchestrator import _research_approval
+    with patch('aicoder.executor.get_state', return_value={'workspace_root': str(tmp_path)}):
+        result, is_error = run_tool(
+            MagicMock(), 'directory_create', {'path': str(tmp_path / 'blocked')},
+            approval_fn=_research_approval, allowed_tools={'directory_create'},
+        )
+    assert is_error is False
+    assert 'stage_policy_denied' in result
+    assert not (tmp_path / 'blocked').exists()
+
+
+def test_other_autonomous_policy_denials_remain_errors(tmp_path):
+    from unittest.mock import MagicMock, patch
+    from aicoder.executor import run_tool
+
+    def deny(_name, _args):
+        return False
+    deny._aicoder_autonomous_policy = True
+
+    with patch('aicoder.executor.get_state', return_value={'workspace_root': str(tmp_path)}):
+        result, is_error = run_tool(
+            MagicMock(), 'directory_create', {'path': str(tmp_path / 'blocked')},
+            approval_fn=deny, allowed_tools={'directory_create'},
+        )
+    assert is_error is True
+    assert 'blocked by autonomous policy' in result
+
+
+def test_stage_provider_resume_preserves_active_contract_repair_prompt():
+    from unittest.mock import MagicMock, patch
+    from aicoder.agent_runtime import AgentRunResult
+    from aicoder.team_orchestrator import _call_stage_agent_core
+    calls = []
+
+    class Runtime:
+        def __init__(self, **kwargs): calls.append(kwargs)
+        def run(self):
+            if len(calls) == 1:
+                return AgentRunResult('completed','SECTION_A:\nok','test/model',[],[],'system')
+            if len(calls) == 2:
+                return AgentRunResult('paused','provider fail','test/model',[],[],'system',error='provider fail',failure_category='transient')
+            return AgentRunResult('completed','SECTION_A:\nok\nSECTION_B:\nok','test/model',[],[],'system')
+
+    with patch('aicoder.team_orchestrator.NativeLightRuntime', Runtime), patch('aicoder.team_orchestrator._wait_before_resume', return_value=True):
+        result = _call_stage_agent_core(client=MagicMock(), model_client=MagicMock(), model='test/model', system='sys', prompt='ORIGINAL-TASK', tools=[], workspace_root='.', event_fn=None, role='coordinator:test', stop_requested=None, approval_fn=None, required_sections=('SECTION_A','SECTION_B'), max_iterations=4)
+    assert result.status == 'completed'
+    assert 'CONTRACT REPAIR' in calls[2]['initial_prompt']
+    assert 'missing section: SECTION_B' in calls[2]['initial_prompt']
+    assert 'AUTHORITATIVE ORIGINAL STAGE TASK' in calls[2]['initial_prompt']
+
+
+def test_research_provider_resume_preserves_active_contract_repair_prompt(tmp_path):
+    from unittest.mock import MagicMock, patch
+    from aicoder.agent_runtime import AgentRunResult
+    from aicoder.team_orchestrator import _run_researcher_core
+    calls=[]
+
+    class Runtime:
+        def __init__(self, **kwargs): calls.append(kwargs)
+        def run(self):
+            if len(calls)==1:
+                return AgentRunResult('completed','FINDINGS:\nok','test/model',[],[],'system')
+            if len(calls)==2:
+                return AgentRunResult('paused','provider fail','test/model',[],[],'system',error='provider fail',failure_category='transient')
+            return AgentRunResult('completed','FINDINGS:\na\nSOURCES:\nb\nAPPLICABILITY:\nc\nRISKS:\nd\nRECOMMENDATIONS:\ne','test/model',[],[],'system')
+
+    with patch('aicoder.team_orchestrator.NativeLightRuntime', Runtime), patch('aicoder.team_orchestrator._wait_before_resume', return_value=True):
+        result=_run_researcher_core(client=MagicMock(),model_client=MagicMock(),model='test/model',role='primary_sources',source_workspace=str(tmp_path),tools=[],stop_requested=None,task='task',research_plan='plan')
+    assert result.status=='completed'
+    assert 'RESEARCH CONTRACT REPAIR' in calls[2]['initial_prompt']
+    assert 'AUTHORITATIVE ORIGINAL RESEARCH ASSIGNMENT' in calls[2]['initial_prompt']
+
+
+def test_planning_blocks_duplicate_subagent_fanout_but_research_policy_does_not():
+    from aicoder.team_orchestrator import _planning_approval, _research_approval
+    args = {"task": "duplicate R1 research", "role": "researcher"}
+    assert _planning_approval("subagent_run", args) is False
+    # Do not globally hide subagents from the dedicated research stage; this check is
+    # specifically about duplicate planner fan-out.
+    assert _research_approval("subagent_run", args) is True
+
+
+def test_research_evidence_excludes_stage_policy_denials(tmp_path):
+    from unittest.mock import MagicMock, patch
+    from aicoder.agent_runtime import AgentRunResult
+    from aicoder.team_orchestrator import _run_researcher_core
+    calls=[]
+
+    class Runtime:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+            self.event_fn=kwargs.get('event_fn')
+        def run(self):
+            self.event_fn('tool_call', {'name':'file_edit','arguments':{'path':'x'}})
+            self.event_fn('tool_result', {'name':'file_edit','result':'file_edit: stage_policy_denied — this observational stage is read-only','is_error':False})
+            self.event_fn('tool_call', {'name':'file_tree','arguments':{'path':'.'}})
+            self.event_fn('tool_result', {'name':'file_tree','result':'ok','is_error':False})
+            return AgentRunResult('completed','FINDINGS:\na\nSOURCES:\nb\nAPPLICABILITY:\nc\nRISKS:\nd\nRECOMMENDATIONS:\ne','test/model',[],[],'system')
+
+    with patch('aicoder.team_orchestrator.NativeLightRuntime', Runtime):
+        result=_run_researcher_core(client=MagicMock(),model_client=MagicMock(),model='test/model',role='best_practices',source_workspace=str(tmp_path),tools=[],stop_requested=None,task='task',research_plan='plan')
+    assert result.status=='completed'
+    assert result.evidence['successful_tools']==['file_tree']
+    assert result.evidence['external_tools']==[]

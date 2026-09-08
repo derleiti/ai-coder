@@ -118,7 +118,7 @@ class RuntimeEvidenceRecallTests(unittest.TestCase):
             self.assertEqual(result.status, "completed")
             self.assertEqual(run_tool.call_count, 1)
             self.assertTrue(any(
-                "Duplicate tool call blocked before execution" in str(message.get("content", ""))
+                "REUSED SUCCESSFUL TOOL RESULT" in str(message.get("content", ""))
                 for message in result.messages
             ))
 

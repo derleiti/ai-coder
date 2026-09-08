@@ -16,7 +16,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
-from .client import ClientError, USER_AGENT, _normalize_chat_response
+from .client import ClientError, USER_AGENT, _error_metadata, _normalize_chat_response
 from .provider_credentials import (
     direct_provider_spec, provider_api_key, provider_for_model, transport_model_id,
 )
@@ -172,7 +172,20 @@ class OpenAICompatibleTransport:
                     pass
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:2000]
-            raise ClientError(f"OpenAI-compatible HTTP {exc.code}: {detail}") from exc
+            try:
+                payload = json.loads(detail) if detail else {}
+            except json.JSONDecodeError:
+                payload = {"raw": detail}
+            status, retryable, retry_after = _error_metadata(payload, exc.code)
+            if retry_after is None:
+                try:
+                    retry_after = int(exc.headers.get("Retry-After")) if exc.headers and exc.headers.get("Retry-After") else None
+                except (TypeError, ValueError):
+                    retry_after = None
+            raise ClientError(
+                f"OpenAI-compatible HTTP {exc.code}: {detail}", status_code=status,
+                retryable=retryable, retry_after=retry_after, payload=payload,
+            ) from exc
         except (URLError, TimeoutError, OSError) as exc:
             raise ClientError(f"OpenAI-compatible request failed: {exc}") from exc
         try:
@@ -328,7 +341,20 @@ class AnthropicMessagesTransport:
                     pass
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:2000]
-            raise ClientError(f"Anthropic HTTP {exc.code}: {detail}") from exc
+            try:
+                payload = json.loads(detail) if detail else {}
+            except json.JSONDecodeError:
+                payload = {"raw": detail}
+            status, retryable, retry_after = _error_metadata(payload, exc.code)
+            if retry_after is None:
+                try:
+                    retry_after = int(exc.headers.get("Retry-After")) if exc.headers and exc.headers.get("Retry-After") else None
+                except (TypeError, ValueError):
+                    retry_after = None
+            raise ClientError(
+                f"Anthropic HTTP {exc.code}: {detail}", status_code=status,
+                retryable=retryable, retry_after=retry_after, payload=payload,
+            ) from exc
         except (URLError, TimeoutError, OSError) as exc:
             raise ClientError(f"Anthropic request failed: {exc}") from exc
         try:

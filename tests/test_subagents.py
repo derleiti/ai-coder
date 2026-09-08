@@ -104,6 +104,15 @@ class SubagentUnitTests(unittest.TestCase):
         self.assertIn("cannot execute tools", call["system_prompt"])
         self.assertIn("Review a parser change", call["message"])
 
+    def test_subagent_accepts_researcher_alias_as_research(self):
+        transport = _RecordingTransport()
+        result, is_error = run_subagent(
+            transport, task="Find authoritative Python guidance", role="researcher", model="test/model"
+        )
+        self.assertFalse(is_error)
+        self.assertIn("Subagent role=research", result)
+        self.assertEqual(len(transport.calls), 1)
+
     def test_subagent_rejects_bad_role_and_empty_task_without_model_call(self):
         transport = MagicMock()
         result, is_error = run_subagent(transport, task="x", role="executor")

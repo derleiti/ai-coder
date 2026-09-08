@@ -53,6 +53,7 @@ from .executor import (
     run_tool,
     strip_tool_calls,
     trim_messages,
+    tool_call_identity,
 )
 from .model_transport import ModelTransport, native_model_transport_from_env
 from .privileges import assess_execution
@@ -180,6 +181,56 @@ def _completion_audit_prompt(prompt: str) -> str:
         "Do not repeat already verified work.\n\nOriginal task:\n" + task
     )
 
+
+
+def _model_response_diagnostics(result: Any, request_id: str) -> dict[str, Any]:
+    """Return bounded, non-secret diagnostics for malformed/empty model responses.
+
+    Provider payload text is intentionally not copied wholesale into logs. We preserve
+    envelope shape and completion metadata so a 200/empty provider response is
+    distinguishable from transport errors, tool-only turns, truncation and reasoning-only
+    responses.
+    """
+    if not isinstance(result, dict):
+        return {
+            "request_id": str(request_id or ""),
+            "result_type": type(result).__name__,
+        }
+    response = str(result.get("response") or "")
+    tool_calls = result.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        tool_calls = []
+    diagnostics: dict[str, Any] = {
+        "request_id": str(request_id or ""),
+        "keys": sorted(str(key) for key in result.keys())[:64],
+        "response_chars": len(response),
+        "tool_call_count": len(tool_calls),
+        "native_tool_calls": _native_tool_call_diagnostics(result),
+    }
+    for key in ("model", "backend", "provider", "finish_reason", "tool_transport"):
+        value = result.get(key)
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            diagnostics[key] = value
+    for key in ("reasoning", "reasoning_content"):
+        value = result.get(key)
+        if value is not None:
+            diagnostics[f"{key}_chars"] = len(str(value))
+    usage = result.get("usage")
+    if isinstance(usage, dict):
+        diagnostics["usage"] = {
+            str(k): v for k, v in usage.items()
+            if isinstance(v, (str, int, float, bool)) or v is None
+        }
+    provider_diagnostics = result.get("provider_diagnostics")
+    if isinstance(provider_diagnostics, dict):
+        diagnostics["provider_diagnostics"] = dict(provider_diagnostics)
+        if diagnostics.get("finish_reason") is None:
+            diagnostics["finish_reason"] = provider_diagnostics.get("finish_reason")
+    telemetry = result.get("_transport_telemetry")
+    if isinstance(telemetry, dict):
+        diagnostics["transport"] = dict(telemetry)
+    return diagnostics
+
 _FINAL_RESPONSE_REPAIR_PROMPT = (
     "Your previous response was empty or contained an invalid/incomplete tool call. "
     "Discard that malformed output completely; do not continue or complete its fragment. "
@@ -188,6 +239,43 @@ _FINAL_RESPONSE_REPAIR_PROMPT = (
     "Use the exact tool name and only its argument JSON object. No prose before or after it. "
     "Otherwise finish the user's task with a normal textual answer. Do not return an empty response."
 )
+
+
+def _native_tool_call_diagnostics(result: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return bounded, non-secret structural diagnostics for native tool calls.
+
+    Never copy full argument values into diagnostics: paths, commands, or connector
+    payloads may be sensitive. We only expose shape, name, and JSON validity so a
+    provider protocol failure can be distinguished from an actually empty response.
+    """
+    rows: list[dict[str, Any]] = []
+    raw_calls = result.get("tool_calls") if isinstance(result, dict) else None
+    for raw in raw_calls if isinstance(raw_calls, list) else []:
+        if not isinstance(raw, dict):
+            rows.append({"shape": type(raw).__name__, "valid": False})
+            continue
+        fn = raw.get("function") if isinstance(raw.get("function"), dict) else raw
+        name = fn.get("name") if isinstance(fn, dict) else None
+        args = fn.get("arguments", fn.get("args")) if isinstance(fn, dict) else None
+        json_valid = None
+        if isinstance(args, str):
+            try:
+                decoded = json.loads(args)
+                json_valid = isinstance(decoded, dict)
+            except json.JSONDecodeError:
+                json_valid = False
+        elif args is None:
+            json_valid = True
+        else:
+            json_valid = isinstance(args, dict)
+        rows.append({
+            "name": str(name or "")[:120],
+            "argument_type": type(args).__name__,
+            "arguments_json_object": json_valid,
+            "has_id": bool(raw.get("id") or raw.get("call_id") or raw.get("tool_call_id")),
+            "raw_type": str(raw.get("type") or "")[:60],
+        })
+    return rows[:8]
 
 
 def _recover_unclosed_tool_calls(text: str) -> list[dict]:
@@ -255,6 +343,9 @@ class AgentRunResult:
     fallback_used: bool = False
     plan_id: str = ""
     error: str = ""
+    failure_category: str = ""
+    retry_after: int | None = None
+    failure_detail: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -284,13 +375,32 @@ class NativeLightRuntime:
     resume_plan_id: str | None = None
     base_timeout: int = 300
     max_output_tokens: int = 16384
+    # Optional per-runtime soft cap for conversation history. Team planning and
+    # research stages use this to stay compact even when the selected model has
+    # a very large advertised context window. The system prompt and newest turn
+    # are always retained by trim_messages().
+    max_context_chars: int | None = None
     tools_unavailable_reason: str = ""
     max_iterations: int = MAX_ITERATIONS
+    # Optional cap for a single assistant turn. The overall tool_budget still
+    # limits the whole run; this prevents one model response from fan-out
+    # executing dozens of independent searches before it can inspect results.
+    max_tool_calls_per_turn: int | None = None
     require_mutation_or_explicit_no_change: bool = False
     require_test_verification: bool = False
+    # Coding/merge runs must verify fresh mutations before completion. Disposable
+    # observational team stages deliberately do not enforce this generic coding
+    # invariant because incidental writes (for example memory_store in the RAM
+    # snapshot) are discarded and must not turn planning into a verification loop.
+    enforce_post_mutation_verification: bool = True
     allow_completion_signal: bool = False
     progressive_tool_disclosure: bool = True
     native_openrouter_tool_calling: bool = False
+    # Observational team stages may legitimately quote TOOL_CALL examples inside
+    # their structured handoff. When enabled, such mixed text is treated as final
+    # prose only; it is never parsed/executed as a tool call. Coding/merge runtimes
+    # keep the strict default.
+    allow_mixed_tool_protocol_final: bool = False
     tool_budget: int = DEFAULT_TOOL_BUDGET
     max_expansion_rounds: int = MAX_EXPANSION_ROUNDS
     hooks: HookBus = field(default_factory=HookBus)
@@ -847,10 +957,32 @@ class NativeLightRuntime:
             context_char_budget = max(16384, min(400000, usable_tokens * 4))
         else:
             context_char_budget = 240000
+        if isinstance(self.max_context_chars, int) and self.max_context_chars > 0:
+            context_char_budget = min(
+                context_char_budget, max(16384, int(self.max_context_chars))
+            )
         total_latency = 0
         fallback_used = False
-        tool_was_called = False
-        tool_nudge_sent = False
+        # Provider/stage resumes carry prior conversation into a fresh runtime.
+        # Preserve the fact that tools were already used, otherwise the generic
+        # action-task nudge incorrectly forces redundant inspection after every
+        # transient provider interruption and may push observational stages into
+        # needless mutation attempts.
+        tool_was_called = any(
+            str(message.get("role") or "") == "tool"
+            or (
+                str(message.get("role") or "") == "user"
+                and str(message.get("content") or "").lstrip().startswith("Tool ")
+                and " result:" in str(message.get("content") or "")[:300]
+            )
+            for message in prior_context
+            if isinstance(message, dict)
+        )
+        tool_nudge_sent = bool(tool_was_called)
+        # Short-lived semantic result cache for successful non-mutating calls.
+        # This avoids burning turns on duplicate diagnostics while preserving
+        # correctness: any successful mutation clears the cache immediately.
+        successful_tool_cache: dict[str, str] = {}
         mutation_seen, verification_seen = plan.progress_flags() if resumed and plan else (False, False)
         test_verification_seen = False
         verification_nudge_sent = False
@@ -898,11 +1030,13 @@ class NativeLightRuntime:
             native_tool_protocol=self._native_tool_calling_enabled(active_model),
             context_window_tokens=context_window_tokens or 0,
             context_char_budget=context_char_budget,
+            context_char_cap=(int(self.max_context_chars) if isinstance(self.max_context_chars, int) and self.max_context_chars > 0 else 0),
             tools=len(tools),
             workspace=workspace,
             source_workspace=self._plan_workspace(),
             plan_id=plan.id if plan else "",
             resumed=resumed,
+            prior_tool_evidence=bool(tool_was_called),
         )
 
         iteration_limit = max(1, min(MAX_ITERATIONS, int(self.max_iterations or MAX_ITERATIONS)))
@@ -1001,6 +1135,8 @@ class NativeLightRuntime:
                         "paused", pause_reason, model_used, messages, tools, system,
                         iterations=i + 1, latency_ms=total_latency,
                         fallback_used=fallback_used, plan_id=plan.id if plan else "",
+                        failure_category=category,
+                        retry_after=(int(retry_after) if isinstance(retry_after, int) and retry_after > 0 else None),
                     )
                 self._fail_plan(plan, reason)
                 self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
@@ -1028,10 +1164,14 @@ class NativeLightRuntime:
             latency = int(result.get("latency_ms") or elapsed_ms)
             total_latency += latency
             transport_telemetry = result.get("_transport_telemetry") if isinstance(result, dict) else None
+            response_diagnostics = _model_response_diagnostics(result, request_id)
             self._emit(
                 "model_response", iteration=i + 1, elapsed_ms=elapsed_ms,
                 model=model_used, requested=active_model or "backend-default", request_id=request_id,
+                response_chars=len(response), tool_call_count=response_diagnostics.get("tool_call_count", 0),
+                finish_reason=response_diagnostics.get("finish_reason"),
                 transport_telemetry=(transport_telemetry if isinstance(transport_telemetry, dict) else {}),
+                response_diagnostics=response_diagnostics,
             )
 
             native_mode = self._native_tool_calling_enabled(active_model)
@@ -1047,6 +1187,19 @@ class NativeLightRuntime:
                 )
                 recovered_calls = []
             calls = merge_tool_calls(native_calls, text_calls, recovered_calls)
+            requested_call_count = len(calls)
+            per_turn_cap = (
+                max(1, int(self.max_tool_calls_per_turn))
+                if isinstance(self.max_tool_calls_per_turn, int) and self.max_tool_calls_per_turn > 0
+                else None
+            )
+            truncated_tool_batch = bool(per_turn_cap is not None and len(calls) > per_turn_cap)
+            if truncated_tool_batch:
+                calls = calls[:per_turn_cap]
+                self._emit(
+                    "tool_batch_limited", iteration=i + 1, requested=requested_call_count,
+                    executed=len(calls), omitted=requested_call_count - len(calls),
+                )
             if native_mode:
                 for call_index, call in enumerate(calls):
                     if not call.get("id"):
@@ -1061,38 +1214,64 @@ class NativeLightRuntime:
                 unusable_final = (
                     (not response)
                     or _has_incomplete_tool_markup(response)
-                    or (protocol_expected and _has_embedded_text_tool_protocol(response))
+                    or (
+                        protocol_expected
+                        and not self.allow_mixed_tool_protocol_final
+                        and _has_embedded_text_tool_protocol(response)
+                    )
                 )
                 if unusable_final:
                     if response:
                         messages.append({"role": "assistant", "content": response})
+                    raw_native_calls = result.get("tool_calls") if isinstance(result, dict) else None
+                    malformed_reason = (
+                        "malformed_native_tool_call"
+                        if native_mode and isinstance(raw_native_calls, list) and raw_native_calls and not calls
+                        else "empty_response" if not response
+                        else "mixed_tool_protocol" if (
+                            not self.allow_mixed_tool_protocol_final
+                            and _has_embedded_text_tool_protocol(response)
+                        )
+                        else "incomplete_tool_call"
+                    )
+                    diagnostics = _model_response_diagnostics(result, request_id)
                     if not final_response_repair_sent:
-                        current_input = _FINAL_RESPONSE_REPAIR_PROMPT
+                        finish_reason = str(diagnostics.get("finish_reason") or "").lower()
+                        if finish_reason == "length":
+                            current_input = (
+                                "Your previous response hit the output-length limit. Do NOT continue the truncated text. "
+                                "Rewrite the final answer from scratch as a compact summary using only the required output sections. "
+                                "Preserve the important evidence and decisions already gathered, omit raw transcripts/repetition, "
+                                "and finish well before the token limit. Do not make a tool call unless essential missing evidence truly requires one."
+                            )
+                        else:
+                            current_input = _FINAL_RESPONSE_REPAIR_PROMPT
                         final_response_repair_sent = True
                         self._emit(
                             "final_response_repair", iteration=i + 1,
-                            reason=(
-                                "empty_response" if not response
-                                else "mixed_tool_protocol" if _has_embedded_text_tool_protocol(response)
-                                else "incomplete_tool_call"
-                            ),
+                            reason=malformed_reason, diagnostics=diagnostics,
                         )
                         self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
                         continue
+                    diagnostic_json = json.dumps(diagnostics, ensure_ascii=False, sort_keys=True, default=str)
                     reason = (
-                        "Agent paused because the model returned no usable final response after "
-                        "a final-response repair request. Existing tool results and plan state "
-                        "were preserved for resume."
+                        "Transient provider/model protocol failure: model returned no usable final response after "
+                        f"a final-response repair request ({malformed_reason}). "
+                        f"Provider diagnostics: {diagnostic_json}. Existing tool results and plan state were preserved for resume."
                     )
                     self._pause_plan(plan, reason, response)
                     self._save_journal(plan, messages, pending_input=reason, tool_batches=journal_batches)
-                    self._emit("paused", reason=reason)
+                    self._emit(
+                        "paused", reason=reason, failure_category="transient", resumable=True,
+                        diagnostics=diagnostics,
+                    )
                     if self.conversation is not None:
                         self.conversation[:] = [dict(message) for message in messages[1:]][-MAX_CONTEXT_MESSAGES:]
                     return AgentRunResult(
                         "paused", reason, model_used, messages, tools, system,
                         iterations=i + 1, latency_ms=total_latency,
                         fallback_used=fallback_used, plan_id=plan.id if plan else "",
+                        error=reason, failure_category="transient", failure_detail=diagnostics,
                     )
 
                 if self.require_mutation_or_explicit_no_change and not mutation_seen:
@@ -1124,7 +1303,7 @@ class NativeLightRuntime:
                         )
 
                 verification_ready = verification_seen and (not self.require_test_verification or test_verification_seen)
-                if mutation_seen and not verification_ready:
+                if self.enforce_post_mutation_verification and mutation_seen and not verification_ready:
                     messages.append({"role": "assistant", "content": response})
                     if not verification_nudge_sent:
                         current_input = _VERIFICATION_REQUIRED_PROMPT
@@ -1161,7 +1340,10 @@ class NativeLightRuntime:
                     tool_nudge_sent = True
                     self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
                     continue
-                if mutation_seen and tool_was_called and not completion_audit_sent and _needs_completion_audit(self.initial_prompt):
+                if (
+                    self.enforce_post_mutation_verification and mutation_seen and tool_was_called
+                    and not completion_audit_sent and _needs_completion_audit(self.initial_prompt)
+                ):
                     messages.append({"role": "assistant", "content": response})
                     current_input = _completion_audit_prompt(self.initial_prompt)
                     completion_audit_sent = True
@@ -1196,46 +1378,61 @@ class NativeLightRuntime:
                 )
 
             consecutive_call_batches = loop_guard.observe_calls(calls)
+            repeat_reusable = all(
+                not assess_execution(
+                    str(call.get("name") or ""),
+                    call.get("arguments") if isinstance(call.get("arguments"), dict) else {},
+                    destructive=False,
+                ).mutation
+                for call in calls
+            )
             polling_read_only_repeat = (
                 consecutive_call_batches <= 3
                 and bool(_POLLING_INTENT_RE.search(self.initial_prompt))
-                and all(
-                    not assess_execution(
-                        str(call.get("name") or ""),
-                        call.get("arguments") if isinstance(call.get("arguments"), dict) else {},
-                        destructive=False,
-                    ).mutation
-                    for call in calls
-                )
+                and repeat_reusable
             )
             if consecutive_call_batches >= 2 and not polling_read_only_repeat:
-                messages.append({"role": "assistant", "content": response})
-                if consecutive_call_batches == 2:
-                    current_input = (
-                        "Duplicate tool call blocked before execution: this exact tool operation "
-                        "was already executed on the previous turn. Use the existing result, "
-                        "inspect different evidence, change the arguments, or finish with a clear "
-                        "answer/blocker. Do not repeat the same call unchanged."
-                    )
+                if repeat_reusable:
                     self._emit(
                         "loop_prevented", iteration=i + 1, repeats=consecutive_call_batches,
-                        action="nudge",
+                        action="reuse" if consecutive_call_batches == 2 else "stop_duplicate_loop",
                     )
-                    self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
-                    continue
-                reason = (
-                    "Agent paused because it kept requesting the same tool operation after that "
-                    "duplicate had already been blocked. The previous tool result remains available; "
-                    "resume after changing the approach."
-                )
-                self._pause_plan(plan, reason, response)
-                self._save_journal(plan, messages, pending_input=reason, tool_batches=journal_batches)
-                self._emit("paused", reason=reason)
-                return AgentRunResult(
-                    "paused", reason, model_used, messages, tools, system,
-                    iterations=i + 1, latency_ms=total_latency,
-                    fallback_used=fallback_used, plan_id=plan.id if plan else "",
-                )
+                    if consecutive_call_batches >= 3:
+                        reason = (
+                            "Agent paused because it kept requesting the same non-mutating tool operation "
+                            "after the successful result had already been reused. No duplicate tool execution occurred; "
+                            "resume only after changing the approach or arguments."
+                        )
+                        messages.append({"role": "assistant", "content": response})
+                        self._pause_plan(plan, reason, response)
+                        self._save_journal(plan, messages, pending_input=reason, tool_batches=journal_batches)
+                        self._emit("paused", reason=reason)
+                        return AgentRunResult(
+                            "paused", reason, model_used, messages, tools, system,
+                            iterations=i + 1, latency_ms=total_latency,
+                            fallback_used=fallback_used, plan_id=plan.id if plan else "",
+                        )
+                else:
+                    messages.append({"role": "assistant", "content": response})
+                    if consecutive_call_batches == 2:
+                        current_input = (
+                            "Duplicate mutating tool call prevented before execution. Use the existing result, "
+                            "inspect current state, change the arguments, or finish. Do not repeat the mutation unchanged."
+                        )
+                        self._emit(
+                            "loop_prevented", iteration=i + 1, repeats=consecutive_call_batches, action="nudge",
+                        )
+                        self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
+                        continue
+                    reason = "Agent paused after repeatedly requesting the same mutating tool operation."
+                    self._pause_plan(plan, reason, response)
+                    self._save_journal(plan, messages, pending_input=reason, tool_batches=journal_batches)
+                    self._emit("paused", reason=reason)
+                    return AgentRunResult(
+                        "paused", reason, model_used, messages, tools, system,
+                        iterations=i + 1, latency_ms=total_latency,
+                        fallback_used=fallback_used, plan_id=plan.id if plan else "",
+                    )
 
             tool_was_called = True
             tool_results: list[str] = []
@@ -1281,7 +1478,11 @@ class NativeLightRuntime:
                     elif self.require_mutation_or_explicit_no_change and not mutation_seen and not no_change_justified:
                         accepted = False
                         reject_reason = "runtime completion rejected: no repository mutation was observed and no_change_justified was not set"
-                    elif mutation_seen and not (verification_seen and (not self.require_test_verification or test_verification_seen)):
+                    elif (
+                        self.enforce_post_mutation_verification
+                        and mutation_seen
+                        and not (verification_seen and (not self.require_test_verification or test_verification_seen))
+                    ):
                         accepted = False
                         reject_reason = (
                             "runtime completion rejected: repository state changed but fresh post-change test verification is still missing"
@@ -1289,7 +1490,8 @@ class NativeLightRuntime:
                             "runtime completion rejected: repository state changed but successful post-change verification is still missing"
                         )
                     elif (
-                        mutation_seen and tool_was_called and not completion_audit_sent
+                        self.enforce_post_mutation_verification
+                        and mutation_seen and tool_was_called and not completion_audit_sent
                         and _needs_completion_audit(self.initial_prompt)
                     ):
                         accepted = False
@@ -1424,6 +1626,38 @@ class NativeLightRuntime:
                 risk = assess_execution(
                     name, args, destructive=is_destructive(str(args.get("command", "")))
                 )
+                cache_key = json.dumps(
+                    tool_call_identity({"name": name, "arguments": args}),
+                    sort_keys=True, ensure_ascii=False, default=str,
+                )
+                explicit_polling = bool(_POLLING_INTENT_RE.search(self.initial_prompt))
+                if allowed and not explicit_polling and not risk.mutation and cache_key in successful_tool_cache:
+                    tool_result = (
+                        "REUSED SUCCESSFUL TOOL RESULT FROM THIS RUN; identical non-mutating call was already executed.\n"
+                        + successful_tool_cache[cache_key]
+                    )
+                    is_error = False
+                    elapsed = 0.0
+                    performance.record_tool(name, elapsed, is_error=False)
+                    self._emit(
+                        "tool_result", name=name, result=tool_result, is_error=False, elapsed=0.0,
+                        iteration=i + 1, request_id=request_id, handoff_ms=handoff_ms, reused=True,
+                    )
+                    self._emit("duplicate_tool_reused", name=name, iteration=i + 1)
+                    tool_results.append(f"Tool {name} result:\n{tool_result}")
+                    if native_mode:
+                        native_tool_messages.append({
+                            "role": "tool", "tool_call_id": str(call.get("id") or ""),
+                            "name": name, "content": str(tool_result),
+                        })
+                    batch_records.append({
+                        "id": str(call.get("id") or ""), "name": name,
+                        "provider": str(call.get("provider") or ""),
+                        "raw_type": str(call.get("raw_type") or ""),
+                        "metadata": call.get("metadata") if isinstance(call.get("metadata"), dict) else {},
+                        "arguments": args, "is_error": False, "reused": True,
+                    })
+                    continue
                 pre_hook = self.hooks.emit("PreToolUse", {
                     "name": name, "arguments": dict(args), "workspace": workspace,
                     "iteration": i + 1, "risk": tuple(risk.reasons),
@@ -1538,6 +1772,12 @@ class NativeLightRuntime:
                             protected_workspace_root=self.protected_workspace_root,
                         )
                     elapsed = time.monotonic() - started_tool
+                if not is_error and risk.mutation:
+                    successful_tool_cache.clear()
+                elif not is_error:
+                    successful_tool_cache[cache_key] = str(tool_result)
+                    if len(successful_tool_cache) > 64:
+                        successful_tool_cache.pop(next(iter(successful_tool_cache)))
                 if not is_error and name in _INSPECTION_TOOLS:
                     fresh_inspection_after_resume = True
                 performance.record_tool(name, elapsed, is_error=is_error)
@@ -1790,11 +2030,18 @@ class NativeLightRuntime:
             else:
                 messages.append({"role": "assistant", "content": response})
                 current_input = format_untrusted_tool_results(tool_results)
+            if truncated_tool_batch:
+                current_input += (
+                    "\n\nTOOL BATCH LIMITED: this turn requested "
+                    f"{requested_call_count} tool calls; only the first {len(calls)} were executed. "
+                    "Review these results now. Prioritize only truly missing evidence on the next turn; "
+                    "do not recreate the omitted bulk batch. Finish the requested compact handoff as soon as sufficient evidence exists."
+                )
             self._save_journal(plan, messages, tool_batches=journal_batches)
 
             if response.strip().upper().startswith("DONE:"):
                 verification_ready = verification_seen and (not self.require_test_verification or test_verification_seen)
-                if mutation_seen and not verification_ready:
+                if self.enforce_post_mutation_verification and mutation_seen and not verification_ready:
                     if not verification_nudge_sent:
                         current_input += "\n\n" + _VERIFICATION_REQUIRED_PROMPT
                         if self.require_test_verification:

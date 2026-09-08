@@ -36,6 +36,11 @@ _PROFILES = {
     "system-diagnostician": SubagentProfile("system-diagnostician", "Inspect local system state read-only and diagnose likely causes. Do not change the system.", ("system_diagnostics", "network", "storage", "packages", "services", "containers"), True, True, 8),
     "optimizer-planner": SubagentProfile("optimizer-planner", "Inspect evidence and produce an optimization plan only. Do not apply system changes.", ("system_diagnostics", "network", "storage", "packages", "services", "containers"), True, True, 8),
 }
+# Small compatibility aliases for natural role nouns that models commonly emit.
+# Keep this explicit/fail-closed: arbitrary unknown roles must still be rejected.
+_ROLE_ALIASES = {
+    "researcher": "research",
+}
 SUBAGENT_ROLES = frozenset(_PROFILES)
 TOOL_CAPABLE_ROLES = frozenset(name for name, profile in _PROFILES.items() if profile.tool_capable)
 MAX_SUBAGENT_TASK = 5000
@@ -55,8 +60,13 @@ _READ_ONLY_LOCAL_TOOLS = frozenset({
 })
 
 
+def normalize_subagent_role(role: str) -> str:
+    normalized = str(role or "analyze").strip().lower()
+    return _ROLE_ALIASES.get(normalized, normalized)
+
+
 def get_subagent_profile(role: str) -> SubagentProfile | None:
-    return _PROFILES.get(str(role or "analyze").strip().lower())
+    return _PROFILES.get(normalize_subagent_role(role))
 
 
 def _tool_is_read_only(tool: dict) -> bool:
@@ -136,7 +146,7 @@ def run_subagent(
     stop_requested: Callable[[], bool] | None = None,
 ) -> tuple[str, bool]:
     """Run a bounded advisory or tool-capable subagent."""
-    normalized_role = str(role or "analyze").strip().lower()
+    normalized_role = normalize_subagent_role(role)
     profile = get_subagent_profile(normalized_role)
     if profile is None:
         return f"subagent_run: unsupported role '{normalized_role}'", True

@@ -388,7 +388,7 @@ class NativeLightPlanTests(unittest.TestCase):
             self.assertEqual(plan.last_response, "")
             self.assertIn("no usable final response", plan.pause_reason)
 
-    def test_duplicate_tool_call_is_blocked_before_second_execution(self):
+    def test_duplicate_tool_call_reuses_successful_result(self):
         with tempfile.TemporaryDirectory() as temp:
             workspace = Path(temp)
             client = MagicMock()
@@ -417,9 +417,9 @@ class NativeLightPlanTests(unittest.TestCase):
             self.assertEqual(result.response, "DONE: used the existing result")
             self.assertEqual(run_tool.call_count, 1)
             self.assertEqual(client.chat.call_count, 3)
-            self.assertTrue(any(name == "loop_prevented" for name, _ in events))
+            self.assertTrue(any(name == "duplicate_tool_reused" for name, _ in events))
 
-    def test_repeated_blocked_duplicate_pauses_with_visible_reason(self):
+    def test_repeated_duplicate_reads_are_reused_without_reexecution(self):
         with tempfile.TemporaryDirectory() as temp:
             workspace = Path(temp)
             client = MagicMock()
@@ -428,20 +428,27 @@ class NativeLightPlanTests(unittest.TestCase):
                 "response": '<tool_call>{"name":"file_read","arguments":{"path":"README.md"}}</tool_call>',
                 "model": "test/model",
             }
-            client.chat.side_effect = [repeated, repeated, repeated]
+            client.chat.side_effect = [repeated, repeated, repeated, {"response": "DONE: reused cached evidence", "model": "test/model"}]
             runtime = NativeLightRuntime(
                 client=client, initial_prompt="Inspect README", model="test/model",
                 fallback_model=None, workspace_root=str(workspace),
                 tools=[LOCAL_FILE_READ_SCHEMA], load_tools_on_start=True,
                 persistent_plan=False, base_timeout=30,
             )
+            events = []
+            runtime.event_fn = lambda name, payload: events.append((name, payload))
             with patch("aicoder.agent_runtime.run_tool", return_value=("README contents", False)) as run_tool:
                 result = runtime.run()
 
             self.assertEqual(result.status, "paused")
-            self.assertIn("same tool operation", result.response)
+            self.assertIn("same non-mutating tool operation", result.response)
             self.assertEqual(run_tool.call_count, 1)
             self.assertEqual(client.chat.call_count, 3)
+            self.assertGreaterEqual(sum(1 for name, _ in events if name == "duplicate_tool_reused"), 1)
+            self.assertTrue(any(
+                name == "loop_prevented" and payload.get("action") == "stop_duplicate_loop"
+                for name, payload in events
+            ))
 
     def test_resume_reuses_paused_plan_id(self):
         with tempfile.TemporaryDirectory() as temp:

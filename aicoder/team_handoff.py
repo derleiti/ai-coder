@@ -20,6 +20,8 @@ class HandoffEnvelope:
     handoff_id: str
     raw: str
     compact: str
+    source_stage: str = ""
+    parent_handoff_id: str = ""
 
     @property
     def original_chars(self) -> int:
@@ -34,8 +36,13 @@ class HandoffEnvelope:
         return max(0, self.original_chars - self.compact_chars)
 
     def render(self) -> str:
+        lineage = ""
+        if self.source_stage:
+            lineage += f" source_stage={self.source_stage}"
+        if self.parent_handoff_id:
+            lineage += f" parent={self.parent_handoff_id}"
         return (
-            f"[HANDOFF id={self.handoff_id} kind={self.kind} "
+            f"[HANDOFF id={self.handoff_id} kind={self.kind}{lineage} "
             f"chars={self.compact_chars}/{self.original_chars}]\n{self.compact}"
         )
 
@@ -43,6 +50,8 @@ class HandoffEnvelope:
         return {
             "id": self.handoff_id,
             "kind": self.kind,
+            "source_stage": self.source_stage,
+            "parent_handoff_id": self.parent_handoff_id,
             "original_chars": self.original_chars,
             "compact_chars": self.compact_chars,
             "saved_chars": self.saved_chars,
@@ -56,18 +65,38 @@ def _clean(text: str) -> str:
 
 
 def _bounded(text: str, max_chars: int) -> str:
+    """Bound handoff text while preserving both stable context and newest state.
+
+    Cumulative StageOff data grows by appending stages, so a head-only truncation
+    silently discarded the most recent work. Keep a slightly larger head for task/
+    repository identity and always retain a substantial tail for the latest stage,
+    errors and next-stage instructions.
+    """
     text = _clean(text)
     max_chars = max(256, int(max_chars))
     if len(text) <= max_chars:
         return text
-    suffix = _OMISSION_TEMPLATE.format(omitted=max(0, len(text) - max_chars))
-    limit = max(64, max_chars - len(suffix))
-    cut = text.rfind("\n", 0, limit)
-    if cut < limit // 2:
-        cut = text.rfind(" ", 0, limit)
-    if cut < limit // 2:
-        cut = limit
-    return text[:cut].rstrip() + suffix
+    marker = _OMISSION_TEMPLATE.format(omitted=max(0, len(text) - max_chars)) + "\n"
+    budget = max(128, max_chars - len(marker))
+    head_budget = max(64, int(budget * 0.55))
+    tail_budget = max(64, budget - head_budget)
+
+    head_cut = text.rfind("\n", 0, head_budget)
+    if head_cut < head_budget // 2:
+        head_cut = text.rfind(" ", 0, head_budget)
+    if head_cut < head_budget // 2:
+        head_cut = head_budget
+
+    tail_start_target = max(head_cut, len(text) - tail_budget)
+    tail_cut = text.find("\n", tail_start_target)
+    if tail_cut < 0 or tail_cut > tail_start_target + max(64, tail_budget // 3):
+        tail_cut = text.find(" ", tail_start_target)
+    if tail_cut < 0 or tail_cut >= len(text):
+        tail_cut = tail_start_target
+
+    head = text[:head_cut].rstrip()
+    tail = text[tail_cut:].lstrip()
+    return (head + marker + tail)[:max_chars]
 
 
 def _structured_projection(text: str, labels: tuple[str, ...], max_chars: int) -> str | None:
@@ -116,11 +145,17 @@ def make_handoff(
     *,
     max_chars: int,
     section_labels: tuple[str, ...] = (),
+    source_stage: str = "",
+    parent_handoff_id: str = "",
 ) -> HandoffEnvelope:
     raw = _clean(text)
-    digest = hashlib.sha256((str(kind) + "\0" + raw).encode("utf-8")).hexdigest()[:12]
+    lineage_key = f"{source_stage}\0{parent_handoff_id}"
+    digest = hashlib.sha256((str(kind) + "\0" + lineage_key + "\0" + raw).encode("utf-8")).hexdigest()[:12]
     compact = _structured_projection(raw, section_labels, max_chars) or _bounded(raw, max_chars)
-    return HandoffEnvelope(str(kind), f"ho-{digest}", raw, compact)
+    return HandoffEnvelope(
+        str(kind), f"ho-{digest}", raw, compact,
+        source_stage=str(source_stage or ""), parent_handoff_id=str(parent_handoff_id or ""),
+    )
 
 
 BRAINSTORM_SECTIONS = (

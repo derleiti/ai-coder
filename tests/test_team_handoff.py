@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from aicoder.team_handoff import CODE_PLAN_SECTIONS, RESEARCH_SECTIONS, make_handoff
-from aicoder.team_orchestrator import AgentStageResult, _blind_merge_prompt, _build_planner_prompt
+from aicoder.team_orchestrator import AgentStageResult, _blind_merge_prompt, _build_planner_prompt, _contract_issues, _planning_approval
 
 
 class HandoffEnvelopeTests(unittest.TestCase):
@@ -29,6 +29,118 @@ class HandoffEnvelopeTests(unittest.TestCase):
             self.assertIn(heading + ":", handoff.compact)
         self.assertIn("https://example.invalid/source", handoff.compact)
         self.assertLessEqual(handoff.compact_chars, 3000)
+
+
+    def test_unstructured_tool_json_is_rejected_as_stage_contract(self):
+        text = '{"tool":"file_tree","path":"/tmp/project"}'
+        issues = _contract_issues(text, ("SESSION MEMORY", "RESEARCH PLAN"))
+        self.assertTrue(any("tool-call syntax" in issue for issue in issues))
+        self.assertTrue(any("missing section" in issue for issue in issues))
+
+    def test_markdown_headings_are_valid_stage_contract_sections(self):
+        labels = (
+            "SESSION MEMORY", "RESEARCH PLAN", "R1 PRIMARY SOURCES",
+            "R2 BEST PRACTICES", "R3 SECURITY RELIABILITY",
+            "R4 ALTERNATIVE ARCHITECTURES", "EVIDENCE GAPS",
+            "NEXT STAGE INSTRUCTIONS",
+        )
+        text = """# SESSION MEMORY
+state facts
+
+# RESEARCH PLAN
+plan
+
+## R1 PRIMARY SOURCES — Authoritative References Needed
+refs
+
+## R2 BEST PRACTICES — Engineering Patterns
+patterns
+
+## R3 SECURITY RELIABILITY — Failure/Recovery/Observability
+reliability
+
+## R4 ALTERNATIVE ARCHITECTURES — Trade-offs
+tradeoffs
+
+# EVIDENCE GAPS (Must Be Resolved, Not Guessed)
+gaps
+
+# NEXT STAGE INSTRUCTIONS
+next
+"""
+        self.assertEqual(_contract_issues(text, labels), [])
+
+    def test_colon_contract_sections_still_work_with_inline_body(self):
+        text = "SESSION MEMORY: state facts\nRESEARCH PLAN: plan details\n"
+        self.assertEqual(_contract_issues(text, ("SESSION MEMORY", "RESEARCH PLAN")), [])
+
+    def test_markdown_parent_heading_may_be_populated_by_required_child_sections(self):
+        text = """# SESSION MEMORY
+state
+
+# RESEARCH PLAN
+
+## R1 PRIMARY SOURCES: Sources
+source facts
+
+## R2 BEST PRACTICES
+practice facts
+"""
+        labels = ("SESSION MEMORY", "RESEARCH PLAN", "R1 PRIMARY SOURCES", "R2 BEST PRACTICES")
+        self.assertEqual(_contract_issues(text, labels), [])
+
+    def test_empty_peer_heading_is_still_invalid(self):
+        text = """# SESSION MEMORY
+state
+
+# RESEARCH PLAN
+
+# R1 PRIMARY SOURCES
+source facts
+"""
+        issues = _contract_issues(text, ("SESSION MEMORY", "RESEARCH PLAN", "R1 PRIMARY SOURCES"))
+        self.assertIn("missing section: RESEARCH PLAN", issues)
+
+    def test_bold_markdown_contract_labels_are_accepted(self):
+        text = """SESSION MEMORY: compact state
+
+RESEARCH PLAN: concise plan
+
+**R1 PRIMARY SOURCES: authoritative docs**
+- source
+
+**R2 BEST PRACTICES: patterns**
+- pattern
+
+**R3 SECURITY RELIABILITY: risks**
+- risk
+
+**R4 ALTERNATIVE ARCHITECTURES: tradeoffs**
+- tradeoff
+
+EVIDENCE GAPS: none critical
+
+NEXT STAGE INSTRUCTIONS: research
+"""
+        labels = (
+            "SESSION MEMORY", "RESEARCH PLAN", "R1 PRIMARY SOURCES", "R2 BEST PRACTICES",
+            "R3 SECURITY RELIABILITY", "R4 ALTERNATIVE ARCHITECTURES", "EVIDENCE GAPS",
+            "NEXT STAGE INSTRUCTIONS",
+        )
+        self.assertEqual(_contract_issues(text, labels), [])
+
+    def test_bounded_handoff_preserves_newest_tail(self):
+        raw = "START-MARKER\n" + ("middle-line\n" * 3000) + "LATEST-STAGE-MARKER\nNEXT STAGE INSTRUCTIONS: keep this"
+        handoff = make_handoff("stageoff", raw, max_chars=1800)
+        self.assertIn("START-MARKER", handoff.compact)
+        self.assertIn("LATEST-STAGE-MARKER", handoff.compact)
+        self.assertIn("NEXT STAGE INSTRUCTIONS", handoff.compact)
+        self.assertIn("handoff compacted", handoff.compact)
+
+    def test_planning_policy_allows_verification_but_not_file_mutation(self):
+        self.assertTrue(_planning_approval("test", {"command": "python -m pytest"}))
+        self.assertTrue(_planning_approval("lint", {"command": "python -m compileall ."}))
+        self.assertFalse(_planning_approval("file_edit", {"path": "app.py", "content": "x"}))
 
     def test_code_contract_projection_preserves_acceptance_and_verification(self):
         raw = (

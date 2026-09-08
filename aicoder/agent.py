@@ -373,7 +373,11 @@ def run_agent(
         session = load_session()
         request_timeout = int(state.get("request_timeout", 300))
         client = TriForceClient(session.base_url, token=session.token, timeout=request_timeout)
-        source_workspace = str(active_workspace(state.get("workspace_root")))
+        configured_workspace = str(state.get("workspace_root") or "").strip()
+        source_workspace = str(
+            Path(configured_workspace).expanduser().resolve(strict=False)
+            if configured_workspace else active_workspace()
+        )
         model_client, _ = native_model_transport_from_env(client, default_model=model or state.get("selected_model"))
 
         def team_event(kind: str, payload: dict) -> None:

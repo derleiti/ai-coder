@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from aicoder.agent_runtime import AgentRunResult
-from aicoder.team_orchestrator import _run_candidate
+from aicoder.team_orchestrator import _run_candidate, _resume_delay_seconds
 from aicoder.workspace_backend import RamWorkspace
 
 
@@ -110,6 +110,63 @@ class TeamCandidateAutoResumeTests(unittest.TestCase):
         self.assertEqual(result.run.status, "completed")
         self.assertEqual(len(calls), 2)
         self.assertNotIn("liveness timeout", result.run.error.lower())
+
+
+    def test_provider_retry_after_controls_resume_delay(self):
+        paused = _result("paused", "Transient model/backend failure")
+        paused.failure_category = "transient"
+        paused.retry_after = 120
+        self.assertEqual(_resume_delay_seconds(paused, 1), 120.0)
+        paused.retry_after = None
+        self.assertEqual(_resume_delay_seconds(paused, 1), 1.0)
+        self.assertEqual(_resume_delay_seconds(paused, 3), 4.0)
+
+    def test_liveness_timeout_is_auto_resumed_with_preserved_conversation(self):
+        backend = self._backend()
+        backend.delta_summary.return_value = {"changed_count": 0, "deleted_count": 0}
+        clock = [0.0]
+        calls = []
+
+        def fake_monotonic():
+            return clock[0]
+
+        def runtime_factory(**kwargs):
+            calls.append(kwargs)
+            runtime = MagicMock()
+            if len(calls) == 1:
+                def first_run():
+                    clock[0] = 121.0
+                    return _result(
+                        "paused", "Agent stopped by user",
+                        [{"role": "assistant", "content": "already inspected parser.py"}],
+                    )
+                runtime.run.side_effect = first_run
+            else:
+                def second_run():
+                    clock[0] = 122.0
+                    return _result("completed", "DONE: resumed candidate")
+                runtime.run.side_effect = second_run
+            return runtime
+
+        with (
+            patch("aicoder.team_orchestrator.create_isolated_team_workspace", return_value=backend),
+            patch("aicoder.team_orchestrator.configured_project_python", return_value=None),
+            patch("aicoder.team_orchestrator.NativeLightRuntime", side_effect=runtime_factory),
+            patch("aicoder.team_orchestrator.evaluate_candidate", return_value={"verification_passed": True}),
+            patch("aicoder.team_orchestrator._wait_before_resume", return_value=True),
+            patch("aicoder.team_orchestrator.time.monotonic", side_effect=fake_monotonic),
+        ):
+            result = _run_candidate(
+                client=_NoopClient(), model_client=_NoopClient(), source_workspace="/tmp/source",
+                backend_mode="ram", slot=1, model="test/model", strategy="conservative",
+                task="fix bug", plan="shared plan", coordinator="", tools=[], stop_requested=None,
+                liveness_timeout_s=60,
+            )
+
+        self.assertEqual(result.run.status, "completed")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1]["conversation"][0]["content"], "already inspected parser.py")
+        self.assertIn("liveness timeout", calls[1]["initial_prompt"].lower())
 
     def test_explicit_user_stop_is_not_auto_resumed(self):
         backend = self._backend()
