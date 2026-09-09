@@ -24,6 +24,7 @@ from .failure_tracking import FailureTracker
 from .executor import MAX_ITERATIONS, atomic_write_text, build_system_prompt, load_tools, trim_messages
 from .model_transport import ModelTransport
 from .performance import RuntimePerformance
+from .task_contract import TaskContract, compile_task_contract
 from .team_runtime import (
     BRAINSTORM_EVOLUTION_SYSTEM_PROMPT, BRAINSTORM_OPERATOR_SYSTEM_PROMPT,
     BRAINSTORM_PERSPECTIVES, BRAINSTORM_SYNTHESIS_SYSTEM_PROMPT, BRAINSTORM_SYSTEM_PROMPT,
@@ -37,7 +38,7 @@ from .team_handoff import (
 )
 from .team_pipeline import (
     StageLedger, TeamStage, blind_candidate_id, configured_project_python, execute_verification_plan,
-    objective_rank_key, project_verification_plan, test_change_evidence, verification_passed,
+    objective_rank_key, project_verification_plan, task_acceptance_verification_plan, merge_verification_plans, test_change_evidence, verification_passed,
 )
 from .workspace import resolve_or_create_project_workspace
 from .workspace_backend import (
@@ -596,6 +597,7 @@ def _call_stage_agent_core(
             progressive_tool_disclosure=False,
             native_openrouter_tool_calling=bool(native_openrouter_tool_calling),
             allow_mixed_tool_protocol_final=True,
+            allow_tool_free_final=True,
             enforce_post_mutation_verification=False,
         )
         run = runtime.run()
@@ -779,7 +781,7 @@ def _coordinate_stageoff(
             ),
             required_sections=_STAGEOFF_COORDINATOR_SECTIONS, max_tokens=2200, max_iterations=30,
             event_fn=event_fn, role=f"coordinator:{stage_name}", stop_requested=stop_requested,
-            approval_fn=_planning_approval, request_timeout=request_timeout,
+            approval_fn=_approval_with_task_backend_policy(_planning_approval, str(previous.get("user_task") or "")), request_timeout=request_timeout,
             native_openrouter_tool_calling=native_openrouter_tool_calling,
         )
         review = coordinator.response if coordinator.status == "completed" else (coordinator.error or coordinator.response)
@@ -962,27 +964,46 @@ def _observational_diagnostic_allowed(tool_name: str, args: dict) -> bool:
     return False
 
 
-_EXTERNAL_RESEARCH_SIGNAL_RE = re.compile(
-    r"(?i)(?:https?://|\b(?:latest|recent)\b|\bcurrent\s+(?:version|release|status)\b|"
-    r"\brelease\s+notes?\b|\bdeprecat(?:ed|ion|ions)?\b|\bcompatib(?:ility|le)\b|"
-    r"\bCVE-\d{4}-\d+\b|\bsecurity\s+advisory\b|\bAPI\b|\bSDK\b|"
-    r"\bprotocol\b|\bspecification\b|\bupstream\b|\bofficial\s+documentation\b|"
-    r"\bexternal\s+sources?\b|\bprovider\b|\bendpoint\b)"
-)
+def _as_task_contract(task: str | TaskContract) -> TaskContract:
+    return task if isinstance(task, TaskContract) else compile_task_contract(str(task or ""))
 
 
-def _task_requires_external_research(task: str) -> bool:
-    """Conservatively detect tasks whose correctness depends on outside/fresh facts."""
-    return bool(_EXTERNAL_RESEARCH_SIGNAL_RE.search(str(task or "")))
+def _task_requires_external_research(task: str | TaskContract) -> bool:
+    return _as_task_contract(task).external_research_required
 
 
-def _research_approval_for_task(task: str) -> Callable[[str, dict], bool]:
-    external_allowed = _task_requires_external_research(task)
+def _task_forbids_triforce_backend(task: str | TaskContract) -> bool:
+    return _as_task_contract(task).forbid_triforce_backend
+
+
+def _approval_with_task_backend_policy(approval_fn: Callable[[str, dict], bool], task: str | TaskContract) -> Callable[[str, dict], bool]:
+    """Wrap a stage approval policy with authoritative TriForce backend isolation."""
+    def approval(tool_name: str, args: dict) -> bool:
+        return approval_fn(tool_name, args)
+
+    for attr in (
+        "_aicoder_autonomous_policy",
+        "_aicoder_policy_denial_is_error",
+        "_aicoder_enforce_all_tools",
+    ):
+        if hasattr(approval_fn, attr):
+            setattr(approval, attr, getattr(approval_fn, attr))
+    contract = _as_task_contract(task)
+    approval._aicoder_forbid_triforce_backend = contract.forbid_triforce_backend
+    approval._aicoder_task_contract = contract
+    return approval
+
+def _research_approval_for_task(task: str | TaskContract) -> Callable[[str, dict], bool]:
+    contract = _as_task_contract(task)
+    # Research is allowed to use read-only external sources by default. Whether
+    # external research is *required* is a separate planning signal. Only an
+    # explicit research-stage web prohibition disables those tools.
+    external_allowed = not contract.forbid_research_web
 
     def approval(tool_name: str, args: dict) -> bool:
         canonical = str(tool_name or "").strip().lower().rsplit(".", 1)[-1].rsplit(":", 1)[-1].rsplit("/", 1)[-1]
         payload = dict(args or {})
-        if not external_allowed and canonical in {"search", "crawl", "crawl_url", "web_fetch_local"}:
+        if not external_allowed and canonical in {"search", "crawl", "crawl_url", "web_fetch", "web_fetch_local", "browser", "browser_search"}:
             return False
         # Common diagnostic tools with required selectors must never be invoked as
         # empty speculative probes during autonomous observational stages.
@@ -996,6 +1017,9 @@ def _research_approval_for_task(task: str) -> Callable[[str, dict], bool]:
     approval._aicoder_policy_denial_is_error = False
     approval._aicoder_external_research_allowed = external_allowed
     approval._aicoder_enforce_all_tools = True
+    approval._aicoder_forbid_triforce_backend = contract.forbid_triforce_backend
+    approval._aicoder_task_contract = contract
+    approval._aicoder_allow_research_web = external_allowed
     return approval
 
 
@@ -1717,6 +1741,11 @@ def _candidate_pause_is_resumable(run: AgentRunResult, stop_requested: StopFn | 
         "explicit confirmation",
         "security policy",
         "high-risk",
+        # Runtime-level authoritative verification stagnation is terminal for
+        # this candidate. Auto-resuming it only repeats the same failing
+        # strategy and can block already-verified sibling candidates from
+        # reaching ensemble merge. Provider/transport pauses remain resumable.
+        "authoritative verification reproduced the same non-transient failure",
     )
     return not any(marker in reason for marker in non_resumable_markers)
 
@@ -1958,9 +1987,11 @@ def _run_candidate(
             "Do not use apt/pip/sudo to repair the test runner.\n"
             if test_python else ""
         )
+        contract = compile_task_contract(task)
         system = (
             build_system_prompt(tools, str(backend.info.execution_root)).rstrip()
             + "\n\n" + CODER_SYSTEM_TEMPLATE.format(slot=slot, strategy=strategy)
+            + "\n\n" + contract.prompt_projection()
             + test_runtime_note
         )
         started = time.monotonic()
@@ -2011,7 +2042,7 @@ def _run_candidate(
                 model=model, fallback_model=None, workspace_root=str(backend.info.execution_root),
                 plan_workspace_root=source_workspace, protected_workspace_root=source_workspace,
                 tools=tools, system_prompt=system, load_tools_on_start=True,
-                quick_chat=False, persistent_plan=False, approval_fn=_candidate_approval,
+                quick_chat=False, persistent_plan=False, approval_fn=_approval_with_task_backend_policy(_candidate_approval, contract),
                 max_iterations=None, max_output_tokens=12000,
                 stop_requested=lambda: bool(
                     (stop_requested and stop_requested())
@@ -2366,6 +2397,7 @@ def _run_team_pipeline(
     errors = config.validate()
     if errors:
         return TeamRunResult("failed", "", "", [], [], {}, "; ".join(errors))
+    task_contract = compile_task_contract(task)
     try:
         resolved_workspace, auto_selected, workspace_reason = resolve_or_create_project_workspace(
             source_workspace, task, state.get("projects_root")
@@ -2396,6 +2428,7 @@ def _run_team_pipeline(
     stageoff: dict[str, Any] = {
         "schema": "aicoder-stageoff-v1",
         "user_task": task,
+        "task_contract": task_contract.as_dict(),
         "repository_context": _repository_context(source_workspace),
         "current_stage": "run_start",
         "handoff_id": "",
@@ -2452,7 +2485,7 @@ def _run_team_pipeline(
             ),
             required_sections=_BOOTSTRAP_SECTIONS, max_tokens=2200, max_iterations=30,
             event_fn=event_fn, role="coordinator:plan_research", stop_requested=stop_requested,
-            approval_fn=_planning_approval, request_timeout=request_timeout,
+            approval_fn=_approval_with_task_backend_policy(_planning_approval, task_contract), request_timeout=request_timeout,
             native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
         )
     research_plan.role = "coordinator:plan_research"; stages.append(research_plan)
@@ -2603,7 +2636,7 @@ def _run_team_pipeline(
                     ),
                     required_sections=BRAINSTORM_SECTIONS, max_tokens=4000, max_iterations=35,
                     event_fn=event_fn, role=f"brainstorm:r{round_index}:{label}", stop_requested=stop_requested,
-                    approval_fn=_research_approval_for_task(task), request_timeout=request_timeout,
+                    approval_fn=_research_approval_for_task(task_contract), request_timeout=request_timeout,
                     native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
                 ): (label, model)
                 for label, model, perspective in brainstorm_participants
@@ -2631,11 +2664,11 @@ def _run_team_pipeline(
             break
         operator = _call_stage_agent(
             client=client, model_client=model_client, model=synthesis_model, system=BRAINSTORM_OPERATOR_SYSTEM_PROMPT,
-            tools=all_tools, workspace_root=source_workspace,
+            tools=[], workspace_root=source_workspace,
             prompt=_build_brainstorm_operator_prompt(task, round_index, usable, brainstorm_state),
             required_sections=BRAINSTORM_SECTIONS, max_tokens=5000, max_iterations=30,
             event_fn=event_fn, role=f"brainstorm_state:r{round_index}", stop_requested=stop_requested,
-            approval_fn=_research_approval_for_task(task), request_timeout=request_timeout,
+            approval_fn=_research_approval_for_task(task_contract), request_timeout=request_timeout,
             native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
         )
         operator.role = f"brainstorm_state:r{round_index}"
@@ -2652,11 +2685,11 @@ def _run_team_pipeline(
     if brainstorm_results:
         brainstorm_synthesis = _call_stage_agent(
             client=client, model_client=model_client, model=synthesis_model, system=BRAINSTORM_SYNTHESIS_SYSTEM_PROMPT,
-            tools=all_tools, workspace_root=source_workspace,
+            tools=[], workspace_root=source_workspace,
             prompt=_build_brainstorm_synthesis_prompt(task, brainstorm_state, brainstorm_results),
             required_sections=BRAINSTORM_SECTIONS, max_tokens=6000, max_iterations=30,
             event_fn=event_fn, role="brainstorm_synthesis", stop_requested=stop_requested,
-            approval_fn=_research_approval_for_task(task), request_timeout=request_timeout,
+            approval_fn=_research_approval_for_task(task_contract), request_timeout=request_timeout,
             native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
         )
         brainstorm_synthesis.role = "brainstorm_synthesis"
@@ -2679,11 +2712,11 @@ def _run_team_pipeline(
             )
             retried = _call_stage_agent(
                 client=client, model_client=model_client, model=synthesis_model,
-                system=BRAINSTORM_SYNTHESIS_SYSTEM_PROMPT, tools=all_tools,
+                system=BRAINSTORM_SYNTHESIS_SYSTEM_PROMPT, tools=[],
                 workspace_root=source_workspace, prompt=retry_prompt,
                 required_sections=BRAINSTORM_SECTIONS, max_tokens=3500, max_iterations=12,
                 event_fn=event_fn, role="brainstorm_synthesis:retry", stop_requested=stop_requested,
-                approval_fn=_research_approval_for_task(task), request_timeout=request_timeout,
+                approval_fn=_research_approval_for_task(task_contract), request_timeout=request_timeout,
                 native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
             )
             retried.role = "brainstorm_synthesis:retry"
@@ -2745,7 +2778,7 @@ def _run_team_pipeline(
               "Do not assume prior-stage conversation."
         ),
         required_sections=CODE_PLAN_SECTIONS, max_tokens=6500, max_iterations=50,
-        event_fn=event_fn, role="plan_code", stop_requested=stop_requested, approval_fn=_planning_approval,
+        event_fn=event_fn, role="plan_code", stop_requested=stop_requested, approval_fn=_approval_with_task_backend_policy(_planning_approval, task_contract),
         request_timeout=request_timeout, native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
     )
     code_plan.role = "plan_code"
@@ -2901,7 +2934,7 @@ def _run_team_pipeline(
                 + f"\n\nDETERMINISTIC BASE CANDIDATE: {winner_id}"
             ),
             required_sections=MERGE_PLAN_SECTIONS, max_tokens=4000, max_iterations=40,
-            event_fn=event_fn, role="merge_plan", stop_requested=stop_requested, approval_fn=_planning_approval,
+            event_fn=event_fn, role="merge_plan", stop_requested=stop_requested, approval_fn=_approval_with_task_backend_policy(_planning_approval, task_contract),
             request_timeout=request_timeout, native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
         )
         merge_plan.role = "merge_plan"; stages.append(merge_plan)
@@ -2937,9 +2970,17 @@ def _run_team_pipeline(
         )
         _stage_complete(ledger, TeamStage.MERGE_PLAN, event_fn)
 
-        # 6) merge — optional LLM. Empty merge slot means deterministic winner only.
+        # 6) merge — ensemble integration is always attempted for verified candidates.
+        # A dedicated merge model remains optional; when omitted, reuse the coordinator,
+        # planner, or verified base model instead of silently degrading to winner-only.
         _stage_start(ledger, TeamStage.MERGE, event_fn)
-        merge_model = config.merge_model
+        merge_model = (
+            config.merge_model
+            or config.coordinator_model
+            or config.planner_model
+            or winner.run.model
+            or winner.model
+        )
         if merge_model:
             merge_prompt = (
                 "PREVIOUS STAGEOFF (authoritative; fresh model process):\n" + stageoff_handoff.render()
@@ -2947,7 +2988,7 @@ def _run_team_pipeline(
                 "Integrate only evidence-backed improvements required by the cumulative StageOff. "
                 "Do not assume any prior model conversation."
             )
-            merge_system = build_system_prompt(coder_tools, str(integration.info.execution_root)).rstrip()+"\n\n"+MERGE_SYSTEM_PROMPT
+            merge_system = build_system_prompt(coder_tools, str(integration.info.execution_root)).rstrip()+"\n\n"+MERGE_SYSTEM_PROMPT+"\n\n"+task_contract.prompt_projection()
             merge_conversation: list[dict[str, Any]] = []
             merge_auto_resumes = 0
             merge_run: AgentRunResult | None = None
@@ -2960,7 +3001,7 @@ def _run_team_pipeline(
                     plan_workspace_root=source_workspace, protected_workspace_root=source_workspace,
                     tools=coder_tools, system_prompt=merge_system,
                     load_tools_on_start=True, quick_chat=False, persistent_plan=False,
-                    approval_fn=_candidate_approval, max_iterations=14, max_output_tokens=10000, stop_requested=stop_requested,
+                    approval_fn=_approval_with_task_backend_policy(_candidate_approval, task_contract), max_iterations=14, max_output_tokens=10000, stop_requested=stop_requested,
                     base_timeout=request_timeout, conversation=merge_conversation, allow_completion_signal=True,
                     event_fn=_worker_event_forwarder(event_fn, "merge"),
                     native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
@@ -3016,8 +3057,12 @@ def _run_team_pipeline(
             final_response = merge_run.response
             result_model = merge_run.model or merge_model
         else:
-            stages.append(AgentStageResult("merge", "deterministic", "completed", f"Selected {winner_id} without LLM merge", 0))
-            final_response = f"Selected verified base candidate {winner_id}."
+            # Defensive fallback for malformed configurations with no usable model at all.
+            stages.append(AgentStageResult(
+                "merge", "deterministic", "completed",
+                f"Selected {winner_id}; ensemble merge unavailable because no merge-capable model resolved", 0,
+            ))
+            final_response = f"Selected verified base candidate {winner_id}; no merge-capable model resolved."
             result_model = winner.run.model
         stageoff, coordinator_stage, stageoff_handoff = _coordinate_stageoff(
             current=stageoff, stage=TeamStage.MERGE,
@@ -3040,7 +3085,10 @@ def _run_team_pipeline(
 
         # 7) plan_tests — model may explain/extend intent, deterministic commands remain authoritative.
         _stage_start(ledger, TeamStage.PLAN_TESTS, event_fn)
-        deterministic_plan = project_verification_plan(integration.info.execution_root)
+        deterministic_plan = merge_verification_plans(
+            project_verification_plan(integration.info.execution_root),
+            task_acceptance_verification_plan(task_contract, integration.info.execution_root),
+        )
         test_plan_text = json.dumps([
             {"name": item.name, "argv": list(item.argv), "timeout": item.timeout, "required": item.required}
             for item in deterministic_plan
@@ -3057,7 +3105,7 @@ def _run_team_pipeline(
                       "Do not assume prior conversation."
                 ),
                 required_sections=_TEST_PLAN_SECTIONS, max_tokens=3000, max_iterations=35,
-                event_fn=event_fn, role="plan_tests", stop_requested=stop_requested, approval_fn=_planning_approval,
+                event_fn=event_fn, role="plan_tests", stop_requested=stop_requested, approval_fn=_approval_with_task_backend_policy(_planning_approval, task_contract),
                 request_timeout=request_timeout, native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
             )
             test_plan.role = "plan_tests"; stages.append(test_plan)

@@ -32,6 +32,7 @@ from .privileges import assess_execution
 from .session_state import get_state
 from .plugins import discover_plugins
 from .workspace import active_workspace, path_within_workspace
+from .task_contract import TaskContract
 from .tool_policy import (
     OPERATOR_MCP_TOOLS,
     filter_tool_catalog,
@@ -657,6 +658,12 @@ LOCAL_TOOL_SCHEMAS = [
 
 # Names of all local tools (for dispatch in run_tool)
 LOCAL_TOOL_NAMES = {t["name"] for t in LOCAL_TOOL_SCHEMAS}
+
+# User-facing backend services are allowed even when the task forbids targeting
+# TriForce itself as an administrative/system object.
+_TRIFORCE_USER_SERVICE_TOOLS = {
+    "search", "crawl", "crawl_url", "memory_search", "models", "specialist",
+}
 
 SYSTEM_TEMPLATE = """\
 You are ai-coder — an autonomous AILinux operator agent for coding, DevOps, system work, and infrastructure through controlled tools (api.ailinux.me).
@@ -2197,6 +2204,24 @@ def _run_tool_impl(
         )
         return result, True
 
+    contract = getattr(approval_fn, "_aicoder_task_contract", None) if approval_fn is not None else None
+    if isinstance(contract, TaskContract):
+        denial = contract.tool_denial(name, args)
+        if (
+            denial
+            and getattr(approval_fn, "_aicoder_allow_research_web", False) is True
+            and "web/network access" in denial
+            and not contract.forbid_research_web
+        ):
+            denial = None
+        if denial:
+            result = f"{name}: task_contract_denied — {denial}"
+            audit.log_tool(
+                tool_name=name, arguments=args, result=result, duration_s=0,
+                is_error=False, model=model, iteration=iteration,
+            )
+            return result, False
+
     args = _normalize_accidental_workspace_read_path(name, args)
 
     if name in {"code_read", "code_tree", "code_search"}:
@@ -2431,10 +2456,33 @@ def _run_tool_impl(
     elif (provider := discover_plugins(_workspace_root()).provider_for_tool(name)) is not None:
         result, is_error = provider.execute(name, execution_args)
     elif name.startswith("mcp."):
-        from .mcp_service import call_external_tool
-        result, is_error = call_external_tool(name, execution_args)
+        forbid_triforce_backend = bool(
+            approval_fn is not None
+            and getattr(approval_fn, "_aicoder_forbid_triforce_backend", False) is True
+        )
+        external_server = name.split(".", 2)[1].lower() if name.count(".") >= 2 else ""
+        if forbid_triforce_backend and external_server.startswith("triforce"):
+            result, is_error = (
+                f"{name}: stage_policy_denied — TriForce backend MCP access is disabled by the authoritative task constraints",
+                False,
+            )
+        else:
+            from .mcp_service import call_external_tool
+            result, is_error = call_external_tool(name, execution_args)
     elif _is_local:
         result, is_error = f"{name}: no safe local handler is registered", True
+    elif (
+        approval_fn is not None
+        and getattr(approval_fn, "_aicoder_forbid_triforce_backend", False) is True
+        and str(name or "").strip().lower().rsplit(".", 1)[-1] not in _TRIFORCE_USER_SERVICE_TOOLS
+    ):
+        # Task-level TriForce isolation forbids treating the backend itself as
+        # an admin/diagnostic target. User-facing backend services such as web
+        # search remain usable; they are capabilities, not backend inspection.
+        result, is_error = (
+            f"{name}: stage_policy_denied — TriForce backend targeting is disabled by the authoritative task constraints",
+            False,
+        )
     else:
         result, is_error = run_mcp_tool(
             client, name, args,

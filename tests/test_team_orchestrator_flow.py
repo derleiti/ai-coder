@@ -1017,8 +1017,9 @@ def test_self_contained_research_task_blocks_external_web_tools():
     task = "Build a deterministic Python standard-library terminal game in this empty workspace."
     assert _task_requires_external_research(task) is False
     approval = _research_approval_for_task(task)
-    assert approval("search", {"query": "python game examples"}) is False
-    assert approval("crawl", {"url": "https://example.com"}) is False
+    # Not required does not mean forbidden: researchers may still use read-only web research.
+    assert approval("search", {"query": "python game examples"}) is True
+    assert approval("crawl", {"url": "https://example.com"}) is True
     assert approval("file_tree", {"path": "."}) is True
 
 
@@ -1102,6 +1103,7 @@ def test_self_contained_research_policy_blocks_safe_remote_search_in_executor(tm
     from aicoder.team_orchestrator import _research_approval_for_task
 
     client = MagicMock()
+    client.mcp_call.return_value = {"result": {"content": [{"type": "text", "text": "research ok"}]}}
     approval = _research_approval_for_task(
         "Build a deterministic Python standard-library terminal game."
     )
@@ -1110,9 +1112,8 @@ def test_self_contained_research_policy_blocks_safe_remote_search_in_executor(tm
         approval_fn=approval, allowed_tools={"search"}, workspace_root=tmp_path,
     )
     assert is_error is False
-    assert "stage_policy_denied" in result
-    assert "current autonomous stage policy" in result
-    assert client.method_calls == []
+    assert result == "research ok"
+    client.mcp_call.assert_called_once()
 
     tree_result, tree_error = run_tool(
         client, "file_tree", {"path": "."},
@@ -1308,7 +1309,7 @@ def test_task_aware_research_policy_denies_empty_config_probe():
     approval = _research_approval_for_task("Build a standard library only terminal game")
     assert approval("config", {}) is False
     assert approval("config", {"key": "runtime"}) is True
-    assert approval("search", {"query": "pygame"}) is False
+    assert approval("search", {"query": "pygame"}) is True
 
 
 def test_deterministic_greenfield_bootstrap_preserves_verbatim_task():
@@ -1390,3 +1391,212 @@ def test_brainstorm_participant_limit_still_applies_with_same_model():
         merge_model=model, test_planner_model=model,
     )
     assert len(_brainstorm_participants(config, limit=3)) == 3
+
+
+def test_explicit_task_triforce_prohibition_is_propagated_to_stage_policies(tmp_path):
+    from unittest.mock import MagicMock
+    from aicoder.executor import run_tool
+    from aicoder.team_orchestrator import _research_approval_for_task
+
+    approval = _research_approval_for_task(
+        "Use local AICoder tools only. Do not target or inspect the TriForce backend, services, or processes."
+    )
+    assert getattr(approval, "_aicoder_forbid_triforce_backend", False) is True
+
+    client = MagicMock()
+    result, is_error = run_tool(
+        client, "status", {}, approval_fn=approval,
+        allowed_tools={"status"}, workspace_root=tmp_path,
+    )
+    assert is_error is False
+    assert "TriForce backend targeting is disabled" in result
+    client.mcp_call.assert_not_called()
+
+    tree, tree_error = run_tool(
+        client, "file_tree", {"path": "."}, approval_fn=approval,
+        allowed_tools={"file_tree"}, workspace_root=tmp_path,
+    )
+    assert tree_error is False
+    assert "empty directory" in tree
+    client.mcp_call.assert_not_called()
+
+
+def test_explicit_task_triforce_prohibition_blocks_external_triforce_profile(tmp_path):
+    from unittest.mock import MagicMock, patch
+    from aicoder.executor import run_tool
+    from aicoder.team_orchestrator import _research_approval_for_task
+
+    approval = _research_approval_for_task(
+        "Never inspect the TriForce backend; operate only on the local workspace."
+    )
+    with patch("aicoder.mcp_service.call_external_tool") as external_call:
+        result, is_error = run_tool(
+            MagicMock(), "mcp.triforce_remote.status", {}, approval_fn=approval,
+            allowed_tools={"mcp.triforce_remote.status"}, workspace_root=tmp_path,
+        )
+    assert is_error is False
+    assert "TriForce backend MCP access is disabled" in result
+    external_call.assert_not_called()
+
+
+def test_task_backend_policy_does_not_disable_triforce_without_explicit_prohibition():
+    from aicoder.team_orchestrator import _research_approval_for_task
+
+    approval = _research_approval_for_task(
+        "Check the latest TriForce API status and official provider compatibility."
+    )
+    assert getattr(approval, "_aicoder_forbid_triforce_backend", False) is False
+
+
+def test_observational_stage_runtime_allows_complete_contract_without_tool_use(tmp_path):
+    from unittest.mock import MagicMock, patch
+    from aicoder.team_orchestrator import _call_stage_agent_core
+
+    model_client = MagicMock()
+    model_client.chat.return_value = {
+        "response": (
+            "## DIRECTIONS\n- keep it small\n\n"
+            "## IDEAS\n- one package\n\n"
+            "## TRADEOFFS\n- simplicity over abstraction\n\n"
+            "## RISKS\n- scope creep\n\n"
+            "## OPEN QUESTIONS\n- none\n\n"
+            "## RECOMMENDATIONS\n- proceed"
+        ),
+        "model": "mistral/codestral-latest",
+        "finish_reason": "stop",
+        "tool_calls": [],
+    }
+    tool = {"name": "file_tree", "description": "tree", "inputSchema": {"type": "object"}}
+    result = _call_stage_agent_core(
+        client=MagicMock(), model_client=model_client, model="mistral/codestral-latest",
+        system="Brainstorm only.", prompt="Build something useful.", tools=[tool],
+        workspace_root=str(tmp_path), event_fn=None, role="brainstorm_state:r1",
+        stop_requested=None, approval_fn=lambda _n, _a: True,
+        required_sections=("DIRECTIONS", "IDEAS", "TRADEOFFS", "RISKS", "OPEN QUESTIONS", "RECOMMENDATIONS"),
+        max_tokens=1000, max_iterations=10,
+    )
+    assert result.status == "completed"
+    assert result.evidence["iterations"] == 1
+    assert model_client.chat.call_count == 1
+
+
+def test_brainstorm_operator_and_synthesis_are_tool_free():
+    from pathlib import Path
+    source = Path('aicoder/team_orchestrator.py').read_text()
+    operator_anchor = 'system=BRAINSTORM_OPERATOR_SYSTEM_PROMPT,\n            tools=[], workspace_root=source_workspace,'
+    synthesis_anchor = 'system=BRAINSTORM_SYNTHESIS_SYSTEM_PROMPT,\n            tools=[], workspace_root=source_workspace,'
+    retry_anchor = 'system=BRAINSTORM_SYNTHESIS_SYSTEM_PROMPT, tools=[],'
+    assert operator_anchor in source
+    assert synthesis_anchor in source
+    assert retry_anchor in source
+
+
+def test_ensemble_merge_falls_back_when_dedicated_merge_model_is_disabled():
+    from pathlib import Path
+    source = Path('aicoder/team_orchestrator.py').read_text()
+    assert 'config.merge_model\n            or config.coordinator_model\n            or config.planner_model' in source
+    assert 'or winner.run.model\n            or winner.model' in source
+    assert 'without LLM merge' not in source
+
+
+def test_merge_prompts_make_winner_a_base_not_exclusive_source():
+    from aicoder.team_runtime import MERGE_PLANNER_SYSTEM_PROMPT, MERGE_SYSTEM_PROMPT
+    assert 'stable base, not an exclusive source' in MERGE_PLANNER_SYSTEM_PROMPT
+    assert 'stable base, not a winner-takes-all result' in MERGE_SYSTEM_PROMPT
+    assert 'every other verified candidate' in MERGE_SYSTEM_PROMPT
+
+
+
+def test_candidate_verification_stall_pause_is_terminal_but_provider_pause_is_resumable():
+    from aicoder.agent_runtime import AgentRunResult
+    from aicoder.team_orchestrator import _candidate_pause_is_resumable
+
+    stalled = AgentRunResult(
+        status="paused",
+        response=(
+            "Agent paused because authoritative verification reproduced the same "
+            "non-transient failure at least five times despite intervening mutations. "
+            "The edits are not changing the failing behavior; resume only with a different "
+            "root-cause strategy. Failure signature: code:example"
+        ),
+        model="mistral/codestral-latest",
+        messages=[], tools=[], system_prompt="",
+    )
+    assert _candidate_pause_is_resumable(stalled, None) is False
+
+    provider_pause = AgentRunResult(
+        status="paused",
+        response="Transient model/backend failure after request retries were exhausted: ReadTimeout",
+        model="mistral/codestral-latest",
+        messages=[], tools=[], system_prompt="",
+        failure_category="transient",
+    )
+    assert _candidate_pause_is_resumable(provider_pause, None) is True
+
+
+def test_task_contract_blocks_web_tools_before_transport_but_keeps_local_tools(tmp_path):
+    from unittest.mock import MagicMock
+    from aicoder.executor import run_tool
+    from aicoder.team_orchestrator import _research_approval_for_task
+
+    (tmp_path / "README.md").write_text("local evidence\n", encoding="utf-8")
+    approval = _research_approval_for_task(
+        "Analyze only local evidence. Researchers must not browse the web or internet. Do not inspect the TriForce backend."
+    )
+    client = MagicMock()
+
+    search_result, search_error = run_tool(
+        client, "search", {"query": "AICoder", "mode": "all"}, approval_fn=approval,
+        allowed_tools={"search"}, workspace_root=tmp_path,
+    )
+    assert search_error is False
+    assert "task_contract_denied" in search_result
+
+    fetch_result, fetch_error = run_tool(
+        client, "web_fetch_local", {"url": "https://example.com"}, approval_fn=approval,
+        allowed_tools={"web_fetch_local"}, workspace_root=tmp_path,
+    )
+    assert fetch_error is False
+    assert "task_contract_denied" in fetch_result
+
+    local_result, local_error = run_tool(
+        client, "file_read", {"path": "README.md"}, approval_fn=approval,
+        allowed_tools={"file_read"}, workspace_root=tmp_path,
+    )
+    assert local_error is False
+    assert "local evidence" in local_result
+    client.mcp_call.assert_not_called()
+
+
+def test_research_stage_may_use_web_even_when_implementation_web_is_forbidden(tmp_path):
+    from unittest.mock import MagicMock, patch
+    from aicoder.executor import run_tool
+    from aicoder.team_orchestrator import _research_approval_for_task
+
+    approval = _research_approval_for_task(
+        "Do not browse the web during implementation. Researchers should investigate the topic thoroughly."
+    )
+    with patch("aicoder.executor.run_mcp_tool", return_value=("research result", False)) as remote:
+        result, is_error = run_tool(
+            MagicMock(), "search", {"query": "topic"}, approval_fn=approval,
+            allowed_tools={"search"}, workspace_root=tmp_path,
+        )
+    assert is_error is False
+    assert result == "research result"
+    remote.assert_called_once()
+
+
+def test_explicit_research_no_web_blocks_research_web_tool(tmp_path):
+    from unittest.mock import MagicMock, patch
+    from aicoder.executor import run_tool
+    from aicoder.team_orchestrator import _research_approval_for_task
+
+    approval = _research_approval_for_task("Researchers must not browse the web; use local evidence only.")
+    with patch("aicoder.executor.run_mcp_tool") as remote:
+        result, is_error = run_tool(
+            MagicMock(), "search", {"query": "topic"}, approval_fn=approval,
+            allowed_tools={"search"}, workspace_root=tmp_path,
+        )
+    assert is_error is False
+    assert "task_contract_denied" in result or "stage_policy_denied" in result
+    remote.assert_not_called()

@@ -928,3 +928,94 @@ def test_repeated_failure_circuit_blocks_same_verification_until_real_mutation()
         assert result.status == "completed"
         assert execute.call_count == 4
         assert any(name == "failure_call_blocked" for name, _ in events)
+
+
+def test_tool_free_runtime_does_not_execute_textual_tool_call_syntax(tmp_path):
+    from unittest.mock import MagicMock
+    from aicoder.agent_runtime import NativeLightRuntime
+
+    model_client = MagicMock()
+    model_client.chat.return_value = {
+        "response": (
+            "## DIRECTIONS\n- synthesize only\n\n"
+            "## IDEAS\n- compact plan\n\n"
+            "## TRADEOFFS\n- none\n\n"
+            "## RISKS\n- none\n\n"
+            "## OPEN QUESTIONS\n- none\n\n"
+            "## RECOMMENDATIONS\n- proceed\n\n"
+            "TOOL_CALL code_read {\"path\": \"missing.py\"}"
+        ),
+        "model": "mistral/codestral-latest",
+        "finish_reason": "stop",
+        "tool_calls": [],
+    }
+    client = MagicMock()
+    runtime = NativeLightRuntime(
+        client=client, model_client=model_client, initial_prompt="Synthesize.",
+        model="mistral/codestral-latest", fallback_model=None,
+        workspace_root=str(tmp_path), tools=[], load_tools_on_start=False,
+        persistent_plan=False, allow_tool_free_final=True,
+        allow_mixed_tool_protocol_final=True, enforce_post_mutation_verification=False,
+        max_iterations=3,
+    )
+    result = runtime.run()
+    assert result.status == "completed"
+    assert result.iterations == 1
+    client.mcp_call.assert_not_called()
+
+
+def test_same_verification_failure_across_mutations_pauses_as_stalled(tmp_path):
+    from unittest.mock import MagicMock, patch
+    from aicoder.agent_runtime import NativeLightRuntime
+
+    client = MagicMock()
+    client.timeout = 30
+    turns = []
+    for index in range(5):
+        turns.append({
+            "response": (
+                '<tool_call>{"name":"file_edit","arguments":'
+                f'{{"path":"game.py","operation":"replace","old_text":"x{index}","new_text":"y{index}"}}'
+                '}</tool_call>'
+            ),
+            "model": "test/model",
+        })
+        turns.append({
+            "response": '<tool_call>{"name":"test","arguments":{"command":"python -m pytest -q"}}</tool_call>',
+            "model": "test/model",
+        })
+    client.chat.side_effect = turns
+    schemas = [
+        {
+            "name": "file_edit", "description": "Edit file",
+            "inputSchema": {"type": "object", "properties": {
+                "path": {"type": "string"}, "operation": {"type": "string"},
+                "old_text": {"type": "string"}, "new_text": {"type": "string"},
+            }, "required": ["path", "operation", "old_text", "new_text"]},
+        },
+        {
+            "name": "test", "description": "Run tests",
+            "inputSchema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]},
+        },
+    ]
+    runtime = NativeLightRuntime(
+        client=client, initial_prompt="Fix the failing tests", model="test/model",
+        fallback_model=None, workspace_root=str(tmp_path), tools=schemas,
+        load_tools_on_start=True, persistent_plan=False, base_timeout=30,
+        max_iterations=12,
+    )
+    events = []
+    runtime.event_fn = lambda name, payload: events.append((name, payload))
+
+    def fake_tool(_client, name, _args, **_kwargs):
+        if name == "file_edit":
+            return "updated game.py; verified exact content", False
+        return "OSError: pytest: reading from stdin while output is captured!", True
+
+    with patch("aicoder.agent_runtime.run_tool", side_effect=fake_tool) as execute:
+        result = runtime.run()
+
+    assert result.status == "paused"
+    assert "authoritative verification" in result.response
+    assert execute.call_count == 10
+    assert any(name == "verification_stalled" for name, _ in events)

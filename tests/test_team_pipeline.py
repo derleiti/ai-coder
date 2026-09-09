@@ -9,7 +9,8 @@ from pathlib import Path
 
 from aicoder.team_pipeline import (
     STAGE_ORDER, StageLedger, TeamStage, blind_candidate_id, content_fingerprint, objective_rank_key,
-    configured_project_python, execute_verification_plan, normalize_project_test_argv, project_verification_plan,
+    configured_project_python, execute_verification_plan, merge_verification_plans, normalize_project_test_argv,
+    project_verification_plan, task_acceptance_verification_plan,
 )
 
 
@@ -158,6 +159,42 @@ class ProjectPlanTests(unittest.TestCase):
             second = execute_verification_plan(root, plan)
             python_tests = next(row for row in second if row.name == "python-tests")
             self.assertFalse(python_tests.ok, python_tests.output)
+
+
+    def test_task_acceptance_commands_are_extracted_without_shell(self):
+        task = """Acceptance checks that must actually execute successfully before completion:
+1. python -m pytest -q
+2. python -m sample --seed 42 --demo
+3. python -c "import sample"
+4. README documents controls
+Important runtime constraints:
+- Do not browse the web.
+"""
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"AICODER_TEST_PYTHON": sys.executable}):
+            plan = task_acceptance_verification_plan(task, tmp)
+            self.assertEqual(len(plan), 3)
+            self.assertEqual(plan[0].argv[:3], (str(Path(sys.executable).resolve()), "-m", "pytest"))
+            self.assertEqual(plan[1].argv[1:3], ("-m", "sample"))
+            self.assertEqual(plan[2].argv[1:], ("-c", "import sample"))
+
+    def test_task_acceptance_rejects_shell_operators_and_unrelated_commands(self):
+        task = """ACCEPTANCE TESTS:
+- python -m pytest -q && rm -rf /
+- sudo apt update
+- curl https://example.invalid
+- cargo test --all-targets
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = task_acceptance_verification_plan(task, tmp)
+            self.assertEqual([item.argv[0] for item in plan], ["cargo"])
+
+    def test_merge_verification_plans_deduplicates_same_command(self):
+        from aicoder.team_pipeline import VerificationCommand
+        one = VerificationCommand("repo", ("python3", "-m", "pytest", "-q"))
+        two = VerificationCommand("task", ("python3", "-m", "pytest", "-q"))
+        merged = merge_verification_plans([one], [two])
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].name, "repo")
 
     def test_python_project_gets_compile_and_test_gates(self):
         with tempfile.TemporaryDirectory() as tmp:

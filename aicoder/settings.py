@@ -236,7 +236,7 @@ _register(SettingSpec(
 ))
 _register(SettingSpec(
     key="team_merge_model", type="model", default="@primary", group="team",
-    description="Merge/integration model. @primary reuses the base model; empty/off disables optional roles.",
+    description="Preferred merge/integration model. @primary reuses the base model; empty/off disables only the dedicated merge slot, while ensemble integration falls back to coordinator/planner/base model.",
 ))
 _register(SettingSpec(
     key="team_test_planner_model", type="model", default="@primary", group="team",

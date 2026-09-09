@@ -417,6 +417,11 @@ class NativeLightRuntime:
     # prose only; it is never parsed/executed as a tool call. Coding/merge runtimes
     # keep the strict default.
     allow_mixed_tool_protocol_final: bool = False
+    # Observational/planning stages may return a complete structured contract
+    # without first exercising a tool merely because the user task is actionable.
+    # Tools remain available with tool_choice=auto; this only removes the artificial
+    # protocol requirement that otherwise turns a valid first response into a loop.
+    allow_tool_free_final: bool = False
     tool_budget: int = DEFAULT_TOOL_BUDGET
     max_expansion_rounds: int = MAX_EXPANSION_ROUNDS
     hooks: HookBus = field(default_factory=HookBus)
@@ -1029,7 +1034,7 @@ class NativeLightRuntime:
                     pending_continuation = is_action_request(content)
                     break
         intent_prompt = plan.task if resumed and plan is not None else self.initial_prompt
-        must_use_tools = bool(tools) and (
+        must_use_tools = bool(tools) and not self.allow_tool_free_final and (
             is_action_request(intent_prompt) or pending_continuation or resumed
         )
         allowed_tool_names = {
@@ -1192,7 +1197,14 @@ class NativeLightRuntime:
             )
 
             native_mode = self._native_tool_calling_enabled(active_model)
-            if native_mode:
+            if not tools:
+                # A tool-free runtime is an intentional capability boundary. Models
+                # sometimes emit tool-call-shaped text even when no tools were
+                # advertised; never reinterpret that prose as executable calls.
+                native_calls = []
+                text_calls = []
+                recovered_calls = []
+            elif native_mode:
                 native_calls = normalize_tool_calls(result.get("tool_calls") or [])
                 text_calls = []
                 recovered_calls = []
@@ -1476,6 +1488,7 @@ class NativeLightRuntime:
             batch_records: list[dict[str, Any]] = []
             batch_failure_repeats = 0
             batch_failure_category = ""
+            batch_verification_stall_reason = ""
             for call in calls:
                 if self._stopped():
                     reason = "Agent stopped by user"
@@ -1853,7 +1866,9 @@ class NativeLightRuntime:
                 if not is_error and state_mutation:
                     successful_tool_cache.clear()
                     blocked_failure_calls.clear()
-                    failure_tracker.reset()
+                    # Keep failure-family history across mutations. A mutation is only
+                    # meaningful progress when authoritative verification changes;
+                    # otherwise tiny/irrelevant edits can mask a persistent failure.
                 elif not is_error:
                     successful_tool_cache[cache_key] = str(tool_result)
                     if len(successful_tool_cache) > 64:
@@ -1918,6 +1933,19 @@ class NativeLightRuntime:
                     if failure.count > batch_failure_repeats:
                         batch_failure_repeats = failure.count
                         batch_failure_category = failure.category
+                    if (
+                        mutation_seen
+                        and _is_behavior_verification_call(name, args)
+                        and failure.count >= 5
+                        and not failure.retryable
+                    ):
+                        batch_verification_stall_reason = (
+                            "Agent paused because authoritative verification reproduced the same "
+                            "non-transient failure at least five times despite intervening mutations. "
+                            "The edits are not changing the failing behavior; resume only with a different "
+                            "root-cause strategy. "
+                            f"Failure signature: {failure.signature}"
+                        )
                 if is_error and str(tool_result).strip().endswith(": aborted by user"):
                     reason = f"Agent paused because the user rejected {name}."
                     if native_mode:
@@ -2060,6 +2088,38 @@ class NativeLightRuntime:
                 self._emit(
                     "implementation_required", iteration=i + 1,
                     reason="inspection_without_mutation", inspections=pre_mutation_inspection_count,
+                )
+
+            if batch_verification_stall_reason:
+                reason = batch_verification_stall_reason
+                if native_mode:
+                    messages.append({
+                        "role": "assistant", "content": response or "",
+                        "tool_calls": [
+                            {
+                                "id": str(item.get("id") or ""), "type": "function",
+                                "function": {
+                                    "name": str(item.get("name") or ""),
+                                    "arguments": json.dumps(item.get("arguments") or {}, ensure_ascii=False),
+                                },
+                            }
+                            for item in calls
+                        ],
+                    })
+                    messages.extend(native_tool_messages)
+                else:
+                    messages.append({"role": "assistant", "content": response})
+                    messages.append({"role": "user", "content": format_untrusted_tool_results(tool_results)})
+                self._pause_plan(plan, reason, response)
+                self._save_journal(plan, messages, tool_batches=journal_batches)
+                self._emit("verification_stalled", reason=reason, iteration=i + 1, repeats=batch_failure_repeats)
+                self._emit("paused", reason=reason)
+                if self.conversation is not None:
+                    self.conversation[:] = [dict(message) for message in messages[1:]][-MAX_CONTEXT_MESSAGES:]
+                return AgentRunResult(
+                    "paused", reason, model_used, messages, tools, system,
+                    iterations=i + 1, latency_ms=total_latency,
+                    fallback_used=fallback_used, plan_id=plan.id if plan else "",
                 )
 
             if repeats >= STALL_FALLBACK_REPEATS:

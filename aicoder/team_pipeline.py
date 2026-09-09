@@ -7,11 +7,14 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import tempfile
 import time
 import uuid
 from typing import Any, Iterable
+
+from .task_contract import TaskContract, compile_task_contract
 
 
 class TeamStage(str, Enum):
@@ -143,6 +146,53 @@ def test_change_evidence(delta: dict[str, Any]) -> dict[str, Any]:
         "behavior_change": bool(source_paths), "tests_changed": bool(test_paths),
         "coverage_evidence_ok": (not source_paths) or bool(test_paths),
     }
+
+_SHELL_META_RE = __import__("re").compile(r"(?:&&|\|\||[|;<>`]|\$\(|\n|\r)")
+
+_ACCEPTANCE_EXECUTABLES = {
+    "python", "python3", "python.exe", "pytest", "py.test",
+    "npm", "pnpm", "yarn", "cargo", "go", "cmake", "make",
+    "ctest", "meson", "ninja", "dotnet", "mvn", "gradle", "gradlew",
+    "bash", "sh", "grep", "rg",
+}
+def task_acceptance_verification_plan(task: str | TaskContract, root: str | Path) -> list[VerificationCommand]:
+    """Convert task-contract acceptance commands into safe executable verification gates."""
+    root = Path(root)
+    contract = task if isinstance(task, TaskContract) else compile_task_contract(str(task or ""))
+    commands: list[VerificationCommand] = []
+    for command_text in contract.acceptance_commands:
+        command_text = str(command_text or "").strip().strip("`")
+        if _SHELL_META_RE.search(command_text):
+            continue
+        try:
+            argv = shlex.split(command_text)
+        except ValueError:
+            continue
+        if not argv:
+            continue
+        executable = Path(argv[0]).name.lower()
+        if executable not in _ACCEPTANCE_EXECUTABLES:
+            continue
+        argv = normalize_project_test_argv(argv, root)
+        if Path(argv[0]).name.lower() in {"python", "python3", "python.exe"}:
+            argv[0] = project_python_interpreter(root)
+        commands.append(VerificationCommand(f"task-acceptance-{len(commands)+1}", tuple(argv), 300, True))
+    return commands
+
+
+def merge_verification_plans(*plans: Iterable[VerificationCommand]) -> list[VerificationCommand]:
+    """Combine verification plans while preserving order and removing exact argv duplicates."""
+    merged: list[VerificationCommand] = []
+    seen: set[tuple[str, ...]] = set()
+    for plan in plans:
+        for command in plan:
+            key = tuple(command.argv)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(command)
+    return merged
+
 
 def project_verification_plan(root: str | Path) -> list[VerificationCommand]:
     """Infer deterministic checks from repository-native metadata, without an LLM vote."""
