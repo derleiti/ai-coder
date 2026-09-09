@@ -146,6 +146,13 @@ def compile_task_contract(task: str) -> TaskContract:
         and re.search(r"(?i)\b(?:research(?:er|ers|ing)?|rechercheur|rechercheure|recherche|research-stage)\b", segment)
         and _NEGATION_RE.search(segment)
         for segment in _segments(text)
+    ) or bool(
+        forbid_web
+        and re.search(
+            r"(?i)\b(?:use|using|nutze|verwende)\s+only\s+(?:local|repository)|"
+            r"\bonly\s+local\s+(?:repository\s+)?evidence\b|\boffline[- ]only\b",
+            text,
+        )
     )
     forbid_triforce = _explicitly_forbids(text, _TRIFORCE_RE)
     requirements, prohibitions = _extract_constraints(text)
@@ -156,6 +163,6 @@ def compile_task_contract(task: str) -> TaskContract:
         forbid_web=forbid_web,
         forbid_research_web=forbid_research_web,
         forbid_triforce_backend=forbid_triforce,
-        external_research_required=bool(_EXTERNAL_RESEARCH_SIGNAL_RE.search(text)) and not forbid_web,
+        external_research_required=bool(_EXTERNAL_RESEARCH_SIGNAL_RE.search(text)) and not forbid_research_web,
         acceptance_commands=_extract_acceptance_commands(text),
     )

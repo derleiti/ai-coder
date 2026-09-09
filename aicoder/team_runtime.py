@@ -210,12 +210,14 @@ Your result becomes the next StageOff update, so make completed/open work and ne
 Preferred tools for this stage: `file_tree`, `file_read`, `code_tree`, `code_search`, `code_read`, `git`, `test`, `lint`, `status`, `log_viewer`, and `memory_search` for observational verification. All authenticated tools remain available; prefer the smallest tool that answers the planning question and do not persist mutations."""
 
 COORDINATOR_SYSTEM_PROMPT = """You are the Session Memory / StageOff coordinator for an isolated multi-agent coding run.
-The cumulative StageOff is the authoritative run memory. At every stage boundary, reconcile the previous StageOff with the new
-stage output, reorganize or replace stale working-memory wording when useful, preserve all still-valid requirements and evidence,
-mark completed work explicitly, carry unresolved items forward, and write precise NEXT STAGE INSTRUCTIONS. Never silently drop
-requirements, failures, retry metadata, acceptance criteria or evidence gaps. The runtime may expose the full authenticated tool
-catalogue; use observational tools when they materially improve coordination, but never weaken security boundaries or perform
-destructive/elevated host mutations. Your output must agree with the status events and StageOff content passed to the next stage.
+The cumulative StageOff is the coordinator-curated run memory. The immutable user task/TaskContract defines intent, while the
+`runtime_truth` block is machine-derived evidence and always outranks model prose about what is implemented, verified, or persisted.
+At every stage boundary, reconcile the previous StageOff with the new stage output, reorganize or replace stale working-memory
+wording when useful, preserve all still-valid requirements and evidence, carry unresolved items forward, and write precise NEXT
+STAGE INSTRUCTIONS. Never rewrite RuntimeTruth, silently drop requirements/failures/retry metadata/acceptance criteria/evidence
+gaps, or mark work complete beyond deterministic evidence. The runtime may expose the full authenticated tool catalogue; use
+observational tools when they materially improve coordination, but never weaken security boundaries or perform destructive/elevated
+host mutations. Your output must agree with RuntimeTruth, status events, and StageOff content passed to the next stage.
 Preferred tools for this stage: `.aicoder-team/stageoff.json` via `file_read`, plus `file_tree`, `code_tree`, `code_search`, `code_read`, `git`, `status`, `log_viewer`, `memory_search`, and `memory_history` when they clarify unresolved state. All authenticated tools remain available; use tools to reconcile facts, not to bypass stage responsibilities."""
 
 CODER_STRATEGIES = (

@@ -1056,7 +1056,7 @@ def test_research_prompt_carries_immutable_original_task(tmp_path):
         )
     assert result.status == "completed"
     assert sentinel in calls[0]["initial_prompt"]
-    assert "SELF-CONTAINED TASK" in calls[0]["initial_prompt"]
+    assert "EXTERNAL RESEARCH OPTIONAL" in calls[0]["initial_prompt"]
 
 
 def test_research_constraint_guard_blocks_positive_recommendation_of_forbidden_tool():
@@ -1265,7 +1265,7 @@ def test_deterministic_greenfield_research_stageoff_skips_model_coordinator(tmp_
     assert coordinator.model == "deterministic"
     assert coordinator.evidence["model_skipped"] is True
     assert "Research completed deterministically" in updated["working_memory"]["stage_summary"]
-    assert "No implementation item is marked complete" in updated["working_memory"]["completed_items"]
+    assert "No implementation item is runtime-confirmed complete" in updated["working_memory"]["completed_items"]
     assert handoff.source_stage == "research"
     assert any(
         kind == "team_worker_event"

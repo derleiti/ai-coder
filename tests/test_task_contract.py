@@ -42,3 +42,12 @@ def test_explicit_research_no_web_is_separate_hard_constraint():
     contract = compile_task_contract("Researchers must not browse the web; use local evidence only.")
     assert contract.forbid_web is True
     assert contract.forbid_research_web is True
+
+
+def test_implementation_only_no_web_keeps_external_research_signal():
+    contract = compile_task_contract(
+        "Check the latest API docs. Do not browse the web during implementation. Researchers may research the topic."
+    )
+    assert contract.forbid_web is True
+    assert contract.forbid_research_web is False
+    assert contract.external_research_required is True

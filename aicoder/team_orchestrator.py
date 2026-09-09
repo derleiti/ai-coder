@@ -25,6 +25,7 @@ from .executor import MAX_ITERATIONS, atomic_write_text, build_system_prompt, lo
 from .model_transport import ModelTransport
 from .performance import RuntimePerformance
 from .task_contract import TaskContract, compile_task_contract
+from .stage_context import build_runtime_truth, build_stage_initialization, mark_persistent_write_completed, runtime_completion_summary
 from .team_runtime import (
     BRAINSTORM_EVOLUTION_SYSTEM_PROMPT, BRAINSTORM_OPERATOR_SYSTEM_PROMPT,
     BRAINSTORM_PERSPECTIVES, BRAINSTORM_SYNTHESIS_SYSTEM_PROMPT, BRAINSTORM_SYSTEM_PROMPT,
@@ -749,6 +750,8 @@ def _coordinate_stageoff(
     """Append one stage to the cumulative run StageOff and let a fresh coordinator curate it."""
     stage_name = stage.value if isinstance(stage, TeamStage) else str(stage)
     previous = json.loads(json.dumps(current, ensure_ascii=False, default=str))
+    runtime_truth = build_runtime_truth(previous, stage_name, stage_payload)
+    previous["runtime_truth"] = runtime_truth
     stage_text = stage_payload if isinstance(stage_payload, str) else json.dumps(stage_payload, ensure_ascii=False, indent=2, default=str)
     coordinator: AgentStageResult | None = None
     review = ""
@@ -773,10 +776,12 @@ def _coordinate_stageoff(
                 "You are the StageOff coordinator for a staged coding run. This is a FRESH model process. "
                 "Reconcile the new stage output with cumulative state. You may reorganize working-memory wording, "
                 "but never silently drop still-valid requirements, facts, failures, evidence gaps or acceptance criteria. "
-                "The `user_task` field in CURRENT CUMULATIVE STAGEOFF is immutable and outranks every model summary; "
-                "do not weaken, reinterpret, or mark any of its requirements complete without deterministic evidence. "
+                "The `user_task` field in CURRENT CUMULATIVE STAGEOFF is immutable and outranks every model summary. "
+                "The `runtime_truth` field is machine-derived and outranks every coordinator/worker claim: never rewrite it, "
+                "never claim implementation/verification/persistence beyond it, and keep OPEN/NEXT work consistent with it. "
                 "Use tools observationally when they help verify state.\n\n"
-                "CURRENT CUMULATIVE STAGEOFF:\n" + json.dumps(previous, ensure_ascii=False, indent=2, default=str)
+                "MACHINE RUNTIME TRUTH (authoritative):\n" + json.dumps(runtime_truth, ensure_ascii=False, indent=2, sort_keys=True)
+                + "\n\nCURRENT CUMULATIVE STAGEOFF:\n" + json.dumps(previous, ensure_ascii=False, indent=2, default=str)
                 + "\n\nNEW STAGE OUTPUT:\n" + stage_text
             ),
             required_sections=_STAGEOFF_COORDINATOR_SECTIONS, max_tokens=2200, max_iterations=30,
@@ -802,7 +807,8 @@ def _coordinate_stageoff(
             "stage_summary": sections.get("STAGE SUMMARY", ""),
             "new_facts": sections.get("NEW FACTS", ""),
             "required_changes": sections.get("REQUIRED CHANGES", ""),
-            "completed_items": sections.get("COMPLETED ITEMS", ""),
+            "completed_items": runtime_completion_summary(runtime_truth),
+            "coordinator_reported_completed_items": sections.get("COMPLETED ITEMS", ""),
             "open_items": sections.get("OPEN ITEMS", ""),
             "risks": sections.get("RISKS", ""),
             "next_stage_instructions": sections.get("NEXT STAGE INSTRUCTIONS", ""),
@@ -1328,14 +1334,23 @@ def _run_researcher_core(
             "stageoff", json.dumps(legacy, ensure_ascii=False, indent=2),
             max_chars=120000, source_stage="plan_research",
         )
-    external_research_allowed = _task_requires_external_research(task)
+    contract = compile_task_contract(task)
+    external_research_allowed = not contract.forbid_research_web
+    external_research_required = contract.external_research_required
     research_scope_note = (
-        "EXTERNAL RESEARCH REQUIRED/ALLOWED: the original task depends on outside or freshness-sensitive facts.\n"
-        if external_research_allowed else
-        "SELF-CONTAINED TASK: external web search/crawl/fetch is disabled for this research stage. Use the immutable user task and repository evidence; do not pad the report with generic web sources. An empty greenfield workspace is expected evidence, not a blocker: do not ask the user to create files and do not treat missing implementation files as inability to complete the research contract.\n"
+        "EXTERNAL RESEARCH REQUIRED: freshness/external facts are part of the task; use credible sources and record evidence.\n"
+        if external_research_required else
+        "EXTERNAL RESEARCH OPTIONAL: read-only web research is permitted when it materially improves this research role; do not browse merely to pad the report.\n"
+    ) if external_research_allowed else (
+        "EXTERNAL RESEARCH FORBIDDEN FOR RESEARCHERS by the authoritative TaskContract; use only task/repository evidence.\n"
+    )
+    stage_init = build_stage_initialization(
+        stage_input=stage_input, contract=contract, current_stage=f"research:{role}",
+        sought="Ground the assigned research role in evidence and return only facts, applicability, risks, and recommendations needed by later stages.",
+        permissions=("- Workspace mutation: forbidden.\n- Web research: " + ("allowed read-only." if external_research_allowed else "forbidden.")),
     )
     prompt = (
-        "PREVIOUS STAGE OUTPUT (authoritative input; do not infer hidden prior conversation):\n"
+        stage_init + "\n\nPREVIOUS STAGE OUTPUT (authoritative input; do not infer hidden prior conversation):\n"
         f"{stage_input.render()}\n\n"
         "AUTHORITATIVE ORIGINAL USER TASK (immutable; never replace it with a coordinator summary):\n"
         + str(task or "")[:16000] + "\n\n"
@@ -1652,9 +1667,14 @@ def _build_planner_prompt(task: str, repo_context: str, research: list[AgentStag
     )
 
 
-def _candidate_prompt(stage_input: HandoffEnvelope, strategy: str) -> str:
+def _candidate_prompt(stage_input: HandoffEnvelope, strategy: str, contract: TaskContract) -> str:
+    stage_init = build_stage_initialization(
+        stage_input=stage_input, contract=contract, current_stage="code",
+        sought=f"Produce one complete, test-backed implementation candidate. Strategy emphasis: {strategy}.",
+        permissions="- Isolated RAM workspace mutation: allowed.\n- Protected source workspace mutation: forbidden.\n- Web research: not part of implementation; rely on local evidence/tests unless TaskContract explicitly requires otherwise.",
+    )
     return (
-        "PREVIOUS STAGE OUTPUT (authoritative input; this is a fresh model process):\n"
+        stage_init + "\n\nPREVIOUS STAGE OUTPUT (authoritative input; this is a fresh model process):\n"
         f"{stage_input.render()}\n\n"
         f"Your strategy emphasis is {strategy}. Implement the complete contract contained in the handoff, "
         "not only the strategy-specific parts. Do not assume any conversation from an earlier stage."
@@ -2014,7 +2034,7 @@ def _run_candidate(
                     ".aicoder-team/stageoff.json",
                     json.dumps(stage_handoffs["stageoff"], ensure_ascii=False, indent=2),
                 )
-        prompt = _candidate_prompt(stage_input, strategy)
+        prompt = _candidate_prompt(stage_input, strategy, contract)
         forward = _worker_event_forwarder(event_fn, worker_role)
 
         def candidate_event(kind: str, payload: dict[str, Any]) -> None:
@@ -2477,7 +2497,12 @@ def _run_team_pipeline(
             client=client, model_client=model_client, model=research_planner_model,
             system=RESEARCH_PLANNER_SYSTEM_PROMPT, tools=all_tools, workspace_root=source_workspace,
             prompt=(
-                "BOOTSTRAP SESSION MEMORY / STAGEOFF FROM THIS RUN.\n\n"
+                build_stage_initialization(
+                    stage_input=stageoff_handoff, contract=task_contract, current_stage="plan_research",
+                    sought="Bootstrap the first curated StageOff and a task-specific research plan without implementing or inventing repository state.",
+                    permissions="- Workspace mutation: forbidden.\n- Observational repository tools: allowed.\n- Research planning may identify web evidence needs but does not itself implement.",
+                )
+                + "\n\nBOOTSTRAP SESSION MEMORY / STAGEOFF FROM THIS RUN.\n\n"
                 f"USER TASK:\n{_task_handoff(task).render()}\n\n"
                 f"REPOSITORY CONTEXT:\n{make_handoff('repository-context', _repository_context(source_workspace), max_chars=5000).render()}\n\n"
                 "Create a task-specific research plan for all four researcher roles. Inspect the actual project with tools where useful. "
@@ -2499,10 +2524,17 @@ def _run_team_pipeline(
         "compact": research_contract_handoff.compact,
     }
 
-    # The coordinator may replace/reorganize working memory at bootstrap; AICoder keeps immutable run identity separately.
+    # The coordinator may replace/reorganize working memory at bootstrap; immutable
+    # TaskContract and machine RuntimeTruth remain outside coordinator control.
+    bootstrap_truth = build_runtime_truth(
+        stageoff, TeamStage.PLAN_RESEARCH, {"research_contract": research_plan.response}
+    )
+    bootstrap_sections = _extract_contract_sections(research_plan.response, _BOOTSTRAP_SECTIONS)
     stageoff = {
         "schema": "aicoder-stageoff-v1",
         "user_task": task,
+        "task_contract": task_contract.as_dict(),
+        "runtime_truth": bootstrap_truth,
         "repository_context": _repository_context(source_workspace),
         "current_stage": TeamStage.PLAN_RESEARCH.value,
         "handoff_id": "",
@@ -2510,10 +2542,12 @@ def _run_team_pipeline(
         "research_plan": research_plan.response,
         "latest_coordinator_review": research_plan.response,
         "working_memory": {
-            "session_memory": _extract_contract_sections(research_plan.response, _BOOTSTRAP_SECTIONS).get("SESSION MEMORY", ""),
-            "research_plan": _extract_contract_sections(research_plan.response, _BOOTSTRAP_SECTIONS).get("RESEARCH PLAN", ""),
-            "evidence_gaps": _extract_contract_sections(research_plan.response, _BOOTSTRAP_SECTIONS).get("EVIDENCE GAPS", ""),
-            "next_stage_instructions": _extract_contract_sections(research_plan.response, _BOOTSTRAP_SECTIONS).get("NEXT STAGE INSTRUCTIONS", ""),
+            "session_memory": bootstrap_sections.get("SESSION MEMORY", ""),
+            "research_plan": bootstrap_sections.get("RESEARCH PLAN", ""),
+            "evidence_gaps": bootstrap_sections.get("EVIDENCE GAPS", ""),
+            "completed_items": runtime_completion_summary(bootstrap_truth),
+            "open_items": bootstrap_sections.get("SESSION MEMORY", ""),
+            "next_stage_instructions": bootstrap_sections.get("NEXT STAGE INSTRUCTIONS", ""),
         },
         "stages": [{
             "stage": TeamStage.PLAN_RESEARCH.value,
@@ -2629,7 +2663,12 @@ def _run_team_pipeline(
                     _call_stage_agent, client=client, model_client=model_client, model=model, system=system_prompt,
                     tools=all_tools, workspace_root=source_workspace,
                     prompt=(
-                        "PREVIOUS STAGE OUTPUT (authoritative; fresh model process):\n"
+                        build_stage_initialization(
+                            stage_input=stageoff_handoff, contract=task_contract, current_stage="brainstorm",
+                            sought=f"Generate evidence-grounded implementation alternatives for round {round_index} from the {perspective} perspective; do not implement.",
+                            permissions="- Workspace mutation: forbidden.\n- Observational repository tools: allowed.\n- Read-only web research: allowed only when it materially resolves a factual uncertainty.",
+                        )
+                        + "\n\nPREVIOUS STAGE OUTPUT (authoritative; fresh model process):\n"
                         + stageoff_handoff.render()
                         + f"\n\nBRAINSTORM ROUND: {round_index}\nYOUR PERSPECTIVE: {perspective}\n\n"
                         + f"CURRENT ANONYMIZED BRAINSTORM STATE:\n{brainstorm_state or '(none - create independent ideas)'}"
@@ -2772,7 +2811,12 @@ def _run_team_pipeline(
         client=client, model_client=model_client, model=config.planner_model or "", system=PLANNER_SYSTEM_PROMPT,
         tools=all_tools, workspace_root=source_workspace,
         prompt=(
-            "PREVIOUS STAGE OUTPUT (authoritative; fresh model process):\n"
+            build_stage_initialization(
+                stage_input=stageoff_handoff, contract=task_contract, current_stage="plan_code",
+                sought="Convert unresolved TaskContract + StageOff work into one concrete implementation contract and verification roadmap; do not implement.",
+                permissions="- Workspace mutation: forbidden.\n- Observational repository/test inspection: allowed.\n- Treat research evidence as evidence, not completion proof.",
+            )
+            + "\n\nPREVIOUS STAGE OUTPUT (authoritative; fresh model process):\n"
             + stageoff_handoff.render()
             + "\n\nCreate the implementation contract from this handoff only. Inspect the actual repository with tools where needed. "
               "Do not assume prior-stage conversation."
@@ -2928,7 +2972,12 @@ def _run_team_pipeline(
             client=client, model_client=model_client, model=merge_planner_model, system=MERGE_PLANNER_SYSTEM_PROMPT,
             tools=all_tools, workspace_root=str(integration.info.execution_root),
             prompt=(
-                "PREVIOUS STAGEOFF (authoritative; fresh model process):\n" + stageoff_handoff.render()
+                build_stage_initialization(
+                    stage_input=stageoff_handoff, contract=task_contract, current_stage="merge_plan",
+                    sought="Plan an evidence-backed ensemble merge across every verified candidate, preserving the strongest base and selecting only compatible improvements.",
+                    permissions="- Workspace mutation: forbidden.\n- Candidate/repository inspection: allowed.\n- Candidate prose never outranks deterministic checks.",
+                )
+                + "\n\nPREVIOUS STAGEOFF (authoritative; fresh model process):\n" + stageoff_handoff.render()
                 + "\n\nANONYMIZED CANDIDATE EVIDENCE:\n"
                 + make_handoff("candidate-evidence", json.dumps(_compact_candidate_evidence(blind_evidence), ensure_ascii=False, indent=2), max_chars=30000).render()
                 + f"\n\nDETERMINISTIC BASE CANDIDATE: {winner_id}"
@@ -2983,7 +3032,12 @@ def _run_team_pipeline(
         )
         if merge_model:
             merge_prompt = (
-                "PREVIOUS STAGEOFF (authoritative; fresh model process):\n" + stageoff_handoff.render()
+                build_stage_initialization(
+                    stage_input=stageoff_handoff, contract=task_contract, current_stage="merge",
+                    sought="Create one integrated candidate from the verified base plus evidence-backed compatible improvements, then verify the integrated workspace.",
+                    permissions="- Integration RAM workspace mutation: allowed.\n- Protected source workspace mutation: forbidden.\n- Candidate snapshots are read-only evidence.",
+                )
+                + "\n\nPREVIOUS STAGEOFF (authoritative; fresh model process):\n" + stageoff_handoff.render()
                 + "\n\nCandidate snapshots are under .aicoder-team/candidates/. "
                 "Integrate only evidence-backed improvements required by the cumulative StageOff. "
                 "Do not assume any prior model conversation."
@@ -3098,7 +3152,12 @@ def _run_team_pipeline(
                 client=client, model_client=model_client, model=config.test_planner_model, system=TEST_PLANNER_SYSTEM_PROMPT,
                 tools=all_tools, workspace_root=str(integration.info.execution_root),
                 prompt=(
-                    "PREVIOUS STAGEOFF (authoritative; fresh model process):\n" + stageoff_handoff.render()
+                    build_stage_initialization(
+                        stage_input=stageoff_handoff, contract=task_contract, current_stage="plan_tests",
+                        sought="Produce a verification contract that covers the immutable acceptance criteria and the merged repository without modifying implementation code.",
+                        permissions="- Implementation mutation: forbidden.\n- Observational test/build inspection: allowed.\n- Deterministic repository checks remain authoritative.",
+                    )
+                    + "\n\nPREVIOUS STAGEOFF (authoritative; fresh model process):\n" + stageoff_handoff.render()
                     + "\n\nDETERMINISTIC REPOSITORY CHECKS (authoritative):\n"
                     + make_handoff("deterministic-checks", test_plan_text, max_chars=6000).render()
                     + "\n\nPlan verification from this cumulative state only; inspect repository state with tools when needed. "
@@ -3185,6 +3244,11 @@ def _run_team_pipeline(
         handoff_metrics.append(stageoff_handoff.metrics())
         integration.write_candidate_artifact(".aicoder-team/stageoff.json", json.dumps(stageoff, ensure_ascii=False, indent=2))
         integration.finalize(verified=True)
+        stageoff["runtime_truth"] = mark_persistent_write_completed(stageoff.get("runtime_truth") or {})
+        if isinstance(stageoff.get("working_memory"), dict):
+            stageoff["working_memory"]["completed_items"] = runtime_completion_summary(stageoff["runtime_truth"])
+        atomic_write_text(stageoff_file, json.dumps(stageoff, ensure_ascii=False, indent=2) + "\n")
+        _emit(event_fn, "team_runtime_truth", stage=TeamStage.ATOMIC_DISK_WRITE.value, runtime_truth=stageoff["runtime_truth"])
         _stage_complete(ledger, TeamStage.ATOMIC_DISK_WRITE, event_fn)
 
         wall_ms = int((time.monotonic() - started) * 1000)
