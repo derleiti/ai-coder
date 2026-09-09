@@ -68,6 +68,14 @@ _OBSERVATIONAL_STAGE_DISCIPLINE = (
     "still be present; use short bullets/tables instead of essays. Do not spend output budget restating the full user task."
 )
 
+_USER_CONSTRAINT_DISCIPLINE = (
+    "\n\n## USER CONSTRAINT DISCIPLINE\n"
+    "- Explicit user requirements and prohibitions are authoritative constraints, not research hypotheses. Never recommend, probe, install, or depend on something the user explicitly forbids.\n"
+    "- Do not invent settings, skills, tool names, files, or capabilities. If a named capability is not already known from the supplied catalogue/context, list/inspect available options first or proceed without it.\n"
+    "- A failed lookup of a nonexistent setting/skill is evidence to stop guessing nearby names, not a reason to keep probing variants."
+)
+
+
 _BOOTSTRAP_SECTIONS = (
     "SESSION MEMORY", "RESEARCH PLAN", "R1 PRIMARY SOURCES", "R2 BEST PRACTICES",
     "R3 SECURITY RELIABILITY", "R4 ALTERNATIVE ARCHITECTURES", "EVIDENCE GAPS",
@@ -427,6 +435,48 @@ def _extract_contract_sections(text: str, labels: tuple[str, ...]) -> dict[str, 
     return found
 
 
+def _deterministic_contract_fallback(text: str, required_sections: tuple[str, ...]) -> str:
+    """Normalize a semantically useful but structurally invalid stage result without inventing facts."""
+    sections = _extract_contract_sections(str(text or ""), required_sections)
+    rows: list[str] = []
+    for label in required_sections:
+        body = str(sections.get(label.upper()) or "").strip()
+        if not body:
+            if label.upper() == "NEXT STAGE INSTRUCTIONS":
+                body = "Continue from the authoritative user task and prior StageOff; preserve unresolved requirements and do not infer missing facts."
+            else:
+                body = "Not supplied by the model after bounded repair; treat this item as unresolved and preserve the authoritative user task and prior StageOff."
+        rows.append(f"## {label}\n{body}")
+    return "\n\n".join(rows)
+
+
+def _observational_state_issues(text: str, *, role: str, workspace_root: str) -> list[str]:
+    """Reject impossible completion/mutation claims in observational bootstrap stages."""
+    if str(role or "") != "coordinator:plan_research":
+        return []
+    root = Path(workspace_root)
+    try:
+        meaningful = [
+            path for path in root.iterdir()
+            if path.name not in {".git", ".aicoder-team", ".venv", "node_modules", "__pycache__"}
+        ]
+    except OSError:
+        return []
+    if meaningful:
+        return []
+    value = str(text or "")
+    contradiction = re.search(
+        r"(?i)\b(?:task has been completed|files? (?:have|has) been created|"
+        r"implementation (?:has been|is) completed|created in the workspace|project is complete)\b",
+        value,
+    )
+    if contradiction:
+        return [
+            "observational state contradiction: bootstrap workspace is empty/read-only but output claims implementation or files already exist"
+        ]
+    return []
+
+
 def _contract_issues(text: str, required_sections: tuple[str, ...]) -> list[str]:
     """Return deterministic reasons why a model stage output is not a usable contract."""
     value = str(text or "").strip()
@@ -524,6 +574,7 @@ def _call_stage_agent_core(
     stage_system = (
         build_system_prompt(tools, workspace_root).rstrip()
         + "\n\n## CURRENT TEAM STAGE\n" + system.strip()
+        + _USER_CONSTRAINT_DISCIPLINE
         + _OBSERVATIONAL_STAGE_DISCIPLINE
     )
 
@@ -552,7 +603,9 @@ def _call_stage_agent_core(
         response = str(run.response or "").strip()
 
         if run.status == "completed":
-            issues = _contract_issues(response, required_sections)
+            contract_issues = _contract_issues(response, required_sections)
+            state_issues = _observational_state_issues(response, role=role, workspace_root=workspace_root)
+            issues = contract_issues + [issue for issue in state_issues if issue not in contract_issues]
             if not issues:
                 return AgentStageResult(
                     role, run.model or model, "completed", response, elapsed_ms,
@@ -562,10 +615,16 @@ def _call_stage_agent_core(
                     },
                 )
             if repair_attempts >= 2:
+                normalized_source = "" if state_issues else response
+                normalized = _deterministic_contract_fallback(normalized_source, required_sections)
+                _emit(
+                    event_fn, "team_worker_event", role=role, event="runtime_status",
+                    category="contract", status="normalized", phase="stage_contract",
+                    message="model contract remained structurally invalid after bounded repair; deterministic non-inventing envelope applied",
+                )
                 return AgentStageResult(
-                    role, run.model or model, "failed", response, elapsed_ms,
-                    "stage output contract invalid after repair: " + "; ".join(issues),
-                    evidence={"contract_issues": issues, "tool_count": len(tools)},
+                    role, run.model or model, "completed", normalized, elapsed_ms,
+                    evidence={"contract_issues": issues, "contract_normalized": True, "tool_count": len(tools)},
                 )
             repair_attempts += 1
             _emit(
@@ -623,7 +682,10 @@ def _call_stage_agent_core(
 
 
 def _task_handoff(task: str) -> HandoffEnvelope:
-    return make_handoff("task", task, max_chars=5000)
+    # The original user task is an immutable run contract. Keep substantially more
+    # room than ordinary compact handoffs so detailed acceptance criteria survive
+    # bootstrap/research even when a coordinator summarizes them aggressively.
+    return make_handoff("task", task, max_chars=16000)
 
 
 def _research_plan_handoff(text: str) -> HandoffEnvelope:
@@ -649,6 +711,32 @@ def _emit_stage_handoff(event_fn: EventFn | None, handoff: HandoffEnvelope, *, n
         fresh_model_process=True,
     )
 
+def _deterministic_greenfield_research_stageoff_review() -> str:
+    return (
+        "## STAGE SUMMARY\nResearch completed deterministically from the immutable user task and greenfield workspace state; no external research was required.\n\n"
+        "## NEW FACTS\nNo meaningful implementation files exist yet beyond AICoder/Git metadata. No code, test, security, compatibility, or completion claim is established.\n\n"
+        "## REQUIRED CHANGES\nAll implementation requirements and acceptance checks from the original user task remain authoritative and open for planning/coding.\n\n"
+        "## COMPLETED ITEMS\nGreenfield research preflight only. No implementation item is marked complete.\n\n"
+        "## OPEN ITEMS\nArchitecture decisions, implementation, tests, merge, deterministic acceptance checks, documentation, and final verification remain open.\n\n"
+        "## RISKS\nDo not infer missing implementation, add unrelated setup work, weaken user constraints, or claim external evidence that was not gathered.\n\n"
+        "## NEXT STAGE INSTRUCTIONS\nProceed to brainstorm/planning using the original user task as immutable contract. Generate implementation options without inventing existing code or unrelated infrastructure requirements."
+    )
+
+
+def _stage_payload_is_deterministic_greenfield_research(stage_name: str, stage_payload: Any) -> bool:
+    if stage_name != TeamStage.RESEARCH.value or not isinstance(stage_payload, dict):
+        return False
+    reports = stage_payload.get("reports")
+    if not isinstance(reports, list) or not reports:
+        return False
+    return all(
+        isinstance(item, dict)
+        and isinstance(item.get("evidence"), dict)
+        and bool(item["evidence"].get("deterministic_greenfield"))
+        for item in reports
+    )
+
+
 def _coordinate_stageoff(
     *, current: dict[str, Any], stage: TeamStage | str, stage_payload: Any,
     client, model_client: ModelTransport, coordinator_model: str | None, tools: list[dict],
@@ -662,7 +750,20 @@ def _coordinate_stageoff(
     stage_text = stage_payload if isinstance(stage_payload, str) else json.dumps(stage_payload, ensure_ascii=False, indent=2, default=str)
     coordinator: AgentStageResult | None = None
     review = ""
-    if coordinator_model:
+    deterministic_greenfield_research = _stage_payload_is_deterministic_greenfield_research(stage_name, stage_payload)
+    if deterministic_greenfield_research:
+        review = _deterministic_greenfield_research_stageoff_review()
+        coordinator = AgentStageResult(
+            role=f"coordinator:{stage_name}", model="deterministic", status="completed",
+            response=review, elapsed_ms=0,
+            evidence={"deterministic_greenfield": True, "model_skipped": True},
+        )
+        _emit(
+            event_fn, "team_worker_event", role=f"coordinator:{stage_name}", event="runtime_status",
+            category="research", status="deterministic", phase="stageoff_coordination",
+            message="deterministic greenfield research reports detected; model StageOff coordinator skipped to avoid speculative setup/hallucination",
+        )
+    elif coordinator_model:
         coordinator = _call_stage_agent(
             client=client, model_client=model_client, model=coordinator_model,
             system=COORDINATOR_SYSTEM_PROMPT, tools=tools, workspace_root=workspace_root,
@@ -670,11 +771,13 @@ def _coordinate_stageoff(
                 "You are the StageOff coordinator for a staged coding run. This is a FRESH model process. "
                 "Reconcile the new stage output with cumulative state. You may reorganize working-memory wording, "
                 "but never silently drop still-valid requirements, facts, failures, evidence gaps or acceptance criteria. "
+                "The `user_task` field in CURRENT CUMULATIVE STAGEOFF is immutable and outranks every model summary; "
+                "do not weaken, reinterpret, or mark any of its requirements complete without deterministic evidence. "
                 "Use tools observationally when they help verify state.\n\n"
                 "CURRENT CUMULATIVE STAGEOFF:\n" + json.dumps(previous, ensure_ascii=False, indent=2, default=str)
                 + "\n\nNEW STAGE OUTPUT:\n" + stage_text
             ),
-            required_sections=_STAGEOFF_COORDINATOR_SECTIONS, max_tokens=5000, max_iterations=40,
+            required_sections=_STAGEOFF_COORDINATOR_SECTIONS, max_tokens=2200, max_iterations=30,
             event_fn=event_fn, role=f"coordinator:{stage_name}", stop_requested=stop_requested,
             approval_fn=_planning_approval, request_timeout=request_timeout,
             native_openrouter_tool_calling=native_openrouter_tool_calling,
@@ -859,6 +962,43 @@ def _observational_diagnostic_allowed(tool_name: str, args: dict) -> bool:
     return False
 
 
+_EXTERNAL_RESEARCH_SIGNAL_RE = re.compile(
+    r"(?i)(?:https?://|\b(?:latest|recent)\b|\bcurrent\s+(?:version|release|status)\b|"
+    r"\brelease\s+notes?\b|\bdeprecat(?:ed|ion|ions)?\b|\bcompatib(?:ility|le)\b|"
+    r"\bCVE-\d{4}-\d+\b|\bsecurity\s+advisory\b|\bAPI\b|\bSDK\b|"
+    r"\bprotocol\b|\bspecification\b|\bupstream\b|\bofficial\s+documentation\b|"
+    r"\bexternal\s+sources?\b|\bprovider\b|\bendpoint\b)"
+)
+
+
+def _task_requires_external_research(task: str) -> bool:
+    """Conservatively detect tasks whose correctness depends on outside/fresh facts."""
+    return bool(_EXTERNAL_RESEARCH_SIGNAL_RE.search(str(task or "")))
+
+
+def _research_approval_for_task(task: str) -> Callable[[str, dict], bool]:
+    external_allowed = _task_requires_external_research(task)
+
+    def approval(tool_name: str, args: dict) -> bool:
+        canonical = str(tool_name or "").strip().lower().rsplit(".", 1)[-1].rsplit(":", 1)[-1].rsplit("/", 1)[-1]
+        payload = dict(args or {})
+        if not external_allowed and canonical in {"search", "crawl", "crawl_url", "web_fetch_local"}:
+            return False
+        # Common diagnostic tools with required selectors must never be invoked as
+        # empty speculative probes during autonomous observational stages.
+        required_selectors = {"config": ("key",)}
+        required = required_selectors.get(canonical, ())
+        if required and any(not str(payload.get(key) or "").strip() for key in required):
+            return False
+        return _research_approval(tool_name, payload)
+
+    approval._aicoder_autonomous_policy = True
+    approval._aicoder_policy_denial_is_error = False
+    approval._aicoder_external_research_allowed = external_allowed
+    approval._aicoder_enforce_all_tools = True
+    return approval
+
+
 def _research_approval(tool_name: str, args: dict) -> bool:
     """Read-only autonomous policy for team research.
 
@@ -910,6 +1050,65 @@ _planning_approval._aicoder_autonomous_policy = True
 _planning_approval._aicoder_policy_denial_is_error = False
 
 
+def _workspace_has_meaningful_project_files(root: str | Path) -> bool:
+    base = Path(root)
+    ignored = {".git", ".aicoder-team", ".venv", "node_modules", "__pycache__"}
+    try:
+        for path in base.rglob("*"):
+            rel = path.relative_to(base)
+            if any(part in ignored for part in rel.parts):
+                continue
+            if path.is_file() or path.is_symlink():
+                return True
+        return False
+    except OSError:
+        # If inspection fails, do not assume greenfield; fall back to model research.
+        return True
+
+
+def _deterministic_greenfield_bootstrap_plan(task: str) -> str:
+    """Bootstrap StageOff without paraphrasing away greenfield user requirements."""
+    task_text = str(task or "").strip()
+    return (
+        "## SESSION MEMORY\n"
+        "AUTHORITATIVE USER TASK (verbatim; preserve every requirement and prohibition):\n"
+        + task_text
+        + "\n\nGreenfield state: no meaningful implementation files exist yet. No implementation, test, documentation, security, compatibility, or completion claim is established.\n\n"
+        "## RESEARCH PLAN\n"
+        "This is a self-contained greenfield task. Perform deterministic local/task preflight only; external research is not required. Preserve the user task unchanged and do not turn missing files into a blocker.\n\n"
+        "## R1 PRIMARY SOURCES\n"
+        "Use the explicit user task as the primary requirements source and confirm only the greenfield workspace state. Do not invent external sources.\n\n"
+        "## R2 BEST PRACTICES\n"
+        "Do not present generic architecture advice as research evidence before code exists. Defer design alternatives to brainstorm/planning.\n\n"
+        "## R3 SECURITY RELIABILITY\n"
+        "No implementation exists to audit yet. Record that security/reliability verification must occur after code exists; do not infer findings.\n\n"
+        "## R4 ALTERNATIVE ARCHITECTURES\n"
+        "No existing architecture exists to compare. Defer alternative designs to brainstorm and preserve all explicit user constraints.\n\n"
+        "## EVIDENCE GAPS\n"
+        "Implementation evidence, tests, runtime behavior, documentation, merge state, and acceptance results do not exist yet and must remain open until deterministically verified.\n\n"
+        "## NEXT STAGE INSTRUCTIONS\n"
+        "Run the deterministic greenfield research preflight, then proceed to brainstorm/planning from the immutable user task. Do not add unrelated infrastructure/setup requirements or mark implementation work complete."
+    )
+
+
+def _greenfield_self_contained_research_report(role: str, task: str) -> str:
+    role_note = {
+        "primary_sources": "No external/current API fact is required by the task; the explicit user task is the primary requirements source.",
+        "best_practices": "There is no implementation yet to assess against repository-specific practice; architecture advice belongs to brainstorm/planning, not evidence.",
+        "security_reliability": "There is no implementation yet to audit; reliability/security verification must be performed after code exists.",
+        "alternative_architectures": "There is no existing architecture to compare; alternative designs belong to the brainstorm stage rather than being presented as research facts.",
+    }.get(str(role or ""), "No implementation evidence exists yet; preserve the user task as authoritative.")
+    return (
+        "## FINDINGS\n"
+        + role_note
+        + " The project is greenfield: no meaningful implementation files exist beyond AICoder/Git metadata.\n\n"
+        "## SOURCES\nOriginal user task and local workspace inspection only; external research is not required for this self-contained task.\n\n"
+        "## APPLICABILITY\nPreserve every explicit user requirement and acceptance check unchanged. Treat missing implementation files as expected greenfield state, not a blocker or completed work.\n\n"
+        "## RISKS\nNo implementation evidence exists yet, so do not claim code quality, test coverage, security, compatibility, or completion.\n\n"
+        "## RECOMMENDATIONS\nProceed to brainstorm and implementation planning using the immutable user task; inspect and verify the actual code once coding begins."
+    )
+
+
 def _run_researcher(
     *, client, model_client: ModelTransport, model: str, role: str,
     source_workspace: str, tools: list[dict], stop_requested: StopFn | None,
@@ -918,6 +1117,28 @@ def _run_researcher(
     request_timeout: int = 300,
 ) -> AgentStageResult:
     """Run a researcher against a disposable snapshot and discard any accidental writes."""
+    if (
+        stage_input is not None
+        and str(task or "").strip()
+        and not _task_requires_external_research(task)
+        and not _workspace_has_meaningful_project_files(source_workspace)
+    ):
+        report = _greenfield_self_contained_research_report(role, task)
+        _emit(
+            event_fn, "team_worker_event", role=f"research:{role}", event="runtime_status",
+            category="research", status="deterministic", phase="greenfield_preflight",
+            message="self-contained greenfield task detected; using deterministic task/workspace evidence instead of speculative external/model research",
+        )
+        return AgentStageResult(
+            role=f"research:{role}", model=model or "deterministic", status="completed",
+            response=report, elapsed_ms=0,
+            evidence={
+                "deterministic_greenfield": True,
+                "externally_verified": False,
+                "external_tools": [],
+                "successful_tools": ["workspace_preflight"],
+            },
+        )
     backend = create_isolated_team_workspace(source_workspace, "ram")
     execution_root = str(backend.prepare())
     source_root = str(Path(source_workspace).expanduser().resolve(strict=False))
@@ -957,6 +1178,119 @@ def _run_researcher(
         backend.abort()
 
 
+def _explicit_forbidden_terms(task: str) -> list[str]:
+    terms: list[str] = []
+    text = str(task or "")
+    patterns = (
+        r"(?im)(?:^|[.;]\s*|[-*]\s*)do not\s+(?:require|use|install|add|include|depend on)\s+([^\n.;]+)",
+        r"(?im)(?:^|[.;]\s*|[-*]\s*)no\s+([^\n.;]+)",
+        r"(?im)\bwithout\s+([^\n.;]+)",
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            phrase = match.group(1)
+            for item in re.split(r"\s*(?:,|\bor\b|\band\b)\s*", phrase, flags=re.IGNORECASE):
+                value = re.sub(r"^(?:any|the|a|an)\s+", "", item.strip(), flags=re.IGNORECASE)
+                value = value.strip(" `*'\"")
+                if 2 <= len(value) <= 80:
+                    terms.append(value.lower())
+    return list(dict.fromkeys(terms))
+
+
+def _research_constraint_issues(response: str, task: str) -> list[str]:
+    sections = _extract_contract_sections(str(response or ""), RESEARCH_SECTIONS)
+    recommendations = str(sections.get("RECOMMENDATIONS", ""))
+    if not recommendations:
+        return []
+    positive = re.compile(r"(?i)\b(?:recommend|consider|use|install|add|include|adopt|depend|require|choose)\b")
+    negative = re.compile(r"(?i)\b(?:avoid|do not|don't|must not|never|without|no)\b")
+    issues: list[str] = []
+    for line in recommendations.splitlines():
+        low = line.lower()
+        if not positive.search(line) or negative.search(line):
+            continue
+        for term in _explicit_forbidden_terms(task):
+            candidates = {term, term[:-1] if term.endswith("s") else term}
+            if any(candidate and candidate in low for candidate in candidates):
+                issues.append(f"recommendation violates explicit user prohibition: {term}")
+    return list(dict.fromkeys(issues))
+
+
+def _research_grounding_issues(response: str, *, external_allowed: bool, evidence_events: list[dict[str, Any]]) -> list[str]:
+    if external_allowed:
+        return []
+    sections = _extract_contract_sections(str(response or ""), RESEARCH_SECTIONS)
+    sources = str(sections.get("SOURCES", ""))
+    if not sources:
+        return []
+    successful_external = {
+        str(item.get("name") or "") for item in evidence_events
+        if item.get("kind") == "tool_result"
+        and str(item.get("name") or "") in {"search", "crawl", "crawl_url", "web_fetch_local"}
+        and not bool(item.get("is_error"))
+        and "stage_policy_denied" not in str(item.get("result") or "")
+    }
+    if successful_external:
+        return []
+    if re.search(r"(?i)(?:https?://|www\.|\b[a-z0-9-]+\.(?:com|org|net|io|dev)\b)", sources):
+        return ["source grounding violation: external source/URL claimed although external research was disabled and no successful external tool result exists"]
+    return []
+
+
+def _sanitize_self_contained_research(response: str) -> str:
+    sections = _extract_contract_sections(str(response or ""), RESEARCH_SECTIONS)
+    if not sections:
+        return str(response or "")
+    url_re = re.compile(r"(?i)(?:https?://|www\.|\b[a-z0-9-]+\.(?:com|org|net|io|dev)\b)")
+    for label in RESEARCH_SECTIONS:
+        body = str(sections.get(label, ""))
+        if label == "SOURCES":
+            sections[label] = "Original user task and successful local repository/tool evidence only; external research was disabled for this self-contained task."
+            continue
+        kept = [line for line in body.splitlines() if not url_re.search(line)]
+        sections[label] = "\n".join(kept).strip()
+    return "\n\n".join(f"## {label}\n{sections.get(label, '').strip()}" for label in RESEARCH_SECTIONS)
+
+
+def _deterministic_research_fallback(*, external_allowed: bool) -> str:
+    source_line = (
+        "No verified external source is asserted; use only successful tool evidence and the original user task."
+        if external_allowed else
+        "Original user task and local repository/tool evidence only; external research was disabled for this self-contained task."
+    )
+    return (
+        "## FINDINGS\nNo additional research fact is asserted after bounded contract repair; the original user task and repository state remain authoritative.\n\n"
+        f"## SOURCES\n{source_line}\n\n"
+        "## APPLICABILITY\nProceed from the explicit user requirements and inspect the repository directly during planning/coding.\n\n"
+        "## RISKS\nResearch evidence is incomplete; do not infer missing facts or weaken user constraints.\n\n"
+        "## RECOMMENDATIONS\nPreserve every explicit user requirement and continue with repository-grounded implementation planning."
+    )
+
+
+def _sanitize_research_constraints(response: str, task: str) -> str:
+    forbidden = _explicit_forbidden_terms(task)
+    if not forbidden:
+        return str(response or "")
+    sections = _extract_contract_sections(str(response or ""), RESEARCH_SECTIONS)
+    recommendations = str(sections.get("RECOMMENDATIONS", ""))
+    positive = re.compile(r"(?i)\b(?:recommend|consider|use|install|add|include|adopt|depend|require|choose)\b")
+    negative = re.compile(r"(?i)\b(?:avoid|do not|don't|must not|never|without|no)\b")
+    kept: list[str] = []
+    for line in recommendations.splitlines():
+        low = line.lower()
+        violates = False
+        if positive.search(line) and not negative.search(line):
+            for term in forbidden:
+                candidates = {term, term[:-1] if term.endswith("s") else term}
+                if any(candidate and candidate in low for candidate in candidates):
+                    violates = True
+                    break
+        if not violates:
+            kept.append(line)
+    sections["RECOMMENDATIONS"] = "\n".join(kept).strip() or "Respect the explicit user constraints; no additional recommendation is justified."
+    return "\n\n".join(f"## {label}\n{sections.get(label, '').strip()}" for label in RESEARCH_SECTIONS)
+
+
 def _run_researcher_core(
     *, client, model_client: ModelTransport, model: str, role: str,
     source_workspace: str, tools: list[dict], stop_requested: StopFn | None,
@@ -970,14 +1304,24 @@ def _run_researcher_core(
             "stageoff", json.dumps(legacy, ensure_ascii=False, indent=2),
             max_chars=120000, source_stage="plan_research",
         )
+    external_research_allowed = _task_requires_external_research(task)
+    research_scope_note = (
+        "EXTERNAL RESEARCH REQUIRED/ALLOWED: the original task depends on outside or freshness-sensitive facts.\n"
+        if external_research_allowed else
+        "SELF-CONTAINED TASK: external web search/crawl/fetch is disabled for this research stage. Use the immutable user task and repository evidence; do not pad the report with generic web sources. An empty greenfield workspace is expected evidence, not a blocker: do not ask the user to create files and do not treat missing implementation files as inability to complete the research contract.\n"
+    )
     prompt = (
         "PREVIOUS STAGE OUTPUT (authoritative input; do not infer hidden prior conversation):\n"
         f"{stage_input.render()}\n\n"
-        f"Repository root for read-only inspection: {source_workspace}\n\n"
+        "AUTHORITATIVE ORIGINAL USER TASK (immutable; never replace it with a coordinator summary):\n"
+        + str(task or "")[:16000] + "\n\n"
+        + research_scope_note + "\n"
+        + f"Repository root for read-only inspection: {source_workspace}\n\n"
         + RESEARCH_INSTRUCTIONS[role] + "\n\n" + RESEARCH_OUTPUT_CONTRACT
     )
     system = build_system_prompt(tools, source_workspace).rstrip() + (
         "\n\n## RESEARCH AGENT ROLE\n" + RESEARCH_INSTRUCTIONS[role] + "\n\n" + RESEARCH_OUTPUT_CONTRACT
+        + _USER_CONSTRAINT_DISCIPLINE
         + _OBSERVATIONAL_STAGE_DISCIPLINE
     )
     started = time.monotonic()
@@ -1004,7 +1348,7 @@ def _run_researcher_core(
             model=model, fallback_model=None, workspace_root=source_workspace,
             plan_workspace_root=source_workspace, protected_workspace_root=None,
             tools=tools, system_prompt=system, load_tools_on_start=True,
-            quick_chat=False, persistent_plan=False, approval_fn=_research_approval,
+            quick_chat=False, persistent_plan=False, approval_fn=_research_approval_for_task(task),
             max_iterations=60, max_output_tokens=1200, max_tool_calls_per_turn=4,
             max_context_chars=_TEAM_OBSERVATIONAL_CONTEXT_CHARS, stop_requested=stop_requested,
             progressive_tool_disclosure=False,
@@ -1017,6 +1361,14 @@ def _run_researcher_core(
         result = runtime.run()
         if result.status == "completed":
             contract_issues = _contract_issues(str(result.response or ""), RESEARCH_SECTIONS)
+            constraint_issues = _research_constraint_issues(str(result.response or ""), task)
+            grounding_issues = _research_grounding_issues(
+                str(result.response or ""), external_allowed=external_research_allowed,
+                evidence_events=evidence_events,
+            )
+            for issue in constraint_issues + grounding_issues:
+                if issue not in contract_issues:
+                    contract_issues.append(issue)
             if contract_issues and contract_repairs < 4:
                 contract_repairs += 1
                 _emit(
@@ -1035,8 +1387,30 @@ def _run_researcher_core(
                 )
                 continue
             if contract_issues:
-                result.status = "failed"
-                result.error = "research output contract invalid: " + "; ".join(contract_issues)
+                sanitized = _sanitize_research_constraints(str(result.response or ""), task)
+                if not external_research_allowed:
+                    sanitized = _sanitize_self_contained_research(sanitized)
+                remaining = (
+                    _contract_issues(sanitized, RESEARCH_SECTIONS)
+                    + _research_constraint_issues(sanitized, task)
+                    + _research_grounding_issues(
+                        sanitized, external_allowed=external_research_allowed,
+                        evidence_events=evidence_events,
+                    )
+                )
+                if remaining:
+                    sanitized = _deterministic_research_fallback(external_allowed=external_research_allowed)
+                    remaining = _contract_issues(sanitized, RESEARCH_SECTIONS)
+                result.response = sanitized
+                if remaining:
+                    result.status = "failed"
+                    result.error = "research output contract invalid: " + "; ".join(remaining)
+                else:
+                    _emit(
+                        event_fn, "team_worker_event", role=f"research:{role}", event="runtime_status",
+                        category="contract", status="normalized", phase="research_contract",
+                        message="research report normalized after bounded repair using only grounded evidence and explicit user constraints",
+                    )
         if result.status != "paused" or (stop_requested and stop_requested()):
             break
         reason = str(result.response or result.error or "research worker paused")
@@ -1132,13 +1506,16 @@ def _brainstorm_rounds(state: dict[str, Any]) -> int:
 
 def _brainstorm_participants(config: TeamConfig, limit: int = 6) -> list[tuple[str, str, str]]:
     rows: list[tuple[str, str, str]] = []
-    seen: set[str] = set()
+    seen_roles: set[str] = set()
 
     def add(label: str, model: str | None, perspective: str) -> None:
         value = str(model or "").strip()
-        if not value or value in seen or len(rows) >= max(1, int(limit)):
+        role_key = str(label or "").strip().lower()
+        if not value or not role_key or role_key in seen_roles or len(rows) >= max(1, int(limit)):
             return
-        seen.add(value)
+        # Distinct perspectives remain valuable even when every slot uses the same
+        # provider/model. Each participant is a fresh isolated model process.
+        seen_roles.add(role_key)
         rows.append((label, value, perspective))
 
     for slot in config.research:
@@ -2045,21 +2422,39 @@ def _run_team_pipeline(
     # 1) plan_research -- coordinator bootstraps cumulative Session Memory / StageOff and research assignments.
     _stage_start(ledger, TeamStage.PLAN_RESEARCH, event_fn)
     research_planner_model = config.coordinator_model or config.planner_model or ""
-    research_plan = _call_stage_agent(
-        client=client, model_client=model_client, model=research_planner_model,
-        system=RESEARCH_PLANNER_SYSTEM_PROMPT, tools=all_tools, workspace_root=source_workspace,
-        prompt=(
-            "BOOTSTRAP SESSION MEMORY / STAGEOFF FROM THIS RUN.\n\n"
-            f"USER TASK:\n{_task_handoff(task).render()}\n\n"
-            f"REPOSITORY CONTEXT:\n{make_handoff('repository-context', _repository_context(source_workspace), max_chars=5000).render()}\n\n"
-            "Create a task-specific research plan for all four researcher roles. Inspect the actual project with tools where useful. "
-            "The resulting Session Memory becomes the authoritative cumulative working state for the next stage."
-        ),
-        required_sections=_BOOTSTRAP_SECTIONS, max_tokens=5000, max_iterations=50,
-        event_fn=event_fn, role="coordinator:plan_research", stop_requested=stop_requested,
-        approval_fn=_planning_approval, request_timeout=request_timeout,
-        native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
+    deterministic_greenfield_bootstrap = bool(
+        str(task or "").strip()
+        and not _task_requires_external_research(task)
+        and not _workspace_has_meaningful_project_files(source_workspace)
     )
+    if deterministic_greenfield_bootstrap:
+        bootstrap_response = _deterministic_greenfield_bootstrap_plan(task)
+        research_plan = AgentStageResult(
+            role="coordinator:plan_research", model="deterministic", status="completed",
+            response=bootstrap_response, elapsed_ms=0,
+            evidence={"deterministic_greenfield": True, "model_skipped": True},
+        )
+        _emit(
+            event_fn, "team_worker_event", role="coordinator:plan_research", event="runtime_status",
+            category="research", status="deterministic", phase="greenfield_bootstrap",
+            message="self-contained greenfield task detected; bootstrapping StageOff deterministically from the immutable user task",
+        )
+    else:
+        research_plan = _call_stage_agent(
+            client=client, model_client=model_client, model=research_planner_model,
+            system=RESEARCH_PLANNER_SYSTEM_PROMPT, tools=all_tools, workspace_root=source_workspace,
+            prompt=(
+                "BOOTSTRAP SESSION MEMORY / STAGEOFF FROM THIS RUN.\n\n"
+                f"USER TASK:\n{_task_handoff(task).render()}\n\n"
+                f"REPOSITORY CONTEXT:\n{make_handoff('repository-context', _repository_context(source_workspace), max_chars=5000).render()}\n\n"
+                "Create a task-specific research plan for all four researcher roles. Inspect the actual project with tools where useful. "
+                "The resulting Session Memory becomes the authoritative cumulative working state for the next stage."
+            ),
+            required_sections=_BOOTSTRAP_SECTIONS, max_tokens=2200, max_iterations=30,
+            event_fn=event_fn, role="coordinator:plan_research", stop_requested=stop_requested,
+            approval_fn=_planning_approval, request_timeout=request_timeout,
+            native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
+        )
     research_plan.role = "coordinator:plan_research"; stages.append(research_plan)
     if research_plan.status != "completed":
         return TeamRunResult("failed", "", research_plan.model, stages, [], {"ledger": ledger.as_dict(), "stageoff": stageoff}, research_plan.error)
@@ -2124,7 +2519,7 @@ def _run_team_pipeline(
                     _run_researcher, client=client, model_client=model_client, model=slot.model,
                     role=slot.role, source_workspace=source_workspace,
                     tools=research_tools, stop_requested=stop_requested,
-                    stage_input=stageoff_handoff,
+                    stage_input=stageoff_handoff, task=task, research_plan=research_plan.response,
                     native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)), event_fn=event_fn,
                     request_timeout=request_timeout,
                 ): slot for slot in config.research
@@ -2208,7 +2603,7 @@ def _run_team_pipeline(
                     ),
                     required_sections=BRAINSTORM_SECTIONS, max_tokens=4000, max_iterations=35,
                     event_fn=event_fn, role=f"brainstorm:r{round_index}:{label}", stop_requested=stop_requested,
-                    approval_fn=_research_approval, request_timeout=request_timeout,
+                    approval_fn=_research_approval_for_task(task), request_timeout=request_timeout,
                     native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
                 ): (label, model)
                 for label, model, perspective in brainstorm_participants
@@ -2240,7 +2635,7 @@ def _run_team_pipeline(
             prompt=_build_brainstorm_operator_prompt(task, round_index, usable, brainstorm_state),
             required_sections=BRAINSTORM_SECTIONS, max_tokens=5000, max_iterations=30,
             event_fn=event_fn, role=f"brainstorm_state:r{round_index}", stop_requested=stop_requested,
-            approval_fn=_research_approval, request_timeout=request_timeout,
+            approval_fn=_research_approval_for_task(task), request_timeout=request_timeout,
             native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
         )
         operator.role = f"brainstorm_state:r{round_index}"
@@ -2261,15 +2656,44 @@ def _run_team_pipeline(
             prompt=_build_brainstorm_synthesis_prompt(task, brainstorm_state, brainstorm_results),
             required_sections=BRAINSTORM_SECTIONS, max_tokens=6000, max_iterations=30,
             event_fn=event_fn, role="brainstorm_synthesis", stop_requested=stop_requested,
-            approval_fn=_research_approval, request_timeout=request_timeout,
+            approval_fn=_research_approval_for_task(task), request_timeout=request_timeout,
             native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
         )
         brainstorm_synthesis.role = "brainstorm_synthesis"
         stages.append(brainstorm_synthesis)
+        synthesis_error = str(brainstorm_synthesis.error or brainstorm_synthesis.response or "")
+        if (
+            brainstorm_synthesis.status != "completed"
+            and "safety pause after an unusually long run" in synthesis_error.lower()
+            and not (stop_requested and stop_requested())
+        ):
+            _emit(
+                event_fn, "team_worker_event", role="brainstorm_synthesis", event="runtime_status",
+                category="brainstorm", status="retrying", phase="synthesis",
+                message="brainstorm synthesis hit the bounded safety pause; retrying once from compact authoritative evidence",
+            )
+            retry_prompt = (
+                "AUTONOMOUS SYNTHESIS RETRY. Do not inspect broadly and do not repeat completed research. "
+                "Use only the compact authoritative evidence below and immediately produce the required brainstorm contract.\n\n"
+                + _build_brainstorm_synthesis_prompt(task, brainstorm_state, brainstorm_results)
+            )
+            retried = _call_stage_agent(
+                client=client, model_client=model_client, model=synthesis_model,
+                system=BRAINSTORM_SYNTHESIS_SYSTEM_PROMPT, tools=all_tools,
+                workspace_root=source_workspace, prompt=retry_prompt,
+                required_sections=BRAINSTORM_SECTIONS, max_tokens=3500, max_iterations=12,
+                event_fn=event_fn, role="brainstorm_synthesis:retry", stop_requested=stop_requested,
+                approval_fn=_research_approval_for_task(task), request_timeout=request_timeout,
+                native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
+            )
+            retried.role = "brainstorm_synthesis:retry"
+            stages.append(retried)
+            if retried.status == "completed":
+                brainstorm_synthesis = retried
         if brainstorm_synthesis.status != "completed":
             _emit(event_fn, "team_worker_event", role="brainstorm_synthesis", event="runtime_status",
                   category="brainstorm", status="warning", phase="synthesis",
-                  message=f"brainstorm synthesis unavailable; planner continues from research evidence: {brainstorm_synthesis.error[:500]}")
+                  message=f"brainstorm synthesis unavailable; planner continues from research evidence: {str(brainstorm_synthesis.error or brainstorm_synthesis.response)[:500]}")
             brainstorm_contract_handoff = _brainstorm_handoff(
                 "Brainstorm synthesis unavailable. Treat creative ideas as unavailable and plan strictly from the research evidence and user task."
             )

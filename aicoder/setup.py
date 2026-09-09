@@ -446,6 +446,238 @@ def _repl_settings_command(value: str) -> int:
     return 2
 
 
+def _repl_mcp_command(value: str) -> int:
+    """Manage MCP servers through the canonical service without putting secrets in history."""
+    import shlex
+    from .mcp_registry import MCPServerConfig
+    from .mcp_service import (
+        authentication_status, authorize_and_save_server, authorize_oauth, doctor,
+        get_server, list_servers, remove_server, required_secret_field, save_server,
+        server_tools, set_server_enabled, test_server,
+    )
+
+    def ask(label: str, default: str = "") -> str:
+        suffix = f" [{default}]" if default else ""
+        entered = input(f"  {label}{suffix}: ").strip()
+        return entered or default
+
+    def yes_no(label: str, default: bool = True) -> bool:
+        hint = "Y/n" if default else "y/N"
+        answer = input(f"  {label} [{hint}]: ").strip().lower()
+        if not answer:
+            return default
+        return answer in {"y", "yes", "j", "ja"}
+
+    def csv_list(label: str, current: list[str] | None = None) -> list[str]:
+        default = ",".join(current or [])
+        raw = ask(label, default)
+        return [item.strip() for item in raw.split(",") if item.strip()]
+
+    def parse_options(tokens: list[str]) -> dict[str, str | list[str]]:
+        options: dict[str, str | list[str]] = {}
+        i = 0
+        repeatable = {"arg", "env", "allow-tool", "deny-tool", "capability", "oauth-scope"}
+        while i < len(tokens):
+            token = tokens[i]
+            if not token.startswith("--"):
+                raise ValueError(f"unexpected argument: {token}")
+            key = token[2:]
+            if key == "secret":
+                raise ValueError("--secret is forbidden; credentials are entered through a hidden prompt")
+            if i + 1 >= len(tokens) or tokens[i + 1].startswith("--"):
+                raise ValueError(f"missing value for {token}")
+            val = tokens[i + 1]
+            if key in repeatable:
+                options.setdefault(key, [])
+                assert isinstance(options[key], list)
+                options[key].append(val)
+            else:
+                options[key] = val
+            i += 2
+        return options
+
+    def config_from_options(name: str, options: dict[str, str | list[str]], base: MCPServerConfig | None = None) -> MCPServerConfig:
+        c = MCPServerConfig.from_dict(base.__dict__) if base else MCPServerConfig(name=name)
+        c.name = name
+        scalar = lambda key, default="": str(options.get(key, default) or default)
+        if "transport" in options: c.transport = scalar("transport")
+        elif "url" in options: c.transport = "streamable-http"
+        elif "command" in options: c.transport = "stdio"
+        if "url" in options: c.url = scalar("url")
+        if "command" in options: c.command = scalar("command")
+        if "trust" in options: c.trust = scalar("trust")
+        if "auth" in options: c.auth_type = scalar("auth")
+        if "username" in options: c.auth_username = scalar("username")
+        if "header" in options: c.auth_header = scalar("header")
+        if "timeout" in options: c.timeout = int(scalar("timeout"))
+        if "oauth-authorization-url" in options: c.oauth_authorization_url = scalar("oauth-authorization-url")
+        if "oauth-token-url" in options: c.oauth_token_url = scalar("oauth-token-url")
+        if "oauth-client-id" in options: c.oauth_client_id = scalar("oauth-client-id")
+        mappings = {
+            "arg": "args", "env": "env_names", "allow-tool": "allow_tools",
+            "deny-tool": "deny_tools", "capability": "capability_tags", "oauth-scope": "oauth_scopes",
+        }
+        for source, target in mappings.items():
+            if source in options:
+                setattr(c, target, [str(x) for x in options[source]] if isinstance(options[source], list) else [str(options[source])])
+        return c
+
+    def wizard(existing: MCPServerConfig | None = None, supplied_name: str = "") -> tuple[MCPServerConfig, dict[str, str], bool]:
+        c = MCPServerConfig.from_dict(existing.__dict__) if existing else MCPServerConfig(name=supplied_name or "")
+        print("\n  ── MCP Server Setup ───────────────────────────")
+        c.name = ask("Name", c.name)
+        c.transport = ask("Transport (stdio/streamable-http)", c.transport or "streamable-http")
+        if c.transport == "stdio":
+            c.command = ask("Command", c.command)
+            c.args = shlex.split(ask("Arguments", shlex.join(c.args) if c.args else ""))
+            c.env_names = csv_list("Environment allowlist", c.env_names)
+            c.url = ""
+            c.auth_type = "none"
+        else:
+            c.url = ask("URL", c.url)
+            c.command = ""
+            c.args = []
+            c.env_names = []
+            c.auth_type = ask("Authentication (none/api-key/bearer/basic/oauth2/custom-header)", c.auth_type or "none")
+            if c.auth_type == "basic":
+                c.auth_username = ask("Username", c.auth_username)
+            else:
+                c.auth_username = ""
+            if c.auth_type in {"api-key", "custom-header"}:
+                default_header = c.auth_header or ("X-API-Key" if c.auth_type == "api-key" else "X-MCP-Token")
+                c.auth_header = ask("Header name", default_header)
+            if c.auth_type == "oauth2":
+                c.oauth_client_id = ask("OAuth Client ID", c.oauth_client_id)
+                c.oauth_authorization_url = ask("Authorization URL (blank = discovery)", c.oauth_authorization_url)
+                c.oauth_token_url = ask("Token URL (blank = discovery)", c.oauth_token_url)
+                c.oauth_scopes = csv_list("OAuth scopes", c.oauth_scopes)
+        c.trust = ask("Trust (untrusted/trusted)", c.trust or "untrusted")
+        c.timeout = int(ask("Timeout seconds", str(c.timeout or 30)))
+        c.allow_tools = csv_list("Allow tools (blank = all)", c.allow_tools)
+        c.deny_tools = csv_list("Deny tools", c.deny_tools)
+        c.capability_tags = csv_list("Capability tags", c.capability_tags)
+        c.enabled = yes_no("Enabled", c.enabled)
+
+        secrets: dict[str, str] = {}
+        field = required_secret_field(c)
+        status = authentication_status(c.name) if existing is not None else {"credential_status": {}}
+        present = bool((status.get("credential_status") or {}).get(field)) if field else False
+        if field and (not present or yes_no("Replace stored credential", False)):
+            secret = getpass(f"  {c.auth_type} credential: ").strip()
+            if not secret and not present:
+                raise ValueError("required credential was not provided")
+            if secret:
+                secrets[field] = secret
+        if c.auth_type == "oauth2" and yes_no("Store/replace OAuth client secret", False):
+            secret = getpass("  OAuth client secret: ").strip()
+            if secret:
+                secrets["oauth_client_secret"] = secret
+        run_test = yes_no("Test connection before saving", True)
+        return c, secrets, run_test
+
+    try:
+        parts = shlex.split(value or "")
+        action = parts[0].lower() if parts else "list"
+
+        if action in {"list", "ls"}:
+            for row in list_servers():
+                marker = "●" if row.get("enabled") else "○"
+                print(f"  {marker} {row['name']:<20} {row.get('transport',''):<16} {row.get('trust','')}")
+            return 0
+
+        if action == "doctor" and len(parts) == 1:
+            print(json.dumps(doctor(), indent=2, ensure_ascii=False))
+            return 0
+
+        if action == "add":
+            name = parts[1] if len(parts) > 1 and not parts[1].startswith("--") else ""
+            option_start = 2 if name else 1
+            options = parse_options(parts[option_start:]) if len(parts) > option_start else {}
+            if not name and not options:
+                config, secrets, run_test = wizard()
+            else:
+                if not name:
+                    name = ask("Name")
+                config = config_from_options(name, options)
+                if not options:
+                    config, secrets, run_test = wizard(supplied_name=name)
+                else:
+                    secrets = {}
+                    field = required_secret_field(config)
+                    if field:
+                        secret = getpass(f"  {config.auth_type} credential: ").strip()
+                        if not secret:
+                            raise ValueError("required credential was not provided")
+                        secrets[field] = secret
+                    if config.auth_type == "oauth2":
+                        secret = getpass("  OAuth client secret (optional): ").strip()
+                        if secret:
+                            secrets["oauth_client_secret"] = secret
+                    run_test = True
+            if config.auth_type == "oauth2":
+                check = authorize_and_save_server(config, secrets=secrets)
+            else:
+                check = save_server(config, secrets=secrets, test=run_test)
+            print(json.dumps(check, indent=2, ensure_ascii=False))
+            return 0
+
+        if len(parts) < 2:
+            raise ValueError("server name required")
+        name = parts[1]
+        if action in {"enable", "disable"}:
+            set_server_enabled(name, action == "enable")
+            print(f"  {name} → {'enabled' if action == 'enable' else 'disabled'}")
+            return 0
+        if action == "remove":
+            if not remove_server(name):
+                raise ValueError(f"unknown MCP server: {name}")
+            print(f"  {name} → removed")
+            return 0
+        if action in {"doctor", "test"}:
+            print(json.dumps(test_server(name), indent=2, ensure_ascii=False))
+            return 0
+        if action == "tools":
+            for tool in server_tools(name):
+                read_only = bool((tool.get("annotations") or {}).get("readOnlyHint"))
+                print(f"  {tool.get('name',''):<36} {'read-only' if read_only else 'approval'}  {(tool.get('description','') or '')[:60]}")
+            return 0
+        if action == "edit":
+            existing = get_server(name)
+            if existing is None:
+                raise ValueError(f"unknown MCP server: {name}")
+            config, secrets, run_test = wizard(existing)
+            if config.name != name:
+                raise ValueError("renaming MCP servers is not supported; create a new server instead")
+            if config.auth_type == "oauth2" and not authentication_status(name).get("configured"):
+                check = authorize_and_save_server(config, secrets=secrets)
+            else:
+                check = save_server(config, secrets=secrets, test=run_test)
+            print(json.dumps(check, indent=2, ensure_ascii=False))
+            return 0
+        if action == "auth":
+            config = get_server(name)
+            if config is None:
+                raise ValueError(f"unknown MCP server: {name}")
+            if config.auth_type == "oauth2":
+                print(json.dumps(authorize_oauth(name), indent=2, ensure_ascii=False))
+                return 0
+            field = required_secret_field(config)
+            if field is None:
+                print("  Authentication: none")
+                return 0
+            secret = getpass(f"  {config.auth_type} credential: ").strip()
+            if not secret:
+                raise ValueError("credential was not changed")
+            print(json.dumps(save_server(config, secrets={field: secret}, test=True), indent=2, ensure_ascii=False))
+            return 0
+    except Exception as exc:
+        print(f"  Fehler: {type(exc).__name__}: {exc}")
+        return 2
+
+    print("  usage: /mcp [list|add|edit NAME|remove NAME|enable NAME|disable NAME|test NAME|doctor [NAME]|tools NAME|auth NAME]")
+    return 2
+
+
 
 
 from .team_runtime import TEAM_ROLE_ALIASES as _MODEL_ROLE_KEYS, team_model_rows as _shared_team_model_rows
@@ -760,6 +992,8 @@ def run_repl(skip_setup: bool = False) -> int:
                 _repl_settings_command(val)
                 state = get_state()
                 model = state.get("selected_model")
+            elif cmd == "/mcp":
+                _repl_mcp_command(val)
             elif cmd == "/runtime":
                 _repl_runtime_command(val)
                 _print_repl_header()
@@ -875,7 +1109,7 @@ def run_repl(skip_setup: bool = False) -> int:
             elif cmd == "/models":
                 _repl_models_command(val)
             elif cmd == "/help":
-                print("  /team · /models · /settings · /runtime · /status")
+                print("  /team · /models · /settings · /mcp · /runtime · /status")
                 print("  /team [show|models|mode|set|pick] · /runtime [agent|workspace|team] · /settings [ask|set|get]")
                 print("  /commands · /command <name> [args] · /guidelines")
                 print("  /setup · /new · /clear · /keys · /permissions · /exit")

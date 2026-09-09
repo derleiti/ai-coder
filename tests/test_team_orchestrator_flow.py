@@ -964,3 +964,429 @@ def test_normal_missing_code_tree_remains_error(tmp_path):
     )
     assert is_error is True
     assert "path does not exist" in result
+
+
+def test_observational_missing_file_tree_is_non_error_hint(tmp_path):
+    from aicoder.executor import run_tool
+
+    def approval(name, args):
+        return True
+    approval._aicoder_autonomous_policy = True
+    approval._aicoder_policy_denial_is_error = False
+
+    result, is_error = run_tool(
+        None, "file_tree", {"path": "definitely-missing"},
+        workspace_root=str(tmp_path), approval_fn=approval,
+        allowed_tools={"file_tree"},
+    )
+    assert is_error is False
+    assert "observational_not_found" in result
+
+
+def test_deterministic_contract_fallback_preserves_existing_sections_without_inventing():
+    from aicoder.team_orchestrator import _contract_issues, _deterministic_contract_fallback
+
+    required = ("OBJECTIVE", "RISKS", "NEXT STAGE INSTRUCTIONS")
+    normalized = _deterministic_contract_fallback("## OBJECTIVE\nBuild the requested package.", required)
+    assert _contract_issues(normalized, required) == []
+    assert "Build the requested package." in normalized
+    assert "treat this item as unresolved" in normalized
+    assert "do not infer missing facts" in normalized
+
+
+def test_task_handoff_preserves_detailed_user_contract():
+    from aicoder.team_orchestrator import _task_handoff
+    task = "A" * 12000 + " ACCEPTANCE_SENTINEL"
+    handoff = _task_handoff(task)
+    assert "ACCEPTANCE_SENTINEL" in handoff.raw
+    assert "ACCEPTANCE_SENTINEL" in handoff.compact
+
+
+def test_team_prompts_pin_original_task_and_bounded_coordinator_budget():
+    from pathlib import Path
+    source = Path("aicoder/team_orchestrator.py").read_text(encoding="utf-8")
+    runtime = Path("aicoder/team_runtime.py").read_text(encoding="utf-8")
+    assert "AUTHORITATIVE ORIGINAL USER TASK" in source
+    assert "max_tokens=2200, max_iterations=30" in source
+    assert "SOURCE RELEVANCE RULE" in runtime
+    assert "Generic homepages" in runtime
+
+
+def test_self_contained_research_task_blocks_external_web_tools():
+    from aicoder.team_orchestrator import _research_approval_for_task, _task_requires_external_research
+    task = "Build a deterministic Python standard-library terminal game in this empty workspace."
+    assert _task_requires_external_research(task) is False
+    approval = _research_approval_for_task(task)
+    assert approval("search", {"query": "python game examples"}) is False
+    assert approval("crawl", {"url": "https://example.com"}) is False
+    assert approval("file_tree", {"path": "."}) is True
+
+
+def test_fresh_external_task_keeps_web_research_capability():
+    from aicoder.team_orchestrator import _research_approval_for_task, _task_requires_external_research
+    task = "Check the latest API compatibility and official documentation for provider version changes."
+    assert _task_requires_external_research(task) is True
+    approval = _research_approval_for_task(task)
+    assert approval("search", {"query": "official API compatibility"}) is True
+
+
+def test_research_prompt_carries_immutable_original_task(tmp_path):
+    from unittest.mock import MagicMock, patch
+    from aicoder.agent_runtime import AgentRunResult
+    from aicoder.team_orchestrator import _run_researcher_core
+    calls = []
+    sentinel = "ORIGINAL-USER-ACCEPTANCE-SENTINEL-7319"
+
+    class Runtime:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+        def run(self):
+            return AgentRunResult(
+                "completed",
+                "FINDINGS:\na\nSOURCES:\nNo external source required; task/repository evidence only.\nAPPLICABILITY:\nc\nRISKS:\nd\nRECOMMENDATIONS:\ne",
+                "test/model", [], [], "system"
+            )
+
+    with patch("aicoder.team_orchestrator.NativeLightRuntime", Runtime):
+        result = _run_researcher_core(
+            client=MagicMock(), model_client=MagicMock(), model="test/model",
+            role="primary_sources", source_workspace=str(tmp_path), tools=[],
+            stop_requested=None, task="Build local game " + sentinel, research_plan="plan",
+        )
+    assert result.status == "completed"
+    assert sentinel in calls[0]["initial_prompt"]
+    assert "SELF-CONTAINED TASK" in calls[0]["initial_prompt"]
+
+
+def test_research_constraint_guard_blocks_positive_recommendation_of_forbidden_tool():
+    from aicoder.team_orchestrator import _research_constraint_issues, _sanitize_research_constraints
+    task = "Text-only UI; do not require curses or any third-party package."
+    report = (
+        "FINDINGS:\na\nSOURCES:\nlocal evidence\nAPPLICABILITY:\nc\nRISKS:\nd\n"
+        "RECOMMENDATIONS:\n1. Consider using Python's curses library.\n2. Use a simple input loop."
+    )
+    issues = _research_constraint_issues(report, task)
+    assert any("curses" in issue for issue in issues)
+    cleaned = _sanitize_research_constraints(report, task)
+    assert "curses" not in cleaned.lower()
+    assert "simple input loop" in cleaned.lower()
+
+
+def test_research_constraint_guard_allows_negative_reference_to_forbidden_tool():
+    from aicoder.team_orchestrator import _research_constraint_issues
+    task = "Do not require curses."
+    report = (
+        "FINDINGS:\na\nSOURCES:\nlocal evidence\nAPPLICABILITY:\nc\nRISKS:\nd\n"
+        "RECOMMENDATIONS:\n1. Avoid curses and use plain input/output."
+    )
+    assert _research_constraint_issues(report, task) == []
+
+
+def test_empty_bootstrap_workspace_rejects_fake_created_files_claim(tmp_path):
+    from aicoder.team_orchestrator import _observational_state_issues
+    text = "DONE: The task has been completed. The following files have been created in the workspace."
+    issues = _observational_state_issues(text, role="coordinator:plan_research", workspace_root=str(tmp_path))
+    assert issues
+    assert "observational state contradiction" in issues[0]
+
+
+def test_non_bootstrap_role_does_not_use_bootstrap_state_guard(tmp_path):
+    from aicoder.team_orchestrator import _observational_state_issues
+    text = "Files have been created in the workspace."
+    assert _observational_state_issues(text, role="coordinator:merge", workspace_root=str(tmp_path)) == []
+
+
+def test_self_contained_research_policy_blocks_safe_remote_search_in_executor(tmp_path):
+    from unittest.mock import MagicMock
+    from aicoder.executor import run_tool
+    from aicoder.team_orchestrator import _research_approval_for_task
+
+    client = MagicMock()
+    approval = _research_approval_for_task(
+        "Build a deterministic Python standard-library terminal game."
+    )
+    result, is_error = run_tool(
+        client, "search", {"query": "python game examples"},
+        approval_fn=approval, allowed_tools={"search"}, workspace_root=tmp_path,
+    )
+    assert is_error is False
+    assert "stage_policy_denied" in result
+    assert "current autonomous stage policy" in result
+    assert client.method_calls == []
+
+    tree_result, tree_error = run_tool(
+        client, "file_tree", {"path": "."},
+        approval_fn=approval, allowed_tools={"file_tree"}, workspace_root=tmp_path,
+    )
+    assert tree_error is False
+    assert "empty directory" in tree_result
+
+
+def test_self_contained_research_rejects_unverified_external_url_claim():
+    from aicoder.team_orchestrator import _research_grounding_issues
+    report = (
+        "FINDINGS:\na\n"
+        "SOURCES:\nPython docs https://docs.python.org/3/\n"
+        "APPLICABILITY:\nc\nRISKS:\nd\nRECOMMENDATIONS:\ne"
+    )
+    issues = _research_grounding_issues(
+        report, external_allowed=False,
+        evidence_events=[{
+            "kind": "tool_result", "name": "web_fetch_local",
+            "result": "stage_policy_denied", "is_error": False,
+        }],
+    )
+    assert issues
+    assert "source grounding violation" in issues[0]
+
+
+def test_self_contained_research_sanitizer_replaces_external_sources():
+    from aicoder.team_orchestrator import _sanitize_self_contained_research
+    report = (
+        "FINDINGS:\nUse local requirements.\n"
+        "SOURCES:\nPython docs https://docs.python.org/3/\n"
+        "APPLICABILITY:\nLocal task.\nRISKS:\nNone.\nRECOMMENDATIONS:\nProceed locally."
+    )
+    cleaned = _sanitize_self_contained_research(report)
+    assert "https://" not in cleaned
+    assert "external research was disabled" in cleaned
+    assert "Use local requirements" in cleaned
+
+
+def test_deterministic_research_fallback_is_valid_contract():
+    from aicoder.team_orchestrator import _deterministic_research_fallback, _contract_issues
+    from aicoder.team_handoff import RESEARCH_SECTIONS
+    text = _deterministic_research_fallback(external_allowed=False)
+    assert _contract_issues(text, RESEARCH_SECTIONS) == []
+    assert "do not infer missing facts" in text
+
+
+def test_greenfield_self_contained_research_uses_deterministic_evidence(tmp_path):
+    from unittest.mock import MagicMock, patch
+    from aicoder.team_handoff import make_handoff
+    from aicoder.team_orchestrator import _run_researcher
+
+    (tmp_path / ".aicoder-team").mkdir()
+    (tmp_path / ".aicoder-team" / "stageoff.json").write_text("{}")
+    stage = make_handoff("stageoff", '{"user_task":"build local game"}', max_chars=120000)
+    with patch("aicoder.team_orchestrator._run_researcher_core") as core:
+        result = _run_researcher(
+            client=MagicMock(), model_client=MagicMock(), model="test/model",
+            role="primary_sources", source_workspace=str(tmp_path), tools=[],
+            stop_requested=None, stage_input=stage,
+            task="Build a deterministic Python standard-library terminal game.",
+        )
+    assert result.status == "completed"
+    assert result.evidence["deterministic_greenfield"] is True
+    assert "Original user task and local workspace inspection only" in result.response
+    assert "do not claim" in result.response
+    core.assert_not_called()
+
+
+def test_greenfield_external_research_task_still_uses_model_path(tmp_path):
+    from unittest.mock import MagicMock, patch
+    from aicoder.team_handoff import make_handoff
+    from aicoder.team_orchestrator import AgentStageResult, _run_researcher
+
+    stage = make_handoff("stageoff", '{"user_task":"check API"}', max_chars=120000)
+    fake = AgentStageResult("research:primary_sources", "test/model", "completed", "ok", 1)
+    with patch("aicoder.team_orchestrator._run_researcher_core", return_value=fake) as core:
+        result = _run_researcher(
+            client=MagicMock(), model_client=MagicMock(), model="test/model",
+            role="primary_sources", source_workspace=str(tmp_path), tools=[],
+            stop_requested=None, stage_input=stage,
+            task="Check the latest API compatibility and official documentation.",
+        )
+    assert result.status == "completed"
+    core.assert_called_once()
+
+
+def test_existing_project_files_disable_greenfield_shortcut(tmp_path):
+    from unittest.mock import MagicMock, patch
+    from aicoder.team_handoff import make_handoff
+    from aicoder.team_orchestrator import AgentStageResult, _run_researcher
+
+    (tmp_path / "app.py").write_text("print('x')")
+    stage = make_handoff("stageoff", '{"user_task":"review local code"}', max_chars=120000)
+    fake = AgentStageResult("research:best_practices", "test/model", "completed", "ok", 1)
+    with patch("aicoder.team_orchestrator._run_researcher_core", return_value=fake) as core:
+        result = _run_researcher(
+            client=MagicMock(), model_client=MagicMock(), model="test/model",
+            role="best_practices", source_workspace=str(tmp_path), tools=[],
+            stop_requested=None, stage_input=stage,
+            task="Review and improve this local Python project.",
+        )
+    assert result.status == "completed"
+    core.assert_called_once()
+
+
+def test_deterministic_greenfield_research_stageoff_review_is_valid_contract():
+    from aicoder.team_orchestrator import (
+        _contract_issues,
+        _deterministic_greenfield_research_stageoff_review,
+        _STAGEOFF_COORDINATOR_SECTIONS,
+    )
+    text = _deterministic_greenfield_research_stageoff_review()
+    assert _contract_issues(text, _STAGEOFF_COORDINATOR_SECTIONS) == []
+    assert "No implementation item is marked complete" in text
+    assert "unrelated setup work" in text
+
+
+def test_deterministic_greenfield_research_stageoff_skips_model_coordinator(tmp_path):
+    from unittest.mock import MagicMock, patch
+    from aicoder.team_orchestrator import _coordinate_stageoff
+    from aicoder.team_pipeline import TeamStage
+
+    current = {
+        "schema": "aicoder-stageoff-v1",
+        "user_task": "Build Brumo's Dungeon",
+        "stages": [],
+        "handoff_id": "root",
+    }
+    payload = {
+        "reports": [
+            {"role": "research:primary_sources", "evidence": {"deterministic_greenfield": True}},
+            {"role": "research:best_practices", "evidence": {"deterministic_greenfield": True}},
+        ]
+    }
+    events = []
+    with patch("aicoder.team_orchestrator._call_stage_agent") as model_call:
+        updated, coordinator, handoff = _coordinate_stageoff(
+            current=current, stage=TeamStage.RESEARCH, stage_payload=payload,
+            client=MagicMock(), model_client=MagicMock(), coordinator_model="test/model",
+            tools=[], workspace_root=str(tmp_path),
+            event_fn=lambda kind, payload: events.append((kind, payload)),
+            stop_requested=None,
+        )
+    model_call.assert_not_called()
+    assert coordinator is not None
+    assert coordinator.status == "completed"
+    assert coordinator.model == "deterministic"
+    assert coordinator.evidence["model_skipped"] is True
+    assert "Research completed deterministically" in updated["working_memory"]["stage_summary"]
+    assert "No implementation item is marked complete" in updated["working_memory"]["completed_items"]
+    assert handoff.source_stage == "research"
+    assert any(
+        kind == "team_worker_event"
+        and payload.get("category") == "research"
+        and payload.get("status") == "deterministic"
+        for kind, payload in events
+    )
+
+
+def test_mixed_research_payload_keeps_model_coordinator_path(tmp_path):
+    from unittest.mock import MagicMock, patch
+    from aicoder.team_orchestrator import AgentStageResult, _coordinate_stageoff
+    from aicoder.team_pipeline import TeamStage
+
+    payload = {
+        "reports": [
+            {"role": "research:primary_sources", "evidence": {"deterministic_greenfield": True}},
+            {"role": "research:best_practices", "evidence": {"deterministic_greenfield": False}},
+        ]
+    }
+    response = (
+        "## STAGE SUMMARY\nok\n\n## NEW FACTS\nfacts\n\n"
+        "## REQUIRED CHANGES\nchanges\n\n## COMPLETED ITEMS\nnone\n\n"
+        "## OPEN ITEMS\nopen\n\n## RISKS\nrisks\n\n"
+        "## NEXT STAGE INSTRUCTIONS\ncontinue"
+    )
+    fake = AgentStageResult("coordinator:research", "test/model", "completed", response, 1)
+    with patch("aicoder.team_orchestrator._call_stage_agent", return_value=fake) as model_call:
+        _, coordinator, _ = _coordinate_stageoff(
+            current={"stages": [], "handoff_id": ""},
+            stage=TeamStage.RESEARCH, stage_payload=payload,
+            client=MagicMock(), model_client=MagicMock(), coordinator_model="test/model",
+            tools=[], workspace_root=str(tmp_path), event_fn=None, stop_requested=None,
+        )
+    model_call.assert_called_once()
+    assert coordinator.model == "test/model"
+
+
+def test_task_aware_research_policy_denies_empty_config_probe():
+    from aicoder.team_orchestrator import _research_approval_for_task
+    approval = _research_approval_for_task("Build a standard library only terminal game")
+    assert approval("config", {}) is False
+    assert approval("config", {"key": "runtime"}) is True
+    assert approval("search", {"query": "pygame"}) is False
+
+
+def test_deterministic_greenfield_bootstrap_preserves_verbatim_task():
+    from aicoder.team_orchestrator import (
+        _BOOTSTRAP_SECTIONS,
+        _contract_issues,
+        _deterministic_greenfield_bootstrap_plan,
+    )
+    sentinel = "MUST-PRESERVE-ACCEPTANCE-SENTINEL-8842"
+    task = "Build the local game.\n- " + sentinel + "\n- Do not require curses."
+    text = _deterministic_greenfield_bootstrap_plan(task)
+    assert _contract_issues(text, _BOOTSTRAP_SECTIONS) == []
+    assert task in text
+    assert sentinel in text
+    assert "No implementation" in text
+    assert "NEXT STAGE INSTRUCTIONS" in text
+
+
+def test_greenfield_bootstrap_gate_is_conservative(tmp_path):
+    from aicoder.team_orchestrator import (
+        _task_requires_external_research,
+        _workspace_has_meaningful_project_files,
+    )
+    local_task = "Build a deterministic Python standard-library terminal game."
+    external_task = "Check the latest API compatibility and official documentation."
+    assert _task_requires_external_research(local_task) is False
+    assert _workspace_has_meaningful_project_files(tmp_path) is False
+    assert _task_requires_external_research(external_task) is True
+    (tmp_path / "app.py").write_text("print('x')")
+    assert _workspace_has_meaningful_project_files(tmp_path) is True
+
+
+def test_same_model_keeps_distinct_brainstorm_perspectives():
+    from aicoder.team_orchestrator import _brainstorm_participants
+    from aicoder.team_runtime import ResearchSlot, TeamConfig
+
+    model = "mistral/codestral-latest"
+    config = TeamConfig(
+        mode="on",
+        research=(
+            ResearchSlot(1, "primary_sources", model),
+            ResearchSlot(2, "best_practices", model),
+            ResearchSlot(3, "security_reliability", model),
+            ResearchSlot(4, "alternative_architectures", model),
+        ),
+        coders=(),
+        planner_model=model,
+        coordinator_model=model,
+        merge_model=model,
+        test_planner_model=model,
+    )
+    participants = _brainstorm_participants(config, limit=6)
+    labels = [label for label, _, _ in participants]
+    assert labels[:4] == [
+        "research:primary_sources",
+        "research:best_practices",
+        "research:security_reliability",
+        "research:alternative_architectures",
+    ]
+    assert len(participants) == 6
+    assert all(participant_model == model for _, participant_model, _ in participants)
+    assert len({perspective for _, _, perspective in participants}) == 6
+
+
+def test_brainstorm_participant_limit_still_applies_with_same_model():
+    from aicoder.team_orchestrator import _brainstorm_participants
+    from aicoder.team_runtime import ResearchSlot, TeamConfig
+
+    model = "same/model"
+    config = TeamConfig(
+        mode="on",
+        research=(
+            ResearchSlot(1, "primary_sources", model),
+            ResearchSlot(2, "best_practices", model),
+            ResearchSlot(3, "security_reliability", model),
+            ResearchSlot(4, "alternative_architectures", model),
+        ),
+        coders=(), planner_model=model, coordinator_model=model,
+        merge_model=model, test_planner_model=model,
+    )
+    assert len(_brainstorm_participants(config, limit=3)) == 3

@@ -148,3 +148,20 @@ class OutputBudgetSettingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_file_edit_rejects_no_effect_replace(tmp_path, monkeypatch):
+    from aicoder import executor
+
+    target = tmp_path / "sample.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    monkeypatch.setattr(executor, "_workspace_root", lambda: tmp_path)
+    result, is_error = executor.run_file_edit({
+        "path": "sample.py",
+        "operation": "replace",
+        "old_text": "value = 1\n",
+        "new_text": "value = 1\n",
+    })
+    assert is_error is True
+    assert "no_effect" in result
+    assert target.read_text(encoding="utf-8") == "value = 1\n"

@@ -169,9 +169,9 @@ class MCPStreamableHTTPTests(unittest.TestCase):
         try:
             config=MCPServerConfig(
                 name="web",transport="streamable-http",url=f"http://127.0.0.1:{server.server_port}/mcp",
-                timeout=5,trust="trusted",header_env={"Authorization":"MCP_HTTP_AUTH"}
+                timeout=5,trust="trusted",auth_type="bearer"
             )
-            with patch.dict(os.environ,{"MCP_HTTP_AUTH":"Bearer test-secret"},clear=False):
+            with patch("aicoder.mcp_credentials.get_mcp_secret", return_value="test-secret"):
                 tools=list_server_tools(config)
                 self.assertEqual([t["name"] for t in tools],["echo"])
                 with patch("aicoder.mcp_registry.MCPRegistry.get", return_value=config):
@@ -184,3 +184,24 @@ class MCPStreamableHTTPTests(unittest.TestCase):
 
 
 if __name__ == "__main__": unittest.main()
+
+class MCPAuthTests(unittest.TestCase):
+    def test_registry_auth_metadata_never_contains_secret(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path=Path(temp)/"mcp.json"; registry=MCPRegistry(path)
+            registry.put(MCPServerConfig(name="secured",transport="streamable-http",url="https://example.test/mcp",auth_type="api-key",auth_header="X-API-Key"))
+            raw=path.read_text(); self.assertIn('"auth_type": "api-key"',raw); self.assertNotIn("super-secret",raw)
+
+    def test_auth_headers_materialize_from_secret_store(self):
+        from aicoder.mcp_credentials import auth_headers
+        with patch("aicoder.mcp_credentials.get_mcp_secret", return_value="sekret"):
+            self.assertEqual(auth_headers(MCPServerConfig(name="a",transport="streamable-http",url="https://x.test",auth_type="bearer")),{"Authorization":"Bearer sekret"})
+            basic=auth_headers(MCPServerConfig(name="a",transport="streamable-http",url="https://x.test",auth_type="basic",auth_username="markus"))
+            self.assertTrue(basic["Authorization"].startswith("Basic "))
+            self.assertEqual(auth_headers(MCPServerConfig(name="a",transport="streamable-http",url="https://x.test",auth_type="api-key",auth_header="X-Test-Key")),{"X-Test-Key":"sekret"})
+
+    def test_invalid_auth_type_and_header_fail_closed(self):
+        with self.assertRaises(MCPRegistryError):
+            MCPRegistry(Path(tempfile.gettempdir())/"unused-mcp.json").put(MCPServerConfig(name="x",transport="streamable-http",url="https://x.test",auth_type="magic"))
+        with self.assertRaises(MCPRegistryError):
+            MCPRegistry(Path(tempfile.gettempdir())/"unused-mcp.json").put(MCPServerConfig(name="x",transport="streamable-http",url="https://x.test",auth_type="api-key",auth_header="bad header"))

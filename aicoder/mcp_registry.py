@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import threading
 from typing import Any
+from urllib.error import HTTPError
 from urllib.parse import parse_qsl, urlsplit
 from urllib.request import Request, urlopen
 
@@ -21,6 +22,12 @@ _ENV_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 _SECRET_KEY_RE = re.compile(r"token|secret|password|passwd|api[_-]?key|authorization", re.I)
 _SAFE_ENV = ("PATH", "HOME", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL", "XDG_RUNTIME_DIR")
 _TRANSPORTS = {"stdio", "streamable-http"}
+_AUTH_TYPES = {"none", "api-key", "bearer", "basic", "oauth2", "custom-header"}
+_FORBIDDEN_AUTH_HEADERS = {
+    "authorization", "proxy-authorization", "proxy-authenticate", "host",
+    "content-length", "connection", "transfer-encoding", "upgrade",
+    "cookie", "set-cookie", "mcp-session-id",
+}
 _PREFIX = "mcp."
 
 
@@ -56,6 +63,13 @@ class MCPServerConfig:
     timeout: int = 30
     capability_tags: list[str] = field(default_factory=list)
     header_env: dict[str, str] = field(default_factory=dict)
+    auth_type: str = "none"
+    auth_username: str = ""
+    auth_header: str = "X-API-Key"
+    oauth_authorization_url: str = ""
+    oauth_token_url: str = ""
+    oauth_client_id: str = ""
+    oauth_scopes: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "MCPServerConfig":
@@ -69,6 +83,10 @@ class MCPServerConfig:
             trust=str(data.get("trust") or "untrusted"), timeout=int(data.get("timeout") or 30),
             capability_tags=[str(x) for x in data.get("capability_tags") or []],
             header_env={str(k): str(v) for k, v in (data.get("header_env") or {}).items()} if isinstance(data.get("header_env"), dict) else {},
+            auth_type=str(data.get("auth_type") or "none"), auth_username=str(data.get("auth_username") or ""),
+            auth_header=str(data.get("auth_header") or "X-API-Key"),
+            oauth_authorization_url=str(data.get("oauth_authorization_url") or ""), oauth_token_url=str(data.get("oauth_token_url") or ""),
+            oauth_client_id=str(data.get("oauth_client_id") or ""), oauth_scopes=[str(x) for x in data.get("oauth_scopes") or []],
         )
 
 
@@ -77,6 +95,20 @@ def _validate(config: MCPServerConfig) -> MCPServerConfig:
         raise MCPRegistryError("invalid MCP server name")
     if config.name.lower() == "triforce":
         raise MCPRegistryError("'triforce' is reserved for the built-in server profile")
+    if config.auth_type not in _AUTH_TYPES:
+        raise MCPRegistryError(f"unsupported MCP authentication: {config.auth_type}")
+    if config.auth_type in {"api-key", "custom-header"}:
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9-]{0,63}", config.auth_header):
+            raise MCPRegistryError("invalid authentication header")
+        if config.auth_header.lower() in _FORBIDDEN_AUTH_HEADERS:
+            raise MCPRegistryError(f"reserved authentication header: {config.auth_header}")
+    if config.auth_type == "basic" and not config.auth_username.strip():
+        raise MCPRegistryError("basic authentication requires a username")
+    if config.auth_type == "oauth2":
+        if config.transport != "streamable-http":
+            raise MCPRegistryError("OAuth is supported only for streamable-http MCP servers")
+        if not config.oauth_client_id.strip():
+            raise MCPRegistryError("OAuth requires a registered client id")
     if config.transport not in _TRANSPORTS:
         raise MCPRegistryError(f"unsupported MCP transport: {config.transport}")
     if not 1 <= int(config.timeout) <= 300:
@@ -104,7 +136,9 @@ def _validate(config: MCPServerConfig) -> MCPServerConfig:
     for name in config.env_names:
         if not _ENV_RE.fullmatch(name):
             raise MCPRegistryError(f"invalid environment variable name: {name}")
-    forbidden_headers = {"host", "content-length", "connection", "mcp-session-id"}
+    if config.transport == "streamable-http" and config.header_env:
+        raise MCPRegistryError("HTTP header environment injection is disabled; use keyring-backed authentication")
+    forbidden_headers = _FORBIDDEN_AUTH_HEADERS
     for header, env_name in config.header_env.items():
         if not re.fullmatch(r"[A-Za-z][A-Za-z0-9-]{0,63}", header) or header.lower() in forbidden_headers:
             raise MCPRegistryError(f"invalid or reserved HTTP header: {header}")
@@ -198,8 +232,12 @@ def _readline_timeout(stream, timeout: int) -> str:
 
 
 def _json_response(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict): raise RuntimeError("invalid MCP JSON-RPC response")
-    if value.get("error") is not None: raise RuntimeError(f"MCP error: {value['error']}")
+    if not isinstance(value, dict):
+        raise RuntimeError("invalid MCP JSON-RPC response")
+    if value.get("error") is not None:
+        error = value.get("error")
+        code = error.get("code") if isinstance(error, dict) else "unknown"
+        raise RuntimeError(f"MCP JSON-RPC request failed (code {code})")
     return value
 
 
@@ -236,38 +274,128 @@ class _StdioSession:
 
 
 class _HttpSession:
-    def __init__(self,config:MCPServerConfig): self.config=config; self.session_id=""; self.next_id=1
+    def __init__(self, config: MCPServerConfig):
+        self.config = config
+        self.session_id = ""
+        self.protocol_version = ""
+        self.next_id = 1
+
     def __enter__(self):
-        self.request("initialize", {"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"aicoder","version":"1.2"}})
+        response = self.request("initialize", {
+            "protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": {"name": "aicoder", "version": "1.2"},
+        })
+        result = response.get("result") if isinstance(response.get("result"), dict) else {}
+        self.protocol_version = str(result.get("protocolVersion") or "2025-06-18")
         self.notify("notifications/initialized", {})
         return self
-    def __exit__(self,*_): return None
+
+    def __exit__(self, *_):
+        if not self.session_id:
+            return None
+        try:
+            headers = self._headers()
+            request = Request(self.config.url, headers=headers, method="DELETE")
+            with urlopen(request, timeout=min(5, self.config.timeout)):
+                pass
+        except Exception:
+            # Session termination is best-effort by protocol design.
+            pass
+        return None
+
     @staticmethod
-    def _parse(body:str,content_type:str) -> dict[str,Any]:
+    def _parse(body: str, content_type: str, expected_id: Any = None) -> dict[str, Any]:
         if "text/event-stream" in content_type:
-            for line in body.splitlines():
+            data_lines: list[str] = []
+            first_message: dict[str, Any] | None = None
+
+            def consume() -> dict[str, Any] | None:
+                nonlocal data_lines, first_message
+                if not data_lines:
+                    return None
+                value = json.loads("\n".join(data_lines))
+                data_lines = []
+                if not isinstance(value, dict):
+                    return None
+                if first_message is None:
+                    first_message = value
+                if expected_id is None or value.get("id") == expected_id:
+                    return value
+                return None
+
+            for raw_line in body.splitlines():
+                line = raw_line.rstrip("\r")
+                if not line:
+                    matched = consume()
+                    if matched is not None:
+                        return matched
+                    continue
+                if line.startswith(":"):
+                    continue
                 if line.startswith("data:"):
-                    value=json.loads(line[5:].strip())
-                    if isinstance(value,dict): return value
+                    data_lines.append(line[5:].lstrip())
+            matched = consume()
+            if matched is not None:
+                return matched
+            return first_message or {}
+        if not body.strip():
             return {}
-        if not body.strip(): return {}
-        value=json.loads(body); return value if isinstance(value,dict) else {}
-    def _post(self,payload:dict[str,Any]) -> dict[str,Any]:
-        headers={"Content-Type":"application/json","Accept":"application/json, text/event-stream"}
-        for header, env_name in self.config.header_env.items():
-            value = os.environ.get(env_name)
-            if value is not None:
-                headers[header] = value
-        if self.session_id: headers["Mcp-Session-Id"]=self.session_id
-        req=Request(self.config.url,data=json.dumps(payload).encode(),headers=headers,method="POST")
-        with urlopen(req,timeout=self.config.timeout) as response:
-            if response.headers.get("Mcp-Session-Id"): self.session_id=response.headers["Mcp-Session-Id"]
-            body=response.read().decode("utf-8",errors="replace")
-            return self._parse(body,response.headers.get("Content-Type", ""))
-    def notify(self,method:str,params:dict[str,Any]): self._post({"jsonrpc":"2.0","method":method,"params":params})
-    def request(self,method:str,params:dict[str,Any]) -> dict[str,Any]:
-        ident=self.next_id; self.next_id+=1
-        return _json_response(self._post({"jsonrpc":"2.0","id":ident,"method":method,"params":params}))
+        value = json.loads(body)
+        return value if isinstance(value, dict) else {}
+
+    def _headers(self) -> dict[str, str]:
+        headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+        from .mcp_credentials import auth_headers
+        headers.update(auth_headers(self.config))
+        if self.session_id:
+            headers["Mcp-Session-Id"] = self.session_id
+        if self.protocol_version:
+            headers["MCP-Protocol-Version"] = self.protocol_version
+        return headers
+
+    def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
+        headers = self._headers()
+        request = Request(self.config.url, data=json.dumps(payload).encode(), headers=headers, method="POST")
+        with urlopen(request, timeout=self.config.timeout) as response:
+            if response.headers.get("Mcp-Session-Id"):
+                self.session_id = response.headers["Mcp-Session-Id"]
+            body = response.read().decode("utf-8", errors="replace")
+            return self._parse(body, response.headers.get("Content-Type", ""), payload.get("id"))
+
+    def notify(self, method: str, params: dict[str, Any]):
+        self._post({"jsonrpc": "2.0", "method": method, "params": params})
+
+    def _restart_session(self) -> None:
+        self.session_id = ""
+        self.protocol_version = ""
+        response = self.request("initialize", {
+            "protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": {"name": "aicoder", "version": "1.2"},
+        })
+        result = response.get("result") if isinstance(response.get("result"), dict) else {}
+        self.protocol_version = str(result.get("protocolVersion") or "2025-06-18")
+        self.notify("notifications/initialized", {})
+
+    def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        ident = self.next_id
+        self.next_id += 1
+        payload = {"jsonrpc": "2.0", "id": ident, "method": method, "params": params}
+        try:
+            raw = self._post(payload)
+        except HTTPError as exc:
+            if exc.code == 404 and self.session_id and method != "initialize":
+                self._restart_session()
+                raw = self._post(payload)
+            elif exc.code == 401 and self.config.auth_type == "oauth2":
+                from .mcp_oauth import refresh_oauth_token
+                refresh_oauth_token(self.config)
+                raw = self._post(payload)
+            else:
+                raise
+        response = _json_response(raw)
+        if response.get("id") != ident:
+            raise RuntimeError("MCP JSON-RPC response id mismatch")
+        return response
 
 
 def _session(config:MCPServerConfig):

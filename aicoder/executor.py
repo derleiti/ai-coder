@@ -925,7 +925,7 @@ def load_tools(client: TriForceClient, force_refresh: bool = False) -> list[dict
     registry = discover_plugins(_workspace_root())
     provider_tools = registry.tool_schemas()
     try:
-        from .mcp_registry import external_tool_schemas
+        from .mcp_service import external_tool_schemas
         external_tools = external_tool_schemas()
     except Exception:
         # A broken optional external server must not take down the built-in agent.
@@ -1583,6 +1583,13 @@ def run_file_edit(args: dict) -> Tuple[str, bool]:
             pending = original.replace(old, new, 1)
         else:
             return "file_edit error: operation must be create, write, append, or replace", True
+
+        if previous is not None and pending == previous:
+            return (
+                f"file_edit error: no_effect — requested {operation} would leave "
+                f"{_display_workspace_path(path)} unchanged; inspect the actual file/error and make a real change before retrying",
+                True,
+            )
 
         syntax_error = _rejects_broken_python(path, previous, pending, args)
         if syntax_error is not None:
@@ -2244,15 +2251,19 @@ def _run_tool_impl(
         approval_args["_workspace_root"] = str(_workspace_root())
     risk = assess_execution(name, approval_args, destructive=is_destructive(cmd))
     needs_scope_approval = escape_target is not None
-    if risk.needs_approval or needs_scope_approval:
+    enforce_stage_policy = bool(
+        approval_fn is not None
+        and getattr(approval_fn, "_aicoder_enforce_all_tools", False)
+    )
+    if risk.needs_approval or needs_scope_approval or enforce_stage_policy:
         if approval_fn is not None:
             if not approval_fn(name, approval_args):
                 autonomous_policy = bool(getattr(approval_fn, "_aicoder_autonomous_policy", False))
                 policy_denial_is_error = bool(getattr(approval_fn, "_aicoder_policy_denial_is_error", True))
                 if autonomous_policy and not policy_denial_is_error:
                     result = (
-                        f"{name}: stage_policy_denied — this observational stage is read-only; "
-                        "use read/search/verification tools or finish the stage contract instead"
+                        f"{name}: stage_policy_denied — this tool is outside the current autonomous stage policy; "
+                        "use only tools permitted for this stage or finish the stage contract instead"
                     )
                     audit.log_tool(
                         tool_name=name, arguments=args, result=result, duration_s=0,
@@ -2365,6 +2376,18 @@ def _run_tool_impl(
         result, is_error = run_directory_create(execution_args)
     elif name == "file_tree":
         result, is_error = run_file_tree(execution_args)
+        observational_policy = bool(
+            approval_fn is not None
+            and getattr(approval_fn, "_aicoder_autonomous_policy", False)
+            and not getattr(approval_fn, "_aicoder_policy_denial_is_error", True)
+        )
+        if observational_policy and is_error and str(result).startswith("file_tree error: path does not exist:"):
+            result = str(result).replace(
+                "file_tree error: path does not exist:",
+                "file_tree: observational_not_found — path does not exist:",
+                1,
+            )
+            is_error = False
     elif name in {"code_read", "code_tree", "code_search"}:
         try:
             code_target = _code_execution_target(execution_args)
@@ -2408,7 +2431,7 @@ def _run_tool_impl(
     elif (provider := discover_plugins(_workspace_root()).provider_for_tool(name)) is not None:
         result, is_error = provider.execute(name, execution_args)
     elif name.startswith("mcp."):
-        from .mcp_registry import call_external_tool
+        from .mcp_service import call_external_tool
         result, is_error = call_external_tool(name, execution_args)
     elif _is_local:
         result, is_error = f"{name}: no safe local handler is registered", True

@@ -116,28 +116,56 @@ def cmd_workspace(args: argparse.Namespace) -> int:
 
 
 def cmd_mcp(args: argparse.Namespace) -> int:
-    action = str(getattr(args, "tool", None) or "").strip()
-    management = {"list", "add", "remove", "enable", "disable", "tools", "doctor"}
+    action = str(getattr(args, "tool", None) or "").strip().lower()
+    management = {"list", "add", "remove", "enable", "disable", "tools", "doctor", "test", "auth"}
     if action in management:
-        from .executor import invalidate_tool_cache
-        from .mcp_registry import (
-            MCPRegistry, MCPRegistryError, MCPServerConfig, doctor_server, list_server_tools, parse_header_env,
+        from .mcp_registry import MCPServerConfig, parse_header_env
+        from .mcp_service import (
+            authentication_status,
+            authorize_and_save_server,
+            authorize_oauth,
+            doctor,
+            list_servers,
+            remove_server,
+            required_secret_field,
+            save_server,
+            server_tools,
+            set_server_enabled,
+            test_server,
         )
-        registry = MCPRegistry()
         values = list(getattr(args, "arg", None) or [])
         try:
             if action == "list":
-                for row in registry.list():
+                for row in list_servers():
                     target = "builtin" if row.get("builtin") else (row.get("command") or row.get("url") or "")
                     print(f"{row.get('name',''):<20} {str(row.get('transport','')):<16} {'enabled' if row.get('enabled') else 'disabled':<9} {row.get('trust',''):<10} {target}")
                 return 0
 
+            if action == "doctor" and not values:
+                print(json.dumps(doctor(), indent=2, ensure_ascii=False, sort_keys=True))
+                return 0
             if not values:
                 print(f"Error: 'aicoder mcp {action}' requires a server NAME", file=sys.stderr)
                 return 2
             name = values[0]
 
+            if name == "triforce":
+                if action in {"remove", "enable", "disable", "add", "auth"}:
+                    print("Error: built-in TriForce profile is managed by AICoder login/RBAC", file=sys.stderr)
+                    return 2
+                _, client = session_client()
+                payload = {"jsonrpc": "2.0", "method": "tools/list", "params": {}, "id": 1}
+                data = client._request("POST", "/v1/mcp", payload, require_auth=True, _label="tools/list")
+                tools = filter_tool_catalog(data.get("result", {}).get("tools", []), __import__('aicoder.executor', fromlist=['AGENT_TOOLS']).AGENT_TOOLS)
+                if action in {"doctor", "test"}:
+                    print(json.dumps({"name":"triforce","ok":True,"transport":"builtin","tool_count":len(tools)}, indent=2, sort_keys=True))
+                else:
+                    for tool in tools:
+                        print(f"{tool.get('name',''):<36} {(tool.get('description','') or '')[:72]}")
+                return 0
+
             if action == "add":
+                auth_type = str(getattr(args, "auth", "none") or "none")
                 config = MCPServerConfig(
                     name=name,
                     enabled=True,
@@ -152,51 +180,74 @@ def cmd_mcp(args: argparse.Namespace) -> int:
                     timeout=int(getattr(args, "server_timeout", 30) or 30),
                     capability_tags=list(getattr(args, "capability", None) or []),
                     header_env=parse_header_env(list(getattr(args, "header_env", None) or [])),
+                    auth_type=auth_type,
+                    auth_username=str(getattr(args, "username", "") or ""),
+                    auth_header=str(getattr(args, "auth_header", "") or "X-API-Key"),
+                    oauth_authorization_url=str(getattr(args, "oauth_authorization_url", "") or ""),
+                    oauth_token_url=str(getattr(args, "oauth_token_url", "") or ""),
+                    oauth_client_id=str(getattr(args, "oauth_client_id", "") or ""),
+                    oauth_scopes=list(getattr(args, "oauth_scope", None) or []),
                 )
-                check = doctor_server(config)
-                if not check.get("ok"):
-                    print(json.dumps(check, indent=2, ensure_ascii=False, sort_keys=True), file=sys.stderr)
-                    return 1
-                registry.put(config)
-                invalidate_tool_cache()
-                print(json.dumps(check, indent=2, ensure_ascii=False, sort_keys=True))
-                return 0
-
-            if name == "triforce":
-                if action in {"remove", "enable", "disable"}:
-                    print("Error: built-in TriForce profile cannot be changed by the external MCP registry", file=sys.stderr)
-                    return 2
-                _, client = session_client()
-                payload = {"jsonrpc": "2.0", "method": "tools/list", "params": {}, "id": 1}
-                data = client._request("POST", "/v1/mcp", payload, require_auth=True, _label="tools/list")
-                tools = filter_tool_catalog(data.get("result", {}).get("tools", []), __import__('aicoder.executor', fromlist=['AGENT_TOOLS']).AGENT_TOOLS)
-                if action == "doctor":
-                    print(json.dumps({"name":"triforce","ok":True,"transport":"builtin","tool_count":len(tools)}, indent=2, sort_keys=True))
+                secrets: dict[str, str] = {}
+                field = required_secret_field(config)
+                if field:
+                    secret = getpass(f"{auth_type} credential: ").strip()
+                    if not secret:
+                        print("Error: credential is required and was not stored", file=sys.stderr)
+                        return 2
+                    secrets[field] = secret
+                if auth_type == "oauth2":
+                    client_secret = getpass("OAuth client secret (optional; Enter for public client): ").strip()
+                    if client_secret:
+                        secrets["oauth_client_secret"] = client_secret
+                    check = authorize_and_save_server(config, secrets=secrets)
                 else:
-                    for tool in tools:
-                        print(f"{tool.get('name',''):<36} {(tool.get('description','') or '')[:72]}")
+                    check = save_server(config, secrets=secrets, test=True)
+                print(json.dumps(check, indent=2, ensure_ascii=False, sort_keys=True))
                 return 0
 
             if action == "remove":
-                if not registry.remove(name):
-                    print(f"Error: unknown MCP server: {name}", file=sys.stderr); return 2
-                invalidate_tool_cache(); print(f"{name} → removed"); return 0
+                if not remove_server(name):
+                    print(f"Error: unknown MCP server: {name}", file=sys.stderr)
+                    return 2
+                print(f"{name} → removed")
+                return 0
             if action in {"enable", "disable"}:
-                registry.set_enabled(name, action == "enable")
-                invalidate_tool_cache(); print(f"{name} → {action}d"); return 0
-
-            config = registry.get(name)
-            if config is None:
-                print(f"Error: unknown MCP server: {name}", file=sys.stderr); return 2
-            if action == "doctor":
-                check = doctor_server(config)
+                set_server_enabled(name, action == "enable")
+                print(f"{name} → {'enabled' if action == 'enable' else 'disabled'}")
+                return 0
+            if action in {"doctor", "test"}:
+                check = test_server(name)
                 print(json.dumps(check, indent=2, ensure_ascii=False, sort_keys=True))
                 return 0 if check.get("ok") else 1
-            for tool in list_server_tools(config):
-                print(f"{tool.get('name',''):<36} {(tool.get('description','') or '')[:72]}")
-            return 0
-        except (MCPRegistryError, OSError, ValueError, RuntimeError) as exc:
-            print(f"Error: {exc}", file=sys.stderr)
+            if action == "tools":
+                for tool in server_tools(name):
+                    print(f"{tool.get('name',''):<36} {(tool.get('description','') or '')[:72]}")
+                return 0
+            if action == "auth":
+                status = authentication_status(name)
+                if status.get("auth_type") == "oauth2":
+                    result = authorize_oauth(name)
+                    print(json.dumps(result, indent=2, ensure_ascii=False, sort_keys=True))
+                    return 0
+                from .mcp_service import get_server
+                config = get_server(name)
+                if config is None:
+                    print(f"Error: unknown MCP server: {name}", file=sys.stderr)
+                    return 2
+                field = required_secret_field(config)
+                if not field:
+                    print(json.dumps(status, indent=2, ensure_ascii=False, sort_keys=True))
+                    return 0
+                secret = getpass(f"{config.auth_type} credential: ").strip()
+                if not secret:
+                    print("Error: credential is required and was not stored", file=sys.stderr)
+                    return 2
+                check = save_server(config, secrets={field: secret}, test=True)
+                print(json.dumps(check, indent=2, ensure_ascii=False, sort_keys=True))
+                return 0
+        except Exception as exc:
+            print(f"Error: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 2
 
     if action == "serve":
@@ -234,7 +285,6 @@ def cmd_mcp(args: argparse.Namespace) -> int:
         )
     print(output)
     return 1 if is_error else 0
-
 
 def cmd_status_demo(args: argparse.Namespace) -> int:
     label = phase_label(args.mode)
@@ -1453,12 +1503,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--url", default="", help="Streamable HTTP endpoint for 'mcp add' (no embedded secrets)")
     p.add_argument("--server-arg", action="append", default=[], help="Argument passed to a stdio MCP server; repeatable")
     p.add_argument("--env", dest="env_name", action="append", default=[], help="Environment variable NAME allowed for the server; repeatable")
-    p.add_argument("--header-env", action="append", default=[], metavar="HEADER=ENV_NAME", help="HTTP header sourced from an environment variable; stores names only")
     p.add_argument("--allow-tool", action="append", default=[], help="Allow only this remote tool name; repeatable")
     p.add_argument("--deny-tool", action="append", default=[], help="Deny this remote tool name; repeatable")
     p.add_argument("--trust", choices=["untrusted", "trusted"], default="untrusted")
     p.add_argument("--server-timeout", type=int, default=30)
     p.add_argument("--capability", action="append", default=[], help="Capability tag added to this server's tools; repeatable")
+    p.add_argument("--auth", choices=["none", "api-key", "bearer", "basic", "oauth2", "custom-header"], default="none")
+    p.add_argument("--username", default="", help="Basic-auth username metadata (password is prompted securely)")
+    p.add_argument("--auth-header", default="X-API-Key", help="Header name for API-key/custom-header authentication")
+    p.add_argument("--oauth-authorization-url", default="", help="OAuth authorization endpoint; optional when discovery succeeds")
+    p.add_argument("--oauth-token-url", default="", help="OAuth token endpoint; optional when discovery succeeds")
+    p.add_argument("--oauth-client-id", default="", help="Pre-registered OAuth client ID")
+    p.add_argument("--oauth-scope", action="append", default=[], help="OAuth scope; repeatable")
     p.set_defaults(func=cmd_mcp)
 
     # session state

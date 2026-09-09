@@ -108,6 +108,22 @@ def _is_behavior_verification_call(name: str, args: dict) -> bool:
 _COMMAND_EXECUTION_TOOLS = {"shell", "task_runner", "binary_exec", "custom_exec", "local_exec"}
 
 
+def _missing_required_tool_arguments(tools: list[dict], name: str, args: dict) -> list[str]:
+    """Return schema-required argument names absent from a model tool call."""
+    target = str(name or "")
+    for tool in tools:
+        if not isinstance(tool, dict) or str(tool.get("name") or "") != target:
+            continue
+        schema = tool.get("inputSchema") or tool.get("input_schema") or {}
+        if not isinstance(schema, dict):
+            return []
+        required = schema.get("required") or []
+        if not isinstance(required, list):
+            return []
+        return [str(key) for key in required if str(key) and str(key) not in args]
+    return []
+
+
 def _has_mutation_effect(name: str, args: dict) -> bool:
     """Classify progress effects separately from conservative approval risk.
 
@@ -983,6 +999,7 @@ class NativeLightRuntime:
         # This avoids burning turns on duplicate diagnostics while preserving
         # correctness: any successful mutation clears the cache immediately.
         successful_tool_cache: dict[str, str] = {}
+        blocked_failure_calls: dict[str, str] = {}
         mutation_seen, verification_seen = plan.progress_flags() if resumed and plan else (False, False)
         test_verification_seen = False
         verification_nudge_sent = False
@@ -1642,6 +1659,7 @@ class NativeLightRuntime:
                     })
                     continue
                 allowed, reason = require_allowed_tool(name, allowed_tool_names)
+                missing_required = _missing_required_tool_arguments(tools, name, args)
                 risk = assess_execution(
                     name, args, destructive=is_destructive(str(args.get("command", "")))
                 )
@@ -1650,6 +1668,35 @@ class NativeLightRuntime:
                     sort_keys=True, ensure_ascii=False, default=str,
                 )
                 explicit_polling = bool(_POLLING_INTENT_RE.search(self.initial_prompt))
+                state_mutation = bool(risk.mutation and not _is_behavior_verification_call(name, args))
+                if allowed and not state_mutation and cache_key in blocked_failure_calls:
+                    tool_result = (
+                        "FAILURE CIRCUIT OPEN: this exact non-mutating tool call previously reproduced the same "
+                        "non-transient failure at least three times in this run. Do not execute it again until a real "
+                        "mutation changes the relevant state; inspect a different fact, change code/input/path, or report the blocker. "
+                        f"Failure signature: {blocked_failure_calls[cache_key]}"
+                    )
+                    is_error = True
+                    elapsed = 0.0
+                    performance.record_tool(name, elapsed, is_error=True)
+                    self._emit(
+                        "failure_call_blocked", name=name, iteration=i + 1,
+                        signature=blocked_failure_calls[cache_key], request_id=request_id,
+                    )
+                    tool_results.append(f"Tool {name} result:\n{tool_result}")
+                    if native_mode:
+                        native_tool_messages.append({
+                            "role": "tool", "tool_call_id": str(call.get("id") or ""),
+                            "name": name, "content": str(tool_result),
+                        })
+                    batch_records.append({
+                        "id": str(call.get("id") or ""), "name": name,
+                        "provider": str(call.get("provider") or ""),
+                        "raw_type": str(call.get("raw_type") or ""),
+                        "metadata": call.get("metadata") if isinstance(call.get("metadata"), dict) else {},
+                        "arguments": args, "is_error": True, "failure_circuit": True,
+                    })
+                    continue
                 if allowed and not explicit_polling and not risk.mutation and cache_key in successful_tool_cache:
                     tool_result = (
                         "REUSED SUCCESSFUL TOOL RESULT FROM THIS RUN; identical non-mutating call was already executed.\n"
@@ -1686,6 +1733,18 @@ class NativeLightRuntime:
                 if not allowed:
                     tool_result, is_error = f"{name}: blocked — {reason}", True
                     elapsed = 0.0
+                elif missing_required:
+                    required_text = ", ".join(missing_required)
+                    tool_result = (
+                        f"{name}: tool_schema_rejected — missing required argument(s): {required_text}. "
+                        "Retry only if this tool is actually needed, using the exact advertised schema; otherwise choose a relevant tool or finish the task."
+                    )
+                    is_error = True
+                    elapsed = 0.0
+                    self._emit(
+                        "tool_schema_rejected", name=name, missing=missing_required,
+                        iteration=i + 1, request_id=request_id,
+                    )
                 elif pre_hook.blocked:
                     tool_result = f"{name}: blocked by hook — {pre_hook.reason or 'policy hook denied operation'}"
                     is_error = True
@@ -1791,8 +1850,10 @@ class NativeLightRuntime:
                             protected_workspace_root=self.protected_workspace_root,
                         )
                     elapsed = time.monotonic() - started_tool
-                if not is_error and risk.mutation:
+                if not is_error and state_mutation:
                     successful_tool_cache.clear()
+                    blocked_failure_calls.clear()
+                    failure_tracker.reset()
                 elif not is_error:
                     successful_tool_cache[cache_key] = str(tool_result)
                     if len(successful_tool_cache) > 64:
@@ -1852,6 +1913,8 @@ class NativeLightRuntime:
                             evidence_store.remember_failure(failure.category, failure.signature, failure.count)
                         except Exception as exc:
                             self._emit("evidence_record_failed", evidence_kind="failure", error=f"{type(exc).__name__}: {exc}")
+                    if failure.count >= 3 and not failure.retryable and not state_mutation:
+                        blocked_failure_calls[cache_key] = failure.signature
                     if failure.count > batch_failure_repeats:
                         batch_failure_repeats = failure.count
                         batch_failure_category = failure.category

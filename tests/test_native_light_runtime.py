@@ -269,7 +269,7 @@ class NativeLightPlanTests(unittest.TestCase):
                 {"response": '<tool_call>{"name":"file_edit","arguments":{"path":"x.py","operation":"write","content":"x=1"}}</tool_call>', "model": "test/model"},
                 {"response": '<tool_call>{"name":"lint","arguments":{}}</tool_call>', "model": "test/model"},
                 {"response": "DONE: linted", "model": "test/model"},
-                {"response": '<tool_call>{"name":"test","arguments":{}}</tool_call>', "model": "test/model"},
+                {"response": '<tool_call>{"name":"test","arguments":{"command":"python -m pytest -q"}}</tool_call>', "model": "test/model"},
                 {"response": "DONE: tested", "model": "test/model"},
             ]
             runtime = NativeLightRuntime(
@@ -452,6 +452,52 @@ class NativeLightPlanTests(unittest.TestCase):
             self.assertTrue(any(
                 name == "loop_prevented" and payload.get("action") == "autonomous_replan"
                 for name, payload in events
+            ))
+
+    def test_missing_required_remote_tool_argument_is_rejected_before_execution(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp)
+            client = MagicMock()
+            client.timeout = 30
+            client.chat.side_effect = [
+                {
+                    "response": '<tool_call>{"name":"config","arguments":{}}</tool_call>',
+                    "model": "test/model",
+                },
+                {"response": "DONE: used schema feedback", "model": "test/model"},
+            ]
+            schema = {
+                "name": "config",
+                "description": "Read config key",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"key": {"type": "string"}},
+                    "required": ["key"],
+                },
+            }
+            runtime = NativeLightRuntime(
+                client=client, initial_prompt="Inspect relevant configuration only if needed",
+                model="test/model", fallback_model=None,
+                workspace_root=str(workspace), tools=[schema],
+                load_tools_on_start=True, persistent_plan=False, base_timeout=30,
+            )
+            events = []
+            runtime.event_fn = lambda name, payload: events.append((name, payload))
+            with patch("aicoder.agent_runtime.run_tool") as execute:
+                result = runtime.run()
+
+            self.assertEqual(result.status, "completed")
+            execute.assert_not_called()
+            rejected = [payload for name, payload in events if name == "tool_schema_rejected"]
+            self.assertEqual(len(rejected), 1)
+            self.assertEqual(rejected[0]["name"], "config")
+            self.assertEqual(rejected[0]["missing"], ["key"])
+            tool_results = [payload for name, payload in events if name == "tool_result"]
+            self.assertTrue(any(
+                payload.get("name") == "config"
+                and payload.get("is_error") is True
+                and "missing required argument(s): key" in str(payload.get("result") or "")
+                for payload in tool_results
             ))
 
     def test_varied_calls_same_failure_open_general_circuit(self):
@@ -831,3 +877,54 @@ class NativeLightGuiTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_repeated_failure_circuit_blocks_same_verification_until_real_mutation():
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import MagicMock, patch
+
+    from aicoder.agent_runtime import NativeLightRuntime
+
+    with tempfile.TemporaryDirectory() as temp:
+        workspace = Path(temp)
+        client = MagicMock()
+        client.timeout = 30
+        client.chat.side_effect = [
+            {"response": '<tool_call>{"name":"test","arguments":{"command":"python -m pytest -q tests/a.py"}}</tool_call>', "model": "test/model"},
+            {"response": '<tool_call>{"name":"test","arguments":{"command":"python -m pytest -q tests/b.py"}}</tool_call>', "model": "test/model"},
+            {"response": '<tool_call>{"name":"test","arguments":{"command":"python -m pytest -q tests/c.py"}}</tool_call>', "model": "test/model"},
+            {"response": '<tool_call>{"name":"test","arguments":{"command":"python -m pytest -q tests/d.py"}}</tool_call>', "model": "test/model"},
+            {"response": '<tool_call>{"name":"test","arguments":{"command":"python -m pytest -q tests/c.py"}}</tool_call>', "model": "test/model"},
+            {"response": "DONE: blocker identified", "model": "test/model"},
+        ]
+        schema = {
+            "name": "test",
+            "description": "Run tests",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        }
+        runtime = NativeLightRuntime(
+            client=client,
+            initial_prompt="Diagnose test failure",
+            model="test/model",
+            fallback_model=None,
+            workspace_root=str(workspace),
+            tools=[schema],
+            load_tools_on_start=True,
+            persistent_plan=False,
+            base_timeout=30,
+            max_iterations=8,
+        )
+        events = []
+        runtime.event_fn = lambda name, payload: events.append((name, payload))
+        failure = "ModuleNotFoundError: No module named 'brumos_dungeon'"
+        with patch("aicoder.agent_runtime.run_tool", return_value=(failure, True)) as execute:
+            result = runtime.run()
+
+        assert result.status == "completed"
+        assert execute.call_count == 4
+        assert any(name == "failure_call_blocked" for name, _ in events)

@@ -26,7 +26,10 @@ except (ImportError, OSError):
 COMMANDS = [
     "/clear", "/exit", "/help", "/keys", "/model",
     "/command", "/commands", "/guidelines", "/models", "/new", "/permissions",
-    "/plan", "/quit", "/runtime", "/settings", "/setup", "/status", "/tools",
+    "/plan", "/quit", "/runtime", "/settings", "/settings get", "/settings set",
+    "/settings reset", "/settings explain", "/mcp", "/mcp list", "/mcp add",
+    "/mcp edit", "/mcp remove", "/mcp enable", "/mcp disable", "/mcp test",
+    "/mcp doctor", "/mcp tools", "/mcp auth", "/setup", "/status", "/tools",
 ]
 
 
