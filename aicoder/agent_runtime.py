@@ -2016,6 +2016,14 @@ class NativeLightRuntime:
 
             base_tool_result_count = len(tool_results)
             repeats = loop_guard.observe(calls, tool_results)
+            batch_mutation_effect = any(
+                (not record.get("is_error")) and _has_mutation_effect(str(record.get("name") or ""), record.get("arguments") or {})
+                and not _is_behavior_verification_call(str(record.get("name") or ""), record.get("arguments") or {})
+                for record in batch_records
+            )
+            semantic_stall_repeats = loop_guard.observe_semantic_stall(
+                calls, tool_results, mutation_effect=batch_mutation_effect
+            )
             all_failed = bool(batch_records) and all(record.get("is_error") for record in batch_records)
             research_tools = {
                 name for name in ("memory_search", "search", "crawl", "web_fetch_local")
@@ -2088,6 +2096,16 @@ class NativeLightRuntime:
                 self._emit(
                     "implementation_required", iteration=i + 1,
                     reason="inspection_without_mutation", inspections=pre_mutation_inspection_count,
+                )
+
+            if semantic_stall_repeats >= 4 and not batch_verification_stall_reason:
+                batch_verification_stall_reason = (
+                    "Agent paused because the same semantic no-progress outcome repeated at least four times "
+                    "without an effective mutation (for example identical verification failure, reused read, or no-effect edit). "
+                    "Resume only with a different root-cause strategy or changed workspace state."
+                )
+                self._emit(
+                    "semantic_progress_stalled", iteration=i + 1, repeats=semantic_stall_repeats,
                 )
 
             if batch_verification_stall_reason:

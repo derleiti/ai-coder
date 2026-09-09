@@ -383,6 +383,27 @@ class WorkspaceEscapeTests(unittest.TestCase):
                 else:
                     os.environ[ACTIVE_WORKSPACE_ENV] = previous
 
+    def test_cli_startup_preserves_explicit_active_workspace_over_launch_cwd(self):
+        import os
+        from aicoder import cli
+        from aicoder.workspace import ACTIVE_WORKSPACE_ENV
+
+        with tempfile.TemporaryDirectory() as selected, tempfile.TemporaryDirectory() as launcher:
+            previous = os.environ.get(ACTIVE_WORKSPACE_ENV)
+            old_cwd = os.getcwd()
+            try:
+                os.environ[ACTIVE_WORKSPACE_ENV] = selected
+                os.chdir(launcher)
+                root = cli._activate_startup_workspace(["aicoder", "agent"])
+                self.assertEqual(root, Path(selected).resolve())
+                self.assertEqual(Path(os.environ[ACTIVE_WORKSPACE_ENV]), Path(selected).resolve())
+            finally:
+                os.chdir(old_cwd)
+                if previous is None:
+                    os.environ.pop(ACTIVE_WORKSPACE_ENV, None)
+                else:
+                    os.environ[ACTIVE_WORKSPACE_ENV] = previous
+
 
     def test_symlink_inside_workspace_pointing_outside_is_rejected(self):
         with tempfile.TemporaryDirectory() as temp:

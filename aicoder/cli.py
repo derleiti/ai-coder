@@ -2026,7 +2026,10 @@ def _activate_startup_workspace(argv: list[str] | None = None) -> Path:
             if projects_path.is_dir():
                 return activate_workspace(projects_path)
         return activate_workspace(os.getcwd())
-    return activate_workspace()
+    # CLI/REPL must preserve an explicitly selected process-local workspace.
+    # Without AICODER_ACTIVE_WORKSPACE, active_workspace() resolves to launch cwd,
+    # so the historical CLI behavior remains unchanged.
+    return activate_workspace(active_workspace())
 
 
 def main() -> int:

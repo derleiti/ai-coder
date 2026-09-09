@@ -232,6 +232,7 @@ class AgentLoopGuard:
         self._recent: list[str] = []
         self._last_call_batch = ""
         self._consecutive_call_batches = 0
+        self._semantic_recent: list[str] = []
 
     def observe_calls(self, calls: list[dict]) -> int:
         """Count consecutive semantically identical call batches before execution."""
@@ -263,8 +264,33 @@ class AgentLoopGuard:
         self._recent = self._recent[-self.window:]
         return repeats
 
+    def observe_semantic_stall(self, calls: list[dict], results: list[str], *, mutation_effect: bool) -> int:
+        """Count repeated no-progress outcomes even when superficial call arguments differ."""
+        if mutation_effect:
+            self._semantic_recent.clear()
+            return 0
+        signatures: list[str] = []
+        for result in results:
+            text = str(result or "")
+            low = text.lower()
+            if "no_effect" in low or "replacement text is identical" in low:
+                signatures.append("no_effect")
+            elif "reused successful tool result from this run" in low:
+                signatures.append("reused_success:" + text[-800:])
+            elif any(token in low for token in ("failed", "failure", "traceback", "assertionerror", "error:")):
+                signatures.append("failure:" + text[-1200:])
+        if not signatures:
+            self._semantic_recent.clear()
+            return 0
+        fingerprint = json.dumps(sorted(signatures), ensure_ascii=False, sort_keys=True)
+        repeats = self._semantic_recent.count(fingerprint) + 1
+        self._semantic_recent.append(fingerprint)
+        self._semantic_recent = self._semantic_recent[-self.window:]
+        return repeats
+
     def reset(self) -> None:
         self._recent.clear()
+        self._semantic_recent.clear()
         self._last_call_batch = ""
         self._consecutive_call_batches = 0
 

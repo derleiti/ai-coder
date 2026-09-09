@@ -739,3 +739,26 @@ class ToolSecurityHardeningTests(unittest.TestCase):
                 executor.AGENT_TOOLS, executor._tool_cache, executor._tool_cache_ts,
                 executor._tool_cache_key, executor._tool_security_hints,
             ) = saved
+
+
+class SemanticLoopGuardTests(unittest.TestCase):
+    def test_agent_loop_guard_detects_semantic_no_effect_stall(self):
+        from aicoder.executor import AgentLoopGuard
+        guard = AgentLoopGuard()
+        counts = [
+            guard.observe_semantic_stall(
+                [{"name": "file_edit", "arguments": {"path": "a.py", "old": str(i)}}],
+                ["file_edit error: no_effect: replacement text is identical to existing content"],
+                mutation_effect=False,
+            )
+            for i in range(4)
+        ]
+        self.assertEqual(counts, [1, 2, 3, 4])
+
+    def test_agent_loop_guard_resets_semantic_stall_after_effective_mutation(self):
+        from aicoder.executor import AgentLoopGuard
+        guard = AgentLoopGuard()
+        first = guard.observe_semantic_stall([], ["error: same failure"], mutation_effect=False)
+        reset = guard.observe_semantic_stall([], ["ok"], mutation_effect=True)
+        again = guard.observe_semantic_stall([], ["error: same failure"], mutation_effect=False)
+        self.assertEqual((first, reset, again), (1, 0, 1))

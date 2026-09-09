@@ -373,11 +373,10 @@ def run_agent(
         session = load_session()
         request_timeout = int(state.get("request_timeout", 300))
         client = TriForceClient(session.base_url, token=session.token, timeout=request_timeout)
-        configured_workspace = str(state.get("workspace_root") or "").strip()
-        source_workspace = str(
-            Path(configured_workspace).expanduser().resolve(strict=False)
-            if configured_workspace else active_workspace()
-        )
+        # Team runs must honor the same process-local workspace selection as the
+        # normal agent runtime. AICODER_ACTIVE_WORKSPACE / launch cwd outrank stale
+        # persisted settings for CLI invocations.
+        source_workspace = str(active_workspace(state.get("workspace_root")))
         model_client, _ = native_model_transport_from_env(client, default_model=model or state.get("selected_model"))
 
         def team_event(kind: str, payload: dict) -> None:

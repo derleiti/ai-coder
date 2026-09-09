@@ -14,7 +14,7 @@ import time
 import uuid
 from typing import Any, Iterable
 
-from .task_contract import TaskContract, compile_task_contract
+from .task_contract import AcceptanceCheck, TaskContract, compile_task_contract
 
 
 class TeamStage(str, Enum):
@@ -61,6 +61,8 @@ class VerificationCommand:
     argv: tuple[str, ...]
     timeout: int = 180
     required: bool = True
+    expected_exit_codes: tuple[int, ...] = (0,)
+    expected_nonzero: bool = False
 
 
 @dataclass
@@ -72,12 +74,15 @@ class VerificationResult:
     elapsed_ms: int
     output: str
     required: bool = True
+    expected_exit_codes: tuple[int, ...] = (0,)
+    expected_nonzero: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "name": self.name, "argv": self.argv, "ok": self.ok,
             "exit_code": self.exit_code, "elapsed_ms": self.elapsed_ms,
             "output": self.output, "required": self.required,
+            "expected_exit_codes": list(self.expected_exit_codes), "expected_nonzero": self.expected_nonzero,
         }
 
 
@@ -138,13 +143,21 @@ def _is_test_path(path: str) -> bool:
     return bool(parts & _TEST_DIR_NAMES or name.startswith("test_") or stem.endswith("_test") or ".test." in name or ".spec." in name)
 
 def test_change_evidence(delta: dict[str, Any]) -> dict[str, Any]:
-    paths = sorted({str(path) for path in (delta.get("changed") or []) + (delta.get("deleted") or [])})
+    changed = [str(path) for path in (delta.get("changed") or [])]
+    deleted = [str(path) for path in (delta.get("deleted") or [])]
+    paths = sorted(set(changed + deleted))
     test_paths = [path for path in paths if _is_test_path(path)]
     source_paths = [path for path in paths if not _is_test_path(path) and Path(path).suffix.lower() in _SOURCE_SUFFIXES]
+    deleted_test_paths = [path for path in deleted if _is_test_path(path)]
+    added_test_paths = [path for path in (delta.get("added_files") or delta.get("added") or []) if _is_test_path(str(path))]
+    tests_weakened = bool(deleted_test_paths) and not bool(added_test_paths)
     return {
         "source_paths": source_paths, "test_paths": test_paths,
+        "added_test_paths": sorted(map(str, added_test_paths)),
+        "deleted_test_paths": sorted(deleted_test_paths),
         "behavior_change": bool(source_paths), "tests_changed": bool(test_paths),
-        "coverage_evidence_ok": (not source_paths) or bool(test_paths),
+        "tests_weakened": tests_weakened,
+        "coverage_evidence_ok": ((not source_paths) or bool(test_paths)) and not tests_weakened,
     }
 
 _SHELL_META_RE = __import__("re").compile(r"(?:&&|\|\||[|;<>`]|\$\(|\n|\r)")
@@ -160,8 +173,9 @@ def task_acceptance_verification_plan(task: str | TaskContract, root: str | Path
     root = Path(root)
     contract = task if isinstance(task, TaskContract) else compile_task_contract(str(task or ""))
     commands: list[VerificationCommand] = []
-    for command_text in contract.acceptance_commands:
-        command_text = str(command_text or "").strip().strip("`")
+    checks = contract.acceptance_checks or tuple(AcceptanceCheck(c) for c in contract.acceptance_commands)
+    for check in checks:
+        command_text = str(check.command or "").strip().strip("`")
         if _SHELL_META_RE.search(command_text):
             continue
         try:
@@ -176,7 +190,7 @@ def task_acceptance_verification_plan(task: str | TaskContract, root: str | Path
         argv = normalize_project_test_argv(argv, root)
         if Path(argv[0]).name.lower() in {"python", "python3", "python.exe"}:
             argv[0] = project_python_interpreter(root)
-        commands.append(VerificationCommand(f"task-acceptance-{len(commands)+1}", tuple(argv), 300, True))
+        commands.append(VerificationCommand(f"task-acceptance-{len(commands)+1}", tuple(argv), 300, True, tuple(check.expected_exit_codes), bool(check.expected_nonzero)))
     return commands
 
 
@@ -284,13 +298,13 @@ def execute_verification_plan(root: str | Path, commands: Iterable[VerificationC
                     timeout=command.timeout, env=verification_env,
                 )
                 results.append(VerificationResult(
-                    command.name, list(command.argv), proc.returncode == 0, proc.returncode,
-                    int((time.monotonic() - started) * 1000), (proc.stdout + "\n" + proc.stderr)[-12000:], command.required,
+                    command.name, list(command.argv), (proc.returncode != 0 if command.expected_nonzero else proc.returncode in command.expected_exit_codes), proc.returncode,
+                    int((time.monotonic() - started) * 1000), (proc.stdout + "\n" + proc.stderr)[-12000:], command.required, command.expected_exit_codes, command.expected_nonzero,
                 ))
             except (OSError, subprocess.SubprocessError) as exc:
                 results.append(VerificationResult(
                     command.name, list(command.argv), False, -1, int((time.monotonic() - started) * 1000),
-                    f"{type(exc).__name__}: {exc}", command.required,
+                    f"{type(exc).__name__}: {exc}", command.required, command.expected_exit_codes, command.expected_nonzero,
                 ))
     return results
 

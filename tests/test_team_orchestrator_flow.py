@@ -13,6 +13,7 @@ from aicoder.team_orchestrator import (
     _call_stage_agent_core, _run_candidate, _run_researcher, evaluate_candidate, run_team,
 )
 from aicoder.team_runtime import config_from_state
+from aicoder.task_contract import compile_task_contract
 from aicoder.workspace_backend import RamWorkspace
 
 
@@ -253,7 +254,7 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
 
             self.assertEqual(candidate.run.status, "completed")
             self.assertEqual(RepairRuntime.calls, 2)
-            self.assertIn("AUTONOMOUS CANDIDATE VERIFICATION REPAIR 1/2", RepairRuntime.prompts[1])
+            self.assertIn("AUTONOMOUS CANDIDATE VERIFICATION REPAIR 1/4", RepairRuntime.prompts[1])
             self.assertIn("regression-test-evidence", RepairRuntime.prompts[1])
             final = evaluate_candidate(candidate)
             self.assertTrue(final["verification_passed"], final)
@@ -325,7 +326,7 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
 
             self.assertEqual(candidate.run.status, "completed")
             self.assertEqual(PausedRepairRuntime.calls, 2)
-            self.assertIn("AUTONOMOUS CANDIDATE VERIFICATION REPAIR 1/2", PausedRepairRuntime.prompts[1])
+            self.assertIn("AUTONOMOUS CANDIDATE VERIFICATION REPAIR 1/4", PausedRepairRuntime.prompts[1])
             self.assertIn("python-tests", PausedRepairRuntime.prompts[1])
             self.assertIn("regression-test-evidence", PausedRepairRuntime.prompts[1])
             final = evaluate_candidate(candidate)
@@ -358,6 +359,38 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
             result = evaluate_candidate(candidate)
             self.assertTrue(result["verification_passed"], result)
             self.assertGreater(result["score"], 0)
+            backend.abort()
+
+
+    def test_candidate_evaluation_enforces_task_acceptance_checks(self):
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as ram_dir:
+            source = Path(source_dir)
+            (source / "app.py").write_text("value = 0\n", encoding="utf-8")
+            (source / "pyproject.toml").write_text('[project]\nname="demo"\nversion="0.1.0"\n', encoding="utf-8")
+            (source / "tests").mkdir()
+            (source / "tests" / "test_app.py").write_text(
+                "import unittest\nimport app\nclass T(unittest.TestCase):\n    def test_value(self): self.assertEqual(app.value, 0)\n",
+                encoding="utf-8",
+            )
+            backend = RamWorkspace(source, ram_root=ram_dir)
+            execution = backend.prepare()
+            (execution / "app.py").write_text("value = 1\n", encoding="utf-8")
+            (execution / "tests" / "test_app.py").write_text(
+                "import unittest\nimport app\nclass T(unittest.TestCase):\n    def test_value(self): self.assertEqual(app.value, 1)\n",
+                encoding="utf-8",
+            )
+            contract = compile_task_contract(
+                'Acceptance checks:\n1. python -c "raise SystemExit(7)"\n'
+            )
+            candidate = CandidateResult(
+                1, "test/model", "minimal", backend,
+                AgentRunResult("completed", "DONE", "test/model", [], [], "system"),
+                task_contract=contract,
+            )
+            result = evaluate_candidate(candidate)
+            self.assertFalse(result["verification_passed"], result)
+            self.assertIn("task-acceptance-1", result["checks"])
+            self.assertEqual(result["checks"]["task-acceptance-1"]["exit_code"], 7)
             backend.abort()
 
     def test_failed_candidate_cannot_score_from_unchanged_passing_workspace(self):
@@ -403,8 +436,12 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
                 "team_test_planner_model": "test/model",
             }
             config = config_from_state(state)
+            research_source_workspaces = []
+            coder_source_workspaces = []
+            coder_tasks = []
 
             def researcher(**kwargs):
+                research_source_workspaces.append(kwargs["source_workspace"])
                 return AgentStageResult(
                     role=f"research:{kwargs['role']}", model=kwargs["model"], status="completed",
                     response=f"evidence {kwargs['role']}", elapsed_ms=1,
@@ -417,6 +454,8 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
 
             candidates = []
             def candidate(**kwargs):
+                coder_source_workspaces.append(kwargs["source_workspace"])
+                coder_tasks.append(kwargs.get("task"))
                 backend = RamWorkspace(source, ram_root=ram_dir)
                 backend.prepare()
                 slot = kwargs["slot"]
@@ -457,6 +496,17 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
                 )
 
             self.assertEqual(result.status, "completed", result.error)
+            expected_workspace = str(source.resolve())
+            self.assertEqual(set(research_source_workspaces), {expected_workspace})
+            self.assertEqual(set(coder_source_workspaces), {expected_workspace})
+            self.assertEqual(set(coder_tasks), {"Implement feature"})
+            stageoffs = [payload for kind, payload in events if kind == "team_stageoff"]
+            self.assertTrue(stageoffs)
+            self.assertEqual(
+                stageoffs[0]["stageoff"]["repository_context"].splitlines()[0],
+                f"workspace={expected_workspace}",
+            )
+            self.assertEqual(result.performance["stageoff"]["repository_context"].splitlines()[0], f"workspace={expected_workspace}")
             self.assertEqual(result.performance["winner_candidate_id"], "cand-2")
             self.assertEqual(result.performance["ledger"]["completed"], [
                 "plan_research", "research", "brainstorm", "plan_code", "code", "merge_plan", "merge",
@@ -1600,3 +1650,41 @@ def test_explicit_research_no_web_blocks_research_web_tool(tmp_path):
     assert is_error is False
     assert "task_contract_denied" in result or "stage_policy_denied" in result
     remote.assert_not_called()
+
+
+class TeamRunLockTests(unittest.TestCase):
+    def test_team_run_lock_rejects_same_task_workspace_pair(self):
+        from aicoder.team_orchestrator import _team_run_lock
+        with tempfile.TemporaryDirectory() as tmp:
+            with _team_run_lock(tmp, "Build   X") as first:
+                self.assertTrue(first)
+                with _team_run_lock(tmp, "build x") as second:
+                    self.assertFalse(second)
+
+    def test_team_run_lock_distinguishes_different_tasks(self):
+        from aicoder.team_orchestrator import _team_run_lock
+        with tempfile.TemporaryDirectory() as tmp:
+            with _team_run_lock(tmp, "build x") as first:
+                self.assertTrue(first)
+                with _team_run_lock(tmp, "build y") as second:
+                    self.assertTrue(second)
+
+
+def test_candidate_policy_enforces_all_tools_and_blocks_web():
+    from aicoder.team_orchestrator import _candidate_approval
+
+    assert getattr(_candidate_approval, "_aicoder_enforce_all_tools", False) is True
+    assert _candidate_approval("search", {"query": "unrelated web search"}) is False
+    assert _candidate_approval("web_fetch_local", {"url": "https://example.com"}) is False
+    assert _candidate_approval("file_read", {"path": "README.md"}) is True
+
+
+def test_brainstorm_policy_is_post_research_and_blocks_web():
+    from aicoder.team_orchestrator import _brainstorm_approval_for_task
+
+    approval = _brainstorm_approval_for_task("Build a dependency-free local CLI. Research may browse if useful.")
+    assert getattr(approval, "_aicoder_enforce_all_tools", False) is True
+    assert getattr(approval, "_aicoder_allow_research_web", True) is False
+    assert approval("search", {"query": "FastAPI PostgreSQL"}) is False
+    assert approval("web_fetch_local", {"url": "https://docs.python.org/3/"}) is False
+    assert approval("file_read", {"path": "README.md"}) is True

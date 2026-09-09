@@ -879,7 +879,7 @@ if __name__ == "__main__":
     unittest.main()
 
 
-def test_repeated_failure_circuit_blocks_same_verification_until_real_mutation():
+def test_repeated_semantic_failure_stalls_before_reissuing_equivalent_verification():
     import tempfile
     from pathlib import Path
     from unittest.mock import MagicMock, patch
@@ -925,9 +925,11 @@ def test_repeated_failure_circuit_blocks_same_verification_until_real_mutation()
         with patch("aicoder.agent_runtime.run_tool", return_value=(failure, True)) as execute:
             result = runtime.run()
 
-        assert result.status == "completed"
+        assert result.status == "paused"
         assert execute.call_count == 4
-        assert any(name == "failure_call_blocked" for name, _ in events)
+        assert any(name == "semantic_progress_stalled" for name, _ in events)
+        assert any(name == "verification_stalled" for name, _ in events)
+        assert not any(name == "failure_call_blocked" for name, _ in events)
 
 
 def test_tool_free_runtime_does_not_execute_textual_tool_call_syntax(tmp_path):

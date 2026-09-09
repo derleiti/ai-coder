@@ -113,14 +113,11 @@ class HeadlessAgentTests(unittest.TestCase):
             self.assertEqual(payloads[-1]["status"], "paused")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-    def test_team_run_uses_persisted_workspace_not_cli_launch_cwd(self):
+class TeamWorkspaceSelectionTests(unittest.TestCase):
+    def test_team_run_prefers_active_process_workspace_over_persisted_workspace(self):
         from pathlib import Path
         from aicoder.agent import run_agent
         with tempfile.TemporaryDirectory() as configured, tempfile.TemporaryDirectory() as launch:
-            captured = {}
             state = {
                 "workspace_root": configured,
                 "projects_root": configured,
@@ -139,7 +136,13 @@ if __name__ == "__main__":
                 patch("aicoder.agent.TriForceClient"),
                 patch("aicoder.model_transport.native_model_transport_from_env", return_value=(MagicMock(), "")),
                 patch("aicoder.team_orchestrator.run_team") as run_team,
+                redirect_stdout(io.StringIO()),
             ):
                 run_team.return_value = fake_result
-                run_agent("do a team task", None, None, json_output=True)
-            self.assertEqual(run_team.call_args.kwargs["source_workspace"], str(Path(configured).resolve()))
+                rc = run_agent("do a team task", None, None, json_output=True)
+            self.assertEqual(rc, 0)
+            self.assertEqual(run_team.call_args.kwargs["source_workspace"], str(Path(launch).resolve()))
+
+
+if __name__ == "__main__":
+    unittest.main()

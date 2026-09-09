@@ -8,12 +8,15 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from contextlib import contextmanager
 import json
+import hashlib
 import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
+import threading
 import time
 from typing import Any, Callable
 import uuid
@@ -115,6 +118,7 @@ class CandidateResult:
     evaluation: dict[str, Any] = field(default_factory=dict)
     elapsed_ms: int = 0
     evaluation_ms: int = 0
+    task_contract: TaskContract | None = None
 
 
 @dataclass
@@ -1029,6 +1033,25 @@ def _research_approval_for_task(task: str | TaskContract) -> Callable[[str, dict
     return approval
 
 
+def _brainstorm_approval_for_task(task: str | TaskContract) -> Callable[[str, dict], bool]:
+    """Brainstorm is post-research: local observational tools only, never web/network discovery."""
+    contract = _as_task_contract(task)
+
+    def approval(tool_name: str, args: dict) -> bool:
+        canonical = str(tool_name or "").strip().lower().rsplit(".", 1)[-1].rsplit(":", 1)[-1].rsplit("/", 1)[-1]
+        if canonical in {"search", "crawl", "crawl_url", "web_fetch", "web_fetch_local", "browser", "browser_search"}:
+            return False
+        return _planning_approval(tool_name, dict(args or {}))
+
+    approval._aicoder_autonomous_policy = True
+    approval._aicoder_policy_denial_is_error = False
+    approval._aicoder_enforce_all_tools = True
+    approval._aicoder_forbid_triforce_backend = contract.forbid_triforce_backend
+    approval._aicoder_task_contract = contract
+    approval._aicoder_allow_research_web = False
+    return approval
+
+
 def _research_approval(tool_name: str, args: dict) -> bool:
     """Read-only autonomous policy for team research.
 
@@ -1682,9 +1705,12 @@ def _candidate_prompt(stage_input: HandoffEnvelope, strategy: str, contract: Tas
 
 
 def _candidate_approval(tool_name: str, args: dict) -> bool:
-    """Autonomous candidate policy: safe RAM mutations yes; elevation/destruction/escape/security never."""
+    """Autonomous coder policy: local isolated implementation only; research belongs to research stages."""
     from .executor import is_destructive
     from .privileges import assess_execution
+    canonical = str(tool_name or "").strip().lower().rsplit(".", 1)[-1].rsplit(":", 1)[-1].rsplit("/", 1)[-1]
+    if canonical in {"search", "crawl", "crawl_url", "web_fetch", "web_fetch_local", "browser", "browser_search"}:
+        return False
     risk = assess_execution(tool_name, args, destructive=is_destructive(str(args.get("command") or "")))
     if args.get("_workspace_escape") or risk.elevation or risk.deletion or risk.destructive or risk.security_change:
         return False
@@ -1693,9 +1719,11 @@ def _candidate_approval(tool_name: str, args: dict) -> bool:
 
 # Distinguish autonomous safety denial from explicit operator rejection.
 _candidate_approval._aicoder_autonomous_policy = True
+_candidate_approval._aicoder_policy_denial_is_error = False
+_candidate_approval._aicoder_enforce_all_tools = True
 
 _TEAM_CANDIDATE_MAX_AUTO_RESUMES = 2
-_TEAM_CANDIDATE_MAX_VERIFICATION_REPAIRS = 2
+_TEAM_CANDIDATE_MAX_VERIFICATION_REPAIRS = 4
 _TEAM_MERGE_MAX_AUTO_RESUMES = 4
 
 
@@ -1829,7 +1857,16 @@ def _candidate_verification_repair_prompt(evaluation: dict[str, Any], attempt: i
         if not isinstance(row, dict) or row.get("ok") is not False:
             continue
         output = str(row.get("output") or "").strip().replace("\x00", "")
-        failed_rows.append(f"- {name}: {output[:1800] or 'failed'}")
+        argv = row.get("argv") if isinstance(row.get("argv"), list) else []
+        command = " ".join(str(part) for part in argv) or "(command unavailable)"
+        expected_nonzero = bool(row.get("expected_nonzero"))
+        expected_codes = row.get("expected_exit_codes") if isinstance(row.get("expected_exit_codes"), list) else [0]
+        expectation = "nonzero exit" if expected_nonzero else f"exit in {expected_codes}"
+        actual = row.get("exit_code")
+        failed_rows.append(
+            f"- {name}: command={command}; expected={expectation}; actual_exit={actual}; "
+            f"output={output[:1800] or 'failed'}"
+        )
     evidence = evaluation.get("test_evidence") or {}
     if evidence.get("behavior_change") and not evidence.get("coverage_evidence_ok"):
         sources = ", ".join(str(path) for path in (evidence.get("source_paths") or [])[:12]) or "(unknown source paths)"
@@ -1847,6 +1884,9 @@ def _candidate_verification_repair_prompt(evaluation: dict[str, Any], attempt: i
         f"FAILED TEAM VERIFICATION:\n{failures}\n\n"
         "Use repository-native test configuration and the provided test tool. Do not invent test paths or unsupported "
         "pytest flags, and do not create virtual environments or install packages just to make verification run. "
+        "If a file_edit replace fails because old_text matches zero/multiple times, or syntax validation rejects a partial "
+        "replacement, STOP retrying nearby replace fragments: read the complete current file and rewrite the whole file "
+        "with one syntactically complete write/edit. Re-run the exact failed acceptance command after the repair. "
         "If behavior-changing source code was modified, add or update a focused regression test that exercises the "
         "changed behavior. Fix genuine failures rather than weakening tests. Finish with DONE: only after the repaired "
         "candidate is ready for deterministic reevaluation."
@@ -2087,6 +2127,7 @@ def _run_candidate(
             if run.status == "completed":
                 probe = CandidateResult(
                     slot=slot, model=model, strategy=strategy, workspace=backend, run=run,
+                    task_contract=contract,
                 )
                 verification = evaluate_candidate(probe)
                 cached_verification = verification
@@ -2132,6 +2173,7 @@ def _run_candidate(
             if has_paused_delta:
                 probe = CandidateResult(
                     slot=slot, model=model, strategy=strategy, workspace=backend, run=run,
+                    task_contract=contract,
                 )
                 verification = evaluate_candidate(probe)
                 cached_verification = verification
@@ -2181,6 +2223,7 @@ def _run_candidate(
             slot=slot, model=model, strategy=strategy, workspace=backend, run=run,
             evaluation=cached_verification,
             elapsed_ms=int((time.monotonic() - started) * 1000),
+            task_contract=contract,
         )
     except Exception:
         backend.abort()
@@ -2222,6 +2265,10 @@ def evaluate_candidate(candidate: CandidateResult) -> dict[str, Any]:
     root = Path(candidate.workspace.info.execution_root)
     delta = candidate.workspace.delta_summary() if isinstance(candidate.workspace, RamWorkspace) else {}
     plan = project_verification_plan(root)
+    if candidate.task_contract is not None:
+        plan = merge_verification_plans(
+            plan, task_acceptance_verification_plan(candidate.task_contract, root)
+        )
     results = execute_verification_plan(root, plan)
     checks = {row.name: row.as_dict() for row in results}
     passed = sum(1 for row in results if row.ok and row.required)
@@ -2359,6 +2406,51 @@ def _attach_blind_candidate_snapshots(integration: RamWorkspace, candidates: lis
     return evidence
 
 
+def _merge_contribution_audit(root: Path, evidence: list[dict[str, Any]], delta: dict[str, Any]) -> dict[str, Any]:
+    """Map final changed files to exact verified candidate snapshots where possible."""
+    rows: list[dict[str, Any]] = []
+    changed_files = sorted(set((delta.get("added_files") or []) + (delta.get("modified_files") or [])))
+    deleted_files = sorted(set(delta.get("deleted_files") or []))
+
+    def digest(path: Path) -> str | None:
+        try:
+            if not path.is_file() or path.stat().st_size > 2_000_000:
+                return None
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            return None
+
+    for rel in changed_files:
+        final_hash = digest(root / rel)
+        matches: list[str] = []
+        if final_hash:
+            for item in evidence:
+                snapshot = root / str(item.get("snapshot") or "") / rel
+                if digest(snapshot) == final_hash:
+                    matches.append(str(item.get("candidate_id") or ""))
+        rows.append({
+            "path": rel, "kind": "changed", "sha256": final_hash or "",
+            "exact_candidate_matches": sorted(x for x in matches if x),
+            "synthesized_or_modified_by_merge": not bool(matches),
+        })
+    for rel in deleted_files:
+        matches = [
+            str(item.get("candidate_id") or "") for item in evidence
+            if rel in set((item.get("delta") or {}).get("deleted_files") or [])
+        ]
+        rows.append({
+            "path": rel, "kind": "deleted", "exact_candidate_matches": sorted(x for x in matches if x),
+            "synthesized_or_modified_by_merge": not bool(matches),
+        })
+    contributors = sorted({cid for row in rows for cid in row.get("exact_candidate_matches", [])})
+    return {
+        "schema": "aicoder-merge-contribution-audit-v1",
+        "files": rows, "exact_contributors": contributors,
+        "changed_file_count": len(changed_files), "deleted_file_count": len(deleted_files),
+        "synthesized_file_count": sum(1 for row in rows if row.get("synthesized_or_modified_by_merge")),
+    }
+
+
 def _blind_merge_prompt(task: str, code_plan: str, evidence: list[dict[str, Any]]) -> str:
     task_handoff = _task_handoff(task)
     code_handoff = _code_plan_handoff(code_plan)
@@ -2372,6 +2464,34 @@ def _blind_merge_prompt(task: str, code_plan: str, evidence: list[dict[str, Any]
     )
 
 
+@contextmanager
+def _team_run_lock(workspace: str, task: str):
+    """Best-effort lock preventing duplicate runs of the same normalized task/workspace pair."""
+    normalized_task = " ".join(str(task or "").split()).strip().lower()
+    identity = str(Path(workspace).expanduser().resolve(strict=False)) + "\n" + normalized_task
+    key = hashlib.sha256(identity.encode("utf-8", errors="replace")).hexdigest()[:20]
+    path = Path("/tmp") / f"aicoder-team-{key}.lock"
+    handle = path.open("a+", encoding="utf-8")
+    locked = False
+    try:
+        try:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locked = True
+            handle.seek(0); handle.truncate(); handle.write(f"pid={os.getpid()}\n"); handle.flush()
+        except (ImportError, BlockingIOError, OSError):
+            locked = False
+        yield locked
+    finally:
+        if locked:
+            try:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except (ImportError, OSError):
+                pass
+        handle.close()
+
+
 def run_team(
     *, task: str, state: dict[str, Any], config: TeamConfig, client,
     model_client: ModelTransport, source_workspace: str,
@@ -2382,11 +2502,20 @@ def run_team(
     run_started = time.monotonic()
     events = _event_with_debug(event_fn, _TeamDebugLog(run_id))
     try:
-        result = _run_team_pipeline(
-            task=task, state=state, config=config, client=client,
-            model_client=model_client, source_workspace=source_workspace,
-            event_fn=events, stop_requested=stop_requested, run_id=run_id,
-        )
+        with _team_run_lock(source_workspace, task) as lock_acquired:
+            if not lock_acquired:
+                result = TeamRunResult(
+                    "failed", "", "", [], [], {},
+                    "another AICoder team run is already active for this workspace",
+                )
+                _emit(events, "team_run_lock", status="rejected", workspace=source_workspace)
+            else:
+                _emit(events, "team_run_lock", status="acquired", workspace=source_workspace)
+                result = _run_team_pipeline(
+                    task=task, state=state, config=config, client=client,
+                    model_client=model_client, source_workspace=source_workspace,
+                    event_fn=events, stop_requested=stop_requested, run_id=run_id,
+                )
         if result.status != "completed" and stop_requested is not None and stop_requested():
             result.status = "cancelled"
             result.error = result.error or "team run cancelled by user"
@@ -2670,12 +2799,15 @@ def _run_team_pipeline(
                         )
                         + "\n\nPREVIOUS STAGE OUTPUT (authoritative; fresh model process):\n"
                         + stageoff_handoff.render()
-                        + f"\n\nBRAINSTORM ROUND: {round_index}\nYOUR PERSPECTIVE: {perspective}\n\n"
+                        + f"\n\nBRAINSTORM ROUND: {round_index}\nYOUR PERSPECTIVE: {perspective}\n"
+                        + f"TASK SHA256: {task_contract.task_sha256}\n"
+                        + "ANTI-DRIFT RULE: Every direction must directly satisfy the immutable user task above. "
+                          "Do not substitute a familiar framework, database, web app, or unrelated project.\n\n"
                         + f"CURRENT ANONYMIZED BRAINSTORM STATE:\n{brainstorm_state or '(none - create independent ideas)'}"
                     ),
                     required_sections=BRAINSTORM_SECTIONS, max_tokens=4000, max_iterations=35,
                     event_fn=event_fn, role=f"brainstorm:r{round_index}:{label}", stop_requested=stop_requested,
-                    approval_fn=_research_approval_for_task(task_contract), request_timeout=request_timeout,
+                    approval_fn=_brainstorm_approval_for_task(task_contract), request_timeout=request_timeout,
                     native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
                 ): (label, model)
                 for label, model, perspective in brainstorm_participants
@@ -2707,7 +2839,7 @@ def _run_team_pipeline(
             prompt=_build_brainstorm_operator_prompt(task, round_index, usable, brainstorm_state),
             required_sections=BRAINSTORM_SECTIONS, max_tokens=5000, max_iterations=30,
             event_fn=event_fn, role=f"brainstorm_state:r{round_index}", stop_requested=stop_requested,
-            approval_fn=_research_approval_for_task(task_contract), request_timeout=request_timeout,
+            approval_fn=_brainstorm_approval_for_task(task_contract), request_timeout=request_timeout,
             native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
         )
         operator.role = f"brainstorm_state:r{round_index}"
@@ -2728,7 +2860,7 @@ def _run_team_pipeline(
             prompt=_build_brainstorm_synthesis_prompt(task, brainstorm_state, brainstorm_results),
             required_sections=BRAINSTORM_SECTIONS, max_tokens=6000, max_iterations=30,
             event_fn=event_fn, role="brainstorm_synthesis", stop_requested=stop_requested,
-            approval_fn=_research_approval_for_task(task_contract), request_timeout=request_timeout,
+            approval_fn=_brainstorm_approval_for_task(task_contract), request_timeout=request_timeout,
             native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
         )
         brainstorm_synthesis.role = "brainstorm_synthesis"
@@ -2755,7 +2887,7 @@ def _run_team_pipeline(
                 workspace_root=source_workspace, prompt=retry_prompt,
                 required_sections=BRAINSTORM_SECTIONS, max_tokens=3500, max_iterations=12,
                 event_fn=event_fn, role="brainstorm_synthesis:retry", stop_requested=stop_requested,
-                approval_fn=_research_approval_for_task(task_contract), request_timeout=request_timeout,
+                approval_fn=_brainstorm_approval_for_task(task_contract), request_timeout=request_timeout,
                 native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
             )
             retried.role = "brainstorm_synthesis:retry"
@@ -2875,13 +3007,18 @@ def _run_team_pipeline(
     futures: dict[Any, Any] = {}
     try:
         _stage_start(ledger, TeamStage.CODE, event_fn)
+        candidate_quorum = max(1, min(len(config.coders), int(state.get("team_candidate_quorum") or min(2, len(config.coders)))))
+        candidate_quorum_stop = threading.Event()
+        def candidate_stop_requested() -> bool:
+            return candidate_quorum_stop.is_set() or bool(stop_requested and stop_requested())
+
         with ThreadPoolExecutor(max_workers=len(config.coders), thread_name_prefix="aicoder-coder") as pool:
             futures = {
                 pool.submit(
                     _run_candidate, client=client, model_client=model_client, source_workspace=source_workspace,
                     backend_mode=workspace_plan.backend_mode, slot=slot.slot, model=slot.model,
-                    strategy=slot.strategy, stage_input=stageoff_handoff,
-                    tools=coder_tools, stop_requested=stop_requested,
+                    strategy=slot.strategy, stage_input=stageoff_handoff, task=task,
+                    tools=coder_tools, stop_requested=candidate_stop_requested,
                     native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
                     request_timeout=request_timeout, event_fn=event_fn,
                     liveness_timeout_s=int(state.get("team_candidate_liveness_timeout_seconds") or 1200),
@@ -2891,6 +3028,11 @@ def _run_team_pipeline(
             for future in as_completed(futures):
                 slot = futures[future]
                 candidate: CandidateResult | None = None
+                if future.cancelled():
+                    _emit(event_fn, "team_candidate", slot=slot.slot, model=slot.model, strategy=slot.strategy,
+                          candidate_id="cancelled-by-quorum", status="cancelled", score=0, error="candidate quorum reached",
+                          verification_passed=False, quorum_cancelled=True)
+                    continue
                 try:
                     candidate = future.result()
                     evaluation_started = time.monotonic()
@@ -2908,6 +3050,16 @@ def _run_team_pipeline(
                           failed_checks=failed_checks, changed_count=int(delta.get("changed_count") or 0),
                           deleted_count=int(delta.get("deleted_count") or 0),
                           elapsed_ms=candidate.elapsed_ms, evaluation_ms=candidate.evaluation_ms)
+                    verified_so_far = sum(1 for item in candidates if _candidate_is_mergeable(item))
+                    if verified_so_far >= candidate_quorum and not candidate_quorum_stop.is_set():
+                        candidate_quorum_stop.set()
+                        cancelled_pending = sum(1 for pending in futures if not pending.done() and pending.cancel())
+                        _emit(
+                            event_fn, "team_candidate_quorum", status="reached",
+                            verified_candidates=verified_so_far, required=candidate_quorum,
+                            pending_candidates=sum(1 for pending in futures if not pending.done()),
+                            cancelled_pending=cancelled_pending,
+                        )
                 except Exception as exc:
                     if candidate is not None:
                         candidate.workspace.abort()
@@ -3118,11 +3270,21 @@ def _run_team_pipeline(
             ))
             final_response = f"Selected verified base candidate {winner_id}; no merge-capable model resolved."
             result_model = winner.run.model
+        merge_delta = integration.delta_summary()
+        merge_contribution_audit = _merge_contribution_audit(
+            integration.info.execution_root, blind_evidence, merge_delta
+        )
+        integration.write_candidate_artifact(
+            ".aicoder-team/merge-contribution-audit.json",
+            json.dumps(merge_contribution_audit, ensure_ascii=False, indent=2),
+        )
+        _emit(event_fn, "team_merge_contribution_audit", **merge_contribution_audit)
         stageoff, coordinator_stage, stageoff_handoff = _coordinate_stageoff(
             current=stageoff, stage=TeamStage.MERGE,
             stage_payload={
                 "merge_status": "completed", "merge_response": final_response,
-                "result_model": result_model, "workspace_delta": integration.delta_summary(),
+                "result_model": result_model, "workspace_delta": merge_delta,
+                "merge_contribution_audit": merge_contribution_audit,
             },
             client=client, model_client=model_client, coordinator_model=config.coordinator_model,
             tools=all_tools, workspace_root=source_workspace,
@@ -3144,7 +3306,11 @@ def _run_team_pipeline(
             task_acceptance_verification_plan(task_contract, integration.info.execution_root),
         )
         test_plan_text = json.dumps([
-            {"name": item.name, "argv": list(item.argv), "timeout": item.timeout, "required": item.required}
+            {
+                "name": item.name, "argv": list(item.argv), "timeout": item.timeout,
+                "required": item.required, "expected_exit_codes": list(item.expected_exit_codes),
+                "expected_nonzero": item.expected_nonzero,
+            }
             for item in deterministic_plan
         ], ensure_ascii=False, indent=2)
         if config.test_planner_model:
@@ -3274,7 +3440,7 @@ def _run_team_pipeline(
                 int((stage.evidence or {}).get("response_chars") or 0) for stage in stages
             ),
             "ledger": ledger.as_dict(), "verification": verification_payload,
-            "change_manifest": change_manifest, "stageoff": stageoff,
+            "change_manifest": change_manifest, "merge_contribution_audit": merge_contribution_audit, "stageoff": stageoff,
             "stage_timings": [
                 {"role": stage.role, "model": stage.model, "status": stage.status, "elapsed_ms": stage.elapsed_ms}
                 for stage in stages

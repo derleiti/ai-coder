@@ -153,7 +153,7 @@ repository context and research evidence. Explicit user constraints are non-nego
 state trade-offs, risks and assumptions. Do not edit files, invent evidence or produce the final implementation plan.
 Use tools observationally when they help verify repository facts or challenge an assumption.
 Return compact structured output with headings: DIRECTIONS, IDEAS, TRADEOFFS, RISKS, OPEN QUESTIONS, RECOMMENDATIONS.
-Preferred tools for this stage: `file_tree`, `file_read`, `code_tree`, `code_search`, `code_read`, `git`, `search`, `crawl`, and `web_fetch_local` for observational checks. All authenticated tools remain available; brainstorming must not persist project mutations."""
+Preferred tools for this stage are local observational tools such as `file_tree`, `file_read`, `code_tree`, `code_search`, `code_read`, and read-only `git`. External web/research tools belong to the completed research stage and must not be used here. All authenticated tools may be visible for capability awareness, but stage policy is authoritative and brainstorming must not persist project mutations."""
 
 BRAINSTORM_EVOLUTION_SYSTEM_PROMPT = """You are a read-only brainstorming participant in a later AICoder brainstorm round.
 Use the prior anonymized brainstorm state as input, but do not merely agree with it. Improve, challenge, combine or replace

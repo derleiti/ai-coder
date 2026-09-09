@@ -118,6 +118,13 @@ class ProjectPlanTests(unittest.TestCase):
         self.assertFalse(missing["coverage_evidence_ok"])
         covered = change_evidence({"changed": ["aicoder/runtime.py", "tests/test_runtime.py"], "deleted": []})
         self.assertTrue(covered["coverage_evidence_ok"])
+        weakened = change_evidence({
+            "changed": ["aicoder/runtime.py"],
+            "deleted": ["tests/test_runtime.py"],
+            "added_files": [],
+        })
+        self.assertTrue(weakened["tests_weakened"])
+        self.assertFalse(weakened["coverage_evidence_ok"])
 
     def test_fresh_non_git_project_uses_content_gate_instead_of_git_diff(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -187,6 +194,32 @@ Important runtime constraints:
         with tempfile.TemporaryDirectory() as tmp:
             plan = task_acceptance_verification_plan(task, tmp)
             self.assertEqual([item.argv[0] for item in plan], ["cargo"])
+
+    def test_acceptance_expected_nonzero_is_success(self):
+        task = """Acceptance checks:
+1. python probe.py
+#1 EXPECTED NONZERO; this is success.
+"""
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"AICODER_TEST_PYTHON": sys.executable}):
+            Path(tmp, "probe.py").write_text("raise SystemExit(2)\n", encoding="utf-8")
+            plan = task_acceptance_verification_plan(task, tmp)
+            self.assertEqual(len(plan), 1)
+            self.assertTrue(plan[0].expected_nonzero)
+            results = execute_verification_plan(tmp, plan)
+            self.assertTrue(results[0].ok)
+            self.assertEqual(results[0].exit_code, 2)
+
+    def test_acceptance_exact_exit_code_is_enforced(self):
+        task = """Acceptance checks:
+1. python probe.py
+Check 1 expected exit code 7.
+"""
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"AICODER_TEST_PYTHON": sys.executable}):
+            Path(tmp, "probe.py").write_text("raise SystemExit(7)\n", encoding="utf-8")
+            plan = task_acceptance_verification_plan(task, tmp)
+            self.assertEqual(plan[0].expected_exit_codes, (7,))
+            results = execute_verification_plan(tmp, plan)
+            self.assertTrue(results[0].ok)
 
     def test_merge_verification_plans_deduplicates_same_command(self):
         from aicoder.team_pipeline import VerificationCommand
