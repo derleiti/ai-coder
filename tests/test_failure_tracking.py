@@ -21,6 +21,25 @@ class FailureTrackerTests(unittest.TestCase):
         self.assertEqual(second.count, 2)
         self.assertFalse(second.retryable)
 
+    def test_python_cli_no_module_is_environment_failure(self):
+        failure = FailureTracker().observe(
+            "/home/zombie/ai-coder/.venv/bin/python: No module named brumos_dungeon",
+            True,
+        )
+        self.assertEqual(failure.category, "environment")
+        self.assertEqual(
+            failure.signature,
+            "environment:modulenotfounderror: no module named brumos_dungeon",
+        )
+
+    def test_python_cli_no_module_matches_exception_signature(self):
+        tracker = FailureTracker()
+        cli = tracker.observe("/usr/bin/python3: No module named demo_pkg", True)
+        exc = tracker.observe("ModuleNotFoundError: No module named demo_pkg", True)
+        self.assertEqual(cli.category, "environment")
+        self.assertEqual(cli.signature, exc.signature)
+        self.assertEqual(exc.count, 2)
+
     def test_transient_provider_failure_is_retryable(self):
         failure = FailureTracker().observe("HTTP 503 temporarily unavailable", True)
         self.assertEqual(failure.category, "transient")

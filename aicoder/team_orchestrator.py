@@ -574,13 +574,16 @@ def _call_stage_agent_core(
                 message=f"contract repair {repair_attempts}/2: {'; '.join(issues)[:1200]}",
             )
             conversation = []
+            required_template = "\n\n".join(f"## {label}\n- ..." for label in required_sections)
             current_prompt = (
-                "CONTRACT REPAIR. Your previous final response was not a valid stage handoff. "
-                "Use tools again if needed, but the FINAL response must be the requested structured contract, "
-                "not tool-call syntax. Preserve valid evidence and fix every issue below.\n\n"
-                + "ISSUES:\n- " + "\n- ".join(issues)
-                + "\n\nORIGINAL STAGE TASK:\n" + base_prompt
-                + "\n\nINVALID PREVIOUS RESPONSE:\n" + response[:30000]
+                "CONTRACT REPAIR. Return the stage handoff ONLY. Do not explain the repair, do not ask questions, "
+                "and do not emit tool-call syntax in the final response. Every heading below is mandatory, must appear "
+                "exactly once, and must contain substantive content. Reuse preserved evidence instead of wandering into "
+                "unrelated tools. If evidence is unavailable, state that explicitly under the appropriate heading.\n\n"
+                + "MANDATORY FINAL FORMAT (copy these headings exactly):\n" + required_template
+                + "\n\nISSUES TO FIX:\n- " + "\n- ".join(issues)
+                + "\n\nAUTHORITATIVE ORIGINAL STAGE TASK:\n" + base_prompt
+                + "\n\nINVALID PREVIOUS RESPONSE (salvage valid facts only):\n" + response[:30000]
             )
             continue
 
@@ -1002,7 +1005,7 @@ def _run_researcher_core(
             plan_workspace_root=source_workspace, protected_workspace_root=None,
             tools=tools, system_prompt=system, load_tools_on_start=True,
             quick_chat=False, persistent_plan=False, approval_fn=_research_approval,
-            max_iterations=60, max_output_tokens=1600, max_tool_calls_per_turn=4,
+            max_iterations=60, max_output_tokens=1200, max_tool_calls_per_turn=4,
             max_context_chars=_TEAM_OBSERVATIONAL_CONTEXT_CHARS, stop_requested=stop_requested,
             progressive_tool_disclosure=False,
             base_timeout=max(10, min(300, int(request_timeout))), event_fn=research_event,
@@ -1079,7 +1082,7 @@ def _run_researcher_core(
         and "stage_policy_denied" not in str(item.get("result") or "")
     }
     external_tools = sorted(name for name in research_tool_names if name in {
-        "search", "crawl", "web_fetch_local", "web_search_local", "doc_search", "doc_read",
+        "search", "crawl", "web_fetch_local",
     })
     evidence = {
         "successful_tools": sorted(research_tool_names),

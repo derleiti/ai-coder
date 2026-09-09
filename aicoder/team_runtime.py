@@ -143,7 +143,7 @@ EVIDENCE GAPS: facts researchers must explicitly mark unknown rather than guess.
 NEXT STAGE INSTRUCTIONS: what the research stage must return to update Session Memory.
 
 Make the four researcher scopes complementary and directly relevant to the user's task. Do not produce generic research topics.
-Preferred tools for this stage: `file_tree`, `file_read`, `code_tree`, `code_search`, `code_read`, `git`, `status`, `health`, `logs`, `logs_errors`, `search`, `crawl`, `web_fetch_local`, `memory_search`, and other observational tools when useful. All authenticated tools remain available; these are guidance, not a capability restriction.
+Preferred tools for this stage: `file_tree`, `file_read`, `code_tree`, `code_search`, `code_read`, `git`, `status`, `log_viewer`, `search`, `crawl`, `web_fetch_local`, `memory_search`, and other observational tools when useful. All authenticated tools remain available; these are guidance, not a capability restriction.
 Return a compact but complete contract suitable for direct handoff to the four researchers."""
 
 BRAINSTORM_SYSTEM_PROMPT = """You are a read-only brainstorming participant in an AICoder team run.
@@ -204,7 +204,7 @@ objective, requirements, non-goals, architecture boundaries, affected areas, com
 acceptance tests, verification commands, merge criteria and unresolved risks. The runtime may expose the full authenticated tool
 catalogue; use observational tools when useful to inspect the active workspace, but planning itself must not persist mutations.
 Your result becomes the next StageOff update, so make completed/open work and next-stage obligations explicit.
-Preferred tools for this stage: `file_tree`, `file_read`, `code_tree`, `code_search`, `code_read`, `git`, `test`, `lint`, `status`, `health`, `logs`, and `memory_search` for observational verification. All authenticated tools remain available; prefer the smallest tool that answers the planning question and do not persist mutations."""
+Preferred tools for this stage: `file_tree`, `file_read`, `code_tree`, `code_search`, `code_read`, `git`, `test`, `lint`, `status`, `log_viewer`, and `memory_search` for observational verification. All authenticated tools remain available; prefer the smallest tool that answers the planning question and do not persist mutations."""
 
 COORDINATOR_SYSTEM_PROMPT = """You are the Session Memory / StageOff coordinator for an isolated multi-agent coding run.
 The cumulative StageOff is the authoritative run memory. At every stage boundary, reconcile the previous StageOff with the new
@@ -213,7 +213,7 @@ mark completed work explicitly, carry unresolved items forward, and write precis
 requirements, failures, retry metadata, acceptance criteria or evidence gaps. The runtime may expose the full authenticated tool
 catalogue; use observational tools when they materially improve coordination, but never weaken security boundaries or perform
 destructive/elevated host mutations. Your output must agree with the status events and StageOff content passed to the next stage.
-Preferred tools for this stage: `.aicoder-team/stageoff.json` via `file_read`, plus `file_tree`, `code_tree`, `code_search`, `code_read`, `git`, `status`, `health`, `logs`, `logs_errors`, `memory_search`, and `hive_recall` when they clarify unresolved state. All authenticated tools remain available; use tools to reconcile facts, not to bypass stage responsibilities."""
+Preferred tools for this stage: `.aicoder-team/stageoff.json` via `file_read`, plus `file_tree`, `code_tree`, `code_search`, `code_read`, `git`, `status`, `log_viewer`, `memory_search`, and `memory_history` when they clarify unresolved state. All authenticated tools remain available; use tools to reconcile facts, not to bypass stage responsibilities."""
 
 CODER_STRATEGIES = (
     "conservative/minimal-change",

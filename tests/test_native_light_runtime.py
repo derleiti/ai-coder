@@ -429,24 +429,66 @@ class NativeLightPlanTests(unittest.TestCase):
                 "model": "test/model",
             }
             client.chat.side_effect = [repeated, repeated, repeated, {"response": "DONE: reused cached evidence", "model": "test/model"}]
+            def autonomous_approval(name, args):
+                return True
+            autonomous_approval._aicoder_autonomous_policy = True
+            autonomous_approval._aicoder_policy_denial_is_error = False
             runtime = NativeLightRuntime(
                 client=client, initial_prompt="Inspect README", model="test/model",
                 fallback_model=None, workspace_root=str(workspace),
                 tools=[LOCAL_FILE_READ_SCHEMA], load_tools_on_start=True,
-                persistent_plan=False, base_timeout=30,
+                persistent_plan=False, base_timeout=30, approval_fn=autonomous_approval,
             )
             events = []
             runtime.event_fn = lambda name, payload: events.append((name, payload))
             with patch("aicoder.agent_runtime.run_tool", return_value=("README contents", False)) as run_tool:
                 result = runtime.run()
 
-            self.assertEqual(result.status, "paused")
-            self.assertIn("same non-mutating tool operation", result.response)
+            self.assertEqual(result.status, "completed")
+            self.assertIn("DONE: reused cached evidence", result.response)
             self.assertEqual(run_tool.call_count, 1)
-            self.assertEqual(client.chat.call_count, 3)
+            self.assertEqual(client.chat.call_count, 4)
             self.assertGreaterEqual(sum(1 for name, _ in events if name == "duplicate_tool_reused"), 1)
             self.assertTrue(any(
-                name == "loop_prevented" and payload.get("action") == "stop_duplicate_loop"
+                name == "loop_prevented" and payload.get("action") == "autonomous_replan"
+                for name, payload in events
+            ))
+
+    def test_varied_calls_same_failure_open_general_circuit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp)
+            client = MagicMock()
+            client.timeout = 30
+            client.chat.side_effect = [
+                {"response": '<tool_call>{"name":"file_read","arguments":{"path":"a.py"}}</tool_call>', "model": "test/model"},
+                {"response": '<tool_call>{"name":"file_read","arguments":{"path":"b.py"}}</tool_call>', "model": "test/model"},
+                {"response": '<tool_call>{"name":"file_read","arguments":{"path":"c.py"}}</tool_call>', "model": "test/model"},
+                {"response": "DONE: blocker classified and approach changed", "model": "test/model"},
+            ]
+            runtime = NativeLightRuntime(
+                client=client, initial_prompt="Diagnose imports", model="test/model",
+                fallback_model=None, workspace_root=str(workspace),
+                tools=[LOCAL_FILE_READ_SCHEMA], load_tools_on_start=True,
+                persistent_plan=False, base_timeout=30,
+            )
+            events = []
+            runtime.event_fn = lambda name, payload: events.append((name, payload))
+            with patch(
+                "aicoder.agent_runtime.run_tool",
+                return_value=("ModuleNotFoundError: No module named demo_pkg", True),
+            ):
+                result = runtime.run()
+
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(client.chat.call_count, 4)
+            self.assertTrue(any(
+                name == "failure_replan" and payload.get("repeats") == 2
+                for name, payload in events
+            ))
+            self.assertTrue(any(
+                name == "failure_circuit_open"
+                and payload.get("category") == "environment"
+                and payload.get("repeats", 0) >= 3
                 for name, payload in events
             ))
 

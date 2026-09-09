@@ -857,6 +857,9 @@ def test_stage_provider_resume_preserves_active_contract_repair_prompt():
     assert result.status == 'completed'
     assert 'CONTRACT REPAIR' in calls[2]['initial_prompt']
     assert 'missing section: SECTION_B' in calls[2]['initial_prompt']
+    assert 'MANDATORY FINAL FORMAT' in calls[2]['initial_prompt']
+    assert '## SECTION_A' in calls[2]['initial_prompt']
+    assert '## SECTION_B' in calls[2]['initial_prompt']
     assert 'AUTHORITATIVE ORIGINAL STAGE TASK' in calls[2]['initial_prompt']
 
 
@@ -913,3 +916,51 @@ def test_research_evidence_excludes_stage_policy_denials(tmp_path):
     assert result.status=='completed'
     assert result.evidence['successful_tools']==['file_tree']
     assert result.evidence['external_tools']==[]
+
+
+def test_observational_missing_file_read_is_non_error_hint(tmp_path):
+    from unittest.mock import MagicMock
+    from aicoder.executor import run_tool
+    from aicoder.team_orchestrator import _research_approval
+    result, is_error = run_tool(
+        MagicMock(), "file_read", {"path": "definitely-missing.py"},
+        approval_fn=_research_approval, workspace_root=tmp_path,
+    )
+    assert is_error is False
+    assert "observational_not_found" in result
+    assert "definitely-missing.py" in result
+
+
+def test_normal_missing_file_read_remains_error(tmp_path):
+    from unittest.mock import MagicMock
+    from aicoder.executor import run_tool
+    result, is_error = run_tool(
+        MagicMock(), "file_read", {"path": "definitely-missing.py"},
+        approval_fn=None, workspace_root=tmp_path,
+    )
+    assert is_error is True
+    assert "path does not exist" in result
+
+
+def test_observational_missing_code_tree_is_non_error_hint(tmp_path):
+    from unittest.mock import MagicMock
+    from aicoder.executor import run_tool
+    from aicoder.team_orchestrator import _research_approval
+    result, is_error = run_tool(
+        MagicMock(), "code_tree", {"path": "definitely-missing-package"},
+        approval_fn=_research_approval, workspace_root=tmp_path,
+    )
+    assert is_error is False
+    assert "observational_not_found" in result
+    assert "definitely-missing-package" in result
+
+
+def test_normal_missing_code_tree_remains_error(tmp_path):
+    from unittest.mock import MagicMock
+    from aicoder.executor import run_tool
+    result, is_error = run_tool(
+        MagicMock(), "code_tree", {"path": "definitely-missing-package"},
+        approval_fn=None, workspace_root=tmp_path,
+    )
+    assert is_error is True
+    assert "path does not exist" in result

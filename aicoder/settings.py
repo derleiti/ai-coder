@@ -272,6 +272,18 @@ def spec_for(name: str) -> SettingSpec:
 # Legacy migration
 # --------------------------------------------------------------------------
 
+_CONSOLIDATED_TOOL_RENAMES = {
+    # Verified one-to-one names from the current TriForce consolidated registry.
+    # Ambiguous removals intentionally remain untouched to avoid broadening a
+    # custom operator selection without consent.
+    "health": "status",
+    "logs": "log_viewer",
+    "logs_errors": "log_viewer",
+    "web_search": "search",
+    "web_search_local": "search",
+    "doc_search": "search",
+}
+
 # Before the operator tool policy was centralized, the Settings UI persisted
 # "Select all" as a concrete snapshot. That snapshot now contains removed
 # admin/ops tools and omits newly introduced safe tools, so filtering it against
@@ -298,7 +310,15 @@ def migrate_enabled_tools(value: Any) -> Optional[List[str]]:
     normalized = [str(name) for name in value if isinstance(name, str) and name]
     if frozenset(normalized) == _LEGACY_ALL_TOOLS:
         return None
-    return normalized
+    migrated: List[str] = []
+    seen: set[str] = set()
+    for name in normalized:
+        canonical = _CONSOLIDATED_TOOL_RENAMES.get(name, name)
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        migrated.append(canonical)
+    return migrated
 
 
 # --------------------------------------------------------------------------

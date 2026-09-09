@@ -668,7 +668,7 @@ You are ai-coder — an autonomous AILinux operator agent for coding, DevOps, sy
 - Simple greeting/chat: respond directly. NO tool calls needed.
 - Coding task or complex question: memory_search first, then act.
 - Time-sensitive/version question: search first, never guess.
-- Do NOT run health/status/init/current_time for basic conversation.
+- Do NOT run status/log_viewer/models for basic conversation unless they are relevant.
 
 ## Tool Model:
 - Typed local tools default to the active workspace. Leaving it requires explicit one-time approval.
@@ -678,11 +678,11 @@ You are ai-coder — an autonomous AILinux operator agent for coding, DevOps, sy
 - MCP tools expose user-facing TriForce backend SERVICES under authenticated RBAC. TriForce itself is never an operator target: do not inspect or modify its host, repository, processes, services, containers, or federation nodes.
 
 ## When to use which:
-- LOCAL READ/ANALYZE: file_read, file_tree, code_grep, code_read, code_search, code_tree on the AICoder machine. code_* accepts an optional project root plus target=auto|local|remote; auto defaults to the local AICoder host, while remote explicitly executes through TriForce.
+- LOCAL READ/ANALYZE: file_read, file_tree, code_grep, code_read, code_search, code_tree on the AICoder machine. These workspace/code tools are local and never target the TriForce backend.
 - MCP schema origin does not imply remote execution. AICoder dispatches workspace/code tools locally; backend-only tools remain remote.
 - CREATE DIRECTORIES: use directory_create. Never use file_edit on a directory path.
 - WRITE/MODIFY FILES: use file_edit with path + operation + typed content fields.
-- BACKEND CONNECTIVITY: health (READ-ONLY)
+- BACKEND/SYSTEM STATUS: status (READ-ONLY); use log_viewer for bounded diagnostic logs when status is insufficient.
 - SKILLS: when a catalogued skill matches the task, call skill_read(name) before acting.
 - SUBAGENTS: use subagent_run for bounded analysis/review/planning or focused debug/task work.
   Tool-capable subagents inherit only the active parent tools, cannot recurse into subagent_run, and remain subject to the same approvals and workspace policy.
@@ -758,7 +758,7 @@ RECOVERY_TOOLS: list[dict] = [
     {"name": "code_tree",      "description": "Show directory structure (read-only)", "inputSchema": {"type":"object","properties":{"path":{"type":"string"}}}},
     {"name": "search",         "description": "Web search", "inputSchema": {"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}},
     {"name": "memory_search",  "description": "Search persistent memory", "inputSchema": {"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}},
-    {"name": "health",         "description": "Backend health check", "inputSchema": {"type":"object","properties":{}}},
+    {"name": "status",         "description": "Backend/system status check", "inputSchema": {"type":"object","properties":{}}},
     {"name": "models",         "description": "List all available AI models", "inputSchema": {"type":"object","properties":{}}},
 ]
 
@@ -893,25 +893,31 @@ def load_tools(client: TriForceClient, force_refresh: bool = False) -> list[dict
 
     mcp_tools = []
     err_msg = ""
-    # Use existing client connection (no new TLS handshake)
+    catalog_loaded = False
+    # Use existing client connection (no new TLS handshake). A successfully
+    # authenticated empty catalogue is authoritative (for example under RBAC)
+    # and must never be replaced by synthetic remote recovery capabilities.
     for attempt in range(2):
         try:
             r = client._request("POST", "/v1/mcp",
                 {"jsonrpc":"2.0","method":"tools/list","params":{},"id":1},
                 require_auth=True, _label="tools/list", _retries=0)
-            catalog = r.get("result", {}).get("tools", [])
+            result_obj = r.get("result", {}) if isinstance(r, dict) else {}
+            if not isinstance(result_obj, dict) or not isinstance(result_obj.get("tools"), list):
+                raise ValueError("MCP tools/list returned no tools array")
+            catalog = result_obj["tools"]
             mcp_tools = filter_tool_catalog(catalog, AGENT_TOOLS)
-            if mcp_tools:
-                break
+            catalog_loaded = True
+            break
         except Exception as e:
             err_msg = str(e)
             if attempt == 0:
                 time.sleep(1)  # Brief pause before retry
-    if not mcp_tools:
+    if not catalog_loaded:
         hint = f" ({err_msg[:80]})" if err_msg else ""
         print(f"\n  \033[1;33m⚠ MCP tools/list fehlgeschlagen{hint}\033[0m", file=sys.stderr)
         print(f"  \033[33m  → Agent läuft mit {len(RECOVERY_TOOLS)} Recovery-Tools (eingeschränkt)\033[0m", file=sys.stderr)
-        print(f"  \033[33m  → Backend erreichbar? Versuch: aicoder mcp health\033[0m", file=sys.stderr)
+        print(f"  \033[33m  → Backend erreichbar? Versuch: aicoder mcp status\033[0m", file=sys.stderr)
         mcp_tools = RECOVERY_TOOLS
 
     # Trusted built-in ToolProviders share the same model-facing catalog. External
@@ -2337,6 +2343,22 @@ def _run_tool_impl(
         result, is_error = read_skill(_workspace_root(), str(args.get("name") or ""))
     elif name == "file_read":
         result, is_error = run_file_read(execution_args)
+        observational_policy = bool(
+            approval_fn is not None
+            and getattr(approval_fn, "_aicoder_autonomous_policy", False)
+            and not getattr(approval_fn, "_aicoder_policy_denial_is_error", True)
+        )
+        if (
+            observational_policy
+            and is_error
+            and str(result).startswith("file_read error: path does not exist:")
+        ):
+            result = str(result).replace(
+                "file_read error: path does not exist:",
+                "file_read: observational_not_found — path does not exist:",
+                1,
+            )
+            is_error = False
     elif name == "file_edit":
         result, is_error = run_file_edit(execution_args)
     elif name == "directory_create":
@@ -2355,6 +2377,19 @@ def _run_tool_impl(
                 result, is_error = run_local_code_tree(execution_args)
             else:
                 result, is_error = run_local_code_search(execution_args)
+        observational_policy = bool(
+            approval_fn is not None
+            and getattr(approval_fn, "_aicoder_autonomous_policy", False)
+            and not getattr(approval_fn, "_aicoder_policy_denial_is_error", True)
+        )
+        missing_prefix = f"{name} error: path does not exist:"
+        if observational_policy and is_error and str(result).startswith(missing_prefix):
+            result = str(result).replace(
+                missing_prefix,
+                f"{name}: observational_not_found — path does not exist:",
+                1,
+            )
+            is_error = False
     elif name == "code_grep":
         result, is_error = run_code_grep(execution_args)
     elif name == "git":

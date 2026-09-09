@@ -75,7 +75,7 @@ aicoder models --filter groq      # gefiltert
 aicoder models --json             # als JSON
 
 aicoder mcp-list                  # Coding-allowlisted MCP-Tools
-aicoder mcp health                # MCP health check
+aicoder mcp status                # MCP/backend status check
 aicoder mcp <tool> [key=val ...]  # erlaubter MCP-Tool-Call + zentrale Policy
 ```
 

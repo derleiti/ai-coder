@@ -83,7 +83,7 @@ _RUNTIME_COMPLETE_SCHEMA = {
     "annotations": {"readOnlyHint": True},
 }
 
-_BEHAVIOR_VERIFY_TOOLS = {"test", "lint", "dev_lint", "dev_analyze"}
+_BEHAVIOR_VERIFY_TOOLS = {"test", "lint"}
 _SHELL_VERIFY_RE = re.compile(
     r"(?:^|\s)(?:pytest|unittest|ruff|mypy|pylint|flake8|pyright|shellcheck|"
     r"cargo\s+(?:test|check|clippy)|go\s+test|npm\s+test|pnpm\s+test|yarn\s+test|"
@@ -1398,6 +1398,25 @@ class NativeLightRuntime:
                         action="reuse" if consecutive_call_batches == 2 else "stop_duplicate_loop",
                     )
                     if consecutive_call_batches >= 3:
+                        autonomous_loop_recovery = bool(
+                            self.approval_fn is not None
+                            and getattr(self.approval_fn, "_aicoder_autonomous_policy", False)
+                        )
+                        if autonomous_loop_recovery:
+                            messages.append({"role": "assistant", "content": response})
+                            current_input = (
+                                "AUTONOMOUS LOOP RECOVERY: the identical read-only tool request was already executed "
+                                "successfully and its result is present in context. Do NOT request it again. Use the cached "
+                                "evidence, choose a different tool or arguments only if new evidence is required, otherwise "
+                                "finish the current task/contract now."
+                            )
+                            loop_guard.reset()
+                            self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
+                            self._emit(
+                                "loop_prevented", iteration=i + 1, repeats=consecutive_call_batches,
+                                action="autonomous_replan",
+                            )
+                            continue
                         reason = (
                             "Agent paused because it kept requesting the same non-mutating tool operation "
                             "after the successful result had already been reused. No duplicate tool execution occurred; "
@@ -1937,6 +1956,17 @@ class NativeLightRuntime:
                 self._emit(
                     "research_recovery", iteration=i + 1, tools=sorted(research_tools),
                     category=batch_failure_category,
+                )
+            elif batch_failure_repeats >= 3:
+                tool_results.append(
+                    "Failure circuit open: the same underlying non-transient failure has recurred at least three times, "
+                    "even if the surrounding tool command changed. Do not issue another equivalent attempt. Inspect or "
+                    "change the relevant code, input, path, environment, or tool strategy before retrying. If no safe "
+                    "state change can resolve it, report the blocker explicitly and continue with independent work."
+                )
+                self._emit(
+                    "failure_circuit_open", iteration=i + 1, category=batch_failure_category,
+                    repeats=batch_failure_repeats,
                 )
             elif all_failed and repeats == 2:
                 tool_results.append(REPEATED_ERROR_RECOVERY_PROMPT)

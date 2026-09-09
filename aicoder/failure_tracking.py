@@ -16,6 +16,9 @@ _EXCEPTION_RE = re.compile(
     r"(?m)^(ImportError|ModuleNotFoundError|SyntaxError|TypeError|ValueError|RuntimeError|"
     r"AttributeError|NameError|AssertionError|OSError|PermissionError):\s*(.+)$"
 )
+_PYTHON_NO_MODULE_RE = re.compile(
+    r"(?mi)^\s*\S*python(?:[0-9.]*)?:\s+No module named\s+['\"]?([^'\"\s]+)['\"]?\s*$"
+)
 
 
 @dataclass(frozen=True)
@@ -52,7 +55,7 @@ class FailureTracker:
             category = "transient"
             retryable = True
         elif any(token in lower for token in (
-            "importerror", "modulenotfounderror", "abi", "partially initialized module",
+            "importerror", "modulenotfounderror", "no module named", "abi", "partially initialized module",
             "unsupported python", "version mismatch",
         )):
             category = "environment"
@@ -68,9 +71,12 @@ class FailureTracker:
             retryable = False
 
         exception = _EXCEPTION_RE.findall(raw)
+        cli_module = _PYTHON_NO_MODULE_RE.search(raw)
         if exception:
             kind, message = exception[-1]
             core = f"{kind}: {message}"
+        elif cli_module:
+            core = f"ModuleNotFoundError: No module named {cli_module.group(1)}"
         else:
             core = text[-700:]
         core = cls._clean(core).lower()

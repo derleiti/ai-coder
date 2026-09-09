@@ -38,6 +38,21 @@ class ToolPolicyIntegrationTests(unittest.TestCase):
         self.assertIsNone(migrate_enabled_tools(legacy))
         self.assertEqual(migrate_enabled_tools(["file_read", "test"]), ["file_read", "test"])
 
+    def test_custom_tool_snapshot_migrates_consolidated_names(self):
+        self.assertEqual(
+            migrate_enabled_tools([
+                "health", "logs", "logs_errors", "doc_search",
+                "web_search_local", "memory_search",
+            ]),
+            ["status", "log_viewer", "search", "memory_search"],
+        )
+
+    def test_custom_tool_snapshot_preserves_ambiguous_unknown_names(self):
+        self.assertEqual(
+            migrate_enabled_tools(["hive_recall", "custom_future_tool"]),
+            ["hive_recall", "custom_future_tool"],
+        )
+
     def test_run_subset_policy_is_separate_from_mcp_transport_boundary(self):
         for name in (
             "vault_keys", "mail_send", "notify_send", "memory_clear",
@@ -96,6 +111,52 @@ class ToolPolicyIntegrationTests(unittest.TestCase):
             [tool["name"] for tool in filter_tool_catalog(catalog, OPERATOR_MCP_TOOLS)],
             ["search"],
         )
+
+    def test_successful_empty_backend_catalog_does_not_inject_recovery_remote_tools(self):
+        client = MagicMock()
+        client.base_url = "https://example.invalid"
+        client.token = "opaque"
+        client._request.return_value = {"result": {"tools": []}}
+        registry = MagicMock()
+        registry.tool_schemas.return_value = []
+        with (
+            patch.object(executor, "_tool_cache", None),
+            patch.object(executor, "_tool_cache_ts", 0),
+            patch.object(executor, "_tool_cache_key", None),
+            patch.object(executor, "_tool_security_hints", {}),
+            patch.object(executor, "discover_plugins", return_value=registry),
+            patch("aicoder.mcp_registry.external_tool_schemas", return_value=[]),
+        ):
+            tools = executor.load_tools(client, force_refresh=True)
+        names = {tool["name"] for tool in tools}
+        self.assertEqual(names, executor.LOCAL_TOOL_NAMES)
+        self.assertNotIn("status", names)
+        self.assertNotIn("models", names)
+        self.assertNotIn("search", names)
+        self.assertEqual(client._request.call_count, 1)
+
+    def test_failed_backend_catalog_still_uses_bounded_recovery_tools(self):
+        client = MagicMock()
+        client.base_url = "https://example.invalid"
+        client.token = "opaque"
+        client._request.side_effect = RuntimeError("offline")
+        registry = MagicMock()
+        registry.tool_schemas.return_value = []
+        with (
+            patch.object(executor, "_tool_cache", None),
+            patch.object(executor, "_tool_cache_ts", 0),
+            patch.object(executor, "_tool_cache_key", None),
+            patch.object(executor, "_tool_security_hints", {}),
+            patch.object(executor, "discover_plugins", return_value=registry),
+            patch("aicoder.mcp_registry.external_tool_schemas", return_value=[]),
+            patch("aicoder.executor.time.sleep", return_value=None),
+        ):
+            tools = executor.load_tools(client, force_refresh=True)
+        names = {tool["name"] for tool in tools}
+        self.assertIn("status", names)
+        self.assertIn("models", names)
+        self.assertIn("search", names)
+        self.assertEqual(client._request.call_count, 2)
 
     def test_loaded_catalog_exposes_exactly_one_search_tool(self):
         client = MagicMock()
