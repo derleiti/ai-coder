@@ -791,7 +791,7 @@ class SettingsWidget(QWidget):
                 button.setEnabled(False)
         label = self._account_status_labels.get(provider)
         if label is not None:
-            label.setText("Browser/Provider-Client wird geöffnet..." if action == "connect" else "Verknüpfung wird entfernt...")
+            label.setText("Client wird geprüft/installiert · danach Login..." if action == "connect" else "Verknüpfung wird entfernt...")
             label.setStyleSheet("color: #00d4ff; font-size: 11px;")
         worker = _AccountWorker(provider, action)
         self._account_workers[provider] = worker

@@ -16,6 +16,8 @@ from aicoder.account_providers import (
     available_account_models,
     is_account_model,
     parse_account_model,
+    connect_account,
+    ensure_provider_client,
 )
 from aicoder.client import ClientError
 
@@ -171,6 +173,84 @@ class ChatGPTTransportTests(unittest.TestCase):
         with patch("aicoder.account_providers.CodexAppServer", return_value=server):
             with self.assertRaisesRegex(ClientError, "provider-side item"):
                 ChatGPTAccountTransport(timeout=30).chat(model="account:chatgpt/gpt-test", message="hello")
+
+
+class AccountInstallAndLoginTests(unittest.TestCase):
+    def test_missing_codex_is_installed_user_local_with_official_package(self):
+        calls = []
+        def fake_which(name, path=None):
+            calls.append((name, path))
+            if name == "npm":
+                return "/usr/bin/npm"
+            if name == "codex" and len([c for c in calls if c[0] == "codex"]) > 1:
+                return str(Path.home() / ".local/bin/codex")
+            return None
+        completed = MagicMock(returncode=0, stdout="", stderr="")
+        with patch("aicoder.account_providers.shutil.which", side_effect=fake_which), \
+             patch("aicoder.account_providers.subprocess.run", return_value=completed) as run:
+            path = ensure_provider_client("chatgpt")
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[:3], ["/usr/bin/npm", "install", "-g"])
+        self.assertIn("--prefix", argv)
+        self.assertEqual(argv[argv.index("--prefix") + 1], str(Path.home() / ".local"))
+        self.assertEqual(argv[-1], "@openai/codex@latest")
+        self.assertTrue(path.endswith("/.local/bin/codex"))
+
+    def test_missing_gemini_uses_official_npm_package(self):
+        seen = {"gemini": 0}
+        def fake_which(name, path=None):
+            if name == "npm": return "/usr/bin/npm"
+            if name == "gemini":
+                seen["gemini"] += 1
+                return None if seen["gemini"] == 1 else str(Path.home() / ".local/bin/gemini")
+            return None
+        with patch("aicoder.account_providers.shutil.which", side_effect=fake_which), \
+             patch("aicoder.account_providers.subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")) as run:
+            ensure_provider_client("gemini")
+        self.assertEqual(run.call_args.args[0][-1], "@google/gemini-cli@latest")
+
+    def test_chatgpt_app_server_failure_falls_back_to_official_device_auth(self):
+        first = MagicMock()
+        first.__enter__.return_value = first
+        first.__exit__.return_value = None
+        first.account_read.return_value = {"account": None}
+        second = MagicMock()
+        second.__enter__.return_value = second
+        second.__exit__.return_value = None
+        second.login_chatgpt.side_effect = ClientError("browser callback failed")
+        third = MagicMock()
+        third.__enter__.return_value = third
+        third.__exit__.return_value = None
+        third.account_read.return_value = {"account": {"type": "chatgpt", "planType": "plus"}}
+        with patch("aicoder.account_providers.ensure_provider_client", return_value="/home/test/.local/bin/codex"), \
+             patch("aicoder.account_providers.CodexAppServer", side_effect=[first, second, third]), \
+             patch("aicoder.account_providers._launch_terminal", return_value=0) as terminal, \
+             patch("aicoder.account_providers.set_provider_linked") as linked:
+            result = connect_account("chatgpt")
+        terminal.assert_called_once_with(
+            ["/home/test/.local/bin/codex", "login", "--device-auth"],
+            title="AICoder · ChatGPT Device Login", wait=True,
+        )
+        linked.assert_called_once_with("chatgpt", True)
+        self.assertTrue(result["authenticated"])
+
+    def test_gemini_is_linked_only_after_login_verification(self):
+        with patch("aicoder.account_providers.ensure_provider_client", return_value="/home/test/.local/bin/gemini"), \
+             patch("aicoder.account_providers._launch_terminal", return_value=0), \
+             patch("aicoder.account_providers._gemini_authenticated", return_value=True), \
+             patch("aicoder.account_providers.set_provider_linked") as linked:
+            result = connect_account("gemini")
+        linked.assert_called_once_with("gemini", True)
+        self.assertTrue(result["authenticated"])
+
+    def test_gemini_failed_verification_is_not_left_linked(self):
+        with patch("aicoder.account_providers.ensure_provider_client", return_value="/home/test/.local/bin/gemini"), \
+             patch("aicoder.account_providers._launch_terminal", return_value=0), \
+             patch("aicoder.account_providers._gemini_authenticated", return_value=False), \
+             patch("aicoder.account_providers.set_provider_linked") as linked:
+            with self.assertRaisesRegex(ClientError, "not authenticated"):
+                connect_account("gemini")
+        linked.assert_called_once_with("gemini", False)
 
 
 if __name__ == "__main__":

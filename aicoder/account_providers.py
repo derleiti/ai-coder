@@ -126,7 +126,68 @@ def set_provider_linked(provider: str, linked: bool) -> None:
 
 
 def _which(spec: AccountProviderSpec) -> str:
-    return str(shutil.which(spec.executable) or "")
+    return _which_executable(spec.executable)
+
+
+_INSTALL_RECIPES: dict[str, tuple[str, ...]] = {
+    "chatgpt": ("npm", "install", "-g", "@openai/codex@latest"),
+    "claude": ("npm", "install", "-g", "@anthropic-ai/claude-code@latest"),
+    "gemini": ("npm", "install", "-g", "@google/gemini-cli@latest"),
+    "mistral": ("uv", "tool", "install", "--upgrade", "mistral-vibe"),
+}
+
+
+def _augmented_path() -> str:
+    """Return PATH including common user-local install locations."""
+    home = Path.home()
+    parts = [
+        str(home / ".npm-global" / "bin"),
+        str(home / ".local" / "bin"),
+        str(home / ".cargo" / "bin"),
+        os.environ.get("PATH", ""),
+    ]
+    return os.pathsep.join(part for part in parts if part)
+
+
+def _which_executable(name: str) -> str:
+    return str(shutil.which(name, path=_augmented_path()) or "")
+
+
+def ensure_provider_client(provider: str) -> str:
+    """Install a missing official provider CLI into the user's normal tool path.
+
+    No sudo/system package mutation is attempted.  npm uses the user's configured
+    global prefix; Mistral uses ``uv tool install``.
+    """
+    spec = provider_spec(provider)
+    existing = _which_executable(spec.executable)
+    if existing:
+        return existing
+    recipe = _INSTALL_RECIPES.get(spec.id)
+    if not recipe:
+        raise ClientError(f"No supported installer is configured for {spec.display_name}")
+    runner = _which_executable(recipe[0])
+    if not runner:
+        dependency = "Node.js/npm" if recipe[0] == "npm" else "uv"
+        raise ClientError(f"{dependency} is required to install the official {spec.display_name} client")
+    if recipe[0] == "npm":
+        argv = [runner, "install", "-g", "--prefix", str(Path.home() / ".local"), recipe[-1]]
+    else:
+        argv = [runner, *recipe[1:]]
+    env = dict(os.environ)
+    env["PATH"] = _augmented_path()
+    try:
+        proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300, env=env)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ClientError(f"Could not install the official {spec.display_name} client") from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()[-1:]
+        suffix = f": {detail[0][:240]}" if detail else ""
+        raise ClientError(f"Official {spec.display_name} client installation failed{suffix}")
+    installed = _which_executable(spec.executable)
+    if not installed:
+        raise ClientError(f"{spec.display_name} client installed but executable '{spec.executable}' is still not on PATH")
+    return installed
 
 
 class CodexAppServer:
@@ -137,7 +198,7 @@ class CodexAppServer:
     """
 
     def __init__(self, *, timeout: int = 30):
-        executable = shutil.which("codex")
+        executable = _which_executable("codex")
         if not executable:
             raise ClientError(
                 "Codex CLI is not installed. Install the official Codex CLI first, then link ChatGPT again."
@@ -375,11 +436,12 @@ def account_status(provider: str) -> dict[str, Any]:
         return _claude_status()
     installed = bool(_which(spec))
     marked = spec.id in linked_provider_ids()
-    detail = "Verknüpft · Login wird vom offiziellen Client verwaltet" if marked and installed else (
+    authenticated: bool | None = None
+    detail = "Verknüpft · Login vom offiziellen Client verwaltet" if marked and installed else (
         f"{spec.display_name}-CLI fehlt" if not installed else "Nicht verbunden"
     )
     return {"provider": spec.id, "display": spec.display_name, "installed": installed,
-            "linked": bool(marked), "authenticated": None, "detail": detail}
+            "linked": bool(marked), "authenticated": authenticated, "detail": detail}
 
 
 def account_statuses() -> list[dict[str, Any]]:
@@ -440,53 +502,165 @@ def linked_account_catalog() -> dict[str, Any]:
     return {"providers": providers, "models": models}
 
 
-def _launch_terminal(command: list[str], *, title: str) -> None:
-    """Launch an official provider's interactive login without handling credentials."""
+def _launch_terminal(command: list[str], *, title: str, wait: bool = False, timeout: int = 360) -> int | None:
+    """Launch an official provider's interactive login without handling credentials.
+
+    For synchronous login flows a temporary completion sentinel is written by
+    the shell *after* the provider command exits.  This is more reliable than
+    waiting for the terminal process because desktop terminals may delegate a
+    new tab/window over D-Bus and exit immediately.
+    """
     joined = shlex.join(command)
+    sentinel = ""
+    if wait:
+        fd, sentinel = tempfile.mkstemp(prefix="aicoder-login-", suffix=".done")
+        os.close(fd)
+        try:
+            os.unlink(sentinel)
+        except OSError:
+            pass
+        script = (
+            f"{joined}; rc=$?; printf '%s' \"$rc\" > {shlex.quote(sentinel)}; "
+            f"exit \"$rc\""
+        )
+    else:
+        script = joined + "; exec bash"
+
     candidates: list[list[str]] = []
     if shutil.which("konsole"):
-        candidates.append(["konsole", "--new-tab", "-p", f"tabtitle={title}", "-e", "bash", "-lc", joined + "; exec bash"])
+        candidates.append(["konsole", "--new-tab", "-p", f"tabtitle={title}", "-e", "bash", "-lc", script])
     if shutil.which("gnome-terminal"):
-        candidates.append(["gnome-terminal", "--title", title, "--", "bash", "-lc", joined + "; exec bash"])
+        candidates.append(["gnome-terminal", "--title", title, "--", "bash", "-lc", script])
     if shutil.which("xfce4-terminal"):
-        candidates.append(["xfce4-terminal", "--title", title, "-e", f"bash -lc {shlex.quote(joined + '; exec bash')}"])
+        candidates.append(["xfce4-terminal", "--title", title, "-e", f"bash -lc {shlex.quote(script)}"])
     if shutil.which("x-terminal-emulator"):
-        candidates.append(["x-terminal-emulator", "-T", title, "-e", "bash", "-lc", joined + "; exec bash"])
+        candidates.append(["x-terminal-emulator", "-T", title, "-e", "bash", "-lc", script])
     if shutil.which("xterm"):
-        candidates.append(["xterm", "-T", title, "-e", "bash", "-lc", joined + "; exec bash"])
+        candidates.append(["xterm", "-T", title, "-e", "bash", "-lc", script])
+
+    launched = False
     for argv in candidates:
         try:
             subprocess.Popen(argv, start_new_session=True)
-            return
+            launched = True
+            break
         except OSError:
             continue
-    raise ClientError(f"No graphical terminal found. Run manually: {joined}")
+    if not launched:
+        if sentinel:
+            try:
+                os.unlink(sentinel)
+            except OSError:
+                pass
+        raise ClientError(f"No graphical terminal found. Run manually: {joined}")
+    if not wait:
+        return None
+
+    deadline = time.monotonic() + max(30, int(timeout))
+    try:
+        while time.monotonic() < deadline:
+            if os.path.exists(sentinel):
+                try:
+                    text = Path(sentinel).read_text(encoding="utf-8").strip()
+                    return int(text) if text else 1
+                except (OSError, ValueError):
+                    return 1
+            time.sleep(0.25)
+    finally:
+        try:
+            os.unlink(sentinel)
+        except OSError:
+            pass
+    raise ClientError(f"{title} timed out before the login process completed")
+
+
+def _gemini_authenticated(executable: str, *, timeout: int = 45) -> bool:
+    """Verify Gemini CLI authentication through its documented headless mode."""
+    with tempfile.TemporaryDirectory(prefix="aicoder-gemini-auth-") as tmp:
+        policy = Path(tmp) / "deny-tools.toml"
+        policy.write_text(
+            '[[rule]]\ntoolName = "*"\ndecision = "deny"\npriority = 999\ninteractive = false\n',
+            encoding="utf-8",
+        )
+        env = dict(os.environ)
+        env["PATH"] = _augmented_path()
+        try:
+            proc = subprocess.run(
+                [executable, "--prompt", "Reply exactly: OK", "--output-format", "json",
+                 "--approval-mode", "plan", "--admin-policy", str(policy), "--skip-trust"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout, cwd=tmp, env=env,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        if proc.returncode != 0:
+            return False
+        try:
+            payload = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            return False
+        return bool(str(payload.get("response") or "").strip()) if isinstance(payload, dict) else False
 
 
 def connect_account(provider: str, *, open_browser: bool = True) -> dict[str, Any]:
     spec = provider_spec(provider)
-    executable = _which(spec)
-    if not executable:
-        install_hints = {
-            "chatgpt": "Install the official Codex CLI, then retry.",
-            "claude": "Install the official Claude Code CLI, then retry.",
-            "mistral": "Install Mistral Vibe, then retry.",
-            "gemini": "Install the official Gemini CLI, then retry.",
-        }
-        raise ClientError(install_hints[spec.id])
+    executable = ensure_provider_client(spec.id)
     if spec.id == "chatgpt":
-        with CodexAppServer(timeout=30) as server:
-            result = server.login_chatgpt(timeout=300, open_browser=open_browser)
-        set_provider_linked(spec.id, True)
-        return {"provider": spec.id, "started": True, "authenticated": True, "account": result.get("account")}
+        # Reuse a valid official Codex/ChatGPT session without forcing another
+        # browser round-trip. Otherwise start the App Server OAuth flow.
+        try:
+            with CodexAppServer(timeout=15) as server:
+                existing = server.account_read().get("account")
+            if isinstance(existing, dict) and existing.get("type") == "chatgpt":
+                set_provider_linked(spec.id, True)
+                return {"provider": spec.id, "started": False, "authenticated": True, "account": existing}
+        except Exception:
+            pass
+        # Preferred integration: official Codex App Server ChatGPT OAuth.
+        try:
+            with CodexAppServer(timeout=30) as server:
+                result = server.login_chatgpt(timeout=300, open_browser=open_browser)
+            set_provider_linked(spec.id, True)
+            return {"provider": spec.id, "started": True, "authenticated": True, "account": result.get("account")}
+        except ClientError as primary_error:
+            # Official Codex CLI exposes device auth specifically for environments
+            # where the localhost browser callback is unavailable/unreliable.
+            exit_code = _launch_terminal(
+                [executable, "login", "--device-auth"], title="AICoder · ChatGPT Device Login", wait=True
+            )
+            if exit_code not in (0, None):
+                raise primary_error
+            try:
+                with CodexAppServer(timeout=15) as server:
+                    account = server.account_read().get("account")
+            except Exception as exc:
+                raise ClientError("ChatGPT device login finished but Codex still reports no authenticated account") from exc
+            if not isinstance(account, dict) or account.get("type") != "chatgpt":
+                raise ClientError("ChatGPT device login did not produce an authenticated ChatGPT account")
+            set_provider_linked(spec.id, True)
+            return {"provider": spec.id, "started": True, "authenticated": True, "account": account}
     if spec.id == "claude":
-        _launch_terminal([executable, "auth", "login"], title="AICoder · Claude Login")
-    elif spec.id == "mistral":
-        _launch_terminal([executable, "--setup"], title="AICoder · Mistral Login")
-    elif spec.id == "gemini":
-        _launch_terminal([executable], title="AICoder · Gemini Login")
-    set_provider_linked(spec.id, True)
-    return {"provider": spec.id, "started": True, "authenticated": None}
+        exit_code = _launch_terminal([executable, "auth", "login"], title="AICoder · Claude Login", wait=True)
+        status = _claude_status()
+        if exit_code not in (0, None) or not status.get("authenticated"):
+            raise ClientError("Claude login finished but Claude Code does not report an authenticated account")
+        set_provider_linked(spec.id, True)
+        return {"provider": spec.id, "started": True, "authenticated": True}
+    if spec.id == "mistral":
+        exit_code = _launch_terminal([executable, "--setup"], title="AICoder · Mistral Login", wait=True)
+        if exit_code not in (0, None):
+            raise ClientError("Mistral Vibe setup did not complete successfully")
+        set_provider_linked(spec.id, True)
+        return {"provider": spec.id, "started": True, "authenticated": None}
+    if spec.id == "gemini":
+        # Gemini CLI performs Google OAuth in interactive mode; wait for the
+        # user to finish/exit, then verify with the documented headless mode.
+        exit_code = _launch_terminal([executable], title="AICoder · Google Gemini Login", wait=True)
+        if exit_code not in (0, None) or not _gemini_authenticated(executable):
+            set_provider_linked(spec.id, False)
+            raise ClientError("Gemini login finished but the official Gemini CLI is not authenticated")
+        set_provider_linked(spec.id, True)
+        return {"provider": spec.id, "started": True, "authenticated": True}
+    raise ClientError(f"Unsupported account provider: {spec.id}")
 
 
 def disconnect_account(provider: str) -> None:
