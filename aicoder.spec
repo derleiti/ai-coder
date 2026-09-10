@@ -18,7 +18,6 @@ a = Analysis(
         'aicoder.status',
         'aicoder.workspace',
         'aicoder.task',
-        'aicoder.swarm_runner',
         'aicoder.agent',
         'aicoder.agent_runtime',
         'aicoder.agent_plan',

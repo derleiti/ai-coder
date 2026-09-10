@@ -94,29 +94,7 @@ jobs:
 
       - name: Build Linux binary
         run: |
-          pyinstaller \
-            --onefile \
-            --name aicoder \
-            --console \
-            --noconfirm \
-            --clean \
-            --strip \
-            --collect-submodules=aicoder \
-            --copy-metadata=aicoder \
-            --collect-submodules=keyring \
-            --collect-submodules=secretstorage \
-            --collect-submodules=jeepney \
-            --hidden-import=PyQt6.QtWidgets \
-            --hidden-import=PyQt6.QtGui \
-            --hidden-import=PyQt6.QtCore \
-            --hidden-import=aicoder.gui \
-            --hidden-import=aicoder.gui.app \
-            --hidden-import=aicoder.gui.main_window \
-            --hidden-import=aicoder.gui.chat_widget \
-            --hidden-import=aicoder.gui.settings_widget \
-            --hidden-import=aicoder.gui.autostart \
-            --hidden-import=certifi \
-            aicoder_main.py
+          python -m PyInstaller aicoder.spec --distpath dist/ --workpath build/ --noconfirm --clean
           chmod +x dist/aicoder
           echo "Binary size: $(du -h dist/aicoder | cut -f1)"
 
