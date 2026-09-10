@@ -9,11 +9,12 @@ from unittest.mock import MagicMock, patch
 
 from aicoder.agent_runtime import AgentRunResult
 from aicoder.team_orchestrator import (
-    AgentStageResult, CandidateResult, _is_incomplete_envelope_reason, _redact_debug_value,
+    AgentStageResult, CandidateResult, _acceptance_artifact_paths, _acceptance_artifact_snapshots, _candidate_execution_handoff, _candidate_has_production_delta, _extract_adaptive_work_units, _work_unit_implementer_budget, CodingWorkUnit, _candidate_test_mutation, _command_matches_acceptance, _external_failed_acceptance_commands, _failed_task_acceptance_commands, _is_incomplete_envelope_reason, _redact_debug_value,
     _call_stage_agent_core, _run_candidate, _run_researcher, evaluate_candidate, run_team,
 )
 from aicoder.team_runtime import config_from_state
 from aicoder.task_contract import compile_task_contract
+from aicoder.team_handoff import make_handoff
 from aicoder.workspace_backend import RamWorkspace
 
 
@@ -22,6 +23,172 @@ def _result(text: str, model: str = "test/model") -> AgentRunResult:
         status="completed", response=text, model=model, messages=[], tools=[], system_prompt="",
     )
 
+
+
+
+
+
+class AdaptiveCodingPlanTests(unittest.TestCase):
+    def _plan(self, units):
+        return "OBJECTIVE:\nDemo\n\nADAPTIVE WORK GRAPH\n```json\n" + json.dumps({"work_units": units}) + "\n```"
+
+    def test_independent_units_remain_parallel_lanes(self):
+        units = _extract_adaptive_work_units(self._plan([
+            {"id":"parser","title":"Parser","goal":"Implement parser","files":["pkg/parser.py"],"depends_on":[],"acceptance":[],"estimated_input_tokens":20000,"estimated_output_tokens":10000,"risk":"medium"},
+            {"id":"cli","title":"CLI","goal":"Implement CLI","files":["pkg/cli.py"],"depends_on":[],"acceptance":[],"estimated_input_tokens":15000,"estimated_output_tokens":8000,"risk":"low"},
+        ]), "parent")
+        self.assertEqual([u.unit_id for u in units], ["parser", "cli"])
+        self.assertEqual(_work_unit_implementer_budget(units[0]), 40500)
+
+    def test_dependency_chain_is_collapsed_into_one_lane(self):
+        units = _extract_adaptive_work_units(self._plan([
+            {"id":"core","goal":"core","files":["pkg/core.py"],"depends_on":[]},
+            {"id":"api","goal":"api","files":["pkg/api.py"],"depends_on":["core"]},
+        ]), "parent")
+        self.assertEqual(len(units), 1)
+        self.assertIn("core", units[0].unit_id)
+        self.assertIn("api", units[0].unit_id)
+
+    def test_shared_file_ownership_is_collapsed(self):
+        units = _extract_adaptive_work_units(self._plan([
+            {"id":"a","goal":"a","files":["pkg/shared.py"],"depends_on":[]},
+            {"id":"b","goal":"b","files":["pkg/shared.py"],"depends_on":[]},
+        ]), "parent")
+        self.assertEqual(len(units), 1)
+
+    def test_invalid_graph_falls_back_without_losing_parent_task(self):
+        units = _extract_adaptive_work_units("ADAPTIVE WORK GRAPH\n```json\n{broken\n```", "KEEP THIS TASK")
+        self.assertEqual(len(units), 1)
+        self.assertEqual(units[0].unit_id, "full-task")
+        self.assertEqual(units[0].task_text("KEEP THIS TASK"), "KEEP THIS TASK")
+
+    def test_planner_estimates_are_bounded(self):
+        self.assertEqual(_work_unit_implementer_budget(CodingWorkUnit("a","a","a", estimated_input_tokens=1, estimated_output_tokens=1)), 40000)
+        self.assertEqual(_work_unit_implementer_budget(CodingWorkUnit("b","b","b", estimated_input_tokens=200000, estimated_output_tokens=100000)), 120000)
+        self.assertEqual(_work_unit_implementer_budget(CodingWorkUnit("c","c","c")), 120000)
+
+    def test_unit_contract_does_not_inherit_parent_global_acceptance(self):
+        unit = CodingWorkUnit(
+            "parser", "Parser", "Implement parser",
+            acceptance=("python -m unittest tests.test_parser",),
+        )
+        parent = (
+            "Requirements:\n- Must support the complete CLI\n"
+            "Acceptance checks:\n- python /tmp/full-system-acceptance.py\n"
+        )
+        contract = compile_task_contract(unit.task_text(parent))
+        self.assertEqual(contract.acceptance_commands, ("python -m unittest tests.test_parser",))
+        self.assertNotIn("python /tmp/full-system-acceptance.py", contract.acceptance_commands)
+
+
+class FinisherAcceptancePolicyTests(unittest.TestCase):
+    def test_test_mutation_detection(self):
+        self.assertTrue(_candidate_test_mutation("file_edit", {"path": "tests/test_cli.py"}))
+        self.assertTrue(_candidate_test_mutation("file_edit", {"path": "/tmp/ws/test_parser.py"}))
+        self.assertFalse(_candidate_test_mutation("file_edit", {"path": "jsonl_run_audit/cli.py"}))
+        self.assertFalse(_candidate_test_mutation("file_read", {"path": "tests/test_cli.py"}))
+
+    def test_production_delta_excludes_tests_and_bookkeeping(self):
+        self.assertFalse(_candidate_has_production_delta({
+            "added_files": ["tests/test_app.py", ".aicoder-team/coder-handoff.json"],
+            "modified_files": [], "deleted_files": [],
+        }))
+        self.assertTrue(_candidate_has_production_delta({
+            "added_files": ["tests/test_app.py", "pkg/core.py"],
+            "modified_files": [], "deleted_files": [],
+        }))
+
+    def test_acceptance_command_matching_normalizes_python3(self):
+        self.assertTrue(_command_matches_acceptance(
+            "python3 /tmp/acceptance.py", "python /tmp/acceptance.py"
+        ))
+        self.assertFalse(_command_matches_acceptance(
+            "python -m unittest discover -s tests -v", "python /tmp/acceptance.py"
+        ))
+
+    def test_acceptance_artifact_snapshot_and_external_filter(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ws = root / "ws"
+            ws.mkdir()
+            acceptance = root / "accept.py"
+            acceptance.write_text("assert True\n")
+            contract = compile_task_contract(
+                f"Acceptance checks:\n- python {acceptance}\n- python -m unittest discover -s tests -v\n"
+            )
+            self.assertEqual(_acceptance_artifact_paths(contract), (acceptance.resolve(),))
+            snapshots = _acceptance_artifact_snapshots(contract)
+            self.assertEqual(snapshots[0]["path"], str(acceptance.resolve()))
+            self.assertIn("assert True", snapshots[0]["content"])
+            evaluation = {"checks": {
+                "task-acceptance-1": {"ok": False, "argv": ["python3", str(acceptance)]},
+                "task-acceptance-2": {"ok": False, "argv": ["python3", "-m", "unittest", "discover", "-s", "tests", "-v"]},
+            }}
+            self.assertEqual(
+                _external_failed_acceptance_commands(evaluation, contract, ws),
+                [f"python3 {acceptance}"],
+            )
+
+    def test_failed_acceptance_commands_preserve_check_order(self):
+        contract = compile_task_contract(
+            "Acceptance checks:\n- python /tmp/a.py\n- python -m unittest discover -s tests -v\n"
+        )
+        evaluation = {"checks": {
+            "task-acceptance-2": {"ok": False, "argv": ["python3", "-m", "unittest", "discover", "-s", "tests", "-v"]},
+            "task-acceptance-1": {"ok": False, "argv": ["python3", "/tmp/a.py"]},
+        }}
+        self.assertEqual(_failed_task_acceptance_commands(evaluation, contract), [
+            "python3 /tmp/a.py", "python3 -m unittest discover -s tests -v"
+        ])
+
+class CoderHandoffProjectionTests(unittest.TestCase):
+    def test_large_stageoff_is_bounded_without_losing_task_contract_or_acceptance(self):
+        task = (
+            "Requirements:\n"
+            "- Preserve malformed input handling.\n"
+            "- Keep deterministic JSON output.\n"
+            "Acceptance checks:\n"
+            "- python /tmp/external-acceptance.py\n"
+        )
+        contract = compile_task_contract(task)
+        large_noise = "old research evidence " * 6000
+        code_contract = (
+            "OBJECTIVE:\nImplement parser.\n\n"
+            "REQUIREMENTS:\nPreserve malformed input handling.\n\n"
+            "ACCEPTANCE TESTS:\npython /tmp/external-acceptance.py\n"
+        )
+        stageoff = {
+            "schema": "aicoder-stageoff-v1",
+            "user_task": task,
+            "task_contract": contract.as_dict(),
+            "repository_context": "repo-root=/tmp/project",
+            "session_memory": large_noise,
+            "working_memory": {
+                "required_changes": "fix parser only",
+                "completed_items": "research complete",
+                "open_items": "external acceptance still red",
+                "risks": "do not regress stdin",
+                "next_stage_instructions": "implement then verify",
+            },
+            "runtime_truth": {"implementation_state": "not_runtime_verified"},
+            "stages": [
+                {
+                    "stage": "plan_code",
+                    "output": {"implementation_contract": code_contract},
+                    "coordinator_review": "Acceptance is authoritative.",
+                }
+            ],
+        }
+        raw = json.dumps(stageoff)
+        self.assertGreater(len(raw), 100_000)
+        parent = make_handoff("stageoff", raw, max_chars=120_000, source_stage="plan_code")
+        handoff = _candidate_execution_handoff(parent, task=task, contract=contract, strategy="minimal")
+        self.assertLessEqual(handoff.compact_chars, 24_000)
+        self.assertIn("python /tmp/external-acceptance.py", handoff.compact)
+        self.assertIn("Preserve malformed input handling", handoff.compact)
+        self.assertIn("external acceptance still red", handoff.compact)
+        self.assertNotIn("old research evidence old research evidence old research evidence", handoff.compact)
 
 class FreshResearchRecoveryTests(unittest.TestCase):
     def test_no_usable_final_response_is_incomplete_envelope(self):
@@ -254,11 +421,15 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
 
             self.assertEqual(candidate.run.status, "completed")
             self.assertEqual(RepairRuntime.calls, 2)
-            self.assertIn("AUTONOMOUS CANDIDATE VERIFICATION REPAIR 1/4", RepairRuntime.prompts[1])
-            self.assertIn("regression-test-evidence", RepairRuntime.prompts[1])
+            self.assertIn("FRESH TEST + REPAIR CODER PROCESS", RepairRuntime.prompts[1])
+            self.assertIn("GEGEBEN", RepairRuntime.prompts[1])
+            self.assertIn("FERTIG", RepairRuntime.prompts[1])
+            self.assertIn("GESUCHT_ZU_MACHEN", RepairRuntime.prompts[1])
+            self.assertIn("test-change-evidence", RepairRuntime.prompts[1])
+            self.assertIn("workspace_is_authoritative", RepairRuntime.prompts[1])
             final = evaluate_candidate(candidate)
             self.assertTrue(final["verification_passed"], final)
-            self.assertEqual(candidate.run.performance.get("team_verification_repairs"), 1)
+            self.assertEqual(candidate.run.performance.get("team_coder_phases"), 2)
             candidate.workspace.abort()
 
     def test_paused_candidate_after_resume_limit_gets_verification_repair(self):
@@ -326,13 +497,13 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
 
             self.assertEqual(candidate.run.status, "completed")
             self.assertEqual(PausedRepairRuntime.calls, 2)
-            self.assertIn("AUTONOMOUS CANDIDATE VERIFICATION REPAIR 1/4", PausedRepairRuntime.prompts[1])
+            self.assertIn("FRESH TEST + REPAIR CODER PROCESS", PausedRepairRuntime.prompts[1])
             self.assertIn("python-tests", PausedRepairRuntime.prompts[1])
-            self.assertIn("regression-test-evidence", PausedRepairRuntime.prompts[1])
+            self.assertIn("test-change-evidence", PausedRepairRuntime.prompts[1])
             final = evaluate_candidate(candidate)
             self.assertTrue(final["verification_passed"], final)
             self.assertEqual(candidate.run.performance.get("team_auto_resumes"), 0)
-            self.assertEqual(candidate.run.performance.get("team_verification_repairs"), 1)
+            self.assertEqual(candidate.run.performance.get("team_coder_phases"), 2)
             candidate.workspace.abort()
 
     def test_paused_candidate_with_real_changes_can_pass_deterministic_verification(self):
@@ -1688,3 +1859,65 @@ def test_brainstorm_policy_is_post_research_and_blocks_web():
     assert approval("search", {"query": "FastAPI PostgreSQL"}) is False
     assert approval("web_fetch_local", {"url": "https://docs.python.org/3/"}) is False
     assert approval("file_read", {"path": "README.md"}) is True
+
+def test_adaptive_unit_contract_preserves_safety_but_scopes_requirements():
+    from aicoder.team_orchestrator import CodingWorkUnit, _work_unit_task_contract
+    parent = compile_task_contract("Requirements:\n- build CLI\n- build parser\n\nNever use web.\n\nAcceptance checks:\n- python /tmp/full.py")
+    unit = CodingWorkUnit("parser", "Parser", "Implement parser only", acceptance=("python -m unittest tests.test_parser",))
+    contract = _work_unit_task_contract(unit, parent)
+    assert contract.requirements == ("Implement parser only",)
+    assert contract.forbid_web is True
+    assert contract.acceptance_commands == ("python -m unittest tests.test_parser",)
+    assert "python /tmp/full.py" not in contract.acceptance_commands
+
+
+def test_adaptive_actual_conflicts_detects_runtime_overlap():
+    from aicoder.team_orchestrator import CandidateResult, _adaptive_lane_actual_conflicts
+    from unittest.mock import MagicMock
+    a = CandidateResult(1, "m", "s", MagicMock(), AgentRunResult("completed", "DONE", "m", [], [], ""), work_unit_id="a")
+    b = CandidateResult(2, "m", "s", MagicMock(), AgentRunResult("completed", "DONE", "m", [], [], ""), work_unit_id="b")
+    a.evaluation = {"delta": {"modified_files": ["pkg/shared.py"], "added_files": [], "deleted_files": []}}
+    b.evaluation = {"delta": {"modified_files": ["pkg/shared.py"], "added_files": [], "deleted_files": []}}
+    assert _adaptive_lane_actual_conflicts([a, b]) == {"pkg/shared.py": ["a", "b"]}
+
+def test_apply_candidate_delta_integrates_disjoint_lane_files():
+    from aicoder.team_orchestrator import CandidateResult, _apply_candidate_delta
+    with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as ram_dir:
+        source = Path(source_dir)
+        (source / "base.txt").write_text("base\n", encoding="utf-8")
+        lane = RamWorkspace(source, ram_root=ram_dir); lane.prepare()
+        (lane.info.execution_root / "pkg").mkdir()
+        (lane.info.execution_root / "pkg" / "lane.py").write_text("value = 1\n", encoding="utf-8")
+        run = AgentRunResult("completed", "DONE", "m", [], [], "")
+        candidate = CandidateResult(1, "m", "s", lane, run, work_unit_id="lane")
+        candidate.evaluation = {"delta": lane.delta_summary()}
+        integration = RamWorkspace(source, ram_root=ram_dir); integration.prepare()
+        _apply_candidate_delta(integration, candidate)
+        assert (integration.info.execution_root / "pkg" / "lane.py").read_text() == "value = 1\n"
+        lane.abort(); integration.abort()
+
+
+def test_final_repair_runtime_is_fresh_and_failure_focused():
+    from aicoder.team_orchestrator import _run_final_repair
+    captured = {}
+    class Runtime:
+        def __init__(self, **kwargs): captured.update(kwargs)
+        def run(self): return AgentRunResult("completed", "DONE: fixed", "m", [], [], "")
+    with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as ram_dir:
+        source = Path(source_dir); (source / "app.py").write_text("x=1\n", encoding="utf-8")
+        integration = RamWorkspace(source, ram_root=ram_dir); integration.prepare()
+        contract = compile_task_contract("Requirements:\n- fix app")
+        verification = [{"name":"python-tests","ok":False,"required":True,"output":"AssertionError: expected 2"}]
+        with patch("aicoder.team_orchestrator.NativeLightRuntime", Runtime):
+            result = _run_final_repair(
+                client=MagicMock(), model_client=MagicMock(), model="m", workspace=integration,
+                task="fix app", contract=contract, verification=verification, tools=[],
+                source_workspace=str(source), stop_requested=None, request_timeout=30,
+                event_fn=None, native_openrouter_tool_calling=False,
+            )
+        assert result.status == "completed"
+        assert captured["conversation"] == []
+        assert "FRESH FINAL INTEGRATION REPAIR" in captured["initial_prompt"]
+        assert "AssertionError: expected 2" in captured["initial_prompt"]
+        assert captured["protected_workspace_root"] == str(source)
+        integration.abort()

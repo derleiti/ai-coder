@@ -22,12 +22,15 @@ class TeamCandidateAutoResumeTests(unittest.TestCase):
         backend.info.execution_root = Path("/tmp/fake-team-candidate")
         return backend
 
-    def test_paused_candidate_with_verified_workspace_is_accepted_without_resume(self):
+    def test_verified_implementer_still_gets_independent_test_repair_run(self):
         backend = self._backend()
-        backend.delta_summary.side_effect = [
-            {"changed_count": 0, "deleted_count": 0},
-            {"changed_count": 1, "deleted_count": 0},
-        ]
+        delta_calls = {"n": 0}
+        def delta_summary():
+            delta_calls["n"] += 1
+            if delta_calls["n"] == 1:
+                return {"changed_count": 0, "deleted_count": 0, "added_files": [], "modified_files": [], "deleted_files": []}
+            return {"changed_count": 1, "deleted_count": 0, "added_files": [], "modified_files": ["app.py"], "deleted_files": []}
+        backend.delta_summary.side_effect = delta_summary
         first = _result(
             "paused",
             "Agent paused: state changed successfully, but verification is incomplete.",
@@ -37,8 +40,9 @@ class TeamCandidateAutoResumeTests(unittest.TestCase):
                 {"role": "user", "content": "Tool result: edit ok"},
             ],
         )
+        second = _result("completed", "DONE: independently verified")
         calls = []
-        results = iter([first])
+        results = iter([first, second])
 
         def runtime_factory(**kwargs):
             calls.append(kwargs)
@@ -58,10 +62,54 @@ class TeamCandidateAutoResumeTests(unittest.TestCase):
                 task="fix bug", plan="shared plan", coordinator="", tools=[], stop_requested=None,
             )
 
-        self.assertEqual(result.run.status, "paused")
-        self.assertEqual(len(calls), 1)
-        self.assertTrue(calls[0]["require_mutation_or_explicit_no_change"])
-        self.assertTrue(result.evaluation.get("verification_passed"))
+        self.assertEqual(result.run.status, "completed")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1]["conversation"], [])
+        self.assertIn("FRESH TEST + REPAIR CODER PROCESS", calls[1]["initial_prompt"])
+        self.assertIn("GEGEBEN", calls[1]["initial_prompt"])
+        self.assertIn("FERTIG", calls[1]["initial_prompt"])
+        self.assertIn("GESUCHT_ZU_MACHEN", calls[1]["initial_prompt"])
+        self.assertIn("AUTHORITATIVE CODER RUN 1 ROLE: IMPLEMENTER", calls[0]["system_prompt"])
+        self.assertIn("AUTHORITATIVE CODER RUN 2 ROLE: TEST ENGINEER + REPAIR CODER", calls[1]["system_prompt"])
+
+
+    def test_directory_only_delta_does_not_trigger_implementer_to_finisher_handoff(self):
+        backend = self._backend()
+        backend.delta_summary.return_value = {
+            "changed_count": 1, "deleted_count": 0,
+            "added_files": [], "modified_files": [], "deleted_files": [],
+        }
+        calls = []
+
+        def runtime_factory(**kwargs):
+            calls.append(kwargs)
+            runtime = MagicMock()
+            if len(calls) == 1:
+                runtime.run.return_value = _result("paused", "Transient model/backend failure")
+                runtime.run.return_value.failure_category = "transient"
+            else:
+                runtime.run.return_value = _result("completed", "DONE: no useful mutation")
+            return runtime
+
+        with (
+            patch("aicoder.team_orchestrator.create_isolated_team_workspace", return_value=backend),
+            patch("aicoder.team_orchestrator.configured_project_python", return_value=None),
+            patch("aicoder.team_orchestrator.NativeLightRuntime", side_effect=runtime_factory),
+            patch("aicoder.team_orchestrator._wait_before_resume", return_value=True),
+            patch("aicoder.team_orchestrator.evaluate_candidate", return_value={"verification_passed": False, "checks": {}, "test_evidence": {}}),
+        ):
+            result = _run_candidate(
+                client=_NoopClient(), model_client=_NoopClient(), source_workspace="/tmp/source",
+                backend_mode="ram", slot=1, model="test/model", strategy="conservative",
+                task="fix bug", plan="shared plan", coordinator="", tools=[], stop_requested=None,
+            )
+
+        self.assertGreaterEqual(len(calls), 2)
+        # First recovery remains in the implementer lifecycle; a directory-only
+        # delta must not be treated as real implementation state.
+        self.assertNotIn("FRESH TEST + REPAIR CODER PROCESS", calls[1]["initial_prompt"])
+        self.assertTrue(calls[1]["require_mutation_or_explicit_no_change"])
+        self.assertFalse(result.evaluation.get("verification_passed", False))
 
     def test_liveness_timeout_tracks_inactivity_not_total_wall_time(self):
         backend = self._backend()
@@ -164,9 +212,14 @@ class TeamCandidateAutoResumeTests(unittest.TestCase):
             )
 
         self.assertEqual(result.run.status, "completed")
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[1]["conversation"][0]["content"], "already inspected parser.py")
-        self.assertIn("liveness timeout", calls[1]["initial_prompt"].lower())
+        # Liveness recovery may consume one bounded implementer retry before the
+        # fresh finisher phase. The key invariant is that the finisher never
+        # inherits the implementer chat history.
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[-1]["conversation"], [])
+        self.assertIn("FRESH TEST + REPAIR CODER PROCESS", calls[-1]["initial_prompt"])
+        self.assertNotIn("already inspected parser.py", calls[-1]["initial_prompt"])
+        self.assertEqual(calls[-1]["max_context_chars"], 64_000)
 
     def test_explicit_user_stop_is_not_auto_resumed(self):
         backend = self._backend()
@@ -309,3 +362,74 @@ class RuntimeCompletionSignalTests(unittest.TestCase):
         self.assertEqual([row["accepted"] for row in signals], [False, True])
         self.assertIn("verification", signals[0]["reason"].lower())
 
+
+class TeamCandidateTokenPhaseBoundaryTests(unittest.TestCase):
+    def test_token_progress_boundary_hands_fresh_workspace_to_test_repair(self):
+        backend = MagicMock(spec=RamWorkspace)
+        backend.info.execution_root = Path('/tmp/candidate-token-boundary')
+        backend.prepare.return_value = backend.info.execution_root
+        backend.delta_summary.return_value = {
+            'changed_count': 1, 'deleted_count': 0,
+            'added_files': ['pkg/core.py'], 'modified_files': [], 'deleted_files': [],
+        }
+        backend.write_candidate_artifact.return_value = None
+        calls = []
+        events = []
+
+        def runtime_factory(**kwargs):
+            calls.append(kwargs)
+            runtime = MagicMock()
+            if len(calls) == 1:
+                def implementer_run():
+                    for iteration in range(1, 7):
+                        kwargs['event_fn']('model_response', {
+                            'iteration': iteration,
+                            'response_diagnostics': {
+                                'usage': {'prompt_tokens': 20000, 'completion_tokens': 1000, 'total_tokens': 21000}
+                            },
+                        })
+                    reason = kwargs['yield_requested']()
+                    self.assertIn('token/progress boundary reached', reason)
+                    result = _result('paused', reason)
+                    result.failure_category = 'phase_yield'
+                    result.performance = {}
+                    return result
+                runtime.run.side_effect = implementer_run
+            else:
+                def repair_run():
+                    result = _result('completed', 'DONE: independently verified')
+                    result.performance = {}
+                    return result
+                runtime.run.side_effect = repair_run
+            return runtime
+
+        evaluations = iter([
+            {'verification_passed': False, 'checks': {'python-tests': {'ok': False, 'required': True, 'output': 'tests needed'}}, 'test_evidence': {}},
+            {'verification_passed': True, 'checks': {}, 'test_evidence': {'coverage_evidence_ok': True}},
+        ])
+        with (
+            patch('aicoder.team_orchestrator.create_isolated_team_workspace', return_value=backend),
+            patch('aicoder.team_orchestrator.configured_project_python', return_value=None),
+            patch('aicoder.team_orchestrator.NativeLightRuntime', side_effect=runtime_factory),
+            patch('aicoder.team_orchestrator.evaluate_candidate', side_effect=lambda candidate: next(evaluations)),
+        ):
+            result = _run_candidate(
+                client=_NoopClient(), model_client=_NoopClient(), source_workspace='/tmp/source',
+                backend_mode='ram', slot=1, model='test/model', strategy='conservative',
+                task='Implement package', plan='plan', coordinator='', tools=[], stop_requested=None,
+                event_fn=lambda kind, payload: events.append((kind, payload)),
+            )
+
+        self.assertEqual(result.run.status, 'completed')
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1]['conversation'], [])
+        self.assertIn('FRESH TEST + REPAIR CODER PROCESS', calls[1]['initial_prompt'])
+        self.assertIn('GEGEBEN', calls[1]['initial_prompt'])
+        self.assertIn('FERTIG', calls[1]['initial_prompt'])
+        self.assertIn('GESUCHT_ZU_MACHEN', calls[1]['initial_prompt'])
+        self.assertIn('AUTHORITATIVE CODER RUN 1 ROLE: IMPLEMENTER', calls[0]['system_prompt'])
+        self.assertIn('AUTHORITATIVE CODER RUN 2 ROLE: TEST ENGINEER + REPAIR CODER', calls[1]['system_prompt'])
+        transfer = [payload for kind, payload in events if kind == 'team_worker_event' and payload.get('category') == 'handoff' and payload.get('status') == 'transferred']
+        self.assertTrue(transfer)
+        self.assertEqual(transfer[-1]['implementer_usage']['total_tokens'], 126000)
+        self.assertEqual(result.run.performance['team_implementer_usage']['total_tokens'], 126000)

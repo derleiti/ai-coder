@@ -497,3 +497,56 @@ def test_runtime_limits_tool_calls_per_turn(tmp_path):
     assert len(tool_calls) == 2
     limited = [payload for kind,payload in events if kind == "tool_batch_limited"]
     assert limited and limited[0]["requested"] == 6 and limited[0]["executed"] == 2
+
+
+def test_cooperative_phase_yield_is_not_user_cancellation():
+    from unittest.mock import MagicMock
+    from aicoder.agent_runtime import NativeLightRuntime
+
+    calls = {"n": 0}
+    def phase_boundary():
+        calls["n"] += 1
+        return "token/progress boundary" if calls["n"] >= 2 else None
+
+    class Transport:
+        timeout = 30
+        def chat(self, **kwargs):
+            return {"response": "TOOL_CALL file_read\n{\"path\":\"README.md\"}\nEND_TOOL_CALL", "model": "test/model"}
+
+    runtime = NativeLightRuntime(
+        client=MagicMock(), model_client=Transport(), initial_prompt="inspect then continue",
+        model="test/model", fallback_model=None, workspace_root=".",
+        tools=[{"name":"file_read","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}],
+        load_tools_on_start=False, persistent_plan=False, max_iterations=3,
+        yield_requested=phase_boundary,
+    )
+    with patch("aicoder.agent_runtime.run_tool", return_value=("README", False)):
+        result = runtime.run()
+    assert result.status == "paused"
+    assert result.failure_category == "phase_yield"
+    assert "token/progress boundary" in result.response
+
+def test_runtime_grace_turn_executes_host_requested_final_response_repair():
+    from unittest.mock import MagicMock
+    from aicoder.agent_runtime import NativeLightRuntime
+
+    class Transport:
+        timeout = 30
+        def __init__(self): self.calls = 0
+        def chat(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return {"response": "", "model": "test/model"}
+            return {"response": "DONE: repaired final", "model": "test/model"}
+
+    transport = Transport()
+    runtime = NativeLightRuntime(
+        client=MagicMock(), model_client=transport, initial_prompt="answer",
+        model="test/model", fallback_model=None, workspace_root=".", tools=[],
+        load_tools_on_start=False, persistent_plan=False, max_iterations=1,
+        allow_tool_free_final=True,
+    )
+    result = runtime.run()
+    assert result.status == "completed"
+    assert transport.calls == 2
+    assert result.iterations == 2

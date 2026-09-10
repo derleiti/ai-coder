@@ -62,6 +62,7 @@ from .tool_policy import require_allowed_tool
 RuntimeEventFn = Callable[[str, dict[str, Any]], None]
 ApprovalFn = Callable[[str, dict], bool]
 StopFn = Callable[[], bool]
+YieldFn = Callable[[], str | None]
 
 _RUNTIME_COMPLETE_TOOL = "runtime_complete"
 _RUNTIME_COMPLETE_SCHEMA = {
@@ -384,6 +385,10 @@ class NativeLightRuntime:
     approval_fn: ApprovalFn | None = None
     event_fn: RuntimeEventFn | None = None
     stop_requested: StopFn | None = None
+    # Optional cooperative phase boundary. Unlike stop_requested this is not an
+    # operator cancellation: the runtime returns a resumable/yielded result so a
+    # higher-level orchestrator can hand the same workspace to a fresh model.
+    yield_requested: YieldFn | None = None
     plan_store: PlanStore = field(default_factory=PlanStore)
     journal_store: ContinuationJournalStore | None = None
     persistent_plan: bool = True
@@ -1064,7 +1069,39 @@ class NativeLightRuntime:
         iteration_limit = max(1, min(MAX_ITERATIONS, int(self.max_iterations or MAX_ITERATIONS)))
         final_response_repair_sent = False
         completion_audit_sent = False
-        for i in range(iteration_limit):
+        completion_grace_remaining = 2
+        iterations_executed = 0
+        for i in range(iteration_limit + 2):
+            if i >= iteration_limit:
+                internal_followup_pending = bool(
+                    final_response_repair_sent or verification_nudge_sent or completion_audit_sent
+                )
+                if not internal_followup_pending or completion_grace_remaining <= 0:
+                    break
+                completion_grace_remaining -= 1
+                self._emit(
+                    "runtime_grace_turn", iteration=i + 1,
+                    remaining=completion_grace_remaining, reason="host_requested_completion_followup",
+                )
+            iterations_executed = i + 1
+            yield_reason = ""
+            if self.yield_requested is not None:
+                try:
+                    yield_reason = str(self.yield_requested() or "").strip()
+                except Exception:
+                    # A phase-boundary observer is advisory. Its failure must not
+                    # abort or corrupt the underlying autonomous run.
+                    yield_reason = ""
+            if yield_reason:
+                self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
+                self._emit("yielded", reason=yield_reason, iteration=i, resumable=True)
+                if self.conversation is not None:
+                    self.conversation[:] = [dict(message) for message in messages[1:]][-MAX_CONTEXT_MESSAGES:]
+                return AgentRunResult(
+                    "paused", yield_reason, model_used, messages, tools, system,
+                    iterations=i, latency_ms=total_latency, fallback_used=fallback_used,
+                    plan_id=plan.id if plan else "", failure_category="phase_yield",
+                )
             if self._stopped():
                 reason = "Agent stopped by user"
                 self._pause_plan(plan, reason)
@@ -2286,6 +2323,6 @@ class NativeLightRuntime:
             self.conversation[:] = [dict(message) for message in messages[1:]][-MAX_CONTEXT_MESSAGES:]
         return AgentRunResult(
             "paused", reason, model_used, messages, tools, system,
-            iterations=iteration_limit, latency_ms=total_latency,
+            iterations=iterations_executed or iteration_limit, latency_ms=total_latency,
             fallback_used=fallback_used, plan_id=plan.id if plan else "",
         )
