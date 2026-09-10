@@ -18,7 +18,7 @@ from urllib.request import Request, urlopen
 
 from .config import CONFIG_DIR, atomic_write_private
 
-_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$")
 _ENV_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 _SECRET_KEY_RE = re.compile(r"token|secret|password|passwd|api[_-]?key|authorization", re.I)
 _SAFE_ENV = ("PATH", "HOME", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL", "XDG_RUNTIME_DIR")
@@ -33,17 +33,16 @@ _PREFIX = "mcp."
 
 
 def normalize_server_name(value: str) -> str:
-    """Return a stable tool-safe server id from a human-entered label.
+    """Normalize only cosmetic whitespace while preserving human-readable names."""
+    return re.sub(r"\s+", " ", str(value or "").strip())[:64].rstrip()
 
-    MCP server ids become part of exported tool names, so whitespace and other
-    punctuation are normalized instead of making the GUI fail after the user
-    has filled the whole form. Dots are preserved for backwards compatibility.
-    """
-    raw = str(value or "").strip()
-    raw = re.sub(r"\s+", "-", raw)
-    raw = re.sub(r"[^A-Za-z0-9._-]+", "-", raw)
-    raw = re.sub(r"-{2,}", "-", raw).strip("._-")
-    return raw[:64].rstrip("._-")
+
+def server_namespace_id(value: str) -> str:
+    """Return the tool-safe namespace id for a human-readable server name."""
+    raw = normalize_server_name(value)
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", raw)
+    slug = re.sub(r"-{2,}", "-", slug).strip("._-")
+    return slug[:64].rstrip("._-")
 
 
 class MCPRegistryError(ValueError):
@@ -108,7 +107,7 @@ class MCPServerConfig:
 def _validate(config: MCPServerConfig) -> MCPServerConfig:
     if not _NAME_RE.fullmatch(config.name):
         suggested = normalize_server_name(config.name)
-        hint = f"; try '{suggested}'" if suggested else "; use letters/numbers plus . _ -"
+        hint = f"; try '{suggested}'" if suggested else "; use letters/numbers, spaces plus . _ -"
         raise MCPRegistryError(f"invalid MCP server name{hint}")
     if config.name.lower() == "triforce":
         raise MCPRegistryError("'triforce' is reserved for the built-in server profile")
@@ -441,18 +440,21 @@ def doctor_server(config:MCPServerConfig) -> dict[str,Any]:
         return {"name":config.name,"ok":False,"transport":config.transport,"tool_count":0,"env_names":list(config.env_names),"error":f"{type(exc).__name__}: {exc}"}
 
 
-def namespaced_tool_name(server:str,tool:str) -> str: return f"{_PREFIX}{server}.{tool}"
+def namespaced_tool_name(server:str,tool:str) -> str:
+    return f"{_PREFIX}{server_namespace_id(server)}.{tool}"
 
 def split_namespaced_tool(name:str, server_names: list[str] | tuple[str, ...] | None = None) -> tuple[str,str] | None:
     if not name.startswith(_PREFIX): return None
     rest=name[len(_PREFIX):]
     if server_names:
-        # Server ids historically allowed dots. Match the longest registered id
-        # so mcp.api.ailinux.me.tool can still be routed unambiguously.
-        matches = [server for server in server_names if rest.startswith(f"{server}.")]
-        if matches:
-            server = max(matches, key=len)
-            tool = rest[len(server) + 1:]
+        candidates = []
+        for server in server_names:
+            namespace = server_namespace_id(server)
+            if namespace and rest.startswith(f"{namespace}."):
+                candidates.append((namespace, server))
+        if candidates:
+            namespace, server = max(candidates, key=lambda item: len(item[0]))
+            tool = rest[len(namespace) + 1:]
             return (server, tool) if tool else None
     server,sep,tool=rest.partition(".")
     return (server,tool) if sep and server and tool else None

@@ -23,10 +23,11 @@ class ProviderCredentialTests(unittest.TestCase):
 
     @patch("aicoder.provider_credentials.keyring")
     def test_secret_is_kept_in_keyring_and_never_returned_by_summary(self, kr):
-        kr.get_keyring.return_value = self._backend()
-        kr.get_password.return_value = "SUPER-SECRET"
+        backend = self._backend()
+        backend.get_password.return_value = "SUPER-SECRET"
+        kr.get_keyring.return_value = backend
         set_provider_key("gemini", "SUPER-SECRET")
-        kr.set_password.assert_called_once_with(SERVICE_NAME, "google", "SUPER-SECRET")
+        backend.set_password.assert_called_once_with(SERVICE_NAME, "google", "SUPER-SECRET")
         summary = credential_summary("google", environ={})
         self.assertTrue(summary["configured"])
         self.assertEqual(summary["source"], "keyring")
@@ -35,26 +36,39 @@ class ProviderCredentialTests(unittest.TestCase):
 
     @patch("aicoder.provider_credentials.keyring")
     def test_keyring_takes_precedence_over_environment(self, kr):
-        kr.get_keyring.return_value = self._backend()
-        kr.get_password.return_value = "stored-secret"
+        backend = self._backend()
+        backend.get_password.return_value = "stored-secret"
+        kr.get_keyring.return_value = backend
         secret, source = provider_api_key("google", environ={"GOOGLE_API_KEY": "env-secret"})
         self.assertEqual(secret, "stored-secret")
         self.assertEqual(source, "keyring")
 
     @patch("aicoder.provider_credentials.keyring")
     def test_environment_remains_supported_when_no_stored_key(self, kr):
-        kr.get_keyring.return_value = self._backend()
-        kr.get_password.return_value = None
+        backend = self._backend()
+        backend.get_password.return_value = None
+        kr.get_keyring.return_value = backend
         secret, source = provider_api_key("openrouter", environ={"OPENROUTER_API_KEY": "env-secret"})
         self.assertEqual(secret, "env-secret")
         self.assertEqual(source, "environment:OPENROUTER_API_KEY")
 
     @patch("aicoder.provider_credentials.keyring")
     def test_delete_uses_canonical_provider_without_exposing_secret(self, kr):
-        kr.get_keyring.return_value = self._backend()
-        kr.get_password.return_value = "secret"
+        backend = self._backend()
+        backend.get_password.return_value = "secret"
+        kr.get_keyring.return_value = backend
         self.assertTrue(delete_provider_key("gemini"))
-        kr.delete_password.assert_called_once_with(SERVICE_NAME, "google")
+        backend.delete_password.assert_called_once_with(SERVICE_NAME, "google")
+
+    @patch("aicoder.provider_credentials._secretservice_backend")
+    @patch("aicoder.provider_credentials._usable_keyring_backend", return_value=None)
+    def test_secretservice_fallback_is_used_when_keyring_plugin_backend_is_missing(self, _kr, fallback):
+        from aicoder.provider_credentials import credential_store_status
+        from aicoder.provider_credentials import _SecretServiceBackend
+        fallback.return_value = _SecretServiceBackend()
+        status = credential_store_status()
+        self.assertTrue(status["available"])
+        self.assertEqual(status["backend"], "secretstorage.SecretService")
 
     def test_provider_alias_and_transport_model_resolution(self):
         self.assertEqual(canonical_provider("gemini"), "google")

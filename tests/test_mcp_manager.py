@@ -84,7 +84,7 @@ class RegistryAndPolicyTests(unittest.TestCase):
 
     def test_human_server_name_normalization_and_update_helper(self):
         from aicoder.mcp_registry import apply_config_updates, normalize_server_name
-        self.assertEqual(normalize_server_name("AILinuX Dev MCP Server"), "AILinuX-Dev-MCP-Server")
+        self.assertEqual(normalize_server_name("  AILinuX   Dev MCP Server  "), "AILinuX Dev MCP Server")
         base = MCPServerConfig(name="demo", command=sys.executable)
         updated = apply_config_updates(base, {
             "url": "https://example.invalid/mcp",
@@ -98,6 +98,14 @@ class RegistryAndPolicyTests(unittest.TestCase):
         self.assertEqual(updated.auth_username, "zombie")
         self.assertEqual(updated.timeout, 45)
         self.assertEqual(updated.command, "")
+
+    def test_spaced_server_name_is_valid_and_tool_namespace_is_safe(self):
+        from aicoder.mcp_registry import namespaced_tool_name, split_namespaced_tool
+        config = MCPServerConfig(name="AILinuX Dev MCP Server", transport="streamable-http", url="https://example.invalid/mcp")
+        mcp_service.test_config(config)
+        tool_name = namespaced_tool_name(config.name, "echo")
+        self.assertEqual(tool_name, "mcp.AILinuX-Dev-MCP-Server.echo")
+        self.assertEqual(split_namespaced_tool(tool_name, [config.name]), (config.name, "echo"))
 
     def test_dotted_server_name_routes_to_longest_registered_id(self):
         from aicoder.mcp_registry import split_namespaced_tool
@@ -571,7 +579,7 @@ class SurfaceIntegrationTests(unittest.TestCase):
             widget.transport.setCurrentText("streamable-http")
             widget.url.setText("https://example.invalid/mcp")
             config = widget._config()
-            self.assertEqual(config.name, "AILinuX-Dev-MCP-Server")
+            self.assertEqual(config.name, "AILinuX Dev MCP Server")
             self.assertFalse(widget.url.isHidden())
             self.assertTrue(widget.command.isHidden())
             self.assertTrue(widget.connection_form.labelForField(widget.command).isHidden())

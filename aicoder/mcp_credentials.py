@@ -1,7 +1,7 @@
 """Secret storage and HTTP authentication for user-managed MCP servers.
 
 Persistent MCP configuration contains metadata only. Every secret value is kept
-in the operating-system keyring and is materialized only for the outbound
+in the operating-system secret store and is materialized only for the outbound
 request that needs it.
 """
 from __future__ import annotations
@@ -9,12 +9,7 @@ from __future__ import annotations
 import base64
 from typing import Iterable
 
-try:
-    import keyring  # type: ignore
-except Exception:  # pragma: no cover - availability is tested through errors
-    keyring = None
-
-from .provider_credentials import CredentialStoreError, _backend_or_error
+from .provider_credentials import CredentialStoreError, _secret_delete, _secret_get, _secret_set
 
 SERVICE_NAME = "ailinux.aicoder.mcp-credentials"
 
@@ -53,37 +48,26 @@ def set_mcp_secret(server: str, field: str, value: str) -> None:
     secret = str(value or "")
     if not secret:
         raise CredentialStoreError("MCP credential must not be empty")
-    _backend_or_error()
     try:
-        assert keyring is not None
-        keyring.set_password(SERVICE_NAME, _account(server, field), secret)
-    except Exception as exc:
-        raise CredentialStoreError("Could not store MCP credential in OS keyring") from exc
+        _secret_set(SERVICE_NAME, _account(server, field), secret)
+    except CredentialStoreError as exc:
+        raise CredentialStoreError(f"Could not store MCP credential: {exc}") from exc
 
 
 def get_mcp_secret(server: str, field: str) -> str:
-    if keyring is None:
-        return ""
     try:
-        _backend_or_error()
-        return str(keyring.get_password(SERVICE_NAME, _account(server, field)) or "")
-    except Exception:
+        return _secret_get(SERVICE_NAME, _account(server, field))
+    except CredentialStoreError:
         # Reads are deliberately quiet so status screens can remain usable on a
-        # headless machine with no keyring backend. Writes fail closed instead.
+        # headless machine with no secret-service backend. Writes fail closed.
         return ""
 
 
 def delete_mcp_secret(server: str, field: str) -> bool:
-    _backend_or_error()
     try:
-        assert keyring is not None
-        account = _account(server, field)
-        if keyring.get_password(SERVICE_NAME, account) is None:
-            return False
-        keyring.delete_password(SERVICE_NAME, account)
-        return True
-    except Exception as exc:
-        raise CredentialStoreError("Could not delete MCP credential from OS keyring") from exc
+        return _secret_delete(SERVICE_NAME, _account(server, field))
+    except CredentialStoreError as exc:
+        raise CredentialStoreError(f"Could not delete MCP credential: {exc}") from exc
 
 
 def snapshot_mcp_secrets(server: str, fields: Iterable[str] = SECRET_FIELDS) -> dict[str, str]:
@@ -114,7 +98,7 @@ def restore_mcp_secrets(
 
 
 def credential_status(server: str) -> dict[str, bool]:
-    """Return presence flags only; never expose keyring values."""
+    """Return presence flags only; never expose secret-store values."""
     return {field: bool(get_mcp_secret(server, field)) for field in SECRET_FIELDS}
 
 
@@ -122,7 +106,7 @@ def _required_secret(server: str, field: str, label: str) -> str:
     value = get_mcp_secret(server, field)
     if value:
         return value
-    raise MCPAuthError(f"{label} is not configured in the OS keyring")
+    raise MCPAuthError(f"{label} is not configured in the OS secret store")
 
 
 def auth_headers(config) -> dict[str, str]:
@@ -137,7 +121,7 @@ def auth_headers(config) -> dict[str, str]:
     if mode == "bearer":
         token = get_mcp_secret(server, "bearer_token") or get_mcp_secret(server, "token")
         if not token:
-            raise MCPAuthError("Bearer token is not configured in the OS keyring")
+            raise MCPAuthError("Bearer token is not configured in the OS secret store")
         return {"Authorization": f"Bearer {token}"}
     if mode == "basic":
         username = str(getattr(config, "auth_username", "") or "")
@@ -145,7 +129,7 @@ def auth_headers(config) -> dict[str, str]:
             raise MCPAuthError("Basic authentication requires a username")
         password = get_mcp_secret(server, "basic_password") or get_mcp_secret(server, "password")
         if not password:
-            raise MCPAuthError("Basic password is not configured in the OS keyring")
+            raise MCPAuthError("Basic password is not configured in the OS secret store")
         encoded = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
         return {"Authorization": f"Basic {encoded}"}
     if mode == "custom-header":

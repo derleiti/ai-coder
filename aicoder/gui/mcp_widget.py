@@ -46,7 +46,7 @@ class MCPServersWidget(QWidget):
         self.connection_form.setHorizontalSpacing(12)
         self.connection_form.setVerticalSpacing(7)
         self.name = QLineEdit()
-        self.name.setPlaceholderText("e.g. ailinux-dev (spaces are normalized to '-')")
+        self.name.setPlaceholderText("e.g. AILinuX Dev MCP Server")
         self.enabled = QCheckBox("Enabled")
         self.enabled.setChecked(True)
         self.transport = QComboBox()
@@ -325,10 +325,10 @@ class MCPServersWidget(QWidget):
         transport = self.transport.currentText()
         entered_name = self.name.text().strip()
         normalized_name = normalize_server_name(entered_name)
-        if normalized_name and normalized_name != entered_name:
+        if normalized_name != entered_name:
             self.name.setText(normalized_name)
         return MCPServerConfig(
-            name=normalized_name or entered_name, enabled=self.enabled.isChecked(),
+            name=normalized_name, enabled=self.enabled.isChecked(),
             transport=transport, url=self.url.text().strip() if transport == "streamable-http" else "",
             command=self.command.text().strip() if transport == "stdio" else "",
             args=args if transport == "stdio" else [],
