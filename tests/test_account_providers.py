@@ -170,6 +170,55 @@ class ChatGPTTransportTests(unittest.TestCase):
                 ChatGPTAccountTransport(timeout=30).chat(model="account:chatgpt/gpt-test", message="hello")
 
 
+class ClaudeAccountStatusTests(unittest.TestCase):
+    def test_claude_status_uses_official_json_logged_in_flag(self):
+        completed = MagicMock(
+            returncode=0,
+            stdout=json.dumps({
+                "loggedIn": True,
+                "authMethod": "claude.ai",
+                "subscriptionType": "max",
+                "email": "user@example.com",
+            }),
+            stderr="",
+        )
+        with patch("aicoder.account_providers._which", return_value="/home/test/.local/bin/claude"), \
+             patch("aicoder.account_providers.linked_provider_ids", return_value=[]), \
+             patch("aicoder.account_providers.subprocess.run", return_value=completed):
+            from aicoder.account_providers import account_status
+            status = account_status("claude")
+        self.assertTrue(status["authenticated"])
+        self.assertTrue(status["linked"])
+        self.assertIn("claude.ai", status["detail"])
+        self.assertEqual(status["subscription"], "max")
+
+    def test_stale_claude_link_is_cleared_when_official_client_is_logged_out(self):
+        completed = MagicMock(
+            returncode=1,
+            stdout=json.dumps({"loggedIn": False}),
+            stderr="",
+        )
+        with patch("aicoder.account_providers._which", return_value="/home/test/.local/bin/claude"), \
+             patch("aicoder.account_providers.subprocess.run", return_value=completed), \
+             patch("aicoder.account_providers.linked_provider_ids", return_value=["claude"]), \
+             patch("aicoder.account_providers.set_provider_linked") as set_linked:
+            from aicoder.account_providers import account_status
+            status = account_status("claude")
+        self.assertFalse(status["authenticated"])
+        self.assertFalse(status["linked"])
+        self.assertIn("Nicht angemeldet", status["detail"])
+        set_linked.assert_called_once_with("claude", False)
+
+    def test_authenticated_claude_exposes_latest_alias_models(self):
+        with patch("aicoder.account_providers.account_status", return_value={
+            "provider": "claude", "linked": True, "installed": True, "authenticated": True,
+        }):
+            models = available_account_models("claude")
+        self.assertEqual([m["model"] for m in models], ["sonnet", "opus", "fable", "haiku"])
+        self.assertTrue(all(m["id"].startswith("account:claude/") for m in models))
+        self.assertTrue(all("latest" in m["display"].lower() for m in models))
+
+
 class AccountInstallAndLoginTests(unittest.TestCase):
     def test_missing_codex_is_installed_user_local_with_official_package(self):
         calls = []

@@ -49,7 +49,8 @@ ACCOUNT_PROVIDERS: tuple[AccountProviderSpec, ...] = (
     AccountProviderSpec("chatgpt", "ChatGPT / OpenAI", "codex", auth_verifiable=True, dynamic_models=True),
     AccountProviderSpec(
         "claude", "Claude / Anthropic", "claude", auth_verifiable=True,
-        models=(("sonnet", "Claude Sonnet"), ("opus", "Claude Opus"), ("haiku", "Claude Haiku"), ("fable", "Claude Fable")),
+        models=(("sonnet", "Claude Sonnet (latest)"), ("opus", "Claude Opus (latest)"),
+                ("fable", "Claude Fable (latest)"), ("haiku", "Claude Haiku (latest)")),
     ),
     AccountProviderSpec(
         "mistral", "Mistral", "vibe",
@@ -438,20 +439,56 @@ def _chatgpt_status() -> dict[str, Any]:
 
 
 def _claude_status() -> dict[str, Any]:
+    """Read the official Claude Code auth status JSON.
+
+    A persisted AICoder linkage is not treated as proof of authentication.
+    This avoids the stale "linked but login required" state after credentials
+    expire or are removed outside AICoder.
+    """
     spec = provider_spec("claude")
     executable = _which(spec)
-    marked = spec.id in linked_provider_ids()
     if not executable:
         return {"provider": spec.id, "display": spec.display_name, "installed": False,
-                "linked": marked, "authenticated": False, "detail": "Claude Code fehlt"}
+                "linked": False, "authenticated": False, "detail": "Claude Code fehlt"}
+    marked = spec.id in linked_provider_ids()
+    payload: dict[str, Any] = {}
     try:
-        proc = subprocess.run([executable, "auth", "status"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
-        authenticated = proc.returncode == 0
-    except Exception:
+        proc = subprocess.run(
+            [executable, "auth", "status", "--json"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=8,
+            env={**os.environ, "PATH": _augmented_path()},
+        )
+        if proc.stdout.strip():
+            parsed = json.loads(proc.stdout)
+            if isinstance(parsed, dict):
+                payload = parsed
+        authenticated = proc.returncode == 0 and payload.get("loggedIn") is True
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
         authenticated = False
-    return {"provider": spec.id, "display": spec.display_name, "installed": True,
-            "linked": bool(marked or authenticated), "authenticated": authenticated,
-            "detail": "Verbunden" if authenticated else ("Verknüpft · Login noch erforderlich" if marked else "Nicht verbunden")}
+
+    auth_method = str(payload.get("authMethod") or "").strip()
+    subscription = str(payload.get("subscriptionType") or "").strip()
+    email = str(payload.get("email") or "").strip()
+    if authenticated:
+        detail_parts = ["Verbunden"]
+        if auth_method:
+            detail_parts.append(auth_method)
+        if subscription:
+            detail_parts.append(subscription)
+        if email:
+            detail_parts.append(email)
+        detail = " · ".join(detail_parts)
+    else:
+        detail = "Nicht angemeldet · Mit Claude verbinden"
+        if marked:
+            # Do not preserve a stale AICoder linkage after the official Claude
+            # client explicitly reports loggedIn=false.
+            set_provider_linked(spec.id, False)
+    return {
+        "provider": spec.id, "display": spec.display_name, "installed": True,
+        "linked": authenticated, "authenticated": authenticated, "detail": detail,
+        "auth_method": auth_method, "subscription": subscription, "email": email,
+    }
 
 
 def account_status(provider: str) -> dict[str, Any]:
@@ -689,12 +726,17 @@ def connect_account(provider: str, *, open_browser: bool = True) -> dict[str, An
             set_provider_linked(spec.id, True)
             return {"provider": spec.id, "started": True, "authenticated": True, "account": account}
     if spec.id == "claude":
+        existing = _claude_status()
+        if existing.get("authenticated"):
+            set_provider_linked(spec.id, True)
+            return {"provider": spec.id, "started": False, "authenticated": True, "account": existing}
         exit_code = _launch_terminal([executable, "auth", "login"], title="AICoder · Claude Login", wait=True)
         status = _claude_status()
         if exit_code not in (0, None) or not status.get("authenticated"):
+            set_provider_linked(spec.id, False)
             raise ClientError("Claude login finished but Claude Code does not report an authenticated account")
         set_provider_linked(spec.id, True)
-        return {"provider": spec.id, "started": True, "authenticated": True}
+        return {"provider": spec.id, "started": True, "authenticated": True, "account": status}
     if spec.id == "mistral":
         exit_code = _launch_terminal([executable, "--setup"], title="AICoder · Mistral Login", wait=True)
         if exit_code not in (0, None):
