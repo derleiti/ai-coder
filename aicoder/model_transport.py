@@ -535,9 +535,13 @@ def native_model_transport_from_env(
     if not base_url:
         # Secure per-provider keys are an opt-in routing layer; unsupported or
         # unconfigured models continue through the existing backend unchanged.
-        if isinstance(default, ProviderRoutingTransport):
+        # Account-backed models are wrapped outermost and route fail-closed via
+        # official provider clients (Codex/Claude/Vibe/Gemini CLI).
+        from .account_providers import AccountRoutingTransport
+        if isinstance(default, AccountRoutingTransport):
             return default, default_model
-        return ProviderRoutingTransport(default), default_model
+        routed = default if isinstance(default, ProviderRoutingTransport) else ProviderRoutingTransport(default)
+        return AccountRoutingTransport(routed), default_model
     raw_headers = os.environ.get("AICODER_NATIVE_MODEL_HEADERS", "").strip()
     headers: dict[str, str] = {}
     if raw_headers:

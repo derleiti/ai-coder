@@ -107,6 +107,14 @@ _register(SettingSpec(
     description="Primary coding model, as 'provider/model'. Unset means the backend default.",
 ))
 _register(SettingSpec(
+    key="linked_account_providers", type="list", default=[],
+    group="model", aliases=("linked_accounts", "account_providers"),
+    description=(
+        "Non-secret list of provider account integrations enabled in AICoder. "
+        "Provider credentials remain owned by the official provider client and are never copied into AICoder state."
+    ),
+))
+_register(SettingSpec(
     key="swarm_mode", type="enum", default="off", choices=frozenset(SWARM_MODES),
     group="agent", aliases=("swarm",),
     description="Multi-model swarm behaviour: off, auto (on demand), on (always), review (second opinion only).",

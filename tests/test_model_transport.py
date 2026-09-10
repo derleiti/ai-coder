@@ -214,7 +214,9 @@ class OpenAICompatibleTransportTests(unittest.TestCase):
         with patch.dict(os.environ, {"AICODER_NATIVE_MODEL_BASE_URL": ""}, clear=False):
             first, _ = native_model_transport_from_env(default, default_model="gemini/test")
             second, _ = native_model_transport_from_env(first, default_model="gemini/test")
-        self.assertIsInstance(first, ProviderRoutingTransport)
+        from aicoder.account_providers import AccountRoutingTransport
+        self.assertIsInstance(first, AccountRoutingTransport)
+        self.assertIsInstance(first.default, ProviderRoutingTransport)
         self.assertIs(first, second)
 
     def test_env_reasoning_effort_is_forwarded_without_persisting_state(self):

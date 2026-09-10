@@ -21,6 +21,9 @@ from ..workspace import sync_active_workspace
 from ..provider_credentials import (
     CredentialStoreError, credential_summary, delete_provider_key, set_provider_key,
 )
+from ..account_providers import (
+    ACCOUNT_PROVIDERS, account_statuses, connect_account, disconnect_account, linked_account_catalog,
+)
 
 
 
@@ -45,25 +48,64 @@ class _LoginWorker(QThread):
 
 
 class _ModelLoader(QThread):
-    """Loads model list from backend in background."""
-    loaded = pyqtSignal(list, str)   # (models, tier)
+    """Loads backend models plus linked-account models in background."""
+    loaded = pyqtSignal(list, str)   # (models, source summary)
     error = pyqtSignal(str)
 
-    def __init__(self, client):
+    def __init__(self, client=None):
         super().__init__()
         self.client = client
 
     def run(self):
+        models: list[str] = []
+        labels: list[str] = []
+        errors: list[str] = []
+        if self.client is not None:
+            try:
+                data = self.client.model_catalog()
+                models.extend(
+                    model_id for item in data.get("models", [])
+                    if (model_id := model_identifier(item))
+                )
+                labels.append(f"TriForce {data.get('tier', '?')}")
+            except Exception as exc:
+                errors.append(f"TriForce: {exc}")
         try:
-            data = self.client.model_catalog()
-            models = [
-                model_id for item in data.get("models", [])
-                if (model_id := model_identifier(item))
-            ]
-            tier = data.get("tier", "?")
-            self.loaded.emit(models, tier)
-        except Exception as e:
-            self.error.emit(str(e))
+            catalog = linked_account_catalog()
+            account_models = [str(item.get("id") or "") for item in catalog.get("models", []) if item.get("id")]
+            models.extend(account_models)
+            if account_models:
+                labels.append(f"Accounts {len(account_models)}")
+        except Exception as exc:
+            errors.append(f"Accounts: {exc}")
+        models = sorted(set(models))
+        if models or labels:
+            self.loaded.emit(models, " · ".join(labels) or "lokal")
+        elif errors:
+            self.error.emit("; ".join(errors))
+        else:
+            self.loaded.emit([], "keine Quellen")
+
+
+class _AccountWorker(QThread):
+    success = pyqtSignal(str, str)
+    error = pyqtSignal(str, str)
+
+    def __init__(self, provider: str, action: str):
+        super().__init__()
+        self.provider = provider
+        self.action = action
+
+    def run(self):
+        try:
+            if self.action == "connect":
+                connect_account(self.provider)
+                self.success.emit(self.provider, "Verknüpfung gestartet/abgeschlossen")
+            else:
+                disconnect_account(self.provider)
+                self.success.emit(self.provider, "Verknüpfung entfernt")
+        except Exception as exc:
+            self.error.emit(self.provider, str(exc))
 
 
 class _ToolLoader(QThread):
@@ -123,6 +165,10 @@ class SettingsWidget(QWidget):
         self._team_model_combos = {}
         self._provider_key_edits = {}
         self._provider_status_labels = {}
+        self._account_status_labels = {}
+        self._account_buttons = {}
+        self._account_workers = {}
+        self._account_models = []
         self._loading_settings = False
         self._settings_snapshot = None
         self._build_ui()
@@ -222,6 +268,51 @@ class SettingsWidget(QWidget):
 
         model_group.setLayout(model_form)
         layout.addWidget(model_group)
+
+        # --- Linked provider accounts (credentials remain provider-owned) ---
+        account_group = QGroupBox("Verknüpfte KI-Konten · offizieller Provider-Login")
+        account_form = QFormLayout()
+        account_form.setHorizontalSpacing(14)
+        account_form.setVerticalSpacing(7)
+        for spec in ACCOUNT_PROVIDERS:
+            row = QHBoxLayout()
+            status = QLabel("Prüfe...")
+            status.setStyleSheet("color: #888; font-size: 11px;")
+            connect_btn = QPushButton("Verbinden")
+            disconnect_btn = QPushButton("Trennen")
+            connect_btn.clicked.connect(lambda _checked=False, p=spec.id: self._account_action(p, "connect"))
+            disconnect_btn.clicked.connect(lambda _checked=False, p=spec.id: self._account_action(p, "disconnect"))
+            row.addWidget(connect_btn)
+            row.addWidget(disconnect_btn)
+            row.addWidget(status, stretch=1)
+            self._account_status_labels[spec.id] = status
+            self._account_buttons[spec.id] = (connect_btn, disconnect_btn)
+            account_form.addRow(spec.display_name + ":", row)
+        self.account_provider_combo = QComboBox()
+        self.account_provider_combo.setMinimumWidth(240)
+        self.account_provider_combo.currentIndexChanged.connect(self._filter_account_models)
+        self.account_model_combo = QComboBox()
+        self.account_model_combo.setMinimumWidth(420)
+        account_form.addRow("Verknüpfter Provider:", self.account_provider_combo)
+        account_form.addRow("Account-Modell:", self.account_model_combo)
+        use_account_model_btn = QPushButton("Account-Modell als Basismodell verwenden")
+        use_account_model_btn.clicked.connect(self._activate_account_model)
+        account_form.addRow(use_account_model_btn)
+
+        account_note = QLabel(
+            "Account-Modelle tragen intern das Präfix account:. Sobald ein solches Modell gewählt ist, "
+            "wird der Modellrequest ausschließlich über den offiziellen Provider-Client geroutet; es gibt keinen "
+            "stillen Fallback zu TriForce oder API-Key-Providern. Zugangsdaten/OAuth-Tokens werden nicht in AICoder kopiert."
+        )
+        account_note.setWordWrap(True)
+        account_note.setStyleSheet("color: #888; font-size: 11px;")
+        account_form.addRow(account_note)
+        refresh_accounts_btn = QPushButton("Konten und Modelle aktualisieren")
+        refresh_accounts_btn.clicked.connect(self._refresh_accounts_and_models)
+        account_form.addRow(refresh_accounts_btn)
+        account_group.setLayout(account_form)
+        layout.addWidget(account_group)
+        self._refresh_account_statuses()
 
         # --- Provider credentials (OS keyring only) ---
         credential_group = QGroupBox("Provider API Keys · sicher im Betriebssystem-Schlüsselbund")
@@ -621,6 +712,105 @@ class SettingsWidget(QWidget):
         if signature != self._settings_snapshot:
             self._apply_state_to_widgets(state, emit_changes=True)
 
+    def _populate_account_picker(self, models: list[str]):
+        self._account_models = sorted(set(str(m) for m in models if str(m).startswith("account:")))
+        current_provider = self.account_provider_combo.currentData()
+        providers = []
+        for model in self._account_models:
+            try:
+                provider = model.split(":", 1)[1].split("/", 1)[0]
+            except Exception:
+                continue
+            if provider not in providers:
+                providers.append(provider)
+        display = {spec.id: spec.display_name for spec in ACCOUNT_PROVIDERS}
+        self.account_provider_combo.blockSignals(True)
+        self.account_provider_combo.clear()
+        for provider in providers:
+            self.account_provider_combo.addItem(display.get(provider, provider), provider)
+        if current_provider in providers:
+            self.account_provider_combo.setCurrentIndex(providers.index(current_provider))
+        self.account_provider_combo.blockSignals(False)
+        self._filter_account_models()
+
+    def _filter_account_models(self):
+        provider = str(self.account_provider_combo.currentData() or "")
+        current = self.account_model_combo.currentData()
+        self.account_model_combo.clear()
+        prefix = f"account:{provider}/" if provider else ""
+        for model in self._account_models:
+            if prefix and model.startswith(prefix):
+                self.account_model_combo.addItem(model.split("/", 1)[1], model)
+        if current:
+            idx = self.account_model_combo.findData(current)
+            if idx >= 0:
+                self.account_model_combo.setCurrentIndex(idx)
+
+    def _activate_account_model(self):
+        model = str(self.account_model_combo.currentData() or "").strip()
+        if not model:
+            self.model_status.setText("Kein verknüpftes Account-Modell verfügbar")
+            self.model_status.setStyleSheet("color: #ffb020; font-size: 11px;")
+            return
+        set_model(model)
+        self.model_combo.setCurrentText(model)
+        self.model_status.setText(f"Account-Modell aktiv · {model}")
+        self.model_status.setStyleSheet("color: #00ff88; font-size: 11px;")
+        self.selection_changed.emit(model)
+
+    def _refresh_account_statuses(self):
+        try:
+            statuses = {row["provider"]: row for row in account_statuses()}
+        except Exception as exc:
+            for label in self._account_status_labels.values():
+                label.setText(f"Statusfehler: {str(exc)[:80]}")
+                label.setStyleSheet("color: #ff6b6b; font-size: 11px;")
+            return
+        for provider, label in self._account_status_labels.items():
+            row = statuses.get(provider, {})
+            linked = bool(row.get("linked"))
+            installed = bool(row.get("installed"))
+            detail = str(row.get("detail") or ("Verbunden" if linked else "Nicht verbunden"))
+            color = "#00ff88" if linked and installed else ("#ffb020" if installed else "#888")
+            label.setText(detail)
+            label.setStyleSheet(f"color: {color}; font-size: 11px;")
+            connect_btn, disconnect_btn = self._account_buttons.get(provider, (None, None))
+            if connect_btn is not None:
+                connect_btn.setEnabled(not bool(row.get("authenticated") is True))
+            if disconnect_btn is not None:
+                disconnect_btn.setEnabled(linked)
+
+    def _refresh_accounts_and_models(self):
+        self._refresh_account_statuses()
+        self._load_models()
+
+    def _account_action(self, provider: str, action: str):
+        buttons = self._account_buttons.get(provider)
+        if buttons:
+            for button in buttons:
+                button.setEnabled(False)
+        label = self._account_status_labels.get(provider)
+        if label is not None:
+            label.setText("Browser/Provider-Client wird geöffnet..." if action == "connect" else "Verknüpfung wird entfernt...")
+            label.setStyleSheet("color: #00d4ff; font-size: 11px;")
+        worker = _AccountWorker(provider, action)
+        self._account_workers[provider] = worker
+        worker.success.connect(self._on_account_action_success)
+        worker.error.connect(self._on_account_action_error)
+        worker.finished.connect(lambda p=provider: self._account_workers.pop(p, None))
+        worker.start()
+
+    def _on_account_action_success(self, provider: str, _message: str):
+        self._refresh_account_statuses()
+        self._load_models()
+
+    def _on_account_action_error(self, provider: str, error: str):
+        label = self._account_status_labels.get(provider)
+        if label is not None:
+            label.setText(f"Fehler: {error[:120]}")
+            label.setStyleSheet("color: #ff6b6b; font-size: 11px;")
+        self._refresh_account_statuses()
+
     def _refresh_provider_credentials(self):
         for provider, label in self._provider_status_labels.items():
             try:
@@ -670,6 +860,7 @@ class SettingsWidget(QWidget):
 
     def _load_current(self):
         # Session
+        models_started = False
         try:
             session = load_session()
             self.base_url_edit.setText(session.base_url)
@@ -683,22 +874,25 @@ class SettingsWidget(QWidget):
                 self.status_label.setStyleSheet("color: #00d4ff;")
                 # Auto-load models on startup if logged in
                 self._load_models()
+                models_started = True
         except Exception:
             self.status_label.setText("Not logged in")
             self.status_label.setStyleSheet("color: #ff6b6b;")
 
         # State
         self._apply_state_to_widgets(get_state())
+        if not models_started:
+            # Linked account providers remain usable even without a TriForce session.
+            self._load_models()
 
     def _load_models(self):
-        """Load model list from backend."""
+        """Load backend models and models exposed by linked provider accounts."""
+        client = None
         try:
             session = load_session()
             client = TriForceClient(session.base_url, token=session.token, timeout=10)
         except Exception:
-            self.model_status.setText("Not logged in")
-            self.model_status.setStyleSheet("color: #ff6b6b; font-size: 11px;")
-            return
+            pass
 
         self.model_status.setText("Modelle werden geladen...")
         self.model_status.setStyleSheet("color: #00d4ff; font-size: 11px;")
@@ -718,8 +912,11 @@ class SettingsWidget(QWidget):
         self.model_combo.clear()
         self.model_combo.addItem("")     # empty = backend default
 
-        for m in self._models:
+        backend_models = [m for m in self._models if not str(m).startswith("account:")]
+        account_models = [m for m in self._models if str(m).startswith("account:")]
+        for m in backend_models:
             self.model_combo.addItem(m)
+        self._populate_account_picker(account_models)
         state = get_state()
         for key, combo in self._team_model_combos.items():
             current = combo.currentText().strip()
@@ -747,12 +944,16 @@ class SettingsWidget(QWidget):
 
     def _test_model(self):
         model = self.model_combo.currentText().strip()
+        timeout = min(30, self.timeout_spin.value())
         try:
-            session = load_session()
-            timeout = min(30, self.timeout_spin.value())
-            client = TriForceClient(session.base_url, token=session.token, timeout=timeout)
-            from ..model_transport import native_model_transport_from_env
-            client, _ = native_model_transport_from_env(client, default_model=model or None)
+            if model.startswith("account:"):
+                from ..account_providers import standalone_account_transport
+                client = standalone_account_transport(timeout=timeout)
+            else:
+                session = load_session()
+                client = TriForceClient(session.base_url, token=session.token, timeout=timeout)
+                from ..model_transport import native_model_transport_from_env
+                client, _ = native_model_transport_from_env(client, default_model=model or None)
         except Exception as e:
             self.model_status.setText(f"Test unavailable: {e}")
             return

@@ -81,6 +81,11 @@ def set_model(model: str) -> None:
     _apply(selected_model=model)
 
 
+def set_linked_account_providers(providers: list[str]) -> None:
+    """Persist only provider IDs; provider credentials remain in official clients."""
+    _apply(linked_account_providers=providers)
+
+
 def set_fallback(model: str) -> None:
     """Deprecated compatibility no-op: automatic fallback routing was removed."""
     return None
