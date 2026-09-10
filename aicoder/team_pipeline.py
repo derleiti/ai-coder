@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -103,12 +104,21 @@ def configured_project_python(root: str | Path) -> str | None:
     else:
         candidates.extend([root / ".venv" / "bin" / "python", root / "venv" / "bin" / "python"])
     for candidate in candidates:
-        try:
-            resolved = candidate.resolve(strict=True)
-        except OSError:
-            continue
-        if resolved.is_file() and os.access(resolved, os.X_OK):
-            return str(resolved)
+        # Do not resolve virtual-environment interpreter symlinks. Executing the
+        # resolved /usr/bin/python target discards pyvenv.cfg discovery and can
+        # silently lose project/AICoder dependencies such as pytest.
+        expanded = candidate.expanduser()
+        path = expanded if expanded.is_absolute() else (Path.cwd() / expanded)
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path.absolute())
+
+    # When AICoder itself runs from a virtual environment, its interpreter is
+    # the dependency-complete runtime already used by the native test tool.
+    # Keep the venv path (including its symlink) so Python sees pyvenv.cfg.
+    if getattr(sys, "prefix", "") != getattr(sys, "base_prefix", ""):
+        current = Path(sys.executable)
+        if current.is_file() and os.access(current, os.X_OK):
+            return str(current.absolute())
     return None
 
 

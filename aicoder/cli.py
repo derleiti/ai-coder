@@ -307,7 +307,7 @@ def cmd_mcp(args: argparse.Namespace) -> int:
             client, action, arguments,
             approval_fn=_cli_approval,
             model="user/direct-mcp",
-            allowed_tools=set(AGENT_TOOLS),
+            allowed_tools=(set(AGENT_TOOLS) if AGENT_TOOLS is not None else None),
         )
     print(output)
     return 1 if is_error else 0

@@ -154,6 +154,16 @@ class TaskContract:
             "acceptance_checks": [item.as_dict() for item in self.acceptance_checks],
         }
 
+    def forbids_test_changes(self) -> bool:
+        """Return whether the user contract explicitly forbids modifying tests.
+
+        This remains a derived policy so existing serialized task-contract schema
+        stays stable while candidate verification can honor immutable test suites.
+        """
+        test_re = re.compile(r"(?i)\b(?:test|tests|testing|testdatei(?:en)?|testsuite|testsuites)\b")
+        change_re = re.compile(r"(?i)\b(?:change|modify|edit|update|rewrite|replace|touch|alter|write|ändern|aendern|bearbeiten|modifizieren|umschreiben)\w*\b")
+        return any(test_re.search(item) and change_re.search(item) and _NEGATION_RE.search(item) for item in self.prohibitions)
+
     def prompt_projection(self) -> str:
         lines = [
             "## AUTHORITATIVE TASK CONTRACT",

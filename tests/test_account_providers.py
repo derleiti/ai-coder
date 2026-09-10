@@ -13,6 +13,7 @@ from aicoder.account_providers import (
     GeminiAccountTransport,
     MistralAccountTransport,
     account_model_id,
+    account_status,
     available_account_models,
     is_account_model,
     parse_account_model,
@@ -84,6 +85,7 @@ class ProviderTransportTests(unittest.TestCase):
         transport = MistralAccountTransport(timeout=30)
         help_result = MagicMock(stdout="usage: vibe --model MODEL\n")
         with patch("aicoder.account_providers.subprocess.run", return_value=help_result), \
+             patch("aicoder.account_providers._mistral_authenticated", return_value=True), \
              patch.object(transport, "_run", return_value=("OK\n", "")) as run:
             result = transport.chat(model="account:mistral/mistral-medium-latest", message="hello")
         argv = run.call_args.args[0]
@@ -95,10 +97,31 @@ class ProviderTransportTests(unittest.TestCase):
         self.assertIn("--model", argv)
         self.assertEqual(result["backend"], "account-mistral")
 
+
+    def test_mistral_fast_fails_when_login_is_required(self):
+        transport = MistralAccountTransport(timeout=60)
+        with patch("aicoder.account_providers._which_executable", return_value="/home/test/.local/bin/vibe"), \
+             patch("aicoder.account_providers._mistral_authenticated", return_value=False), \
+             patch.object(transport, "_run") as run:
+            with self.assertRaisesRegex(ClientError, "^Mistral Vibe login required$"):
+                transport.chat(model="account:mistral/mistral-large-latest", message="hello")
+        run.assert_not_called()
+
+    @patch("aicoder.account_providers._which", return_value="/home/test/.local/bin/vibe")
+    def test_mistral_status_distinguishes_linked_from_authenticated(self, _which):
+        with patch("aicoder.account_providers.linked_provider_ids", return_value={"mistral"}), \
+             patch("aicoder.account_providers._mistral_authenticated", return_value=False):
+            status = account_status("mistral")
+        self.assertTrue(status["installed"])
+        self.assertTrue(status["linked"])
+        self.assertFalse(status["authenticated"])
+        self.assertEqual(status["detail"], "Mistral Vibe login required")
+
     @patch("aicoder.account_providers.shutil.which", return_value="/home/test/.local/bin/agy")
     def test_antigravity_runs_headless_plan_sandbox_with_selected_model(self, _which):
         transport = GeminiAccountTransport(timeout=30)
-        with patch.object(transport, "_run", return_value=(json.dumps({"response": "OK"}), "")) as run:
+        with patch("aicoder.account_providers._antigravity_authenticated", return_value=True), \
+             patch.object(transport, "_run", return_value=(json.dumps({"response": "OK"}), "")) as run:
             result = transport.chat(model="account:gemini/gemini-3.8-flash-high", message="hello")
         argv = run.call_args.args[0]
         self.assertTrue(argv[0].endswith("agy"))
@@ -110,6 +133,17 @@ class ProviderTransportTests(unittest.TestCase):
         self.assertIn("--sandbox", argv)
         self.assertIn("--disable-slash-commands", argv)
         self.assertEqual(result["backend"], "account-antigravity")
+
+
+    def test_antigravity_fast_fails_when_login_is_required(self):
+        transport = GeminiAccountTransport(timeout=60)
+        with patch("aicoder.account_providers._which_executable", return_value="/home/test/.local/bin/agy"), \
+             patch("aicoder.account_providers._antigravity_authenticated", return_value=False), \
+             patch.object(transport, "_run") as run:
+            with self.assertRaisesRegex(ClientError, "^Antigravity login required$"):
+                transport.chat(model="account:gemini/gemini-3.8-flash-high", message="hello")
+        run.assert_not_called()
+
 
 
     @patch("aicoder.account_providers.account_status", return_value={
@@ -150,13 +184,33 @@ class ChatGPTTransportTests(unittest.TestCase):
         first = server._request.call_args_list[0]
         second = server._request.call_args_list[1]
         self.assertEqual(first.args[0], "thread/start")
-        self.assertEqual(first.args[1]["sandbox"], "readOnly")
+        self.assertEqual(first.args[1]["sandbox"], "read-only")
         self.assertEqual(first.args[1]["approvalPolicy"], "never")
         self.assertEqual(second.args[0], "turn/start")
         self.assertEqual(second.args[1]["sandboxPolicy"]["type"], "readOnly")
-        self.assertFalse(second.args[1]["sandboxPolicy"]["access"]["includePlatformDefaults"])
+        self.assertFalse(second.args[1]["sandboxPolicy"]["networkAccess"])
+        self.assertNotIn("access", second.args[1]["sandboxPolicy"])
         self.assertEqual(result["response"], "OK")
         self.assertEqual(result["backend"], "account-chatgpt")
+
+    def test_codex_failed_turn_surfaces_provider_error(self):
+        server = MagicMock()
+        server.account_read.return_value = {"account": {"type": "chatgpt"}}
+        server._request.side_effect = [{"thread": {"id": "thr1"}}, {"turn": {"id": "turn1"}}, {}]
+        server._receive.side_effect = [
+            {"method": "error", "params": {"error": {
+                "message": "Your workspace is out of credits. Add credits to continue.",
+                "codexErrorInfo": "usageLimitExceeded",
+            }}},
+            {"method": "turn/completed", "params": {"turn": {
+                "status": "failed",
+                "error": {"message": "Your workspace is out of credits. Add credits to continue.",
+                          "codexErrorInfo": "usageLimitExceeded"},
+            }}},
+        ]
+        with patch("aicoder.account_providers.CodexAppServer", return_value=server):
+            with self.assertRaisesRegex(ClientError, "out of credits.*usageLimitExceeded"):
+                ChatGPTAccountTransport(timeout=30).chat(model="account:chatgpt/gpt-test", message="hello")
 
     def test_codex_provider_side_item_fails_closed(self):
         server = MagicMock()
@@ -168,6 +222,18 @@ class ChatGPTTransportTests(unittest.TestCase):
         with patch("aicoder.account_providers.CodexAppServer", return_value=server):
             with self.assertRaisesRegex(ClientError, "provider-side item"):
                 ChatGPTAccountTransport(timeout=30).chat(model="account:chatgpt/gpt-test", message="hello")
+
+    def test_claude_account_transport_drops_api_key_precedence(self):
+        transport = ClaudeAccountTransport(timeout=30)
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY":"secret", "ANTHROPIC_AUTH_TOKEN":"gateway", "ANTHROPIC_BASE_URL":"https://example.invalid"}, clear=False), \
+             patch("aicoder.account_providers._which_executable", return_value="/usr/bin/claude"), \
+             patch.object(transport, "_run", return_value=("OK\n", "")) as run:
+            result = transport.chat(model="account:claude/claude-opus-5", message="hello")
+        env = run.call_args.kwargs["env"]
+        self.assertNotIn("ANTHROPIC_API_KEY", env)
+        self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env)
+        self.assertNotIn("ANTHROPIC_BASE_URL", env)
+        self.assertEqual(result["response"], "OK")
 
 
 class ClaudeAccountStatusTests(unittest.TestCase):
@@ -323,6 +389,16 @@ class AccountInstallAndLoginTests(unittest.TestCase):
             models = available_account_models("gemini")
         self.assertEqual([m["model"] for m in models], ["gemini-3.8-flash-high", "claude-sonnet-4-6"])
         self.assertEqual(models[0]["id"], "account:gemini/gemini-3.8-flash-high")
+
+
+    def test_gemini_status_distinguishes_linked_from_authenticated(self):
+        with patch("aicoder.account_providers._which", return_value="/home/test/.local/bin/agy"), \
+             patch("aicoder.account_providers.linked_provider_ids", return_value=["gemini"]), \
+             patch("aicoder.account_providers._antigravity_authenticated", return_value=False):
+            status = account_status("gemini")
+        self.assertTrue(status["linked"])
+        self.assertFalse(status["authenticated"])
+        self.assertEqual(status["detail"], "Antigravity login required")
 
     def test_gemini_is_linked_only_after_login_verification(self):
         with patch("aicoder.account_providers.ensure_provider_client", return_value="/home/test/.local/bin/agy"), \

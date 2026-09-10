@@ -54,6 +54,65 @@ from .workspace_backend import (
 EventFn = Callable[[str, dict[str, Any]], None]
 StopFn = Callable[[], bool]
 
+
+def _team_role_models(config: TeamConfig) -> list[tuple[str, str]]:
+    roles: list[tuple[str, str]] = []
+    roles.extend((f"research:{slot.role}", slot.model) for slot in config.research)
+    if config.planner_model:
+        roles.append(("planner", config.planner_model))
+    if config.coordinator_model:
+        roles.append(("coordinator", config.coordinator_model))
+    roles.extend((f"coder:{slot.slot}", slot.model) for slot in config.coders)
+    if config.merge_model:
+        roles.append(("merge", config.merge_model))
+    if config.test_planner_model:
+        roles.append(("test-planner", config.test_planner_model))
+    return roles
+
+
+def _team_provider_preflight(config: TeamConfig) -> list[str]:
+    """Fail fast for account-backed role models whose provider session is unusable.
+
+    Non-account models remain backend-owned and are validated by the normal
+    transport/catalogue path. Account transports are fail-closed, so checking
+    their official client/session here prevents a late Stage-1 timeout.
+    """
+    from .account_providers import (
+        account_status, available_account_models, is_account_model, parse_account_model, provider_spec,
+    )
+
+    errors: list[str] = []
+    provider_cache: dict[str, tuple[dict[str, Any], set[str] | None]] = {}
+    for role, model in _team_role_models(config):
+        if not is_account_model(model):
+            continue
+        try:
+            provider, provider_model = parse_account_model(model)
+        except Exception as exc:
+            errors.append(f"{role}: invalid account model {model!r}: {exc}")
+            continue
+        if provider not in provider_cache:
+            status = account_status(provider)
+            known: set[str] | None = None
+            if status.get("installed") and status.get("linked") and status.get("authenticated") is not False:
+                spec = provider_spec(provider)
+                if spec.dynamic_models or spec.models:
+                    known = {str(item.get("model") or "") for item in available_account_models(provider)}
+            provider_cache[provider] = (status, known)
+        status, known = provider_cache[provider]
+        if not status.get("installed"):
+            errors.append(f"{role}: {status.get('detail') or provider + ' client is not installed'}")
+            continue
+        if not status.get("linked"):
+            errors.append(f"{role}: {status.get('detail') or provider + ' account is not linked'}")
+            continue
+        if status.get("authenticated") is False:
+            errors.append(f"{role}: {status.get('detail') or provider + ' login required'}")
+            continue
+        if known is not None and provider_model not in known:
+            errors.append(f"{role}: account model {model} is not available for the linked {provider} account")
+    return errors
+
 # Team observational stages should not consume an entire frontier-model context
 # just because one is advertised. StageOff is the durable cross-stage memory; a
 # bounded local conversation keeps free/provider endpoints responsive while still
@@ -2419,7 +2478,11 @@ def _run_final_repair(
         + "\n\n## FINAL INTEGRATION REPAIR ROLE\n"
         "Repair only deterministic final-verification failures in the already integrated candidate. "
         "Do not restart architecture work or broaden scope. TaskContract and executable verification outrank prose. "
-        "You may update production code and regression tests, but never weaken authoritative acceptance just to obtain green checks."
+        + (
+            "Tests are immutable because the TaskContract forbids modifying them; repair production code only. "
+            if contract.forbids_test_changes() else
+            "You may update production code and regression tests, but never weaken authoritative acceptance just to obtain green checks. "
+        )
         + "\n\n" + contract.prompt_projection()
     )
     runtime = NativeLightRuntime(
@@ -2450,7 +2513,8 @@ def _candidate_rejection_reason(candidate: CandidateResult) -> str:
     if failed_checks:
         parts.append("failed_checks=" + ",".join(failed_checks[:8]))
     evidence = evaluation.get("test_evidence") or {}
-    if evidence.get("behavior_change") and not evidence.get("coverage_evidence_ok"):
+    forbids_test_changes = bool(candidate.task_contract and candidate.task_contract.forbids_test_changes())
+    if evidence.get("behavior_change") and not evidence.get("coverage_evidence_ok") and not forbids_test_changes:
         parts.append("missing regression-test change")
     delta = evaluation.get("delta") or {}
     parts.append(
@@ -2724,6 +2788,8 @@ def _run_candidate(
                         resolved = ""
                     if resolved and resolved in {str(path) for path in _acceptance_artifact_paths(contract)}:
                         return True
+                if contract.forbids_test_changes() and _candidate_test_mutation(tool_name, args):
+                    return False
                 if phase == "finisher" and pending_finisher_acceptance and _candidate_test_mutation(tool_name, args):
                     return False
                 return _candidate_approval(tool_name, args)
@@ -2739,8 +2805,12 @@ def _run_candidate(
                 "Do not spend context repairing self-authored tests because there must be none. Yield the workspace while reasoning is still coherent once the host token/progress boundary is reached."
                 if phase == "implementer" else
                 "\n\n## AUTHORITATIVE CODER RUN 2 ROLE: TEST ENGINEER + REPAIR CODER\n"
-                "Independently verify Run 1. You MAY create/update regression tests and MAY repair production code when task/acceptance evidence proves a defect. "
-                "Do not trust Run 1 reasoning; trust TaskContract, current workspace, authoritative acceptance artifacts, and deterministic verification. "
+                + (
+                    "Independently verify Run 1. The TaskContract explicitly forbids modifying tests, so tests are immutable authoritative evidence; repair production code only. "
+                    if contract.forbids_test_changes() else
+                    "Independently verify Run 1. You MAY create/update regression tests and MAY repair production code when task/acceptance evidence proves a defect. "
+                )
+                + "Do not trust Run 1 reasoning; trust TaskContract, current workspace, authoritative acceptance artifacts, and deterministic verification. "
                 "Finish only when all required deterministic checks are green."
             )
 
@@ -2981,8 +3051,17 @@ def evaluate_candidate(candidate: CandidateResult) -> dict[str, Any]:
     diff = candidate.workspace.delta_diff() if isinstance(candidate.workspace, RamWorkspace) else _git_diff(root)
     coverage = test_change_evidence(delta)
     deterministic_ok = verification_passed(results)
-    coverage_ok = bool(coverage.get("coverage_evidence_ok"))
-    if run_eligible and has_delta and not coverage_ok:
+    forbids_test_changes = bool(candidate.task_contract and candidate.task_contract.forbids_test_changes())
+    prohibited_test_mutation = bool(forbids_test_changes and coverage.get("tests_changed"))
+    coverage_ok = bool(coverage.get("coverage_evidence_ok")) or (forbids_test_changes and not prohibited_test_mutation)
+    if run_eligible and has_delta and prohibited_test_mutation:
+        score -= 180
+        checks["test-change-prohibition"] = {
+            "name": "test-change-prohibition", "ok": False, "required": True,
+            "output": "task contract explicitly forbids modifying tests",
+            **coverage,
+        }
+    elif run_eligible and has_delta and not coverage_ok:
         score -= 120
         checks["test-change-evidence"] = {
             "name": "test-change-evidence", "ok": False, "required": True,
@@ -2992,7 +3071,7 @@ def evaluate_candidate(candidate: CandidateResult) -> dict[str, Any]:
     return {
         "score": score, "delta": delta, "checks": checks, "diff": diff,
         "test_evidence": coverage, "candidate_id": blind_candidate_id(diff),
-        "verification_passed": run_eligible and has_delta and deterministic_ok and coverage_ok,
+        "verification_passed": run_eligible and has_delta and deterministic_ok and coverage_ok and not prohibited_test_mutation,
     }
 
 
@@ -3275,6 +3354,11 @@ def _run_team_pipeline(
     errors = config.validate()
     if errors:
         return TeamRunResult("failed", "", "", [], [], {}, "; ".join(errors))
+    provider_errors = _team_provider_preflight(config)
+    if provider_errors:
+        _emit(event_fn, "team_provider_preflight", status="failed", errors=provider_errors)
+        return TeamRunResult("failed", "", "", [], [], {}, "team provider preflight failed: " + "; ".join(provider_errors))
+    _emit(event_fn, "team_provider_preflight", status="passed", roles=len(_team_role_models(config)))
     task_contract = compile_task_contract(task)
     try:
         resolved_workspace, auto_selected, workspace_reason = resolve_or_create_project_workspace(

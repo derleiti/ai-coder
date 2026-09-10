@@ -134,6 +134,17 @@ class MCPRegistryTests(unittest.TestCase):
             result,is_error=executor.run_tool(client,"mcp.demo.echo",{},allowed_tools={"mcp.demo.echo"})
         self.assertFalse(is_error); self.assertEqual(result,"ok"); call.assert_called_once()
 
+    def test_direct_mcp_call_allows_none_global_allowlist(self):
+        args=build_parser().parse_args(["mcp","status"])
+        fake_client=MagicMock()
+        with patch("aicoder.cli.session_client", return_value=(MagicMock(), fake_client)), \
+             patch("aicoder.executor.load_tools", return_value=[]), \
+             patch("aicoder.executor.run_tool", return_value=("ok", False)) as run, \
+             patch("aicoder.cli.require_allowed_tool", return_value=(True, "")):
+            rc=cmd_mcp(args)
+        self.assertEqual(rc,0)
+        self.assertIsNone(run.call_args.kwargs["allowed_tools"])
+
 
 class _HTTPHandler(BaseHTTPRequestHandler):
     seen_session=False

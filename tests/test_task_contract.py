@@ -126,3 +126,9 @@ def test_incidental_provider_event_vocabulary_does_not_force_external_research()
 def test_latest_official_api_docs_still_require_external_research():
     contract = compile_task_contract("Check the latest official API documentation for compatibility changes.")
     assert contract.external_research_required is True
+
+
+def test_contract_detects_explicit_test_change_prohibition():
+    assert compile_task_contract("Fix the bug. Do not change the tests.").forbids_test_changes() is True
+    assert compile_task_contract("Fix den Bug. Tests nicht ändern.").forbids_test_changes() is True
+    assert compile_task_contract("Fix the bug and add regression tests.").forbids_test_changes() is False

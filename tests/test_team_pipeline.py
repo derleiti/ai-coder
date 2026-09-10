@@ -88,15 +88,21 @@ class ProjectPythonRuntimeTests(unittest.TestCase):
     def test_explicit_test_python_routes_pytest_and_unittest(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"AICODER_TEST_PYTHON": sys.executable}):
             root = Path(tmp)
-            self.assertEqual(configured_project_python(root), str(Path(sys.executable).resolve()))
+            self.assertEqual(configured_project_python(root), str(Path(sys.executable).absolute()))
             self.assertEqual(
                 normalize_project_test_argv(["pytest", "-q"], root),
-                [str(Path(sys.executable).resolve()), "-m", "pytest", "-q"],
+                [str(Path(sys.executable).absolute()), "-m", "pytest", "-q"],
             )
             self.assertEqual(
                 normalize_project_test_argv(["python3", "-m", "unittest", "discover"], root),
-                [str(Path(sys.executable).resolve()), "-m", "unittest", "discover"],
+                [str(Path(sys.executable).absolute()), "-m", "unittest", "discover"],
             )
+
+    def test_current_aicoder_venv_is_fallback_test_python(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AICODER_TEST_PYTHON", None)
+            expected = str(Path(sys.executable).absolute()) if sys.prefix != sys.base_prefix else None
+            self.assertEqual(configured_project_python(Path(tmp)), expected)
 
     def test_verification_plan_uses_explicit_test_python(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"AICODER_TEST_PYTHON": sys.executable}):
@@ -106,7 +112,7 @@ class ProjectPythonRuntimeTests(unittest.TestCase):
             plan = project_verification_plan(root)
             python_commands = [item for item in plan if item.name.startswith("python-")]
             self.assertTrue(python_commands)
-            self.assertTrue(all(item.argv[0] == str(Path(sys.executable).resolve()) for item in python_commands))
+            self.assertTrue(all(item.argv[0] == str(Path(sys.executable).absolute()) for item in python_commands))
 
 
 class ProjectPlanTests(unittest.TestCase):
@@ -180,7 +186,7 @@ Important runtime constraints:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"AICODER_TEST_PYTHON": sys.executable}):
             plan = task_acceptance_verification_plan(task, tmp)
             self.assertEqual(len(plan), 3)
-            self.assertEqual(plan[0].argv[:3], (str(Path(sys.executable).resolve()), "-m", "pytest"))
+            self.assertEqual(plan[0].argv[:3], (str(Path(sys.executable).absolute()), "-m", "pytest"))
             self.assertEqual(plan[1].argv[1:3], ("-m", "sample"))
             self.assertEqual(plan[2].argv[1:], ("-c", "import sample"))
 

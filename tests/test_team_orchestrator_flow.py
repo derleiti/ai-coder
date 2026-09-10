@@ -533,6 +533,46 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
             backend.abort()
 
 
+    def test_source_only_change_passes_when_task_forbids_test_changes(self):
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as ram_dir:
+            source = Path(source_dir)
+            (source / "app.py").write_text("value = 0\n", encoding="utf-8")
+            backend = RamWorkspace(source, ram_root=ram_dir)
+            execution = backend.prepare()
+            (execution / "app.py").write_text("value = 1\n", encoding="utf-8")
+            contract = compile_task_contract("Fix app.py. Do not change the tests.")
+            candidate = CandidateResult(
+                1, "test/model", "minimal", backend,
+                AgentRunResult("completed", "DONE", "test/model", [], [], "system"),
+                task_contract=contract,
+            )
+            result = evaluate_candidate(candidate)
+            self.assertTrue(result["verification_passed"], result)
+            self.assertNotIn("test-change-evidence", result["checks"])
+            self.assertNotIn("test-change-prohibition", result["checks"])
+            backend.abort()
+
+    def test_test_mutation_fails_when_task_forbids_test_changes(self):
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as ram_dir:
+            source = Path(source_dir)
+            (source / "app.py").write_text("value = 0\n", encoding="utf-8")
+            (source / "tests").mkdir()
+            (source / "tests" / "test_app.py").write_text("assert True\n", encoding="utf-8")
+            backend = RamWorkspace(source, ram_root=ram_dir)
+            execution = backend.prepare()
+            (execution / "app.py").write_text("value = 1\n", encoding="utf-8")
+            (execution / "tests" / "test_app.py").write_text("assert 1 == 1\n", encoding="utf-8")
+            contract = compile_task_contract("Fix app.py. Do not change the tests.")
+            candidate = CandidateResult(
+                1, "test/model", "minimal", backend,
+                AgentRunResult("completed", "DONE", "test/model", [], [], "system"),
+                task_contract=contract,
+            )
+            result = evaluate_candidate(candidate)
+            self.assertFalse(result["verification_passed"], result)
+            self.assertIn("test-change-prohibition", result["checks"])
+            backend.abort()
+
     def test_candidate_evaluation_enforces_task_acceptance_checks(self):
         with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as ram_dir:
             source = Path(source_dir)
@@ -1921,3 +1961,48 @@ def test_final_repair_runtime_is_fresh_and_failure_focused():
         assert "AssertionError: expected 2" in captured["initial_prompt"]
         assert captured["protected_workspace_root"] == str(source)
         integration.abort()
+
+
+class TeamProviderPreflightTests(unittest.TestCase):
+    def test_unauthed_antigravity_role_fails_before_pipeline_stage(self):
+        from aicoder.team_orchestrator import _team_provider_preflight
+        state = {
+            "team_runtime_mode": "on",
+            "selected_model": "account:mistral/mistral-large-latest",
+            "team_research_model_1": "account:gemini/gemini-3.8-flash-high",
+            "team_research_model_2": "off", "team_research_model_3": "off", "team_research_model_4": "off",
+            "team_planner_model": "@primary", "team_coordinator_model": "@primary",
+            "team_coder_model_1": "@primary", "team_coder_model_2": "off",
+            "team_coder_model_3": "off", "team_coder_model_4": "off",
+            "team_merge_model": "@primary", "team_test_planner_model": "off",
+        }
+        config = config_from_state(state)
+        def status(provider):
+            if provider == "gemini":
+                return {"installed": True, "linked": True, "authenticated": False, "detail": "Antigravity login required"}
+            return {"installed": True, "linked": True, "authenticated": None, "detail": "Verbunden"}
+        def models(provider):
+            if provider == "mistral":
+                return [{"model": "mistral-large-latest"}]
+            return []
+        with patch("aicoder.account_providers.account_status", side_effect=status), \
+             patch("aicoder.account_providers.available_account_models", side_effect=models):
+            errors = _team_provider_preflight(config)
+        self.assertEqual(errors, ["research:primary_sources: Antigravity login required"])
+
+    def test_account_models_are_checked_once_per_provider_and_known_model(self):
+        from aicoder.team_orchestrator import _team_provider_preflight
+        state = {
+            "team_runtime_mode": "on", "selected_model": "account:chatgpt/gpt-test",
+            "team_research_model_1": "off", "team_research_model_2": "off", "team_research_model_3": "off", "team_research_model_4": "off",
+            "team_planner_model": "@primary", "team_coordinator_model": "@primary",
+            "team_coder_model_1": "@primary", "team_coder_model_2": "off", "team_coder_model_3": "off", "team_coder_model_4": "off",
+            "team_merge_model": "@primary", "team_test_planner_model": "off",
+        }
+        config = config_from_state(state)
+        with patch("aicoder.account_providers.account_status", return_value={
+                "installed": True, "linked": True, "authenticated": True, "detail": "Verbunden"}) as status, \
+             patch("aicoder.account_providers.available_account_models", return_value=[{"model": "gpt-test"}]) as models:
+            self.assertEqual(_team_provider_preflight(config), [])
+        status.assert_called_once_with("chatgpt")
+        models.assert_called_once_with("chatgpt")

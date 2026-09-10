@@ -53,7 +53,7 @@ ACCOUNT_PROVIDERS: tuple[AccountProviderSpec, ...] = (
                 ("fable", "Claude Fable (latest)"), ("haiku", "Claude Haiku (latest)")),
     ),
     AccountProviderSpec(
-        "mistral", "Mistral", "vibe",
+        "mistral", "Mistral", "vibe", auth_verifiable=True,
         models=(
             ("mistral-medium-latest", "Mistral Medium"),
             ("zai-glm-5-2", "Z.ai GLM 5.2"),
@@ -499,6 +499,29 @@ def account_status(provider: str) -> dict[str, Any]:
         return _claude_status()
     installed = bool(_which(spec))
     marked = spec.id in linked_provider_ids()
+    if spec.id == "mistral":
+        authenticated = bool(installed and _mistral_authenticated())
+        detail = (
+            "Verbunden" if authenticated else
+            "Mistral Vibe login required" if installed and marked else
+            f"{spec.display_name}-CLI fehlt" if not installed else
+            "Nicht verbunden"
+        )
+        return {"provider": spec.id, "display": spec.display_name, "installed": installed,
+                "linked": bool(marked or authenticated), "authenticated": authenticated, "detail": detail}
+    if spec.id == "gemini":
+        authenticated = False
+        if installed:
+            executable = _which(spec)
+            authenticated = bool(executable and _antigravity_authenticated(executable, timeout=8))
+        detail = (
+            "Verbunden" if authenticated else
+            "Antigravity login required" if installed and marked else
+            f"{spec.display_name}-CLI fehlt" if not installed else
+            "Nicht verbunden"
+        )
+        return {"provider": spec.id, "display": spec.display_name, "installed": installed,
+                "linked": bool(marked or authenticated), "authenticated": authenticated, "detail": detail}
     authenticated: bool | None = None
     detail = "Verknüpft · Login vom offiziellen Client verwaltet" if marked and installed else (
         f"{spec.display_name}-CLI fehlt" if not installed else "Nicht verbunden"
@@ -686,6 +709,45 @@ def _antigravity_authenticated(executable: str, *, timeout: int = 30) -> bool:
         return True
     except ClientError:
         return False
+
+
+def _mistral_authenticated() -> bool:
+    """Check whether Mistral Vibe can resolve its provider credential.
+
+    Vibe 2.x resolves MISTRAL_API_KEY from the process environment, its
+    $VIBE_HOME/.env file, or the provider-owned OS keyring.  Only presence is
+    checked here; secret values never leave their storage backend.
+    """
+    env_key = "MISTRAL_API_KEY"
+    if str(os.environ.get(env_key) or "").strip():
+        return True
+
+    vibe_home = Path(os.path.expanduser(os.environ.get("VIBE_HOME") or "~/.vibe"))
+    env_file = vibe_home / ".env"
+    try:
+        if env_file.is_file():
+            for line in env_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+                raw = line.strip()
+                if not raw or raw.startswith("#") or "=" not in raw:
+                    continue
+                name, value = raw.split("=", 1)
+                if name.strip() == env_key and value.strip().strip("\"'"):
+                    return True
+    except OSError:
+        pass
+
+    try:
+        import keyring  # type: ignore
+        from keyring.errors import KeyringError  # type: ignore
+        for service in ("ai.mistral.vibe", "vibe"):
+            try:
+                if keyring.get_password(service, env_key):
+                    return True
+            except KeyringError:
+                break
+    except Exception:
+        pass
+    return False
 
 
 def connect_account(provider: str, *, open_browser: bool = True) -> dict[str, Any]:
@@ -890,7 +952,7 @@ class ClaudeAccountTransport(_SubprocessAccountTransport):
         provider, provider_model = parse_account_model(model)
         if provider != self.provider:
             raise ClientError("Claude account transport received the wrong provider")
-        executable = shutil.which("claude")
+        executable = _which_executable("claude")
         if not executable:
             raise ClientError("Claude Code CLI is not installed")
         transcript = _conversation_text(message=message, messages=messages, system_prompt=system_prompt)
@@ -899,8 +961,15 @@ class ClaudeAccountTransport(_SubprocessAccountTransport):
             "--tools", "", "--disallowed-tools", "*", "--disable-slash-commands",
             "--no-chrome", "--no-session-persistence", "--system-prompt", _MODEL_BACKEND_SYSTEM,
         ]
+        env = dict(os.environ)
+        env["PATH"] = _augmented_path()
+        # Account-backed Claude must use the provider-owned claude.ai session.
+        # API/gateway credentials inherited from the TriForce host take precedence
+        # in Claude Code and can silently route the request to a depleted API balance.
+        for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
+            env.pop(name, None)
         started = time.monotonic()
-        stdout, _ = self._run(args, request_id=request_id, stdin=transcript)
+        stdout, _ = self._run(args, request_id=request_id, stdin=transcript, env=env)
         text = stdout.strip()
         if not text:
             raise ClientError("Claude account client returned an empty response", retryable=True)
@@ -920,9 +989,11 @@ class MistralAccountTransport(_SubprocessAccountTransport):
         provider, provider_model = parse_account_model(model)
         if provider != self.provider:
             raise ClientError("Mistral account transport received the wrong provider")
-        executable = shutil.which("vibe")
+        executable = _which_executable("vibe")
         if not executable:
             raise ClientError("Mistral Vibe CLI is not installed")
+        if not _mistral_authenticated():
+            raise ClientError("Mistral Vibe login required")
         transcript = _conversation_text(message=message, messages=messages, system_prompt=system_prompt)
         with tempfile.TemporaryDirectory(prefix="aicoder-vibe-") as tmp:
             args = [executable, "--prompt", transcript, "--max-turns", "1", "--output", "text",
@@ -962,6 +1033,8 @@ class GeminiAccountTransport(_SubprocessAccountTransport):
         executable = _which_executable("agy")
         if not executable:
             raise ClientError("Google Antigravity CLI is not installed")
+        if not _antigravity_authenticated(executable, timeout=min(8, self.timeout)):
+            raise ClientError("Antigravity login required")
         transcript = _conversation_text(message=message, messages=messages, system_prompt=system_prompt)
         with tempfile.TemporaryDirectory(prefix="aicoder-antigravity-") as tmp:
             args = [
@@ -1037,7 +1110,7 @@ class ChatGPTAccountTransport:
                     "model": provider_model,
                     "cwd": tmp,
                     "approvalPolicy": "never",
-                    "sandbox": "readOnly",
+                    "sandbox": "read-only",
                     "serviceName": "ailinux_aicoder",
                 }, timeout=min(30, self.timeout))
                 thread = start.get("thread") if isinstance(start.get("thread"), dict) else {}
@@ -1049,9 +1122,11 @@ class ChatGPTAccountTransport:
                     "input": [{"type": "text", "text": transcript}],
                     "cwd": tmp,
                     "approvalPolicy": "never",
+                    # Codex App Server currently uses different enum spellings:
+                    # thread/start.sandbox is kebab-case, turn/start sandboxPolicy.type is camelCase.
                     "sandboxPolicy": {
                         "type": "readOnly",
-                        "access": {"type": "restricted", "includePlatformDefaults": False, "readableRoots": [tmp]},
+                        "networkAccess": False,
                     },
                     "model": provider_model,
                 }
@@ -1060,6 +1135,7 @@ class ChatGPTAccountTransport:
                 server._request("turn/start", turn_params, timeout=min(30, self.timeout))
                 deadline = time.monotonic() + self.timeout
                 answer = ""
+                provider_error = ""
                 while True:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
@@ -1071,6 +1147,12 @@ class ChatGPTAccountTransport:
                         raise ClientError("Codex requested provider-side execution; AICoder account transport refused it")
                     method = str(event.get("method") or "")
                     params = event.get("params") if isinstance(event.get("params"), dict) else {}
+                    if method == "error":
+                        error_payload = params.get("error") if isinstance(params.get("error"), dict) else {}
+                        message_text = str(error_payload.get("message") or "").strip()
+                        error_code = str(error_payload.get("codexErrorInfo") or "").strip()
+                        if message_text:
+                            provider_error = message_text + (f" [{error_code}]" if error_code else "")
                     if method in {"item/started", "item/completed"}:
                         item = params.get("item") if isinstance(params.get("item"), dict) else {}
                         item_type = str(item.get("type") or "")
@@ -1084,7 +1166,14 @@ class ChatGPTAccountTransport:
                         turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
                         status = str(turn.get("status") or "")
                         if status != "completed":
-                            raise ClientError(f"ChatGPT account turn ended with status {status or 'unknown'}")
+                            turn_error = turn.get("error") if isinstance(turn.get("error"), dict) else {}
+                            message_text = str(turn_error.get("message") or "").strip()
+                            error_code = str(turn_error.get("codexErrorInfo") or "").strip()
+                            detail = message_text + (f" [{error_code}]" if message_text and error_code else "")
+                            if not detail:
+                                detail = provider_error
+                            suffix = f": {detail[:500]}" if detail else ""
+                            raise ClientError(f"ChatGPT account turn ended with status {status or 'unknown'}{suffix}")
                         break
                 if not answer:
                     raise ClientError("ChatGPT account client returned an empty response", retryable=True)
