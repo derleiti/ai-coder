@@ -95,27 +95,22 @@ class ProviderTransportTests(unittest.TestCase):
         self.assertIn("--model", argv)
         self.assertEqual(result["backend"], "account-mistral")
 
-    @patch("aicoder.account_providers.shutil.which", return_value="/usr/bin/gemini")
-    def test_gemini_injects_headless_global_deny_policy(self, _which):
+    @patch("aicoder.account_providers.shutil.which", return_value="/home/test/.local/bin/agy")
+    def test_antigravity_runs_headless_plan_sandbox_with_selected_model(self, _which):
         transport = GeminiAccountTransport(timeout=30)
-        captured = {}
+        with patch.object(transport, "_run", return_value=(json.dumps({"response": "OK"}), "")) as run:
+            result = transport.chat(model="account:gemini/gemini-3.8-flash-high", message="hello")
+        argv = run.call_args.args[0]
+        self.assertTrue(argv[0].endswith("agy"))
+        self.assertIn("--print", argv)
+        self.assertIn("--model", argv)
+        self.assertEqual(argv[argv.index("--model") + 1], "gemini-3.8-flash-high")
+        self.assertIn("--mode", argv)
+        self.assertEqual(argv[argv.index("--mode") + 1], "plan")
+        self.assertIn("--sandbox", argv)
+        self.assertIn("--disable-slash-commands", argv)
+        self.assertEqual(result["backend"], "account-antigravity")
 
-        def fake_run(argv, **kwargs):
-            settings_path = Path(kwargs["env"]["GEMINI_CLI_SYSTEM_SETTINGS_PATH"])
-            settings = json.loads(settings_path.read_text())
-            policy = Path(settings["adminPolicyPaths"][0]).read_text()
-            captured.update(argv=argv, policy=policy)
-            return json.dumps({"response": "OK"}), ""
-
-        with patch.object(transport, "_run", side_effect=fake_run):
-            result = transport.chat(model="account:gemini/pro", message="hello")
-        self.assertIn('--model', captured['argv'])
-        self.assertEqual(captured['argv'][captured['argv'].index('--model') + 1], 'pro')
-        self.assertIn('toolName = "*"', captured['policy'])
-        self.assertIn('decision = "deny"', captured['policy'])
-        self.assertIn('priority = 999', captured['policy'])
-        self.assertIn('interactive = false', captured['policy'])
-        self.assertEqual(result["backend"], "account-gemini")
 
     @patch("aicoder.account_providers.account_status", return_value={
         "provider": "chatgpt", "linked": True, "installed": True, "authenticated": True,
@@ -196,18 +191,26 @@ class AccountInstallAndLoginTests(unittest.TestCase):
         self.assertEqual(argv[-1], "@openai/codex@latest")
         self.assertTrue(path.endswith("/.local/bin/codex"))
 
-    def test_missing_gemini_uses_official_npm_package(self):
-        seen = {"gemini": 0}
+    def test_missing_gemini_uses_official_antigravity_installer(self):
+        seen = {"agy": 0}
         def fake_which(name, path=None):
-            if name == "npm": return "/usr/bin/npm"
-            if name == "gemini":
-                seen["gemini"] += 1
-                return None if seen["gemini"] == 1 else str(Path.home() / ".local/bin/gemini")
+            if name == "curl": return "/usr/bin/curl"
+            if name == "bash": return "/usr/bin/bash"
+            if name == "agy":
+                seen["agy"] += 1
+                return None if seen["agy"] == 1 else str(Path.home() / ".local/bin/agy")
             return None
+        download = MagicMock(returncode=0, stdout=b"#!/bin/sh\nexit 0\n", stderr=b"")
+        install = MagicMock(returncode=0, stdout=b"", stderr=b"")
         with patch("aicoder.account_providers.shutil.which", side_effect=fake_which), \
-             patch("aicoder.account_providers.subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")) as run:
-            ensure_provider_client("gemini")
-        self.assertEqual(run.call_args.args[0][-1], "@google/gemini-cli@latest")
+             patch("aicoder.account_providers.subprocess.run", side_effect=[download, install]) as run:
+            path = ensure_provider_client("gemini")
+        first_argv = run.call_args_list[0].args[0]
+        second_argv = run.call_args_list[1].args[0]
+        self.assertEqual(first_argv, ["/usr/bin/curl", "-fsSL", "https://antigravity.google/cli/install.sh"])
+        self.assertEqual(second_argv, ["/usr/bin/bash"])
+        self.assertTrue(path.endswith("/.local/bin/agy"))
+
 
     def test_chatgpt_app_server_failure_falls_back_to_official_device_auth(self):
         first = MagicMock()
@@ -234,19 +237,33 @@ class AccountInstallAndLoginTests(unittest.TestCase):
         linked.assert_called_once_with("chatgpt", True)
         self.assertTrue(result["authenticated"])
 
+    def test_antigravity_models_are_dynamic_from_agy_models(self):
+        completed = MagicMock(
+            returncode=0,
+            stdout="Fetching available models...\ngemini-3.8-flash-high Gemini 3.8 Flash (High)\nclaude-sonnet-4-6 Claude Sonnet 4.6 (Thinking)\n",
+            stderr="",
+        )
+        with patch("aicoder.account_providers.account_status", return_value={
+            "provider": "gemini", "linked": True, "installed": True, "authenticated": None,
+        }), patch("aicoder.account_providers._which", return_value="/home/test/.local/bin/agy"), \
+             patch("aicoder.account_providers.subprocess.run", return_value=completed):
+            models = available_account_models("gemini")
+        self.assertEqual([m["model"] for m in models], ["gemini-3.8-flash-high", "claude-sonnet-4-6"])
+        self.assertEqual(models[0]["id"], "account:gemini/gemini-3.8-flash-high")
+
     def test_gemini_is_linked_only_after_login_verification(self):
-        with patch("aicoder.account_providers.ensure_provider_client", return_value="/home/test/.local/bin/gemini"), \
+        with patch("aicoder.account_providers.ensure_provider_client", return_value="/home/test/.local/bin/agy"), \
              patch("aicoder.account_providers._launch_terminal", return_value=0), \
-             patch("aicoder.account_providers._gemini_authenticated", return_value=True), \
+             patch("aicoder.account_providers._antigravity_authenticated", side_effect=[False, True]), \
              patch("aicoder.account_providers.set_provider_linked") as linked:
             result = connect_account("gemini")
         linked.assert_called_once_with("gemini", True)
         self.assertTrue(result["authenticated"])
 
     def test_gemini_failed_verification_is_not_left_linked(self):
-        with patch("aicoder.account_providers.ensure_provider_client", return_value="/home/test/.local/bin/gemini"), \
+        with patch("aicoder.account_providers.ensure_provider_client", return_value="/home/test/.local/bin/agy"), \
              patch("aicoder.account_providers._launch_terminal", return_value=0), \
-             patch("aicoder.account_providers._gemini_authenticated", return_value=False), \
+             patch("aicoder.account_providers._antigravity_authenticated", side_effect=[False, False]), \
              patch("aicoder.account_providers.set_provider_linked") as linked:
             with self.assertRaisesRegex(ClientError, "not authenticated"):
                 connect_account("gemini")

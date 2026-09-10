@@ -6,7 +6,7 @@ clients.  Each provider keeps ownership of its credentials:
 * ChatGPT: Codex App Server managed ChatGPT OAuth (`account/login/start`).
 * Claude: Claude Code's `claude auth` commands and non-interactive print mode.
 * Mistral: Vibe's setup/login and programmatic mode.
-* Gemini: Gemini CLI's Google login and headless mode.
+* Google: Antigravity CLI (`agy`) Google OAuth and headless mode.
 
 AICoder stores only provider IDs in ``linked_account_providers``.  Account model
 IDs use ``account:<provider>/<model>``.  Once such a model is selected routing is
@@ -65,8 +65,7 @@ ACCOUNT_PROVIDERS: tuple[AccountProviderSpec, ...] = (
         ),
     ),
     AccountProviderSpec(
-        "gemini", "Google Gemini", "gemini",
-        models=(("auto", "Gemini Auto"), ("pro", "Gemini Pro"), ("flash", "Gemini Flash"), ("flash-lite", "Gemini Flash-Lite")),
+        "gemini", "Google Antigravity", "agy", dynamic_models=True,
     ),
 )
 
@@ -132,7 +131,7 @@ def _which(spec: AccountProviderSpec) -> str:
 _INSTALL_RECIPES: dict[str, tuple[str, ...]] = {
     "chatgpt": ("npm", "install", "-g", "@openai/codex@latest"),
     "claude": ("npm", "install", "-g", "@anthropic-ai/claude-code@latest"),
-    "gemini": ("npm", "install", "-g", "@google/gemini-cli@latest"),
+    "gemini": ("antigravity-installer",),
     "mistral": ("uv", "tool", "install", "--upgrade", "mistral-vibe"),
 }
 
@@ -166,6 +165,33 @@ def ensure_provider_client(provider: str) -> str:
     recipe = _INSTALL_RECIPES.get(spec.id)
     if not recipe:
         raise ClientError(f"No supported installer is configured for {spec.display_name}")
+    if recipe[0] == "antigravity-installer":
+        curl = _which_executable("curl")
+        bash = _which_executable("bash")
+        if not curl or not bash:
+            raise ClientError("curl and bash are required to install the official Google Antigravity CLI")
+        try:
+            download = subprocess.run(
+                [curl, "-fsSL", "https://antigravity.google/cli/install.sh"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ClientError("Could not download the official Google Antigravity CLI installer") from exc
+        if download.returncode != 0 or not download.stdout:
+            raise ClientError("Official Google Antigravity CLI installer download failed")
+        try:
+            proc = subprocess.run(
+                [bash], input=download.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ClientError("Could not install the official Google Antigravity CLI") from exc
+        if proc.returncode != 0:
+            raise ClientError("Official Google Antigravity CLI installation failed")
+        installed = _which_executable(spec.executable)
+        if not installed:
+            raise ClientError("Google Antigravity CLI installed but 'agy' is not on PATH")
+        return installed
+
     runner = _which_executable(recipe[0])
     if not runner:
         dependency = "Node.js/npm" if recipe[0] == "npm" else "uv"
@@ -476,7 +502,21 @@ def available_account_models(provider: str) -> list[dict[str, Any]]:
                 "is_default": bool(item.get("isDefault")),
             })
         return result
-    # Claude/Mistral/Gemini do not currently expose a stable account-specific
+    if spec.id == "gemini":
+        executable = _which(spec)
+        if not executable:
+            return []
+        try:
+            rows = _antigravity_models(executable, timeout=20)
+        except ClientError:
+            return []
+        return [
+            {"provider": spec.id, "model": row["model"],
+             "id": account_model_id(spec.id, row["model"]), "display": row["display"]}
+            for row in rows
+        ]
+
+    # Claude/Mistral do not currently expose a stable account-specific
     # model-list RPC through their documented account-login CLI surface.  Use
     # only model aliases/IDs documented by the provider; the CLI performs the
     # final entitlement check on invocation.
@@ -574,31 +614,41 @@ def _launch_terminal(command: list[str], *, title: str, wait: bool = False, time
     raise ClientError(f"{title} timed out before the login process completed")
 
 
-def _gemini_authenticated(executable: str, *, timeout: int = 45) -> bool:
-    """Verify Gemini CLI authentication through its documented headless mode."""
-    with tempfile.TemporaryDirectory(prefix="aicoder-gemini-auth-") as tmp:
-        policy = Path(tmp) / "deny-tools.toml"
-        policy.write_text(
-            '[[rule]]\ntoolName = "*"\ndecision = "deny"\npriority = 999\ninteractive = false\n',
-            encoding="utf-8",
+def _antigravity_models(executable: str, *, timeout: int = 30) -> list[dict[str, str]]:
+    """Return models exposed by the authenticated Antigravity CLI account."""
+    env = dict(os.environ)
+    env["PATH"] = _augmented_path()
+    try:
+        proc = subprocess.run(
+            [executable, "models"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=timeout, env=env,
         )
-        env = dict(os.environ)
-        env["PATH"] = _augmented_path()
-        try:
-            proc = subprocess.run(
-                [executable, "--prompt", "Reply exactly: OK", "--output-format", "json",
-                 "--approval-mode", "plan", "--admin-policy", str(policy), "--skip-trust"],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout, cwd=tmp, env=env,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return False
-        if proc.returncode != 0:
-            return False
-        try:
-            payload = json.loads(proc.stdout)
-        except json.JSONDecodeError:
-            return False
-        return bool(str(payload.get("response") or "").strip()) if isinstance(payload, dict) else False
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ClientError("Could not query Google Antigravity models") from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()[-1:]
+        suffix = f": {detail[0][:200]}" if detail else ""
+        raise ClientError(f"Google Antigravity is not authenticated{suffix}")
+    models: list[dict[str, str]] = []
+    for line in proc.stdout.splitlines():
+        raw = line.strip()
+        if not raw or raw.lower().startswith("fetching available models"):
+            continue
+        parts = raw.split(None, 1)
+        slug = parts[0].strip()
+        if not slug or slug.startswith("-"):
+            continue
+        display = parts[1].strip() if len(parts) > 1 else slug
+        models.append({"model": slug, "display": display})
+    return models
+
+
+def _antigravity_authenticated(executable: str, *, timeout: int = 30) -> bool:
+    try:
+        _antigravity_models(executable, timeout=timeout)
+        return True
+    except ClientError:
+        return False
 
 
 def connect_account(provider: str, *, open_browser: bool = True) -> dict[str, Any]:
@@ -652,12 +702,16 @@ def connect_account(provider: str, *, open_browser: bool = True) -> dict[str, An
         set_provider_linked(spec.id, True)
         return {"provider": spec.id, "started": True, "authenticated": None}
     if spec.id == "gemini":
-        # Gemini CLI performs Google OAuth in interactive mode; wait for the
-        # user to finish/exit, then verify with the documented headless mode.
-        exit_code = _launch_terminal([executable], title="AICoder · Google Gemini Login", wait=True)
-        if exit_code not in (0, None) or not _gemini_authenticated(executable):
+        # Antigravity CLI performs Google OAuth in its interactive TUI. Reuse a
+        # valid shared Antigravity session if present, otherwise open the TUI and
+        # verify authentication with the documented `agy models` command.
+        if _antigravity_authenticated(executable):
+            set_provider_linked(spec.id, True)
+            return {"provider": spec.id, "started": False, "authenticated": True}
+        exit_code = _launch_terminal([executable], title="AICoder · Google Antigravity Login", wait=True)
+        if exit_code not in (0, None) or not _antigravity_authenticated(executable):
             set_provider_linked(spec.id, False)
-            raise ClientError("Gemini login finished but the official Gemini CLI is not authenticated")
+            raise ClientError("Antigravity login finished but the official agy client is not authenticated")
         set_provider_linked(spec.id, True)
         return {"provider": spec.id, "started": True, "authenticated": True}
     raise ClientError(f"Unsupported account provider: {spec.id}")
@@ -679,7 +733,7 @@ def disconnect_account(provider: str) -> None:
         finally:
             set_provider_linked(spec.id, False)
         return
-    # Mistral Vibe and Gemini CLI do not expose a stable provider-account logout
+    # Mistral Vibe and Google Antigravity CLI do not expose a stable provider-account logout
     # command in the documented surfaces used here.  Disconnecting therefore
     # only removes AICoder's non-secret linkage and never deletes provider files.
     set_provider_linked(spec.id, False)
@@ -847,36 +901,38 @@ class GeminiAccountTransport(_SubprocessAccountTransport):
              request_id: str | None = None, reasoning_effort: str | None = None) -> dict[str, Any]:
         provider, provider_model = parse_account_model(model)
         if provider != self.provider:
-            raise ClientError("Gemini account transport received the wrong provider")
-        executable = shutil.which("gemini")
+            raise ClientError("Google Antigravity account transport received the wrong provider")
+        executable = _which_executable("agy")
         if not executable:
-            raise ClientError("Gemini CLI is not installed")
+            raise ClientError("Google Antigravity CLI is not installed")
         transcript = _conversation_text(message=message, messages=messages, system_prompt=system_prompt)
-        with tempfile.TemporaryDirectory(prefix="aicoder-gemini-") as tmp:
-            policy = Path(tmp) / "deny-aicoder-tools.toml"
-            policy.write_text(
-                '[[rule]]\ntoolName = "*"\ndecision = "deny"\npriority = 999\ninteractive = false\n'
-                'denyMessage = "AICoder owns tool execution for this model call."\n',
-                encoding="utf-8",
-            )
-            settings = Path(tmp) / "system-settings.json"
-            settings.write_text(json.dumps({"adminPolicyPaths": [str(policy)]}), encoding="utf-8")
+        with tempfile.TemporaryDirectory(prefix="aicoder-antigravity-") as tmp:
+            args = [
+                executable, "--print", transcript, "--model", provider_model,
+                "--output-format", "json", "--mode", "plan", "--sandbox",
+                "--disable-slash-commands", "--print-timeout", f"{self.timeout}s",
+            ]
+            if reasoning_effort in {"low", "medium", "high"}:
+                args.extend(["--effort", str(reasoning_effort)])
             env = dict(os.environ)
-            env["GEMINI_CLI_SYSTEM_SETTINGS_PATH"] = str(settings)
-            args = [executable, "--prompt", transcript, "--model", provider_model, "--output-format", "json"]
+            env["PATH"] = _augmented_path()
             started = time.monotonic()
             stdout, _ = self._run(args, request_id=request_id, cwd=tmp, env=env)
         try:
             payload = json.loads(stdout)
         except json.JSONDecodeError as exc:
-            raise ClientError("Gemini account client returned invalid JSON") from exc
-        text = str(payload.get("response") or "").strip() if isinstance(payload, dict) else ""
+            raise ClientError("Google Antigravity returned invalid JSON") from exc
+        text = ""
+        if isinstance(payload, dict):
+            text = str(payload.get("response") or payload.get("result") or payload.get("text") or "").strip()
+            if not text and isinstance(payload.get("result"), dict):
+                text = str(payload["result"].get("response") or "").strip()
         if not text:
-            raise ClientError("Gemini account client returned an empty response", retryable=True)
+            raise ClientError("Google Antigravity returned an empty response", retryable=True)
         elapsed = time.monotonic() - started
         return {"response": text, "model": str(model), "provider": self.provider,
-                "backend": "account-gemini", "latency_ms": int(elapsed * 1000),
-                "_transport_telemetry": {"transport": "account-gemini", "elapsed_s": round(elapsed, 3), "request_id": request_id or ""}}
+                "backend": "account-antigravity", "latency_ms": int(elapsed * 1000),
+                "_transport_telemetry": {"transport": "account-antigravity", "elapsed_s": round(elapsed, 3), "request_id": request_id or ""}}
 
 
 class ChatGPTAccountTransport:
