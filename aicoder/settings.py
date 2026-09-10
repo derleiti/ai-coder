@@ -170,6 +170,34 @@ _register(SettingSpec(
         "and is unrelated to shell/subprocess timeouts."),
 ))
 _register(SettingSpec(
+    key="system_log_monitor_enabled", type="bool", default=False, group="monitoring",
+    description="Analyze suspicious local system log events automatically with the current base model; analysis is read-only.",
+))
+_register(SettingSpec(
+    key="system_log_interval_seconds", type="int", default=60, minimum=10, maximum=3600, group="monitoring",
+    description="Polling interval for automatic system log analysis.",
+))
+_register(SettingSpec(
+    key="system_log_since_seconds", type="int", default=300, minimum=10, maximum=86400, group="monitoring",
+    description="Initial/manual system log lookback window in seconds.",
+))
+_register(SettingSpec(
+    key="system_log_cooldown_seconds", type="int", default=900, minimum=0, maximum=86400, group="monitoring",
+    description="Minimum delay before repeating an identical automatic notification.",
+))
+_register(SettingSpec(
+    key="system_log_min_severity", type="enum", default="warning", choices=frozenset({"info", "warning", "security", "critical"}), group="monitoring",
+    description="Minimum AI-classified severity that may trigger an automatic notification.",
+))
+_register(SettingSpec(
+    key="system_log_notify_security", type="bool", default=True, group="monitoring",
+    description="Allow automatic notifications for security-classified log events.",
+))
+_register(SettingSpec(
+    key="system_log_notify_errors", type="bool", default=True, group="monitoring",
+    description="Allow automatic notifications for warning/critical operational errors.",
+))
+_register(SettingSpec(
     key="max_output_tokens", type="int", default=16384, minimum=256, maximum=200000,
     group="runtime", aliases=("max_tokens", "output_tokens"),
     description=(

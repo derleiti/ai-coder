@@ -153,6 +153,7 @@ class SettingsWidget(QWidget):
     models_loaded = pyqtSignal(list)  # emitted with sorted model list
     selection_changed = pyqtSignal(str)  # base model
     tools_changed = pyqtSignal(str, object)  # (mode, selected names or None)
+    systemlog_analyze_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -549,6 +550,11 @@ class SettingsWidget(QWidget):
             schema_row.addWidget(self.schema_status)
             schema_row.addStretch()
             schema_form.addRow(schema_row)
+            if any(key.startswith("system_log_") for key in self._schema_widgets):
+                analyze_logs_btn = QPushButton("Systemlogs jetzt analysieren")
+                analyze_logs_btn.setToolTip("Read-only analysis of the configured recent journal window using the current base model")
+                analyze_logs_btn.clicked.connect(self.systemlog_analyze_requested.emit)
+                schema_form.addRow(analyze_logs_btn)
             schema_group.setLayout(schema_form)
             layout.addWidget(schema_group)
 

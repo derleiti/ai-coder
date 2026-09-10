@@ -1067,6 +1067,24 @@ def cmd_status(_: argparse.Namespace) -> int:
 
 
 
+def cmd_systemlog(args: argparse.Namespace) -> int:
+    from .system_log_monitor import JournalctlSource, SystemLogMonitor, config_from_state, current_model_analyzer
+    state = get_state()
+    config = config_from_state(state)
+    action = getattr(args, "systemlog_action", "status")
+    if action == "status":
+        print(json.dumps({
+            "enabled": config.enabled, "model": state.get("selected_model") or "backend-default",
+            "interval_seconds": config.interval_seconds, "since_seconds": config.since_seconds,
+            "cooldown_seconds": config.cooldown_seconds, "min_severity": config.min_severity,
+        }, indent=2, ensure_ascii=False))
+        return 0
+    monitor = SystemLogMonitor(JournalctlSource(), current_model_analyzer(), config=config)
+    analyses = monitor.analyze_now(since_seconds=int(getattr(args, "since", 300)))
+    print(json.dumps([item.__dict__ for item in analyses], indent=2, ensure_ascii=False))
+    return 0
+
+
 # ── Ask / Chat ───────────────────────────────────────────────────────────────
 
 
@@ -1737,6 +1755,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=10)
     p.add_argument("--clear", action="store_true", help="Clear only the current-plan pointer")
     p.set_defaults(func=cmd_plan)
+
+    p = sub.add_parser("systemlog", help="Analyze suspicious local system/security log events with the current base model")
+    systemlog_sub = p.add_subparsers(dest="systemlog_action")
+    p.set_defaults(func=cmd_systemlog, systemlog_action="status")
+    sp = systemlog_sub.add_parser("status", help="Show system log monitor settings")
+    sp.set_defaults(func=cmd_systemlog)
+    sp = systemlog_sub.add_parser("analyze", help="Manually analyze a bounded local journal window")
+    sp.add_argument("--since", type=int, default=300, help="Lookback window in seconds")
+    sp.set_defaults(func=cmd_systemlog)
 
     p = sub.add_parser("status", help="Show active status (model, fallback, swarm, workspace, docs)")
     p.set_defaults(func=cmd_status)

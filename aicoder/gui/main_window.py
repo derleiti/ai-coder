@@ -3,13 +3,18 @@ from __future__ import annotations
 from PyQt6.QtWidgets import (
     QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame,
 )
-from PyQt6.QtCore import Qt, QSize
+from PyQt6.QtCore import Qt, QSize, QObject, pyqtSignal
 from PyQt6.QtGui import QKeySequence, QShortcut
 
 from .chat_widget import ChatWidget
 from .settings_widget import SettingsWidget
 from .mcp_widget import MCPServersWidget
 from .theme import APP_STYLESHEET
+
+
+class _SystemLogBridge(QObject):
+    notification = pyqtSignal(object)
+    event = pyqtSignal(str, object)
 
 
 class MainWindow(QMainWindow):
@@ -64,6 +69,50 @@ class MainWindow(QMainWindow):
             QShortcut(QKeySequence("Ctrl+,"), self, activated=lambda: self.tabs.setCurrentIndex(1)),
             QShortcut(QKeySequence("Ctrl+3"), self, activated=lambda: self.tabs.setCurrentIndex(2)),
         ]
+        self._setup_system_log_monitor()
+
+
+    def _setup_system_log_monitor(self):
+        from ..session_state import get_state
+        from ..system_log_monitor import JournalctlSource, SystemLogMonitor, config_from_state, current_model_analyzer
+        self._system_log_bridge = _SystemLogBridge(self)
+        self._system_log_bridge.notification.connect(self._show_system_log_notification)
+        self._system_log_bridge.event.connect(self._show_system_log_event)
+        config = config_from_state(get_state())
+        self._system_log_monitor = SystemLogMonitor(
+            JournalctlSource(), current_model_analyzer(), config=config,
+            notify=self._system_log_bridge.notification.emit,
+            event_sink=self._system_log_bridge.event.emit,
+        )
+        self.settings_tab.systemlog_analyze_requested.connect(self._analyze_system_logs_now)
+        self._system_log_monitor.start()
+
+    def _analyze_system_logs_now(self):
+        import threading
+        threading.Thread(target=self._run_manual_system_log_analysis, name="aicoder-systemlog-manual", daemon=True).start()
+
+    def _run_manual_system_log_analysis(self):
+        try:
+            analyses = self._system_log_monitor.analyze_now()
+            if not analyses:
+                self._system_log_bridge.event.emit("system_log_manual_empty", {})
+                return
+            for analysis in analyses:
+                self._system_log_bridge.notification.emit(analysis)
+        except Exception as exc:
+            self._system_log_bridge.event.emit("system_log_monitor_error", {"error": str(exc)})
+
+    def _show_system_log_event(self, name, payload):
+        if name == "system_log_monitor_error":
+            self.chat_tab._append_msg("error", "System log monitor", str(payload.get("error") or "unknown error"))
+        elif name == "system_log_manual_empty":
+            self.chat_tab._append_msg("system", "Systemlog analysis: no suspicious events found in the configured time window.", "read-only")
+
+    def _show_system_log_notification(self, analysis):
+        text = f"{analysis.title}\n{analysis.summary}\n\nReason: {analysis.reason}\nSuggested: {analysis.recommended_action}"
+        self.chat_tab._append_msg("system", text, f"{analysis.severity} · {analysis.source} · confidence {analysis.confidence:.0%}")
+        if self.tray and self.tray.isVisible():
+            self.tray.showMessage(f"AICoder · {analysis.severity.upper()}", f"{analysis.title}: {analysis.summary}"[:500], self.tray.MessageIcon.Warning, 8000)
 
     def _apply_style(self):
         self.setStyleSheet(APP_STYLESHEET)
@@ -80,6 +129,8 @@ class MainWindow(QMainWindow):
             )
             event.ignore()
         else:
+            if hasattr(self, "_system_log_monitor"):
+                self._system_log_monitor.stop()
             event.accept()
 
     def show_and_raise(self):
