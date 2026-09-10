@@ -28,6 +28,14 @@ fi
 # stale project version from a previous build.
 rm -rf aicoder.egg-info
 .venv/bin/python -m pip install -q --no-build-isolation -e .
+# Fail early if security-critical runtime dependencies were not installed into
+# the exact interpreter used by PyInstaller.  A stale/incomplete venv used to
+# produce a binary where MCP credential writes failed with "Python keyring is
+# unavailable" even though keyring is declared in pyproject.toml.
+.venv/bin/python - <<'PYVERIFY'
+import keyring
+print(f"keyring: {keyring.__file__}")
+PYVERIFY
 METADATA_VERSION=$(.venv/bin/python -c "import importlib.metadata as m; print(m.version('aicoder'))")
 if [ "$METADATA_VERSION" != "$VERSION" ]; then
     echo "ERROR: installed metadata version $METADATA_VERSION != project version $VERSION" >&2

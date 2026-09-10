@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import copy_metadata
+from PyInstaller.utils.hooks import collect_submodules, copy_metadata
 
 block_cipher = None
 
@@ -7,7 +7,7 @@ a = Analysis(
     ['aicoder_main.py'],
     pathex=['.'],
     binaries=[],
-    datas=copy_metadata('aicoder'),
+    datas=copy_metadata('aicoder') + copy_metadata('keyring'),
     hiddenimports=[
         'aicoder.cli',
         'aicoder.client',
@@ -72,6 +72,7 @@ a = Analysis(
         'pathlib',
         'json',
         'shutil',
+        *collect_submodules('keyring'),
     ],
     hookspath=[],
     runtime_hooks=[],
