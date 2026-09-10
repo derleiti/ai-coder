@@ -1,4 +1,11 @@
-## Unreleased
+## v1.2.4 (2026-09-10)
+
+- Add official account-backed model routing for ChatGPT/Codex, Claude, Mistral Vibe, and Google Antigravity with provider-aware login/status handling and fail-fast Team preflight checks.
+- Add unified MCP server management across GUI and terminal flows, hardened MCP credentials/OAuth handling, and restore direct authenticated MCP calls when the backend exposes the canonical tool catalog dynamically.
+- Add AI-assisted system-log monitoring and diagnostics integration.
+- Harden Team Runtime task contracts, staged handoffs, candidate recovery, immutable-test handling, deterministic verification, transactional workspace persistence, cancellation cleanup, and final verification.
+- Preserve virtual-environment interpreter semantics during deterministic test execution so project/AICoder pytest dependencies are not lost through resolved interpreter symlinks.
+- Surface real ChatGPT/Codex provider failures such as account/workspace usage limits instead of collapsing them into a generic failed-turn error.
 
 - Restore hardened Team coding/recovery behavior: native OpenRouter tools for workers, durable candidate handoffs, fresh regression-test gates, non-Git candidate diffs, verified-only merge inputs, richer worker diagnostics, advisor/research recovery, coordinator review, and resilient brainstorm/test-planner fallbacks.
 - Let Team Runtime create/select a concrete child project automatically when only `projects_root` is active; prefer a task-specified path and otherwise generate a safe project root.
