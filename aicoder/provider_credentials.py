@@ -95,7 +95,7 @@ def _provider_env_vars(provider: str) -> tuple[str, ...]:
 
 def _backend_or_error():
     if keyring is None:
-        raise CredentialStoreError("Python keyring is unavailable; refusing plaintext credential storage")
+        raise CredentialStoreError("Python keyring is unavailable in this build; refusing plaintext credential storage")
     try:
         backend = keyring.get_keyring()
     except Exception as exc:
@@ -108,6 +108,21 @@ def _backend_or_error():
     if not usable:
         raise CredentialStoreError("No usable OS keyring backend is available; credential was not stored")
     return backend
+
+
+def credential_store_status() -> dict[str, object]:
+    """Secret-free diagnostics for the OS credential backend."""
+    if keyring is None:
+        return {"available": False, "backend": "", "error": "Python keyring is unavailable in this build"}
+    try:
+        backend = _backend_or_error()
+    except CredentialStoreError as exc:
+        return {"available": False, "backend": "", "error": str(exc)}
+    return {
+        "available": True,
+        "backend": f"{type(backend).__module__}.{type(backend).__name__}",
+        "error": "",
+    }
 
 
 def set_provider_key(provider: str, secret: str) -> None:

@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import queue
 import re
+import shlex
 import shutil
 import subprocess
 import threading
@@ -29,6 +30,20 @@ _FORBIDDEN_AUTH_HEADERS = {
     "cookie", "set-cookie", "mcp-session-id",
 }
 _PREFIX = "mcp."
+
+
+def normalize_server_name(value: str) -> str:
+    """Return a stable tool-safe server id from a human-entered label.
+
+    MCP server ids become part of exported tool names, so whitespace and other
+    punctuation are normalized instead of making the GUI fail after the user
+    has filled the whole form. Dots are preserved for backwards compatibility.
+    """
+    raw = str(value or "").strip()
+    raw = re.sub(r"\s+", "-", raw)
+    raw = re.sub(r"[^A-Za-z0-9._-]+", "-", raw)
+    raw = re.sub(r"-{2,}", "-", raw).strip("._-")
+    return raw[:64].rstrip("._-")
 
 
 class MCPRegistryError(ValueError):
@@ -92,7 +107,9 @@ class MCPServerConfig:
 
 def _validate(config: MCPServerConfig) -> MCPServerConfig:
     if not _NAME_RE.fullmatch(config.name):
-        raise MCPRegistryError("invalid MCP server name")
+        suggested = normalize_server_name(config.name)
+        hint = f"; try '{suggested}'" if suggested else "; use letters/numbers plus . _ -"
+        raise MCPRegistryError(f"invalid MCP server name{hint}")
     if config.name.lower() == "triforce":
         raise MCPRegistryError("'triforce' is reserved for the built-in server profile")
     if config.auth_type not in _AUTH_TYPES:
@@ -426,11 +443,81 @@ def doctor_server(config:MCPServerConfig) -> dict[str,Any]:
 
 def namespaced_tool_name(server:str,tool:str) -> str: return f"{_PREFIX}{server}.{tool}"
 
-def split_namespaced_tool(name:str) -> tuple[str,str] | None:
+def split_namespaced_tool(name:str, server_names: list[str] | tuple[str, ...] | None = None) -> tuple[str,str] | None:
     if not name.startswith(_PREFIX): return None
     rest=name[len(_PREFIX):]
+    if server_names:
+        # Server ids historically allowed dots. Match the longest registered id
+        # so mcp.api.ailinux.me.tool can still be routed unambiguously.
+        matches = [server for server in server_names if rest.startswith(f"{server}.")]
+        if matches:
+            server = max(matches, key=len)
+            tool = rest[len(server) + 1:]
+            return (server, tool) if tool else None
     server,sep,tool=rest.partition(".")
     return (server,tool) if sep and server and tool else None
+
+
+def apply_config_updates(config: MCPServerConfig, updates: dict[str, str]) -> MCPServerConfig:
+    """Apply validated terminal-style key/value updates to an MCP config copy."""
+    out = MCPServerConfig.from_dict(asdict(config))
+    aliases = {
+        "auth": "auth_type", "username": "auth_username", "header": "auth_header",
+        "env": "env_names", "allow": "allow_tools", "deny": "deny_tools",
+        "capabilities": "capability_tags", "scopes": "oauth_scopes",
+        "oauth_authorization_url": "oauth_authorization_url",
+        "oauth_token_url": "oauth_token_url", "oauth_client_id": "oauth_client_id",
+    }
+    scalar = {
+        "transport", "url", "command", "trust", "auth_type", "auth_username",
+        "auth_header", "oauth_authorization_url", "oauth_token_url", "oauth_client_id",
+    }
+    list_fields = {"env_names", "allow_tools", "deny_tools", "capability_tags", "oauth_scopes"}
+
+    for raw_key, raw_value in updates.items():
+        key = aliases.get(str(raw_key).strip().lower().replace("-", "_"), str(raw_key).strip().lower().replace("-", "_"))
+        value = str(raw_value)
+        if key == "name":
+            raise MCPRegistryError("MCP server names are stable; create a new profile to rename")
+        if key in scalar:
+            setattr(out, key, value.strip())
+        elif key in list_fields:
+            setattr(out, key, [item.strip() for item in value.split(",") if item.strip()])
+        elif key == "args":
+            try:
+                out.args = shlex.split(value) if value.strip() else []
+            except ValueError as exc:
+                raise MCPRegistryError(f"invalid stdio args: {exc}") from exc
+        elif key == "timeout":
+            try:
+                out.timeout = int(value)
+            except ValueError as exc:
+                raise MCPRegistryError("timeout must be an integer") from exc
+        elif key == "enabled":
+            lowered = value.strip().lower()
+            if lowered not in {"1", "0", "true", "false", "yes", "no", "on", "off"}:
+                raise MCPRegistryError("enabled must be true/false")
+            out.enabled = lowered in {"1", "true", "yes", "on"}
+        else:
+            raise MCPRegistryError(f"unknown MCP setting: {raw_key}")
+
+    if "url" in updates and "transport" not in updates:
+        out.transport = "streamable-http"
+    if "command" in updates and "transport" not in updates:
+        out.transport = "stdio"
+    if out.transport == "stdio":
+        out.url = ""
+        out.auth_type = "none"
+        out.auth_username = ""
+        out.oauth_authorization_url = ""
+        out.oauth_token_url = ""
+        out.oauth_client_id = ""
+        out.oauth_scopes = []
+    elif out.transport == "streamable-http":
+        out.command = ""
+        out.args = []
+        out.env_names = []
+    return _validate(out)
 
 
 def external_tool_schemas(registry:MCPRegistry|None=None) -> list[dict[str,Any]]:
@@ -459,9 +546,11 @@ def external_tool_schemas(registry:MCPRegistry|None=None) -> list[dict[str,Any]]
 
 
 def call_external_tool(name:str,args:dict[str,Any],registry:MCPRegistry|None=None) -> tuple[str,bool]:
-    parts=split_namespaced_tool(name)
+    registry=registry or MCPRegistry()
+    registered = [str(row.get("name") or "") for row in registry.list(include_builtin=False)]
+    parts=split_namespaced_tool(name, registered)
     if parts is None: return f"invalid external MCP tool name: {name}",True
-    server,tool=parts; registry=registry or MCPRegistry(); config=registry.get(server)
+    server,tool=parts; config=registry.get(server)
     if config is None or not config.enabled: return f"external MCP server unavailable: {server}",True
     if not _allowed(config,tool): return f"external MCP tool blocked by server filter: {tool}",True
     try:

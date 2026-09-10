@@ -449,7 +449,7 @@ def _repl_settings_command(value: str) -> int:
 def _repl_mcp_command(value: str) -> int:
     """Manage MCP servers through the canonical service without putting secrets in history."""
     import shlex
-    from .mcp_registry import MCPServerConfig
+    from .mcp_registry import MCPServerConfig, apply_config_updates
     from .mcp_service import (
         authentication_status, authorize_and_save_server, authorize_oauth, doctor,
         get_server, list_servers, remove_server, required_secret_field, save_server,
@@ -585,6 +585,11 @@ def _repl_mcp_command(value: str) -> int:
                 print(f"  {marker} {row['name']:<20} {row.get('transport',''):<16} {row.get('trust','')}")
             return 0
 
+        if action == "keyring":
+            from .provider_credentials import credential_store_status
+            print(json.dumps(credential_store_status(), indent=2, ensure_ascii=False))
+            return 0
+
         if action == "doctor" and len(parts) == 1:
             print(json.dumps(doctor(), indent=2, ensure_ascii=False))
             return 0
@@ -624,6 +629,21 @@ def _repl_mcp_command(value: str) -> int:
         if len(parts) < 2:
             raise ValueError("server name required")
         name = parts[1]
+        if action == "set":
+            existing = get_server(name)
+            if existing is None:
+                raise ValueError(f"unknown MCP server: {name}")
+            updates: dict[str, str] = {}
+            for item in parts[2:]:
+                if "=" not in item:
+                    raise ValueError("/mcp set requires KEY=VALUE pairs")
+                key, val = item.split("=", 1)
+                updates[key] = val
+            if not updates:
+                raise ValueError("/mcp set requires at least one KEY=VALUE pair")
+            config = apply_config_updates(existing, updates)
+            print(json.dumps(save_server(config, test=False), indent=2, ensure_ascii=False))
+            return 0
         if action in {"enable", "disable"}:
             set_server_enabled(name, action == "enable")
             print(f"  {name} → {'enabled' if action == 'enable' else 'disabled'}")
@@ -674,7 +694,7 @@ def _repl_mcp_command(value: str) -> int:
         print(f"  Fehler: {type(exc).__name__}: {exc}")
         return 2
 
-    print("  usage: /mcp [list|add|edit NAME|remove NAME|enable NAME|disable NAME|test NAME|doctor [NAME]|tools NAME|auth NAME]")
+    print("  usage: /mcp [list|add|set NAME KEY=VALUE...|edit NAME|remove NAME|enable NAME|disable NAME|test NAME|doctor [NAME]|tools NAME|auth NAME|keyring]")
     return 2
 
 

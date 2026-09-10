@@ -104,6 +104,8 @@ jobs:
             --collect-submodules=aicoder \
             --copy-metadata=aicoder \
             --collect-submodules=keyring \
+            --collect-submodules=secretstorage \
+            --collect-submodules=jeepney \
             --hidden-import=PyQt6.QtWidgets \
             --hidden-import=PyQt6.QtGui \
             --hidden-import=PyQt6.QtCore \

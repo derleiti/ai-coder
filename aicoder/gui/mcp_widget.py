@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (
     QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from ..mcp_registry import MCPServerConfig
+from ..mcp_registry import MCPServerConfig, normalize_server_name
 from ..mcp_service import (
     authentication_status, authorize_and_save_server, authorize_oauth, get_server,
     list_servers, remove_server, required_secret_field, save_server, server_tools,
@@ -40,8 +40,13 @@ class MCPServersWidget(QWidget):
         root.addWidget(self.servers, 1)
 
         right = QVBoxLayout()
-        form = QFormLayout()
+        self.connection_form = QFormLayout()
+        self.connection_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.connection_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        self.connection_form.setHorizontalSpacing(12)
+        self.connection_form.setVerticalSpacing(7)
         self.name = QLineEdit()
+        self.name.setPlaceholderText("e.g. ailinux-dev (spaces are normalized to '-')")
         self.enabled = QCheckBox("Enabled")
         self.enabled.setChecked(True)
         self.transport = QComboBox()
@@ -61,23 +66,27 @@ class MCPServersWidget(QWidget):
         self.deny_tools = QLineEdit()
         self.capability_tags = QLineEdit()
 
-        form.addRow("Name", self.name)
-        form.addRow("Enabled", self.enabled)
-        form.addRow("Transport", self.transport)
-        form.addRow("URL", self.url)
-        form.addRow("stdio Command", self.command)
-        form.addRow("stdio Arguments", self.arguments)
-        form.addRow("Environment allowlist", self.env_names)
-        form.addRow("Timeout (s)", self.timeout)
-        form.addRow("Trust", self.trust)
-        form.addRow("Allow tools", self.allow_tools)
-        form.addRow("Deny tools", self.deny_tools)
-        form.addRow("Capability tags", self.capability_tags)
+        self.connection_form.addRow("Name", self.name)
+        self.connection_form.addRow("Enabled", self.enabled)
+        self.connection_form.addRow("Transport", self.transport)
+        self.connection_form.addRow("URL", self.url)
+        self.connection_form.addRow("stdio Command", self.command)
+        self.connection_form.addRow("stdio Arguments", self.arguments)
+        self.connection_form.addRow("Environment allowlist", self.env_names)
+        self.connection_form.addRow("Timeout (s)", self.timeout)
+        self.connection_form.addRow("Trust", self.trust)
+        self.connection_form.addRow("Allow tools", self.allow_tools)
+        self.connection_form.addRow("Deny tools", self.deny_tools)
+        self.connection_form.addRow("Capability tags", self.capability_tags)
         connection_box = QGroupBox("Connection & Policy")
-        connection_box.setLayout(form)
+        connection_box.setLayout(self.connection_form)
         right.addWidget(connection_box)
 
-        auth_form = QFormLayout()
+        self.auth_form = QFormLayout()
+        self.auth_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.auth_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        self.auth_form.setHorizontalSpacing(12)
+        self.auth_form.setVerticalSpacing(7)
         self.auth = QComboBox()
         self.auth.addItems(["none", "api-key", "bearer", "basic", "oauth2", "custom-header"])
         self.auth.currentTextChanged.connect(self._auth_changed)
@@ -96,18 +105,18 @@ class MCPServersWidget(QWidget):
         self.oauth_authorize = QPushButton("Authorize OAuth")
         self.oauth_authorize.clicked.connect(self.authorize)
 
-        auth_form.addRow("Authentication", self.auth)
-        auth_form.addRow("Username", self.username)
-        auth_form.addRow("Header name", self.auth_header)
-        auth_form.addRow("Credential", self.secret)
-        auth_form.addRow("OAuth Client ID", self.oauth_client_id)
-        auth_form.addRow("Authorization URL", self.oauth_authorization_url)
-        auth_form.addRow("Token URL", self.oauth_token_url)
-        auth_form.addRow("Scopes", self.oauth_scopes)
-        auth_form.addRow("OAuth Client Secret", self.oauth_client_secret)
-        auth_form.addRow("", self.oauth_authorize)
+        self.auth_form.addRow("Authentication", self.auth)
+        self.auth_form.addRow("Username", self.username)
+        self.auth_form.addRow("Header name", self.auth_header)
+        self.auth_form.addRow("Credential", self.secret)
+        self.auth_form.addRow("OAuth Client ID", self.oauth_client_id)
+        self.auth_form.addRow("Authorization URL", self.oauth_authorization_url)
+        self.auth_form.addRow("Token URL", self.oauth_token_url)
+        self.auth_form.addRow("Scopes", self.oauth_scopes)
+        self.auth_form.addRow("OAuth Client Secret", self.oauth_client_secret)
+        self.auth_form.addRow("", self.oauth_authorize)
         auth_box = QGroupBox("Authentication")
-        auth_box.setLayout(auth_form)
+        auth_box.setLayout(self.auth_form)
         right.addWidget(auth_box)
 
         buttons = QGridLayout()
@@ -158,12 +167,19 @@ class MCPServersWidget(QWidget):
         self.remove_button.setEnabled(enabled)
         self.toggle_button.setEnabled(enabled)
 
+    @staticmethod
+    def _set_form_row_visible(form: QFormLayout, field: QWidget, visible: bool) -> None:
+        label = form.labelForField(field)
+        if label is not None:
+            label.setVisible(visible)
+        field.setVisible(visible)
+
     def _transport_changed(self, transport: str) -> None:
         stdio = transport == "stdio"
-        self.command.setVisible(stdio)
-        self.arguments.setVisible(stdio)
-        self.env_names.setVisible(stdio)
-        self.url.setVisible(not stdio)
+        self._set_form_row_visible(self.connection_form, self.command, stdio)
+        self._set_form_row_visible(self.connection_form, self.arguments, stdio)
+        self._set_form_row_visible(self.connection_form, self.env_names, stdio)
+        self._set_form_row_visible(self.connection_form, self.url, not stdio)
         self.auth.setEnabled(not stdio and self.name.isEnabled())
         if stdio:
             self.auth.setCurrentText("none")
@@ -172,15 +188,15 @@ class MCPServersWidget(QWidget):
     def _auth_changed(self, mode: str) -> None:
         http = self.transport.currentText() == "streamable-http"
         editable = self.name.isEnabled() and http
-        self.username.setVisible(mode == "basic")
-        self.auth_header.setVisible(mode in {"api-key", "custom-header"})
-        self.secret.setVisible(mode in {"api-key", "bearer", "basic", "custom-header"})
+        self._set_form_row_visible(self.auth_form, self.username, mode == "basic")
+        self._set_form_row_visible(self.auth_form, self.auth_header, mode in {"api-key", "custom-header"})
+        self._set_form_row_visible(self.auth_form, self.secret, mode in {"api-key", "bearer", "basic", "custom-header"})
         oauth = mode == "oauth2"
         for widget in (
             self.oauth_client_id, self.oauth_authorization_url, self.oauth_token_url,
             self.oauth_scopes, self.oauth_client_secret, self.oauth_authorize,
         ):
-            widget.setVisible(oauth)
+            self._set_form_row_visible(self.auth_form, widget, oauth)
             widget.setEnabled(editable and oauth)
         if mode == "api-key" and not self.auth_header.text().strip():
             self.auth_header.setText("X-API-Key")
@@ -307,8 +323,12 @@ class MCPServersWidget(QWidget):
         except ValueError as exc:
             raise ValueError(f"invalid stdio arguments: {exc}") from exc
         transport = self.transport.currentText()
+        entered_name = self.name.text().strip()
+        normalized_name = normalize_server_name(entered_name)
+        if normalized_name and normalized_name != entered_name:
+            self.name.setText(normalized_name)
         return MCPServerConfig(
-            name=self.name.text().strip(), enabled=self.enabled.isChecked(),
+            name=normalized_name or entered_name, enabled=self.enabled.isChecked(),
             transport=transport, url=self.url.text().strip() if transport == "streamable-http" else "",
             command=self.command.text().strip() if transport == "stdio" else "",
             args=args if transport == "stdio" else [],

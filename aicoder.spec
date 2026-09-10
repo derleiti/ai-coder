@@ -73,6 +73,8 @@ a = Analysis(
         'json',
         'shutil',
         *collect_submodules('keyring'),
+        *collect_submodules('secretstorage'),
+        *collect_submodules('jeepney'),
     ],
     hookspath=[],
     runtime_hooks=[],

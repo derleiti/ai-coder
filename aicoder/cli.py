@@ -117,9 +117,9 @@ def cmd_workspace(args: argparse.Namespace) -> int:
 
 def cmd_mcp(args: argparse.Namespace) -> int:
     action = str(getattr(args, "tool", None) or "").strip().lower()
-    management = {"list", "add", "remove", "enable", "disable", "tools", "doctor", "test", "auth"}
+    management = {"list", "add", "set", "remove", "enable", "disable", "tools", "doctor", "test", "auth", "keyring"}
     if action in management:
-        from .mcp_registry import MCPServerConfig, parse_header_env
+        from .mcp_registry import MCPServerConfig, apply_config_updates, parse_header_env
         from .mcp_service import (
             authentication_status,
             authorize_and_save_server,
@@ -141,6 +141,11 @@ def cmd_mcp(args: argparse.Namespace) -> int:
                     print(f"{row.get('name',''):<20} {str(row.get('transport','')):<16} {'enabled' if row.get('enabled') else 'disabled':<9} {row.get('trust',''):<10} {target}")
                 return 0
 
+            if action == "keyring":
+                from .provider_credentials import credential_store_status
+                print(json.dumps(credential_store_status(), indent=2, ensure_ascii=False, sort_keys=True))
+                return 0
+
             if action == "doctor" and not values:
                 print(json.dumps(doctor(), indent=2, ensure_ascii=False, sort_keys=True))
                 return 0
@@ -150,7 +155,7 @@ def cmd_mcp(args: argparse.Namespace) -> int:
             name = values[0]
 
             if name == "triforce":
-                if action in {"remove", "enable", "disable", "add", "auth"}:
+                if action in {"remove", "enable", "disable", "add", "set", "auth"}:
                     print("Error: built-in TriForce profile is managed by AICoder login/RBAC", file=sys.stderr)
                     return 2
                 _, client = session_client()
@@ -203,6 +208,27 @@ def cmd_mcp(args: argparse.Namespace) -> int:
                     check = authorize_and_save_server(config, secrets=secrets)
                 else:
                     check = save_server(config, secrets=secrets, test=True)
+                print(json.dumps(check, indent=2, ensure_ascii=False, sort_keys=True))
+                return 0
+
+            if action == "set":
+                from .mcp_service import get_server
+                config = get_server(name)
+                if config is None:
+                    print(f"Error: unknown MCP server: {name}", file=sys.stderr)
+                    return 2
+                updates: dict[str, str] = {}
+                for item in values[1:]:
+                    if "=" not in item:
+                        print("Error: mcp set requires KEY=VALUE pairs", file=sys.stderr)
+                        return 2
+                    key, value = item.split("=", 1)
+                    updates[key] = value
+                if not updates:
+                    print("Error: mcp set requires at least one KEY=VALUE pair", file=sys.stderr)
+                    return 2
+                config = apply_config_updates(config, updates)
+                check = save_server(config, test=False)
                 print(json.dumps(check, indent=2, ensure_ascii=False, sort_keys=True))
                 return 0
 
@@ -1494,7 +1520,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # mcp
     p = sub.add_parser("mcp", help="Manage MCP servers, call TriForce tools, or serve an approved local provider")
-    p.add_argument("tool", nargs="?", help="list/add/remove/enable/disable/tools/doctor/serve, or a TriForce backend tool")
+    p.add_argument("tool", nargs="?", help="list/add/set/remove/enable/disable/tools/doctor/keyring/serve, or a TriForce backend tool")
     p.add_argument("arg", nargs="*", help="Server name for registry actions, or key=value for a direct TriForce tool")
     p.add_argument("--mode", default=None, help="Spinner-Modus (work/swarm/hive)")
     p.add_argument("--plugin", default="local-os", help="Local provider for 'mcp serve' (default: local-os)")

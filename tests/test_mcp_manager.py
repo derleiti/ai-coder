@@ -82,6 +82,30 @@ class RegistryAndPolicyTests(unittest.TestCase):
                     auth_type="custom-header", auth_header=header,
                 ))
 
+    def test_human_server_name_normalization_and_update_helper(self):
+        from aicoder.mcp_registry import apply_config_updates, normalize_server_name
+        self.assertEqual(normalize_server_name("AILinuX Dev MCP Server"), "AILinuX-Dev-MCP-Server")
+        base = MCPServerConfig(name="demo", command=sys.executable)
+        updated = apply_config_updates(base, {
+            "url": "https://example.invalid/mcp",
+            "auth": "basic",
+            "username": "zombie",
+            "timeout": "45",
+        })
+        self.assertEqual(updated.transport, "streamable-http")
+        self.assertEqual(updated.url, "https://example.invalid/mcp")
+        self.assertEqual(updated.auth_type, "basic")
+        self.assertEqual(updated.auth_username, "zombie")
+        self.assertEqual(updated.timeout, 45)
+        self.assertEqual(updated.command, "")
+
+    def test_dotted_server_name_routes_to_longest_registered_id(self):
+        from aicoder.mcp_registry import split_namespaced_tool
+        self.assertEqual(
+            split_namespaced_tool("mcp.api.ailinux.me.echo", ["api", "api.ailinux.me"]),
+            ("api.ailinux.me", "echo"),
+        )
+
     def test_namespace_is_stable_and_collision_resistant(self):
         self.assertEqual(namespaced_tool_name("github", "search_code"), "mcp.github.search_code")
         self.assertNotEqual(namespaced_tool_name("github", "search"), namespaced_tool_name("docs", "search"))
@@ -458,6 +482,34 @@ class SurfaceIntegrationTests(unittest.TestCase):
             self.assertEqual(cmd_mcp(args), 0)
         shared.assert_called_once()
 
+    def test_cli_set_updates_existing_server_through_shared_service(self):
+        args = build_parser().parse_args(["mcp", "set", "demo", "timeout=45", "trust=trusted"])
+        existing = MCPServerConfig(name="demo", command=sys.executable)
+        with (
+            patch("aicoder.mcp_service.get_server", return_value=existing),
+            patch("aicoder.mcp_service.save_server", return_value={"name":"demo","ok":True}) as save,
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(cmd_mcp(args), 0)
+        config = save.call_args.args[0]
+        self.assertEqual(config.timeout, 45)
+        self.assertEqual(config.trust, "trusted")
+        self.assertFalse(save.call_args.kwargs["test"])
+
+    def test_cli_set_rejects_builtin_triforce(self):
+        args = build_parser().parse_args(["mcp", "set", "triforce", "timeout=45"])
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(cmd_mcp(args), 2)
+
+    def test_cli_keyring_reports_secret_free_backend_status(self):
+        args = build_parser().parse_args(["mcp", "keyring"])
+        output = io.StringIO()
+        with patch("aicoder.provider_credentials.credential_store_status", return_value={"available":True,"backend":"test.Backend","error":""}), redirect_stdout(output):
+            self.assertEqual(cmd_mcp(args), 0)
+        data = json.loads(output.getvalue())
+        self.assertTrue(data["available"])
+        self.assertEqual(data["backend"], "test.Backend")
+
     def test_cli_doctor_without_name_uses_shared_service(self):
         args = build_parser().parse_args(["mcp", "doctor"])
         with patch("aicoder.mcp_service.doctor", return_value=[]) as shared, redirect_stdout(io.StringIO()):
@@ -474,6 +526,19 @@ class SurfaceIntegrationTests(unittest.TestCase):
         with patch("aicoder.mcp_service.list_servers", return_value=rows) as shared, redirect_stdout(io.StringIO()):
             self.assertEqual(_repl_mcp_command("list"), 0)
         shared.assert_called_once()
+
+    def test_repl_set_updates_existing_server(self):
+        existing = MCPServerConfig(name="demo", command=sys.executable)
+        output = io.StringIO()
+        with (
+            patch("aicoder.mcp_service.get_server", return_value=existing),
+            patch("aicoder.mcp_service.save_server", return_value={"name":"demo","ok":True}) as save,
+            redirect_stdout(output),
+        ):
+            self.assertEqual(_repl_mcp_command("set demo timeout=50 trust=trusted"), 0)
+        config = save.call_args.args[0]
+        self.assertEqual(config.timeout, 50)
+        self.assertEqual(config.trust, "trusted")
 
     def test_repl_rejects_secret_argument_before_service_call(self):
         output = io.StringIO()
@@ -501,6 +566,15 @@ class SurfaceIntegrationTests(unittest.TestCase):
             widget = widget_module.MCPServersWidget()
             widget._load("triforce")
             self.assertFalse(widget.name.isEnabled())
+            widget.clear()
+            widget.name.setText("AILinuX Dev MCP Server")
+            widget.transport.setCurrentText("streamable-http")
+            widget.url.setText("https://example.invalid/mcp")
+            config = widget._config()
+            self.assertEqual(config.name, "AILinuX-Dev-MCP-Server")
+            self.assertFalse(widget.url.isHidden())
+            self.assertTrue(widget.command.isHidden())
+            self.assertTrue(widget.connection_form.labelForField(widget.command).isHidden())
             widget.clear()
             self.assertTrue(widget.name.isEnabled())
             self.assertEqual(widget.secret.text(), "")
