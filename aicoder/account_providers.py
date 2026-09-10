@@ -730,13 +730,28 @@ def connect_account(provider: str, *, open_browser: bool = True) -> dict[str, An
         if existing.get("authenticated"):
             set_provider_linked(spec.id, True)
             return {"provider": spec.id, "started": False, "authenticated": True, "account": existing}
-        exit_code = _launch_terminal([executable, "auth", "login"], title="AICoder · Claude Login", wait=True)
-        status = _claude_status()
-        if exit_code not in (0, None) or not status.get("authenticated"):
-            set_provider_linked(spec.id, False)
-            raise ClientError("Claude login finished but Claude Code does not report an authenticated account")
-        set_provider_linked(spec.id, True)
-        return {"provider": spec.id, "started": True, "authenticated": True, "account": status}
+
+        # Claude Code may hand browser OAuth off and let `claude auth login`
+        # return before the browser callback has updated the local account.
+        # Keep the terminal shell open and treat the documented auth-status JSON
+        # as the authoritative completion signal instead of terminal exit.
+        _launch_terminal(
+            [executable, "auth", "login", "--claudeai"],
+            title="AICoder · Claude Login",
+            wait=False,
+        )
+        deadline = time.monotonic() + 300
+        status: dict[str, Any] = {}
+        while time.monotonic() < deadline:
+            status = _claude_status()
+            if status.get("authenticated"):
+                set_provider_linked(spec.id, True)
+                return {"provider": spec.id, "started": True, "authenticated": True, "account": status}
+            time.sleep(1.0)
+        set_provider_linked(spec.id, False)
+        raise ClientError(
+            "Claude login timed out after 5 minutes. Finish the browser login and press Connect again."
+        )
     if spec.id == "mistral":
         exit_code = _launch_terminal([executable, "--setup"], title="AICoder · Mistral Login", wait=True)
         if exit_code not in (0, None):

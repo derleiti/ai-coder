@@ -209,6 +209,30 @@ class ClaudeAccountStatusTests(unittest.TestCase):
         self.assertIn("Nicht angemeldet", status["detail"])
         set_linked.assert_called_once_with("claude", False)
 
+    def test_claude_login_keeps_terminal_open_and_polls_official_status(self):
+        logged_out = {
+            "provider": "claude", "linked": False, "installed": True,
+            "authenticated": False, "detail": "Nicht angemeldet",
+        }
+        logged_in = {
+            "provider": "claude", "linked": True, "installed": True,
+            "authenticated": True, "detail": "Verbunden · claude.ai",
+        }
+        with patch("aicoder.account_providers.ensure_provider_client", return_value="/home/test/.local/bin/claude"), \
+             patch("aicoder.account_providers._claude_status", side_effect=[logged_out, logged_out, logged_in]), \
+             patch("aicoder.account_providers._launch_terminal", return_value=None) as terminal, \
+             patch("aicoder.account_providers.time.sleep"), \
+             patch("aicoder.account_providers.set_provider_linked") as linked:
+            result = connect_account("claude")
+        terminal.assert_called_once_with(
+            ["/home/test/.local/bin/claude", "auth", "login", "--claudeai"],
+            title="AICoder · Claude Login",
+            wait=False,
+        )
+        self.assertTrue(result["authenticated"])
+        self.assertTrue(result["started"])
+        linked.assert_called_once_with("claude", True)
+
     def test_authenticated_claude_exposes_latest_alias_models(self):
         with patch("aicoder.account_providers.account_status", return_value={
             "provider": "claude", "linked": True, "installed": True, "authenticated": True,
