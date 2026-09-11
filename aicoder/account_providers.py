@@ -1059,18 +1059,25 @@ def connect_account(provider: str, *, open_browser: bool = True) -> dict[str, An
         set_provider_linked(spec.id, True)
         return {"provider": spec.id, "started": True, "authenticated": None}
     if spec.id == "gemini":
-        # Antigravity CLI performs Google OAuth in its interactive TUI. Reuse a
-        # valid shared Antigravity session if present, otherwise open the TUI and
-        # verify authentication with the documented `agy models` command.
+        # Antigravity is a long-lived interactive TUI: successful OAuth does not
+        # necessarily make the `agy` process exit. Waiting for the terminal
+        # therefore leaves the Settings worker stuck at "Client wird geprüft".
+        # Launch it detached and use `agy models` as the authoritative login
+        # signal, just like Claude uses its provider-owned auth status.
         if _antigravity_authenticated(executable):
             set_provider_linked(spec.id, True)
             return {"provider": spec.id, "started": False, "authenticated": True}
-        exit_code = _launch_terminal([executable], title="AICoder · Google Antigravity Login", wait=True)
-        if exit_code not in (0, None) or not _antigravity_authenticated(executable):
-            set_provider_linked(spec.id, False)
-            raise ClientError("Antigravity login finished but the official agy client is not authenticated")
-        set_provider_linked(spec.id, True)
-        return {"provider": spec.id, "started": True, "authenticated": True}
+        _launch_terminal([executable], title="AICoder · Google Antigravity Login", wait=False)
+        deadline = time.monotonic() + 300
+        while time.monotonic() < deadline:
+            if _antigravity_authenticated(executable, timeout=8):
+                set_provider_linked(spec.id, True)
+                return {"provider": spec.id, "started": True, "authenticated": True}
+            time.sleep(1.0)
+        set_provider_linked(spec.id, False)
+        raise ClientError(
+            "Antigravity login timed out after 5 minutes. Finish the Google login and press Connect again."
+        )
     raise ClientError(f"Unsupported account provider: {spec.id}")
 
 

@@ -56,6 +56,7 @@ DIRECT_PROVIDERS: tuple[DirectProviderSpec, ...] = (
     DirectProviderSpec("cerebras", (), "https://api.cerebras.ai/v1"),
     DirectProviderSpec("nvidia", (), "https://integrate.api.nvidia.com/v1"),
     DirectProviderSpec("anthropic", (), "https://api.anthropic.com/v1"),
+    DirectProviderSpec("ollama", (), "http://127.0.0.1:11434/v1"),
 )
 
 

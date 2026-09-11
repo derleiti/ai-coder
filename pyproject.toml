@@ -19,6 +19,7 @@ dependencies = [
   "pyte>=0.8.2",
   "websockets>=16.1.1",
   "keyring>=25.7.0",
+  "huggingface_hub>=0.35.0",
   "tomli>=2.1.0; python_version < '3.11'",
 ]
 

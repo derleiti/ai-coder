@@ -253,3 +253,18 @@ class OpenAICompatibleTransportTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_provider_routing_sends_ollama_to_local_loopback_without_key(monkeypatch):
+    from aicoder.model_transport import ProviderRoutingTransport, OpenAICompatibleTransport
+
+    class Default:
+        timeout = 30
+        def chat(self, **kwargs):
+            raise AssertionError("TriForce/default transport must not receive local Ollama requests")
+
+    router = ProviderRoutingTransport(Default())
+    transport = router._transport_for_model("ollama/hf-qwen:q4_k_m")
+    assert isinstance(transport, OpenAICompatibleTransport)
+    assert transport.base_url == "http://127.0.0.1:11434/v1"
+    assert transport.api_key == ""

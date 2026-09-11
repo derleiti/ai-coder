@@ -526,21 +526,28 @@ class AccountInstallAndLoginTests(unittest.TestCase):
 
     def test_gemini_is_linked_only_after_login_verification(self):
         with patch("aicoder.account_providers.ensure_provider_client", return_value="/home/test/.local/bin/agy"), \
-             patch("aicoder.account_providers._launch_terminal", return_value=0), \
+             patch("aicoder.account_providers._launch_terminal", return_value=None) as terminal, \
              patch("aicoder.account_providers._antigravity_authenticated", side_effect=[False, True]), \
              patch("aicoder.account_providers.set_provider_linked") as linked:
             result = connect_account("gemini")
+        terminal.assert_called_once_with(
+            ["/home/test/.local/bin/agy"], title="AICoder · Google Antigravity Login", wait=False
+        )
         linked.assert_called_once_with("gemini", True)
         self.assertTrue(result["authenticated"])
 
-    def test_gemini_failed_verification_is_not_left_linked(self):
+    def test_gemini_login_does_not_wait_for_long_lived_tui_to_exit(self):
         with patch("aicoder.account_providers.ensure_provider_client", return_value="/home/test/.local/bin/agy"), \
-             patch("aicoder.account_providers._launch_terminal", return_value=0), \
-             patch("aicoder.account_providers._antigravity_authenticated", side_effect=[False, False]), \
-             patch("aicoder.account_providers.set_provider_linked") as linked:
-            with self.assertRaisesRegex(ClientError, "not authenticated"):
-                connect_account("gemini")
-        linked.assert_called_once_with("gemini", False)
+             patch("aicoder.account_providers._launch_terminal", return_value=None) as terminal, \
+             patch("aicoder.account_providers._antigravity_authenticated", side_effect=[False, False, True]), \
+             patch("aicoder.account_providers.time.sleep"), \
+             patch("aicoder.account_providers.set_provider_linked"):
+            result = connect_account("gemini")
+        terminal.assert_called_once_with(
+            ["/home/test/.local/bin/agy"], title="AICoder · Google Antigravity Login", wait=False
+        )
+        self.assertTrue(result["authenticated"])
+
 
 
 if __name__ == "__main__":

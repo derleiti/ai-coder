@@ -21,6 +21,7 @@ from ..workspace import sync_active_workspace
 from ..provider_credentials import (
     CredentialStoreError, credential_summary, delete_provider_key, set_provider_key,
 )
+from .local_models_widget import LocalModelsWidget
 from ..account_providers import (
     ACCOUNT_PROVIDERS, account_statuses, connect_account, disconnect_account, linked_account_catalog,
 )
@@ -519,6 +520,15 @@ class SettingsWidget(QWidget):
 
         tools_group.setLayout(tools_layout)
         layout.addWidget(tools_group, stretch=1)
+
+        # --- Local Models / Hugging Face GGUF hosting ---
+        local_group = QGroupBox("Lokale Modelle · Hugging Face → Ollama")
+        local_layout = QVBoxLayout(local_group)
+        self.local_models = LocalModelsWidget()
+        self.local_models.model_selected.connect(self._select_local_model)
+        self.local_models.models_changed.connect(self._load_models)
+        local_layout.addWidget(self.local_models)
+        layout.addWidget(local_group)
 
         # --- Schema-driven settings not represented by the dedicated controls above ---
         handled = {
@@ -1162,6 +1172,19 @@ class SettingsWidget(QWidget):
         self._models = []
         self.tool_list.clear()
         self._tools = []
+
+    def _select_local_model(self, model: str):
+        model = str(model or "").strip()
+        if not model:
+            return
+        if self.model_combo.findText(model) < 0:
+            self.model_combo.addItem(model)
+        self.model_combo.setCurrentText(model)
+        set_model(model)
+        self.model_status.setText(f"Lokales Basismodell: {model}")
+        self.model_status.setStyleSheet("color: #00ff88; font-size: 11px;")
+        self._settings_snapshot = self._state_signature(get_state())
+        self.selection_changed.emit(model)
 
     def _save_model_config(self):
         model = self.model_combo.currentText().strip()

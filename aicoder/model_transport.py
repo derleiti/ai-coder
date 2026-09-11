@@ -478,6 +478,18 @@ class ProviderRoutingTransport:
         spec = direct_provider_spec(provider) if provider else None
         if not spec or not spec.direct_supported or not spec.base_url:
             return self.default
+
+        # Local Ollama is an explicit provider namespace and never needs a key.
+        # Route it directly to loopback so locally hosted GGUF models do not make
+        # a pointless round-trip through TriForce or require the backend to know
+        # anything about this workstation.
+        if provider == "ollama":
+            cached = self._direct.get(provider)
+            if cached is None:
+                cached = OpenAICompatibleTransport(spec.base_url, api_key="", timeout=self.timeout)
+                self._direct[provider] = cached
+            return cached
+
         api_key, source = provider_api_key(provider)
         # Existing provider environment variables historically served diagnostics
         # only. Do not silently change routing for users who already have them.
