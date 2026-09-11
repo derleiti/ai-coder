@@ -1,3 +1,7 @@
+## v1.2.6 (2026-09-11)
+
+- Align MCP executor regression coverage with the shared MCP service routing layer used by local and Notify-shared servers.
+
 ## v1.2.5 (2026-09-11)
 
 - Shared Notify/MCP sharing, main-chat integration, Future Lab, browser authentication and local Hugging Face hosting consolidated for the current stack release.
