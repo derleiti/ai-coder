@@ -160,7 +160,15 @@ class NotifyConversationWidget(QWidget):
         if not state.enabled or not state.endpoint_id:
             self.status.setText("Shared Notify is disabled")
             return
-        payload = {"sender_endpoint_id": state.endpoint_id, "kind": "human_chat", "body": body}
+        payload = {
+            "sender_endpoint_id": state.endpoint_id,
+            "kind": "human_chat",
+            "body": body,
+            # A conversation message is interactive by definition. Published AI
+            # endpoints may answer once; their reply explicitly disables further
+            # replies to prevent AI ping-pong.
+            "metadata": {"expect_reply": True},
+        }
         self.input.clear()
         self.send_button.setEnabled(False)
 

@@ -350,13 +350,23 @@ def poll_once(*, dispatch_ai: bool = True) -> dict[str, Any]:
                         directory = client.notify_directory().get("endpoints") or []
                         sender = next((row for row in directory if row.get("endpoint_id") == sender_id), None)
                         if sender and msg.get("hop_count", 0) < 8:
+                            incoming_meta = msg.get("metadata") if isinstance(msg.get("metadata"), dict) else {}
+                            reply_meta = {
+                                "expect_reply": False,
+                                "in_reply_to": message_id,
+                            }
+                            conversation_id = str(incoming_meta.get("conversation_id") or "")
+                            if conversation_id:
+                                reply_meta["conversation_id"] = conversation_id
                             client.notify_send({
                                 "target": sender.get("handle"), "kind": "ai_optimization",
                                 "title": f"Re: {msg.get('title') or 'Shared Notify'}", "body": reply,
                                 "sender_endpoint_id": endpoint_id, "thread_id": msg.get("thread_id") or "",
+                                # correlation_id points to the parent logical message for tracing,
+                                # while history deduplication uses logical_message_id only.
                                 "correlation_id": msg.get("correlation_id") or message_id,
                                 "hop_count": int(msg.get("hop_count") or 0) + 1,
-                                "metadata": {"expect_reply": False},
+                                "metadata": reply_meta,
                             })
                 except Exception as exc:
                     errors.append(f"dispatch:{endpoint_id}:{type(exc).__name__}")

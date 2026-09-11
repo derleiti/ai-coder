@@ -137,3 +137,27 @@ def test_client_inbox_is_queued_before_ack(monkeypatch, tmp_path):
     assert result["messages"] == 1
     assert rows[0]["message_id"] == "msg_1"
     assert calls == [("ep_client", "msg_1")]
+
+
+def test_ai_reply_preserves_conversation_routing_and_disables_ping_pong(monkeypatch, tmp_path):
+    from aicoder import shared_notify as shared
+    monkeypatch.setattr(shared, "STATE_FILE", tmp_path / "reply-state.json")
+    shared.save_shared_notify_state(shared.SharedNotifyState(enabled=True, device_id="d", endpoint_id="ep_human", handle="@zombie", published_ai={"ep_ai":{"endpoint_id":"ep_ai","handle":"@claude","model":"fake/model"}}))
+    sent = []
+    class Client:
+        def notify_heartbeat(self, payload): return {}
+        def notify_presence(self, payload): return {}
+        def notify_inbox(self, endpoint_id, limit=20):
+            if endpoint_id == "ep_ai":
+                return {"messages":[{"message_id":"m1","sender_endpoint_id":"ep_human","title":"","body":"hi","thread_id":"thr","correlation_id":"grp1","hop_count":0,"metadata":{"expect_reply":True,"conversation_id":"conv1"}}]}
+            return {"messages":[]}
+        def notify_ack(self, endpoint_id, message_id): return {}
+        def notify_directory(self): return {"endpoints":[{"endpoint_id":"ep_human","handle":"@zombie"}]}
+        def notify_send(self, payload): sent.append(payload); return {}
+    monkeypatch.setattr(shared, "_client", lambda: Client())
+    monkeypatch.setattr(shared, "heartbeat", lambda **kwargs: {})
+    monkeypatch.setattr(shared, "_local_model_reply", lambda *args, **kwargs: "hello")
+    result = shared.poll_once(dispatch_ai=True)
+    assert result["dispatched"] == 1
+    assert sent[0]["metadata"]["conversation_id"] == "conv1"
+    assert sent[0]["metadata"]["expect_reply"] is False
