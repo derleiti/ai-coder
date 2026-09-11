@@ -345,17 +345,30 @@ class SharedNotifyWidget(QWidget):
         self._render_directory(directory)
         self._render_conversations(conversations)
 
-    def _selected_endpoint_handles(self):
-        handles = []
+    def _selected_endpoints(self):
+        rows = []
         for index in self.directory.selectionModel().selectedRows():
             item = self.directory.item(index.row(), 0)
-            if item and item.text().strip():
-                handles.append(item.text().strip().lstrip("●○ "))
-        return handles
+            handle = item.text().strip().lstrip("●○ ") if item else ""
+            row = next((r for r in self._directory_rows if str(r.get("handle") or "").lstrip("@") == handle.lstrip("@")), None)
+            if row is not None:
+                rows.append(row)
+        return rows
+
+    def _selected_endpoint_handles(self):
+        return [str(row.get("handle") or "") for row in self._selected_endpoints() if row.get("handle")]
 
     def open_selected_chat(self):
-        handles = self._selected_endpoint_handles()
+        endpoints = self._selected_endpoints()
+        handles = [str(row.get("handle") or "") for row in endpoints if row.get("handle")]
         if not handles:
+            return
+        mcp_rows = [row for row in endpoints if str(row.get("kind") or "").lower() == "mcp"]
+        if mcp_rows:
+            QMessageBox.information(
+                self, "Shared MCP",
+                "MCP shares are tool endpoints, not chat participants. Use them through the shared MCP tool interface or an AI controller."
+            )
             return
         if len(handles) == 1:
             self._create_conversation(handles, kind="direct")

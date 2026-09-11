@@ -259,6 +259,60 @@ def set_model_presence(model: str | None, **updates: Any) -> None:
             pass
 
 
+def unpublish_ai(identifier: str) -> bool:
+    """Disable one locally published AI endpoint and forget its local publication state."""
+    state = load_shared_notify_state(create_identity=False)
+    key = str(identifier or "").strip().lstrip("@")
+    match = next((
+        (eid, row) for eid, row in state.published_ai.items()
+        if eid == identifier
+        or str(row.get("handle") or "").lstrip("@") == key
+        or str(row.get("model") or "") == identifier
+    ), None)
+    if match is None:
+        return False
+    eid, _row = match
+    try:
+        _client().notify_disable(eid)
+    finally:
+        state.published_ai.pop(eid, None)
+        save_shared_notify_state(state)
+    return True
+
+
+def reconcile_published_mcp(*, client: TriForceClient | None = None) -> list[str]:
+    """Retire MCP shares whose local server disappeared or was disabled.
+
+    A publication is an explicit durable choice while the local MCP exists.
+    Removing/disabling that MCP is an equally explicit unpublish signal.
+    """
+    from .mcp_service import get_server
+
+    state = load_shared_notify_state(create_identity=False)
+    if not state.enabled or not state.published_mcp:
+        return []
+    api = client or _client()
+    retired: list[str] = []
+    changed = False
+    for endpoint_id, row in list(state.published_mcp.items()):
+        server = str(row.get("server") or "").strip()
+        config = get_server(server) if server else None
+        if config is not None and bool(config.enabled):
+            continue
+        try:
+            api.notify_disable(endpoint_id)
+        except Exception:
+            # Do not heartbeat a stale share merely because retirement could not
+            # reach the server. Keep it locally so a later reconciliation retries.
+            continue
+        state.published_mcp.pop(endpoint_id, None)
+        retired.append(endpoint_id)
+        changed = True
+    if changed:
+        save_shared_notify_state(state)
+    return retired
+
+
 def publish_ai(handle: str, model: str) -> dict[str, Any]:
     state = load_shared_notify_state()
     if not state.enabled:
@@ -501,6 +555,9 @@ def poll_once(*, dispatch_ai: bool = True) -> dict[str, Any]:
         return {"enabled": False, "messages": 0, "dispatched": 0}
     client = _client()
     heartbeat(availability="available", activity="idle")
+    # A removed/disabled local MCP must not be resurrected by the heartbeat loop.
+    reconcile_published_mcp(client=client)
+    state = load_shared_notify_state(create_identity=False)
     total = 0
     dispatched = 0
     errors: list[str] = []

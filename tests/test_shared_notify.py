@@ -196,6 +196,7 @@ def test_poll_dispatches_shared_mcp_rpc_and_acks(tmp_path, monkeypatch):
     }]
     fake.notify_directory = lambda include_offline=True: {"endpoints": [{"endpoint_id": "ep_remote", "handle": "@remote"}]}
     import aicoder.mcp_service as service
+    monkeypatch.setattr(service, "get_server", lambda name: SimpleNamespace(enabled=True) if name == "GIMP MCP" else None)
     monkeypatch.setattr(service, "call_external_tool", lambda name, args: (f"called:{name}:{args['name']}", False))
     result = sn.poll_once(dispatch_ai=False)
     assert result["dispatched"] == 1
@@ -221,3 +222,58 @@ def test_shared_mcp_response_is_consumed_as_rpc_not_chat(tmp_path, monkeypatch):
     sn.poll_once(dispatch_ai=False)
     assert sn.drain_received_messages() == []
     assert sn._pop_rpc_response("rpc_x")["message_id"] == "m2"
+
+
+def test_unpublish_ai_disables_endpoint_and_forgets_local_state(tmp_path, monkeypatch):
+    fake = FakeClient()
+    monkeypatch.setattr(sn, "STATE_FILE", tmp_path / "state-ai-unpublish.json")
+    monkeypatch.setattr(sn, "_client", lambda: fake)
+    sn.save_shared_notify_state(sn.SharedNotifyState(
+        enabled=True, device_id="dev_test", endpoint_id="ep_client", handle="@me",
+        published_ai={"ep_ai": {"endpoint_id": "ep_ai", "handle": "@mistral-old", "model": "account:mistral/old"}},
+    ))
+    disabled = []
+    fake.notify_disable = lambda endpoint_id: disabled.append(endpoint_id) or {"ok": True}
+    assert sn.unpublish_ai("@mistral-old") is True
+    assert disabled == ["ep_ai"]
+    assert sn.load_shared_notify_state().published_ai == {}
+
+
+def test_reconcile_retires_missing_or_disabled_mcp_shares(tmp_path, monkeypatch):
+    fake = FakeClient()
+    monkeypatch.setattr(sn, "STATE_FILE", tmp_path / "state-mcp-reconcile.json")
+    monkeypatch.setattr(sn, "_client", lambda: fake)
+    sn.save_shared_notify_state(sn.SharedNotifyState(
+        enabled=True, device_id="dev_test", endpoint_id="ep_client", handle="@me",
+        published_mcp={
+            "ep_live": {"endpoint_id": "ep_live", "handle": "@live", "server": "Live"},
+            "ep_gone": {"endpoint_id": "ep_gone", "handle": "@gone", "server": "Gone"},
+            "ep_off": {"endpoint_id": "ep_off", "handle": "@off", "server": "Disabled"},
+        },
+    ))
+    import aicoder.mcp_service as service
+    configs = {"Live": SimpleNamespace(enabled=True), "Disabled": SimpleNamespace(enabled=False)}
+    monkeypatch.setattr(service, "get_server", lambda name: configs.get(name))
+    disabled = []
+    fake.notify_disable = lambda endpoint_id: disabled.append(endpoint_id) or {"ok": True}
+    assert set(sn.reconcile_published_mcp(client=fake)) == {"ep_gone", "ep_off"}
+    assert set(disabled) == {"ep_gone", "ep_off"}
+    assert set(sn.load_shared_notify_state().published_mcp) == {"ep_live"}
+
+
+def test_poll_does_not_heartbeat_retired_mcp(tmp_path, monkeypatch):
+    fake = FakeClient()
+    monkeypatch.setattr(sn, "STATE_FILE", tmp_path / "state-mcp-poll-reconcile.json")
+    monkeypatch.setattr(sn, "_client", lambda: fake)
+    monkeypatch.setattr(sn, "heartbeat", lambda **kwargs: {})
+    sn.save_shared_notify_state(sn.SharedNotifyState(
+        enabled=True, device_id="dev_test", endpoint_id="ep_client", handle="@me",
+        published_mcp={"ep_gone": {"endpoint_id": "ep_gone", "handle": "@gone", "server": "Gone"}},
+    ))
+    import aicoder.mcp_service as service
+    monkeypatch.setattr(service, "get_server", lambda name: None)
+    disabled = []
+    fake.notify_disable = lambda endpoint_id: disabled.append(endpoint_id) or {"ok": True}
+    sn.poll_once(dispatch_ai=False)
+    assert disabled == ["ep_gone"]
+    assert not any(row.get("endpoint_id") == "ep_gone" for row in fake.presence)
