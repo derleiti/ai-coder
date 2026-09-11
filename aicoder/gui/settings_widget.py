@@ -15,6 +15,7 @@ from ..session_state import (
     set_approval_mode, set_native_openrouter_tool_calling,
 )
 from ..client import TriForceClient, model_identifier
+from ..browser_auth import browser_login
 from .. import settings as settings_core
 from ..executor import load_tools
 from ..workspace import sync_active_workspace
@@ -46,6 +47,22 @@ class _LoginWorker(QThread):
             self.success.emit(result)
         except Exception as e:
             self.error.emit(str(e))
+
+
+class _BrowserLoginWorker(QThread):
+    """Runs the loopback/PKCE browser login without blocking the Qt UI."""
+    success = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    def __init__(self, base_url):
+        super().__init__()
+        self._base_url = base_url
+
+    def run(self):
+        try:
+            self.success.emit(browser_login(self._base_url, "ailinux-ai-coder"))
+        except Exception as exc:
+            self.error.emit(str(exc))
 
 
 class _ModelLoader(QThread):
@@ -213,10 +230,13 @@ class SettingsWidget(QWidget):
         btn_row = QHBoxLayout()
         self.login_btn = QPushButton("Login")
         self.login_btn.clicked.connect(self._do_login)
+        self.browser_login_btn = QPushButton("Continue with Google in browser")
+        self.browser_login_btn.clicked.connect(self._do_browser_login)
         self.logout_btn = QPushButton("Logout")
         self.logout_btn.clicked.connect(self._do_logout)
         self.status_label = QLabel("")
         btn_row.addWidget(self.login_btn)
+        btn_row.addWidget(self.browser_login_btn)
         btn_row.addWidget(self.logout_btn)
         btn_row.addWidget(self.status_label)
         btn_row.addStretch()
@@ -1141,6 +1161,29 @@ class SettingsWidget(QWidget):
         self._login_worker.success.connect(lambda r: self._on_login_success(r, base_url, email))
         self._login_worker.error.connect(self._on_login_error)
         self._login_worker.start()
+
+    def _do_browser_login(self):
+        base_url = self.base_url_edit.text().strip() or DEFAULT_BASE_URL
+        self.browser_login_btn.setEnabled(False)
+        self.status_label.setText("Opening secure browser login...")
+        self.status_label.setStyleSheet("color: #888; font-size: 11px;")
+        self._browser_login_worker = _BrowserLoginWorker(base_url)
+        self._browser_login_worker.success.connect(
+            lambda result: self._on_browser_login_success(result, base_url)
+        )
+        self._browser_login_worker.error.connect(self._on_browser_login_error)
+        self._browser_login_worker.start()
+
+    def _on_browser_login_success(self, result, base_url):
+        self.browser_login_btn.setEnabled(True)
+        email = result.get("user_id") or result.get("email") or ""
+        self._on_login_success(result, base_url, email)
+
+    def _on_browser_login_error(self, msg):
+        self.browser_login_btn.setEnabled(True)
+        self.status_label.setText("Browser login failed")
+        self.status_label.setStyleSheet("color: #ff6b6b; font-size: 11px;")
+        QMessageBox.critical(self, "Browser login failed", msg)
 
     def _on_login_success(self, result, base_url, email):
         self.login_btn.setEnabled(True)

@@ -159,13 +159,25 @@ class NotifyConversationWidget(QWidget):
                 label = "You"
             else:
                 label = safe_sender
-            meta = f" [{kind}]"
+            metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+            marker = ""
+            if metadata.get("future_lab"):
+                round_no = metadata.get("future_lab_round")
+                marker = f" 🧠 Future Lab R{round_no}" if round_no else " 🧠 Future Lab"
+            elif kind == "brainstorm":
+                marker = " 💡"
+            meta = f" [{kind}]{marker}"
             if title:
                 meta += " · " + html.escape(title)
             if me:
                 body = body.replace(f"@{html.escape(me)}", f"<b>@{html.escape(me)}</b>")
             self.log.append(f"<b>{label}</b><span style='color:#777'>{meta}</span><br>{body}<hr>")
-        self.status.setText(f"{len(messages)} messages · synced")
+        future_rounds = [
+            int((m.get("metadata") or {}).get("future_lab_round") or 0)
+            for m in messages if isinstance(m.get("metadata"), dict) and (m.get("metadata") or {}).get("future_lab")
+        ]
+        suffix = f" · 🧠 Future Lab round {max(future_rounds)}" if future_rounds else ""
+        self.status.setText(f"{len(messages)} messages · synced{suffix}")
 
     def send_message(self):
         body = self.input.text().strip()

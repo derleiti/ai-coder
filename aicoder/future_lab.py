@@ -7,7 +7,7 @@ from __future__ import annotations
 import json, secrets, time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from .config import CONFIG_DIR, atomic_write_private
 from . import shared_notify as shared
 
@@ -75,7 +75,12 @@ def save_run(run):
     RUN_DIR.mkdir(parents=True,exist_ok=True); path=RUN_DIR/f"{run.run_id}.json"
     atomic_write_private(path,json.dumps(asdict(run),indent=2,ensure_ascii=False)+"\n"); return path
 
-def run_future_lab(config: FutureLabConfig):
+def run_future_lab(
+    config: FutureLabConfig,
+    *,
+    on_conversation: Callable[[dict[str, Any]], None] | None = None,
+    on_round: Callable[[dict[str, Any]], None] | None = None,
+):
     topic=str(config.topic or "").strip()
     if not topic: raise ValueError("Future Lab topic is required")
     rounds=max(2,min(int(config.rounds or 3),6)); state=shared.load_shared_notify_state(create_identity=False)
@@ -85,19 +90,26 @@ def run_future_lab(config: FutureLabConfig):
     if len(participants)<2: raise RuntimeError("Future Lab requires at least two online AI endpoints accepting AI chat")
     handles=[_handle(r.get("handle","")) for r in participants]
     created=client.notify_conversation_create(f"Future Lab: {topic[:80]}",state.endpoint_id,handles,kind="group")
-    cid=str((created.get("conversation") or {}).get("conversation_id") or "")
+    conversation = dict(created.get("conversation") or {})
+    cid=str(conversation.get("conversation_id") or "")
     if not cid: raise RuntimeError("Future Lab conversation creation returned no conversation_id")
-    run=FutureLabRun("fl_"+secrets.token_urlsafe(10).replace("-","_"),topic,cid,handles,[],[],"running",int(time.time())); save_run(run)
+    run=FutureLabRun("fl_"+secrets.token_urlsafe(10).replace("-","_"),topic,cid,handles,[],[],"running",int(time.time()))
+    save_run(run)
+    if on_conversation is not None:
+        on_conversation({**conversation, "future_lab": True, "future_lab_run_id": run.run_id, "topic": topic})
     previous=[]; expected={h.lower() for h in handles}
     for n in range(1,rounds+1):
         prompt=_round_prompt(topic,n,previous,include_smalltalk=config.include_smalltalk,max_chars=max(2000,int(config.max_context_chars)))
         sent=client.notify_conversation_send(cid,{"sender_endpoint_id":state.endpoint_id,"kind":"brainstorm","title":f"Future Lab round {n}/{rounds}","body":prompt,"metadata":{"expect_reply":True,"future_lab":True,"future_lab_run_id":run.run_id,"future_lab_round":n},"ttl_seconds":max(60,min(int(config.response_timeout*3),3600))})
         ids={str(x.get("message_id") or "") for x in sent.get("deliveries") or [] if x.get("message_id")}
         replies=_collect_replies(client,cid,ids,expected,timeout=config.response_timeout,poll_interval=config.poll_interval)
-        run.rounds.append({"round":n,"prompt":prompt,"delivery_ids":sorted(ids),"replies":replies,"complete":len(replies)==len(expected)})
+        round_row = {"round":n,"prompt":prompt,"delivery_ids":sorted(ids),"replies":replies,"complete":len(replies)==len(expected)}
+        run.rounds.append(round_row)
         if replies:
             previous = replies
         save_run(run)
+        if on_round is not None:
+            on_round({"run_id": run.run_id, "conversation_id": cid, **round_row})
     # A slow participant may answer after its round deadline. Recover any late
     # replies before distillation so useful thought is not discarded merely
     # because a provider was temporarily slow.

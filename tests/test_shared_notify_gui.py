@@ -113,3 +113,23 @@ def test_notify_chat_renders_reply_reusing_parent_correlation(monkeypatch, tmp_p
     assert "notify funktioniert." in text
     assert "@ailinux-ollama-kimi-k3" in text
     widget.close(); app.processEvents()
+
+
+def test_future_lab_controls_exist_and_chat_marks_round(monkeypatch, tmp_path):
+    from aicoder import shared_notify as shared
+    from aicoder.gui.notify_chat_widget import NotifyConversationWidget
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(shared, "STATE_FILE", tmp_path / "future-ui.json")
+    shared.save_shared_notify_state(shared.SharedNotifyState(enabled=False, device_id="dev_future", handle="@zombie"))
+    monkeypatch.setattr(NotifyConversationWidget, "refresh", lambda self: None)
+    network = SharedNotifyWidget()
+    assert network.future_start_button.text() == "Start Future Lab"
+    assert network.future_rounds.currentText() == "3"
+    chat = NotifyConversationWidget({"conversation_id":"conv_future","title":"Future Lab: Test","kind":"group","members":[]})
+    chat._show_history({"messages":[{
+        "message_id":"m1","sender_handle":"@zombie","kind":"brainstorm","title":"Future Lab round 2/3","body":"Discuss",
+        "metadata":{"future_lab":True,"future_lab_round":2},
+    }]})
+    assert "Future Lab R2" in chat.log.toPlainText()
+    assert "Future Lab round 2" in chat.status.text()
+    network.close(); chat.close(); app.processEvents()

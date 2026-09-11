@@ -33,6 +33,7 @@ class SharedNotifyWidget(QWidget):
     """Manage stable handles, presence and open conversations in the main chat hub."""
 
     conversation_open_requested = pyqtSignal(object)
+    future_lab_round = pyqtSignal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -147,6 +148,14 @@ class SharedNotifyWidget(QWidget):
         self.network_filter = QLineEdit()
         self.network_filter.setPlaceholderText("Filter endpoints or conversations…")
         conversations_layout.addWidget(self.network_filter)
+        future_row = QHBoxLayout()
+        self.future_topic = QLineEdit()
+        self.future_topic.setPlaceholderText("Future Lab topic… select 2+ online AI endpoints or leave none for all")
+        self.future_rounds = QComboBox()
+        self.future_rounds.addItems(["2", "3", "4", "5", "6"]); self.future_rounds.setCurrentText("3")
+        self.future_start_button = QPushButton("Start Future Lab")
+        future_row.addWidget(self.future_topic, 1); future_row.addWidget(self.future_rounds); future_row.addWidget(self.future_start_button)
+        conversations_layout.addLayout(future_row)
         self.conversations = QListWidget()
         self.conversations.setToolTip("Double-click a conversation to open it in the main Chat tab")
         conversations_layout.addWidget(self.conversations)
@@ -162,6 +171,7 @@ class SharedNotifyWidget(QWidget):
         self.network_filter.textChanged.connect(self._apply_filter)
         self.directory.cellDoubleClicked.connect(lambda _row, _column: self.open_selected_chat())
         self.conversations.itemDoubleClicked.connect(lambda _item: self._open_selected_conversation())
+        self.future_start_button.clicked.connect(self.start_future_lab)
 
     def _load_local_state(self):
         state = shared.load_shared_notify_state(create_identity=True)
@@ -376,6 +386,37 @@ class SharedNotifyWidget(QWidget):
         title, ok = QInputDialog.getText(self, "Create Group", "Conversation title:")
         if ok:
             self._create_conversation(handles, kind="group", title=title.strip())
+
+
+    def start_future_lab(self):
+        topic = self.future_topic.text().strip()
+        if not topic:
+            QMessageBox.information(self, "Future Lab", "Enter a discussion topic first.")
+            return
+        selected = [row for row in self._selected_endpoints() if str(row.get("kind") or "").lower() == "ai"]
+        participants = [str(row.get("handle") or "") for row in selected]
+        if selected and len(selected) < 2:
+            QMessageBox.information(self, "Future Lab", "Select at least two AI endpoints, or clear the selection to use all eligible online AIs.")
+            return
+        rounds = int(self.future_rounds.currentText())
+        self.future_start_button.setEnabled(False)
+        self.directory_status.setText("Future Lab starting…")
+
+        def operation():
+            from ..future_lab import FutureLabConfig, run_future_lab
+            return run_future_lab(
+                FutureLabConfig(topic=topic, participants=participants, rounds=rounds),
+                on_conversation=lambda conversation: self.conversation_open_requested.emit(conversation),
+                on_round=lambda row: self.future_lab_round.emit(row),
+            )
+
+        def success(run):
+            self.future_start_button.setEnabled(True)
+            self.future_topic.clear()
+            self.directory_status.setText(f"Future Lab {run.status} · {len(run.rounds)} rounds")
+            self.refresh_directory()
+
+        self._run(operation, success)
 
     def _open_selected_conversation(self):
         item = self.conversations.currentItem()
