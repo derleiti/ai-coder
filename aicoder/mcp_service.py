@@ -307,15 +307,65 @@ def authorize_oauth(name: str, registry: MCPRegistry | None = None, **kwargs: An
         raise
 
 
+def _shared_mcp_server_name(handle: str) -> str:
+    return "shared-" + str(handle or "").lstrip("@")
+
+
+def _shared_mcp_endpoints() -> list[dict[str, Any]]:
+    try:
+        from . import shared_notify as shared
+        state = shared.load_shared_notify_state(create_identity=False)
+        local_ids = set(state.published_mcp)
+        return [row for row in shared.shared_mcp_directory()
+                if row.get("online") and row.get("endpoint_id") not in local_ids and row.get("handle")]
+    except Exception:
+        return []
+
+
 def external_tool_schemas(registry: MCPRegistry | None = None) -> list[dict[str, Any]]:
-    """Runtime-facing schemas routed through the canonical configuration service."""
-    from .mcp_registry import external_tool_schemas as _schemas
-    return _schemas(_registry(registry))
+    """Expose local MCP tools plus online Notify-shared MCP tools."""
+    from .mcp_registry import external_tool_schemas as _schemas, namespaced_tool_name
+    out = _schemas(_registry(registry))
+    try:
+        from . import shared_notify as shared
+        for endpoint in _shared_mcp_endpoints():
+            handle = str(endpoint.get("handle") or "")
+            server = _shared_mcp_server_name(handle)
+            for tool in shared.shared_mcp_tools(handle, timeout=3.0):
+                original = str(tool.get("name") or "")
+                if not original:
+                    continue
+                schema = dict(tool)
+                schema["name"] = namespaced_tool_name(server, original)
+                schema["description"] = f"[{handle} shared MCP] {str(tool.get('description') or original)}"
+                annotations = dict(schema.get("annotations") or {}) if isinstance(schema.get("annotations"), dict) else {}
+                annotations["readOnlyHint"] = False
+                schema["annotations"] = annotations
+                out.append(schema)
+    except Exception:
+        pass
+    return out
 
 
-def call_external_tool(
-    name: str, args: dict[str, Any], registry: MCPRegistry | None = None
-) -> tuple[str, bool]:
-    """Runtime-facing call routed through the canonical configuration service."""
-    from .mcp_registry import call_external_tool as _call
-    return _call(name, args, _registry(registry))
+def call_external_tool(name: str, args: dict[str, Any], registry: MCPRegistry | None = None) -> tuple[str, bool]:
+    """Route a local or Notify-shared MCP tool call."""
+    from .mcp_registry import call_external_tool as _call, split_namespaced_tool
+    reg = _registry(registry)
+    local_names = [str(row.get("name") or "") for row in reg.list(include_builtin=False)]
+    local_parts = split_namespaced_tool(name, local_names) if local_names else None
+    if local_parts is not None and local_parts[0] in local_names:
+        return _call(name, args, reg)
+    endpoints = _shared_mcp_endpoints()
+    shared_names = [_shared_mcp_server_name(str(row.get("handle") or "")) for row in endpoints]
+    parts = split_namespaced_tool(name, shared_names)
+    if parts is None:
+        return f"invalid external MCP tool name: {name}", True
+    server, tool = parts
+    endpoint = next((row for row in endpoints if _shared_mcp_server_name(str(row.get("handle") or "")) == server), None)
+    if endpoint is None:
+        return f"shared MCP server unavailable: {server}", True
+    try:
+        from . import shared_notify as shared
+        return shared.call_shared_mcp_tool(str(endpoint.get("handle") or ""), tool, dict(args), timeout=30.0)
+    except Exception as exc:
+        return f"shared MCP call failed: {type(exc).__name__}: {exc}", True

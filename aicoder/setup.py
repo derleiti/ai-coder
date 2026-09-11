@@ -594,6 +594,13 @@ def _repl_mcp_command(value: str) -> int:
             print(json.dumps(doctor(), indent=2, ensure_ascii=False))
             return 0
 
+        if action == "shared":
+            from .shared_notify import shared_mcp_directory
+            for row in shared_mcp_directory():
+                marker = "●" if row.get("online") else "○"
+                print(f"  {marker} {row.get('handle',''):<28} {row.get('label','')}")
+            return 0
+
         if action == "add":
             name = parts[1] if len(parts) > 1 and not parts[1].startswith("--") else ""
             option_start = 2 if name else 1
@@ -629,6 +636,17 @@ def _repl_mcp_command(value: str) -> int:
         if len(parts) < 2:
             raise ValueError("server name required")
         name = parts[1]
+        if action == "share":
+            from .shared_notify import publish_mcp
+            handle = parts[2] if len(parts) > 2 else ""
+            print(json.dumps(publish_mcp(name, handle), indent=2, ensure_ascii=False))
+            return 0
+        if action == "unshare":
+            from .shared_notify import unpublish_mcp
+            if not unpublish_mcp(name):
+                raise ValueError(f"MCP server is not shared: {name}")
+            print(f"  {name} → share disabled")
+            return 0
         if action == "set":
             existing = get_server(name)
             if existing is None:
@@ -694,7 +712,7 @@ def _repl_mcp_command(value: str) -> int:
         print(f"  Fehler: {type(exc).__name__}: {exc}")
         return 2
 
-    print("  usage: /mcp [list|add|set NAME KEY=VALUE...|edit NAME|remove NAME|enable NAME|disable NAME|test NAME|doctor [NAME]|tools NAME|auth NAME|keyring]")
+    print("  usage: /mcp [list|shared|share NAME [HANDLE]|unshare NAME|add|set NAME KEY=VALUE...|edit NAME|remove NAME|enable NAME|disable NAME|test NAME|doctor [NAME]|tools NAME|auth NAME|keyring]")
     return 2
 
 

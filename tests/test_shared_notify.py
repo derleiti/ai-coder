@@ -161,3 +161,63 @@ def test_ai_reply_preserves_conversation_routing_and_disables_ping_pong(monkeypa
     assert result["dispatched"] == 1
     assert sent[0]["metadata"]["conversation_id"] == "conv1"
     assert sent[0]["metadata"]["expect_reply"] is False
+
+
+def test_publish_mcp_exposes_only_capability_metadata(tmp_path, monkeypatch):
+    fake = FakeClient()
+    monkeypatch.setattr(sn, "STATE_FILE", tmp_path / "state-mcp.json")
+    monkeypatch.setattr(sn, "_client", lambda: fake)
+    sn.enable_shared_notify("mybox")
+    import aicoder.mcp_service as service
+    monkeypatch.setattr(service, "get_server", lambda name: SimpleNamespace(enabled=True) if name == "GIMP MCP" else None)
+    monkeypatch.setattr(service, "server_tools", lambda name: [{"name": "layer_create"}, {"name": "export_png"}])
+    endpoint = sn.publish_mcp("GIMP MCP")
+    payload = fake.registered[-1]
+    assert payload["kind"] == "mcp"
+    assert payload["transport"] == "mailbox"
+    assert payload["target"] == "GIMP MCP"
+    assert payload["capabilities"] == ["mcp", "tools/list", "tools/call", "tools:2"]
+    assert "command" not in payload and "url" not in payload and "token" not in str(payload).lower()
+    state = sn.load_shared_notify_state()
+    assert state.published_mcp[endpoint["endpoint_id"]]["server"] == "GIMP MCP"
+
+
+def test_poll_dispatches_shared_mcp_rpc_and_acks(tmp_path, monkeypatch):
+    fake = FakeClient()
+    monkeypatch.setattr(sn, "STATE_FILE", tmp_path / "state-mcp-rpc.json")
+    monkeypatch.setattr(sn, "_client", lambda: fake)
+    sn.save_shared_notify_state(sn.SharedNotifyState(
+        enabled=True, device_id="dev_test", endpoint_id="ep_client", handle="@zombie",
+        published_mcp={"ep_mcp": {"endpoint_id": "ep_mcp", "handle": "@mcp-zombie-gimp", "server": "GIMP MCP"}},
+    ))
+    fake.inboxes["ep_mcp"] = [{
+        "message_id": "msg_rpc", "sender_endpoint_id": "ep_remote", "thread_id": "thr_rpc",
+        "correlation_id": "rpc_1", "metadata": {"op": "tools/call", "tool": "layer_create", "arguments": {"name": "BG"}},
+    }]
+    fake.notify_directory = lambda include_offline=True: {"endpoints": [{"endpoint_id": "ep_remote", "handle": "@remote"}]}
+    import aicoder.mcp_service as service
+    monkeypatch.setattr(service, "call_external_tool", lambda name, args: (f"called:{name}:{args['name']}", False))
+    result = sn.poll_once(dispatch_ai=False)
+    assert result["dispatched"] == 1
+    assert ("ep_mcp", "msg_rpc") in fake.acks
+    assert fake.sent[-1]["target"] == "@remote"
+    assert fake.sent[-1]["kind"] == "mcp_rpc_result"
+    assert fake.sent[-1]["sender_endpoint_id"] == "ep_mcp"
+    assert fake.sent[-1]["correlation_id"] == "rpc_1"
+    assert "called:mcp.GIMP-MCP.layer_create:BG" in fake.sent[-1]["body"]
+
+
+def test_shared_mcp_response_is_consumed_as_rpc_not_chat(tmp_path, monkeypatch):
+    monkeypatch.setattr(sn, "STATE_FILE", tmp_path / "state-rpc-response.json")
+    sn.save_shared_notify_state(sn.SharedNotifyState(enabled=True, device_id="d", endpoint_id="ep_client", handle="@me"))
+    class Client:
+        def notify_heartbeat(self, payload): return {}
+        def notify_inbox(self, endpoint_id, limit=20):
+            return {"messages": [{"message_id": "m2", "kind": "mcp_rpc_result", "correlation_id": "rpc_x", "body": '{"ok":true,"result":[{"name":"x"}]}'}]}
+        def notify_ack(self, endpoint_id, message_id): return {}
+    monkeypatch.setattr(sn, "_client", lambda: Client())
+    monkeypatch.setattr(sn, "heartbeat", lambda **kwargs: {})
+    sn.drain_received_messages()
+    sn.poll_once(dispatch_ai=False)
+    assert sn.drain_received_messages() == []
+    assert sn._pop_rpc_response("rpc_x")["message_id"] == "m2"
