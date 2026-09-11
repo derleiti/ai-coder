@@ -19,8 +19,30 @@ from aicoder.account_providers import (
     parse_account_model,
     connect_account,
     ensure_provider_client,
+    _external_cli_env,
 )
 from aicoder.client import ClientError
+
+
+class ExternalCliEnvironmentTests(unittest.TestCase):
+    def test_frozen_binary_restores_original_loader_path(self):
+        base = {
+            "PATH": "/usr/bin",
+            "LD_LIBRARY_PATH": "/tmp/_MEI-bundle",
+            "LD_LIBRARY_PATH_ORIG": "/opt/vendor/lib",
+        }
+        with patch("aicoder.account_providers.sys.frozen", True, create=True):
+            env = _external_cli_env(base=base)
+        self.assertEqual(env["LD_LIBRARY_PATH"], "/opt/vendor/lib")
+        self.assertEqual(env["PYINSTALLER_RESET_ENVIRONMENT"], "1")
+        self.assertIn(str(Path.home() / ".local" / "bin"), env["PATH"])
+
+    def test_frozen_binary_removes_injected_loader_path_when_no_original_exists(self):
+        base = {"PATH": "/usr/bin", "LD_LIBRARY_PATH": "/tmp/_MEI-bundle", "LD_LIBRARY_PATH_ORIG": ""}
+        with patch("aicoder.account_providers.sys.frozen", True, create=True):
+            env = _external_cli_env(base=base)
+        self.assertNotIn("LD_LIBRARY_PATH", env)
+        self.assertEqual(env["PYINSTALLER_RESET_ENVIRONMENT"], "1")
 
 
 class AccountProviderIdTests(unittest.TestCase):
@@ -58,6 +80,7 @@ class AccountRoutingTests(unittest.TestCase):
         default.chat.assert_not_called()
 
 
+
 class ProviderTransportTests(unittest.TestCase):
     @patch("aicoder.account_providers.shutil.which", return_value="/usr/bin/claude")
     def test_claude_runs_as_tool_free_provider_process(self, _which):
@@ -79,6 +102,15 @@ class ProviderTransportTests(unittest.TestCase):
         self.assertEqual(result["response"], "OK")
         self.assertEqual(result["backend"], "account-claude")
         self.assertIn("[user]\nhello", run.call_args.kwargs["stdin"])
+
+
+    @patch("aicoder.account_providers.shutil.which", return_value="/usr/bin/claude")
+    def test_claude_filters_known_cli_tool_capability_diagnostic(self, _which):
+        transport = ClaudeAccountTransport(timeout=30)
+        noisy = "OK\nClient.listTools() called but server does not advertise tools capability - returning empty list\n"
+        with patch.object(transport, "_run", return_value=(noisy, "")):
+            result = transport.chat(model="account:claude/sonnet", message="hello")
+        self.assertEqual(result["response"], "OK")
 
     @patch("aicoder.account_providers.shutil.which", return_value="/usr/bin/vibe")
     def test_mistral_preserves_provider_home_and_disables_tools(self, _which):
@@ -134,6 +166,15 @@ class ProviderTransportTests(unittest.TestCase):
         self.assertIn("--disable-slash-commands", argv)
         self.assertEqual(result["backend"], "account-antigravity")
 
+
+    def test_antigravity_surfaces_provider_json_error(self):
+        transport = GeminiAccountTransport(timeout=30)
+        payload = json.dumps({"status": "ERROR", "response": "", "error": "The stream was interrupted."})
+        with patch("aicoder.account_providers._which_executable", return_value="/usr/bin/agy"), \
+             patch("aicoder.account_providers._antigravity_authenticated", return_value=True), \
+             patch.object(transport, "_run", return_value=(payload, "")):
+            with self.assertRaisesRegex(ClientError, "Google Antigravity request failed: The stream was interrupted"):
+                transport.chat(model="account:gemini/gemini-3.8-flash-high", message="hello")
 
     def test_antigravity_fast_fails_when_login_is_required(self):
         transport = GeminiAccountTransport(timeout=60)
@@ -391,14 +432,26 @@ class AccountInstallAndLoginTests(unittest.TestCase):
         self.assertEqual(models[0]["id"], "account:gemini/gemini-3.8-flash-high")
 
 
-    def test_gemini_status_distinguishes_linked_from_authenticated(self):
+    def test_gemini_authentication_self_heals_persisted_link(self):
         with patch("aicoder.account_providers._which", return_value="/home/test/.local/bin/agy"), \
-             patch("aicoder.account_providers.linked_provider_ids", return_value=["gemini"]), \
-             patch("aicoder.account_providers._antigravity_authenticated", return_value=False):
+             patch("aicoder.account_providers.linked_provider_ids", return_value=[]), \
+             patch("aicoder.account_providers._antigravity_authenticated", return_value=True), \
+             patch("aicoder.account_providers.set_provider_linked") as set_linked:
             status = account_status("gemini")
         self.assertTrue(status["linked"])
+        self.assertTrue(status["authenticated"])
+        set_linked.assert_called_once_with("gemini", True)
+
+    def test_stale_gemini_link_is_cleared_when_antigravity_is_logged_out(self):
+        with patch("aicoder.account_providers._which", return_value="/home/test/.local/bin/agy"), \
+             patch("aicoder.account_providers.linked_provider_ids", return_value=["gemini"]), \
+             patch("aicoder.account_providers._antigravity_authenticated", return_value=False), \
+             patch("aicoder.account_providers.set_provider_linked") as set_linked:
+            status = account_status("gemini")
+        self.assertFalse(status["linked"])
         self.assertFalse(status["authenticated"])
-        self.assertEqual(status["detail"], "Antigravity login required")
+        self.assertEqual(status["detail"], "Nicht verbunden · Mit Antigravity verbinden")
+        set_linked.assert_called_once_with("gemini", False)
 
     def test_gemini_is_linked_only_after_login_verification(self):
         with patch("aicoder.account_providers.ensure_provider_client", return_value="/home/test/.local/bin/agy"), \

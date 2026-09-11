@@ -20,6 +20,7 @@ import queue
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -153,6 +154,36 @@ def _which_executable(name: str) -> str:
     return str(shutil.which(name, path=_augmented_path()) or "")
 
 
+def _external_client_env(*, base: dict[str, str] | None = None) -> dict[str, str]:
+    """Return a clean environment for provider-owned external executables.
+
+    PyInstaller one-file builds inject their temporary extraction directory into
+    ``LD_LIBRARY_PATH`` and preserve the previous value in
+    ``LD_LIBRARY_PATH_ORIG``. External CLIs must not inherit the bundle-private
+    loader path: it can make independent binaries load incompatible libraries
+    or hang before their own runtime starts.
+    """
+    env = dict(os.environ if base is None else base)
+    env["PATH"] = _augmented_path()
+    had_original = "LD_LIBRARY_PATH_ORIG" in env
+    original_ld = env.pop("LD_LIBRARY_PATH_ORIG", None)
+    if getattr(sys, "frozen", False) or had_original:
+        if original_ld:
+            env["LD_LIBRARY_PATH"] = original_ld
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
+    if getattr(sys, "frozen", False):
+        # If the provider CLI is itself a PyInstaller bundle, force it to create
+        # its own extraction/runtime environment instead of reusing ours.
+        env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    return env
+
+
+def _external_cli_env(*, base: dict[str, str] | None = None) -> dict[str, str]:
+    """Compatibility alias for the provider subprocess environment helper."""
+    return _external_client_env(base=base)
+
+
 def ensure_provider_client(provider: str) -> str:
     """Install a missing official provider CLI into the user's normal tool path.
 
@@ -174,7 +205,7 @@ def ensure_provider_client(provider: str) -> str:
         try:
             download = subprocess.run(
                 [curl, "-fsSL", "https://antigravity.google/cli/install.sh"],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, env=_external_cli_env(),
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise ClientError("Could not download the official Google Antigravity CLI installer") from exc
@@ -182,7 +213,8 @@ def ensure_provider_client(provider: str) -> str:
             raise ClientError("Official Google Antigravity CLI installer download failed")
         try:
             proc = subprocess.run(
-                [bash], input=download.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300
+                [bash], input=download.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300,
+                env=_external_cli_env(),
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise ClientError("Could not install the official Google Antigravity CLI") from exc
@@ -201,8 +233,7 @@ def ensure_provider_client(provider: str) -> str:
         argv = [runner, "install", "-g", "--prefix", str(Path.home() / ".local"), recipe[-1]]
     else:
         argv = [runner, *recipe[1:]]
-    env = dict(os.environ)
-    env["PATH"] = _augmented_path()
+    env = _external_cli_env()
     try:
         proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300, env=env)
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -235,7 +266,7 @@ class CodexAppServer:
             self.proc = subprocess.Popen(
                 [executable, "app-server"],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding="utf-8", bufsize=1,
+                text=True, encoding="utf-8", bufsize=1, env=_external_cli_env(),
             )
         except OSError as exc:
             raise ClientError("Could not start the official Codex App Server") from exc
@@ -456,7 +487,7 @@ def _claude_status() -> dict[str, Any]:
         proc = subprocess.run(
             [executable, "auth", "status", "--json"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=8,
-            env={**os.environ, "PATH": _augmented_path()},
+            env=_external_cli_env(),
         )
         if proc.stdout.strip():
             parsed = json.loads(proc.stdout)
@@ -514,14 +545,23 @@ def account_status(provider: str) -> dict[str, Any]:
         if installed:
             executable = _which(spec)
             authenticated = bool(executable and _antigravity_authenticated(executable, timeout=8))
+        if authenticated and not marked:
+            # Provider-owned auth is authoritative in both directions: recover
+            # automatically when the user logged in directly with agy.
+            set_provider_linked(spec.id, True)
+            marked = True
+        elif marked and not authenticated:
+            # Do not keep a stale AICoder linkage after the provider session
+            # disappears outside AICoder.
+            set_provider_linked(spec.id, False)
+            marked = False
         detail = (
             "Verbunden" if authenticated else
-            "Antigravity login required" if installed and marked else
             f"{spec.display_name}-CLI fehlt" if not installed else
-            "Nicht verbunden"
+            "Nicht verbunden · Mit Antigravity verbinden"
         )
         return {"provider": spec.id, "display": spec.display_name, "installed": installed,
-                "linked": bool(marked or authenticated), "authenticated": authenticated, "detail": detail}
+                "linked": bool(authenticated), "authenticated": authenticated, "detail": detail}
     authenticated: bool | None = None
     detail = "Verknüpft · Login vom offiziellen Client verwaltet" if marked and installed else (
         f"{spec.display_name}-CLI fehlt" if not installed else "Nicht verbunden"
@@ -641,7 +681,7 @@ def _launch_terminal(command: list[str], *, title: str, wait: bool = False, time
     launched = False
     for argv in candidates:
         try:
-            subprocess.Popen(argv, start_new_session=True)
+            subprocess.Popen(argv, start_new_session=True, env=_external_cli_env())
             launched = True
             break
         except OSError:
@@ -676,8 +716,7 @@ def _launch_terminal(command: list[str], *, title: str, wait: bool = False, time
 
 def _antigravity_models(executable: str, *, timeout: int = 30) -> list[dict[str, str]]:
     """Return models exposed by the authenticated Antigravity CLI account."""
-    env = dict(os.environ)
-    env["PATH"] = _augmented_path()
+    env = _external_cli_env()
     try:
         proc = subprocess.run(
             [executable, "models"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -709,6 +748,24 @@ def _antigravity_authenticated(executable: str, *, timeout: int = 30) -> bool:
         return True
     except ClientError:
         return False
+
+
+def _clean_account_response_text(provider: str, text: str) -> str:
+    """Remove provider-CLI diagnostics that can leak into model stdout.
+
+    Keep this deliberately narrow: only strip exact, known transport diagnostics.
+    Model content must otherwise remain byte-for-byte intact apart from outer
+    whitespace normalization.
+    """
+    lines = str(text or "").splitlines()
+    if provider == "claude":
+        lines = [
+            line for line in lines
+            if not line.strip().startswith(
+                "Client.listTools() called but server does not advertise tools capability"
+            )
+        ]
+    return "\n".join(lines).strip()
 
 
 def _mistral_authenticated() -> bool:
@@ -848,7 +905,10 @@ def disconnect_account(provider: str) -> None:
         return
     if spec.id == "claude" and executable:
         try:
-            subprocess.run([executable, "auth", "logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+            subprocess.run(
+                [executable, "auth", "logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=15, env=_external_cli_env(),
+            )
         finally:
             set_provider_linked(spec.id, False)
         return
@@ -961,8 +1021,7 @@ class ClaudeAccountTransport(_SubprocessAccountTransport):
             "--tools", "", "--disallowed-tools", "*", "--disable-slash-commands",
             "--no-chrome", "--no-session-persistence", "--system-prompt", _MODEL_BACKEND_SYSTEM,
         ]
-        env = dict(os.environ)
-        env["PATH"] = _augmented_path()
+        env = _external_cli_env()
         # Account-backed Claude must use the provider-owned claude.ai session.
         # API/gateway credentials inherited from the TriForce host take precedence
         # in Claude Code and can silently route the request to a depleted API balance.
@@ -970,7 +1029,7 @@ class ClaudeAccountTransport(_SubprocessAccountTransport):
             env.pop(name, None)
         started = time.monotonic()
         stdout, _ = self._run(args, request_id=request_id, stdin=transcript, env=env)
-        text = stdout.strip()
+        text = _clean_account_response_text(self.provider, stdout)
         if not text:
             raise ClientError("Claude account client returned an empty response", retryable=True)
         elapsed = time.monotonic() - started
@@ -998,13 +1057,15 @@ class MistralAccountTransport(_SubprocessAccountTransport):
         with tempfile.TemporaryDirectory(prefix="aicoder-vibe-") as tmp:
             args = [executable, "--prompt", transcript, "--max-turns", "1", "--output", "text",
                     "--disabled-tools", "*", "--workdir", tmp, "--trust"]
-            env = dict(os.environ)
+            env = _external_cli_env()
             # VIBE_* is the documented environment override surface.  Do not set
             # VIBE_HOME: the official client's existing account credentials live
             # there and must remain provider-owned.
             env["VIBE_ACTIVE_MODEL"] = provider_model
             try:
-                help_text = subprocess.run([executable, "--help"], capture_output=True, text=True, timeout=5).stdout
+                help_text = subprocess.run(
+                    [executable, "--help"], capture_output=True, text=True, timeout=5, env=env
+                ).stdout
             except Exception:
                 help_text = ""
             if "--model" in help_text:
@@ -1044,8 +1105,7 @@ class GeminiAccountTransport(_SubprocessAccountTransport):
             ]
             if reasoning_effort in {"low", "medium", "high"}:
                 args.extend(["--effort", str(reasoning_effort)])
-            env = dict(os.environ)
-            env["PATH"] = _augmented_path()
+            env = _external_cli_env()
             started = time.monotonic()
             stdout, _ = self._run(args, request_id=request_id, cwd=tmp, env=env)
         try:
@@ -1054,6 +1114,11 @@ class GeminiAccountTransport(_SubprocessAccountTransport):
             raise ClientError("Google Antigravity returned invalid JSON") from exc
         text = ""
         if isinstance(payload, dict):
+            status = str(payload.get("status") or "").strip().upper()
+            error = str(payload.get("error") or "").strip()
+            if status == "ERROR":
+                detail = error[:300] if error else "provider reported an unspecified error"
+                raise ClientError(f"Google Antigravity request failed: {detail}", retryable=True)
             text = str(payload.get("response") or payload.get("result") or payload.get("text") or "").strip()
             if not text and isinstance(payload.get("result"), dict):
                 text = str(payload["result"].get("response") or "").strip()
