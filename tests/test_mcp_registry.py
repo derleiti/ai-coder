@@ -130,7 +130,7 @@ class MCPRegistryTests(unittest.TestCase):
         with patch("aicoder.mcp_registry.external_tool_schemas", return_value=[external]):
             tools=executor.load_tools(client,force_refresh=True)
         self.assertIn("mcp.demo.echo",{t["name"] for t in tools})
-        with patch("aicoder.mcp_registry.call_external_tool", return_value=("ok",False)) as call, patch.object(executor.audit,"log_tool"):
+        with patch("aicoder.mcp_service.call_external_tool", return_value=("ok",False)) as call, patch.object(executor.audit,"log_tool"):
             result,is_error=executor.run_tool(client,"mcp.demo.echo",{},allowed_tools={"mcp.demo.echo"})
         self.assertFalse(is_error); self.assertEqual(result,"ok"); call.assert_called_once()
 
