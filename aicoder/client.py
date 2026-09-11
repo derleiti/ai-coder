@@ -574,6 +574,40 @@ class TriForceClient:
     def handshake(self) -> Dict[str, Any]:
         return self._request("GET", "/v1/auth/client/handshake", require_auth=True, _label="handshake")
 
+    def notify_register(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return self._request("POST", "/v1/notify-network/endpoints", payload, require_auth=True, _label="notify-register")
+
+    def notify_presence(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return self._request("POST", "/v1/notify-network/presence", payload, require_auth=True, _label="notify-presence", _retries=0)
+
+    def notify_heartbeat(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return self._request("POST", "/v1/notify-network/heartbeat", payload, require_auth=True, _label="notify-heartbeat", _retries=0)
+
+    def notify_directory(self, include_offline: bool = True) -> Dict[str, Any]:
+        value = "true" if include_offline else "false"
+        return self._request("GET", f"/v1/notify-network/directory?include_offline={value}", require_auth=True, _label="notify-directory")
+
+    def notify_send(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return self._request("POST", "/v1/notify-network/send", payload, require_auth=True, _label="notify-send", _retries=0)
+
+    def notify_inbox(self, endpoint_id: str, limit: int = 50) -> Dict[str, Any]:
+        return self._request("GET", f"/v1/notify-network/inbox/{endpoint_id}?limit={max(1, min(int(limit), 200))}", require_auth=True, _label="notify-inbox", _retries=0)
+
+    def notify_ack(self, endpoint_id: str, message_id: str) -> Dict[str, Any]:
+        return self._request("POST", "/v1/notify-network/ack", {"endpoint_id": endpoint_id, "message_id": message_id}, require_auth=True, _label="notify-ack", _retries=0)
+
+    def notify_rename(self, endpoint_id: str, handle: str) -> Dict[str, Any]:
+        return self._request("POST", "/v1/notify-network/handles/rename", {"endpoint_id": endpoint_id, "handle": handle}, require_auth=True, _label="notify-rename", _retries=0)
+
+    def notify_memory_recall(self, query: str) -> Dict[str, Any]:
+        return self._request("POST", "/v1/notify-network/memory/recall", {"query": str(query)[:2000]}, require_auth=True, _label="notify-memory-recall", _retries=0)
+
+    def notify_status(self) -> Dict[str, Any]:
+        return self._request("GET", "/v1/notify-network/status", require_auth=True, _label="notify-status", _retries=0)
+
+    def notify_disable(self, endpoint_id: str) -> Dict[str, Any]:
+        return self._request("DELETE", f"/v1/notify-network/endpoints/{endpoint_id}", require_auth=True, _label="notify-disable", _retries=0)
+
     def mcp_call(
         self,
         tool_name: str,

@@ -1,0 +1,118 @@
+from pathlib import Path
+from types import SimpleNamespace
+
+import aicoder.shared_notify as sn
+
+
+class FakeClient:
+    def __init__(self):
+        self.registered = []
+        self.presence = []
+        self.sent = []
+        self.inboxes = {}
+        self.acks = []
+
+    def notify_register(self, payload):
+        self.registered.append(dict(payload))
+        eid = payload.get("endpoint_id") or f"ep_{'x' * 16}{len(self.registered)}"
+        return {"endpoint": {"endpoint_id": eid, "handle": "@" + payload["handle"].lstrip("@")}}
+
+    def notify_presence(self, payload):
+        self.presence.append(dict(payload))
+        return {"endpoint": dict(payload)}
+
+    def notify_heartbeat(self, payload):
+        self.presence.append(dict(payload))
+        return {"endpoint": dict(payload)}
+
+    def notify_inbox(self, endpoint_id, limit=20):
+        return {"messages": list(self.inboxes.get(endpoint_id, []))[:limit]}
+
+    def notify_ack(self, endpoint_id, message_id):
+        self.acks.append((endpoint_id, message_id))
+        return {"ok": True}
+
+    def notify_directory(self, include_offline=True):
+        return {"endpoints": []}
+
+    def notify_send(self, payload):
+        self.sent.append(dict(payload))
+        return {"ok": True}
+
+    def notify_disable(self, endpoint_id):
+        return {"ok": True, "endpoint_id": endpoint_id}
+
+
+def test_identity_is_stable_and_private(tmp_path, monkeypatch):
+    path = tmp_path / "shared_notify.json"
+    monkeypatch.setattr(sn, "STATE_FILE", path)
+    first = sn.load_shared_notify_state()
+    second = sn.load_shared_notify_state()
+    assert first.device_id.startswith("dev_")
+    assert second.device_id == first.device_id
+    assert path.stat().st_mode & 0o077 == 0
+
+
+def test_enable_registers_stable_machine_endpoint(tmp_path, monkeypatch):
+    fake = FakeClient()
+    monkeypatch.setattr(sn, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(sn, "_client", lambda: fake)
+    endpoint = sn.enable_shared_notify("mybox")
+    state = sn.load_shared_notify_state()
+    assert endpoint["handle"] == "@mybox"
+    assert state.enabled is True
+    assert state.endpoint_id == endpoint["endpoint_id"]
+    assert fake.registered[0]["transport"] == "mailbox"
+    assert fake.presence[-1]["availability"] == "available"
+
+
+def test_published_ai_model_selector_stays_local(tmp_path, monkeypatch):
+    fake = FakeClient()
+    monkeypatch.setattr(sn, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(sn, "_client", lambda: fake)
+    sn.enable_shared_notify("mybox")
+    endpoint = sn.publish_ai("claude-local", "account:claude/sonnet")
+    state = sn.load_shared_notify_state()
+    server_payload = fake.registered[-1]
+    assert "account:claude/sonnet" not in str(server_payload)
+    assert state.published_ai[endpoint["endpoint_id"]]["model"] == "account:claude/sonnet"
+
+
+def test_poll_dispatches_ai_without_tools_and_acks(tmp_path, monkeypatch):
+    fake = FakeClient()
+    monkeypatch.setattr(sn, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(sn, "_client", lambda: fake)
+    sn.enable_shared_notify("mybox")
+    endpoint = sn.publish_ai("reviewer", "account:claude/sonnet")
+    eid = endpoint["endpoint_id"]
+    fake.inboxes[eid] = [{
+        "message_id": "msg-1", "title": "review", "body": "hello",
+        "sender_endpoint_id": "", "thread_id": "thr", "hop_count": 0,
+        "metadata": {"expect_reply": False},
+    }]
+    calls = []
+    monkeypatch.setattr(sn, "_local_model_reply", lambda model, title, body, timeout=120: calls.append((model, title, body)) or "OK")
+    result = sn.poll_once(dispatch_ai=True)
+    assert result["dispatched"] == 1
+    assert calls == [("account:claude/sonnet", "review", "hello")]
+    assert (eid, "msg-1") in fake.acks
+    assert any(row.get("activity") == "thinking" for row in fake.presence)
+    assert fake.presence[-1]["activity"] == "idle"
+
+
+def test_background_worker_is_opt_in(tmp_path, monkeypatch):
+    monkeypatch.setattr(sn, "STATE_FILE", tmp_path / "state.json")
+    sn.save_shared_notify_state(sn.SharedNotifyState(enabled=False, device_id="dev_test"))
+    assert sn.start_background(interval=5) is False
+
+
+def test_recall_context_is_explicitly_untrusted(tmp_path, monkeypatch):
+    fake = FakeClient()
+    fake.notify_memory_recall = lambda query: {"context": "old observation", "ids": [4], "status": "ok"}
+    monkeypatch.setattr(sn, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(sn, "_client", lambda: fake)
+    sn.save_shared_notify_state(sn.SharedNotifyState(enabled=True, device_id="dev_test", endpoint_id="ep_abcdefghijklmnop"))
+    text = sn.recall_context("new task")
+    assert "UNTRUSTED BIG BRAIN HISTORY" in text
+    assert "NOT operator instructions" in text
+    assert "old observation" in text

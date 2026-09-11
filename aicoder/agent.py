@@ -347,7 +347,7 @@ def _run_native_light_agent(
     return 1 if result.status == "failed" else 0
 
 
-def run_agent(
+def _run_agent_impl(
     initial_prompt: str,
     model: Optional[str],
     fallback_model: Optional[str],
@@ -359,10 +359,30 @@ def run_agent(
     json_events: bool = False,
     team_overrides: Optional[dict[str, Any]] = None,
 ) -> int:
-    from .team_runtime import config_from_state, should_use_team, state_with_team_overrides
+    from .team_runtime import (
+        config_from_state, reroute_unavailable_account_models,
+        should_use_team, state_with_team_overrides,
+    )
     state = state_with_team_overrides(
         get_state(), team_overrides, primary_model=model,
     )
+    state, provider_reroutes = reroute_unavailable_account_models(state)
+    effective_primary = str(state.get("selected_model") or "").strip() or model
+    if model and effective_primary and effective_primary != model:
+        model = effective_primary
+
+    for reroute in provider_reroutes:
+        payload = {"type": "provider_reroute", **reroute}
+        if json_events:
+            print(json.dumps(payload, ensure_ascii=False, default=_json_default))
+        elif not json_output:
+            retry_s = int(reroute.get("retry_after_seconds") or 0)
+            retry_text = f" · retry in ~{max(1, retry_s // 3600)}h" if retry_s else ""
+            print(
+                f"  {C.BYELLOW}↪ provider reroute · {reroute.get('from_model')} → "
+                f"{reroute.get('to_model')} · {reroute.get('reason')}{retry_text}{C.RESET}",
+                file=sys.stderr, flush=True,
+            )
     if (
         not resume_plan_id
         and not is_short_confirmation(initial_prompt)
@@ -464,3 +484,60 @@ def run_agent(
         json_events=json_events,
         persistent_plan=(effective_runtime == "native-light"),
     )
+
+def _shared_presence_best_effort(**updates: Any) -> None:
+    try:
+        from .shared_notify import load_shared_notify_state, set_presence
+        shared = load_shared_notify_state(create_identity=False)
+        if shared.enabled and shared.endpoint_id:
+            set_presence(**updates)
+    except Exception:
+        # Presence is advisory and must never make a coding task fail.
+        pass
+
+
+def run_agent(
+    initial_prompt: str,
+    model: Optional[str],
+    fallback_model: Optional[str],
+    verbose: bool = False,
+    conversation: Optional[list[dict]] = None,
+    runtime_mode: Optional[str] = None,
+    resume_plan_id: Optional[str] = None,
+    json_output: bool = False,
+    json_events: bool = False,
+    team_overrides: Optional[dict[str, Any]] = None,
+) -> int:
+    """Public agent boundary with fail-open host-authoritative Shared Presence."""
+    task_id = f"aicoder-{int(time.time())}-{threading.get_ident()}"
+    _shared_presence_best_effort(
+        availability="busy", activity="working", status_text="AICoder task running",
+        current_task_id=task_id, task_started_at=int(time.time()),
+    )
+    effective_prompt = initial_prompt
+    try:
+        from .shared_notify import recall_context, set_model_presence
+        set_model_presence(
+            model, availability="busy", activity="thinking", status_text="AICoder model active",
+            current_task_id=task_id, task_started_at=int(time.time()),
+        )
+        recalled = recall_context(initial_prompt)
+        if recalled:
+            effective_prompt = initial_prompt + "\n\n" + recalled
+    except Exception:
+        pass
+    try:
+        return _run_agent_impl(
+            effective_prompt, model, fallback_model, verbose=verbose, conversation=conversation,
+            runtime_mode=runtime_mode, resume_plan_id=resume_plan_id, json_output=json_output,
+            json_events=json_events, team_overrides=team_overrides,
+        )
+    finally:
+        _shared_presence_best_effort(
+            availability="available", activity="idle", status_text="", current_task_id="",
+        )
+        try:
+            from .shared_notify import set_model_presence
+            set_model_presence(model, availability="available", activity="idle", status_text="", current_task_id="")
+        except Exception:
+            pass

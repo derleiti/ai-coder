@@ -88,3 +88,30 @@ class RamCandidateIsolationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_reroute_unavailable_account_models_rewrites_primary_and_keeps_alias(monkeypatch):
+    from aicoder import account_providers
+    from aicoder.team_runtime import reroute_unavailable_account_models
+
+    def fake(model):
+        if model == "account:gemini/gemini-x":
+            return "account:claude/sonnet", {
+                "from_model": model, "to_model": "account:claude/sonnet",
+                "reason": "quota_exhausted", "provider": "gemini",
+                "retry_after_seconds": 3600, "reset_at": "later",
+            }
+        return model, None
+
+    monkeypatch.setattr(account_providers, "reroute_account_model_if_unavailable", fake)
+    state = {
+        "selected_model": "account:gemini/gemini-x",
+        "team_research_model_1": "@primary",
+        "team_coder_model_1": "account:mistral/mistral-large-latest",
+    }
+    routed, events = reroute_unavailable_account_models(state)
+    assert routed["selected_model"] == "account:claude/sonnet"
+    assert routed["team_research_model_1"] == "@primary"
+    assert routed["team_coder_model_1"] == "account:mistral/mistral-large-latest"
+    assert events[0]["role_key"] == "selected_model"
+    assert events[0]["reason"] == "quota_exhausted"

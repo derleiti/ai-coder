@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import shlex
 import shutil
 import subprocess
@@ -26,6 +27,7 @@ import threading
 import time
 import webbrowser
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -72,6 +74,28 @@ ACCOUNT_PROVIDERS: tuple[AccountProviderSpec, ...] = (
 )
 
 _PROVIDER_MAP = {item.id: item for item in ACCOUNT_PROVIDERS}
+
+# Account-to-account rerouting is deliberately separate from model transport
+# fallback. A selected account model may never escape to TriForce/BYOK. When a
+# provider is known to be temporarily unavailable (currently Antigravity quota),
+# the caller may explicitly choose another authenticated account provider before
+# starting the request.
+_ACCOUNT_REROUTE_ORDER = ("claude", "chatgpt", "mistral", "gemini")
+_ACCOUNT_REROUTE_PREFERRED_MODELS = {
+    "claude": ("sonnet", "haiku", "opus"),
+    "chatgpt": ("gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.5"),
+    "mistral": ("mistral-large-latest", "mistral-medium-latest", "codestral-latest"),
+    "gemini": ("gemini-3.8-flash-high", "gemini-3.8-flash-medium", "gemini-3.1-pro-low"),
+}
+_ANTIGRAVITY_QUOTA_RE = re.compile(
+    r"RESOURCE_EXHAUSTED.*?Individual quota reached.*?Resets in\s+"
+    r"(?:(?P<hours>\d+)h)?(?:(?P<minutes>\d+)m)?(?:(?P<seconds>\d+(?:\.\d+)?)s)?",
+    re.IGNORECASE,
+)
+_ANTIGRAVITY_LOG_TIME_RE = re.compile(
+    r"^[A-Z](?P<month>\d{2})(?P<day>\d{2})\s+"
+    r"(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})(?:\.(?P<micro>\d{1,6}))?"
+)
 
 
 def provider_spec(provider: str) -> AccountProviderSpec:
@@ -522,6 +546,153 @@ def _claude_status() -> dict[str, Any]:
     }
 
 
+def _antigravity_log_event_time(line: str, *, now: datetime) -> datetime | None:
+    match = _ANTIGRAVITY_LOG_TIME_RE.match(line)
+    if not match:
+        return None
+    try:
+        micro = (match.group("micro") or "").ljust(6, "0")[:6]
+        event = now.replace(
+            month=int(match.group("month")), day=int(match.group("day")),
+            hour=int(match.group("hour")), minute=int(match.group("minute")),
+            second=int(match.group("second")), microsecond=int(micro or 0),
+        )
+    except ValueError:
+        return None
+    # CLI log lines omit the year. Around New Year, a December entry observed
+    # from January belongs to the previous year.
+    if event > now + timedelta(days=2):
+        try:
+            event = event.replace(year=event.year - 1)
+        except ValueError:
+            return None
+    return event
+
+
+def antigravity_quota_status(
+    *, log_dir: str | Path | None = None, now: datetime | None = None, max_logs: int = 5,
+) -> dict[str, Any]:
+    """Read provider-owned agy logs for an active individual-quota window.
+
+    This is intentionally observational: no probe request is sent, so checking
+    health cannot consume quota or stall an agent. agy currently exposes no
+    documented quota-status command, but records the authoritative 429 plus its
+    reset countdown in its own CLI log.
+    """
+    current = now or datetime.now().astimezone()
+    root = Path(log_dir).expanduser() if log_dir is not None else Path.home() / ".gemini" / "antigravity-cli" / "log"
+    if not root.is_dir():
+        return {"quota_exhausted": False, "quota_retry_after_seconds": 0, "quota_reset_at": ""}
+    try:
+        logs = sorted(root.glob("cli-*.log"), key=lambda item: item.stat().st_mtime, reverse=True)[:max_logs]
+    except OSError:
+        logs = []
+    for path in logs:
+        try:
+            # The useful quota line is near the end; cap reads so a long-lived
+            # CLI installation cannot make every preflight expensive.
+            with path.open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                handle.seek(max(0, size - 256 * 1024), os.SEEK_SET)
+                text = handle.read().decode("utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in reversed(text.splitlines()):
+            match = _ANTIGRAVITY_QUOTA_RE.search(line)
+            if not match:
+                continue
+            seconds = (
+                int(match.group("hours") or 0) * 3600
+                + int(match.group("minutes") or 0) * 60
+                + float(match.group("seconds") or 0)
+            )
+            if seconds <= 0:
+                continue
+            event_time = _antigravity_log_event_time(line, now=current)
+            if event_time is None:
+                try:
+                    event_time = datetime.fromtimestamp(path.stat().st_mtime, tz=current.tzinfo)
+                except OSError:
+                    continue
+            reset_at = event_time + timedelta(seconds=seconds)
+            retry_after = max(0, int((reset_at - current).total_seconds()))
+            if retry_after <= 0:
+                continue
+            return {
+                "quota_exhausted": True,
+                "quota_retry_after_seconds": retry_after,
+                "quota_reset_at": reset_at.isoformat(),
+            }
+    return {"quota_exhausted": False, "quota_retry_after_seconds": 0, "quota_reset_at": ""}
+
+
+def _account_status_usable(status: dict[str, Any]) -> bool:
+    return bool(
+        status.get("installed")
+        and status.get("linked")
+        and status.get("authenticated") is not False
+        and not status.get("quota_exhausted")
+    )
+
+
+def _preferred_account_model(provider: str) -> str:
+    spec = provider_spec(provider)
+    if spec.models:
+        known = [model for model, _label in spec.models]
+        for candidate in _ACCOUNT_REROUTE_PREFERRED_MODELS.get(provider, ()):
+            if candidate in known:
+                return account_model_id(provider, candidate)
+        if known:
+            return account_model_id(provider, known[0])
+        return ""
+    # Dynamic providers need their live catalogue. This is reached only after a
+    # cheaper authenticated-status check succeeds.
+    rows = available_account_models(provider)
+    known = {str(row.get("model") or ""): row for row in rows}
+    for candidate in _ACCOUNT_REROUTE_PREFERRED_MODELS.get(provider, ()):
+        if candidate in known:
+            return account_model_id(provider, candidate)
+    if rows:
+        model = str(rows[0].get("model") or "").strip()
+        return account_model_id(provider, model) if model else ""
+    return ""
+
+
+def reroute_account_model_if_unavailable(model: str | None) -> tuple[str | None, dict[str, Any] | None]:
+    """Choose another authenticated account provider for known temporary outages.
+
+    Today the only proactive temporary-outage signal is Antigravity's explicit
+    individual-quota 429. Authentication/setup failures remain fail-closed so a
+    broken login is never hidden.
+    """
+    if not is_account_model(model):
+        return model, None
+    provider, _provider_model = parse_account_model(model)
+    status = account_status(provider)
+    if not status.get("quota_exhausted"):
+        return model, None
+
+    for candidate_provider in _ACCOUNT_REROUTE_ORDER:
+        if candidate_provider == provider:
+            continue
+        candidate_status = account_status(candidate_provider)
+        if not _account_status_usable(candidate_status):
+            continue
+        candidate_model = _preferred_account_model(candidate_provider)
+        if not candidate_model:
+            continue
+        return candidate_model, {
+            "from_model": str(model),
+            "to_model": candidate_model,
+            "reason": "quota_exhausted",
+            "provider": provider,
+            "retry_after_seconds": int(status.get("quota_retry_after_seconds") or 0),
+            "reset_at": str(status.get("quota_reset_at") or ""),
+        }
+    return model, None
+
+
 def account_status(provider: str) -> dict[str, Any]:
     spec = provider_spec(provider)
     if spec.id == "chatgpt":
@@ -555,13 +726,23 @@ def account_status(provider: str) -> dict[str, Any]:
             # disappears outside AICoder.
             set_provider_linked(spec.id, False)
             marked = False
-        detail = (
-            "Verbunden" if authenticated else
-            f"{spec.display_name}-CLI fehlt" if not installed else
-            "Nicht verbunden · Mit Antigravity verbinden"
-        )
-        return {"provider": spec.id, "display": spec.display_name, "installed": installed,
-                "linked": bool(authenticated), "authenticated": authenticated, "detail": detail}
+        quota = antigravity_quota_status() if authenticated else {
+            "quota_exhausted": False, "quota_retry_after_seconds": 0, "quota_reset_at": "",
+        }
+        if authenticated and quota.get("quota_exhausted"):
+            retry_h = max(1, int(quota.get("quota_retry_after_seconds") or 0) // 3600)
+            detail = f"Verbunden · Quota erschöpft · Reset in ~{retry_h}h"
+        else:
+            detail = (
+                "Verbunden" if authenticated else
+                f"{spec.display_name}-CLI fehlt" if not installed else
+                "Nicht verbunden · Mit Antigravity verbinden"
+            )
+        return {
+            "provider": spec.id, "display": spec.display_name, "installed": installed,
+            "linked": bool(authenticated), "authenticated": authenticated, "detail": detail,
+            **quota,
+        }
     authenticated: bool | None = None
     detail = "Verknüpft · Login vom offiziellen Client verwaltet" if marked and installed else (
         f"{spec.display_name}-CLI fehlt" if not installed else "Nicht verbunden"

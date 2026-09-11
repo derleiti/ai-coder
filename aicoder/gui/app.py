@@ -101,4 +101,13 @@ def run_gui() -> int:
     window.tray = tray
     window.show()
 
+    # Shared Notify is opt-in. Once enabled, the GUI owns a lightweight daemon
+    # heartbeat/mailbox worker for this machine and stops it on application exit.
+    try:
+        from ..shared_notify import start_background, stop_background
+        start_background(interval=15)
+        app.aboutToQuit.connect(stop_background)
+    except Exception:
+        pass
+
     return app.exec()

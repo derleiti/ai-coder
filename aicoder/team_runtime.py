@@ -305,6 +305,29 @@ def resolve_model(value: Any, state: dict[str, Any]) -> str | None:
     return text
 
 
+def reroute_unavailable_account_models(state: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Replace only account models with known temporary provider outages.
+
+    Authentication/setup failures remain untouched and therefore fail closed.
+    ``@primary`` aliases are preserved so they resolve to the already-rerouted
+    primary model at config construction time.
+    """
+    from .account_providers import reroute_account_model_if_unavailable
+
+    result = dict(state)
+    reroutes: list[dict[str, Any]] = []
+    keys = ["selected_model", *sorted(TEAM_SETTING_KEYS)]
+    for key in keys:
+        configured = str(result.get(key) or "").strip()
+        if not configured or configured == TEAM_PRIMARY_ALIAS:
+            continue
+        effective, info = reroute_account_model_if_unavailable(configured)
+        if info and effective and effective != configured:
+            result[key] = effective
+            reroutes.append({"role_key": key, **info})
+    return result, reroutes
+
+
 def config_from_state(state: dict[str, Any]) -> TeamConfig:
     research: list[ResearchSlot] = []
     for index, role in enumerate(RESEARCH_ROLES, start=1):

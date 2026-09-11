@@ -107,6 +107,90 @@ def cmd_profile(_: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_notify(args: argparse.Namespace) -> int:
+    from . import shared_notify as shared
+
+    action = str(getattr(args, "notify_action", "status") or "status")
+    if action == "enable":
+        print_json(shared.enable_shared_notify(getattr(args, "handle", "") or ""))
+        return 0
+    if action == "disable":
+        print_json(shared.disable_shared_notify())
+        return 0
+    if action == "status":
+        state = shared.load_shared_notify_state(create_identity=False)
+        data = state.to_dict()
+        if state.enabled:
+            try:
+                data["server"] = shared._client().notify_status()
+            except Exception as exc:
+                data["server_error"] = type(exc).__name__
+        print_json(data)
+        return 0
+    if action == "directory":
+        print_json(shared._client().notify_directory(include_offline=not bool(getattr(args, "online_only", False))))
+        return 0
+    if action == "presence":
+        kwargs = {
+            "availability": getattr(args, "availability", None),
+            "activity": getattr(args, "activity", None),
+            "status_text": getattr(args, "status_text", None),
+        }
+        for name in ("accept_human_chat", "accept_ai_chat", "accept_tasks"):
+            value = getattr(args, name, None)
+            if value is not None:
+                kwargs[name] = value == "yes"
+        print_json(shared.set_presence(**kwargs))
+        return 0
+    if action == "rename":
+        state = shared.load_shared_notify_state(create_identity=False)
+        if not state.enabled or not state.endpoint_id:
+            raise RuntimeError("Shared Notify is disabled")
+        result = shared._client().notify_rename(state.endpoint_id, args.handle)
+        endpoint = result.get("endpoint") or {}
+        state.handle = str(endpoint.get("handle") or state.handle)
+        shared.save_shared_notify_state(state)
+        print_json(endpoint)
+        return 0
+    if action == "publish-ai":
+        print_json(shared.publish_ai(args.handle, args.model))
+        return 0
+    if action == "send":
+        state = shared.load_shared_notify_state(create_identity=False)
+        payload = {
+            "target": args.target,
+            "kind": args.kind,
+            "title": args.title or "",
+            "body": " ".join(args.message or []).strip(),
+            "sender_endpoint_id": state.endpoint_id if state.enabled else "",
+            "metadata": {"expect_reply": bool(getattr(args, "expect_reply", False))},
+        }
+        print_json(shared._client().notify_send(payload))
+        return 0
+    if action == "inbox":
+        state = shared.load_shared_notify_state(create_identity=False)
+        endpoint_id = getattr(args, "endpoint_id", "") or state.endpoint_id
+        if not endpoint_id:
+            raise RuntimeError("No Shared Notify endpoint configured")
+        print_json(shared._client().notify_inbox(endpoint_id, limit=getattr(args, "limit", 50)))
+        return 0
+    if action == "ack":
+        state = shared.load_shared_notify_state(create_identity=False)
+        endpoint_id = getattr(args, "endpoint_id", "") or state.endpoint_id
+        if not endpoint_id:
+            raise RuntimeError("No Shared Notify endpoint configured")
+        print_json(shared._client().notify_ack(endpoint_id, args.message_id))
+        return 0
+    if action == "poll":
+        print_json(shared.poll_once(dispatch_ai=True))
+        return 0
+    if action == "serve":
+        print(f"Shared Notify serving every {args.interval}s. Ctrl+C to stop.", file=sys.stderr)
+        shared.serve(interval=args.interval)
+        return 0
+    raise ClientError(f"Unknown notify action: {action}")
+
+
 def cmd_workspace(args: argparse.Namespace) -> int:
     root = activate_workspace(args.path)
     set_workspace(str(root))
@@ -1530,6 +1614,39 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("profile", help="Show local session data (masked)")
     p.set_defaults(func=cmd_profile)
+
+    # shared notify / presence
+    p = sub.add_parser("notify", help="AILinux Shared Notify, Presence and AI endpoint network")
+    p.add_argument("notify_action", nargs="?", default="status", choices=[
+        "enable", "disable", "status", "directory", "presence", "rename", "publish-ai",
+        "send", "inbox", "ack", "poll", "serve",
+    ])
+    p.add_argument("message", nargs="*", help="Message body for notify send")
+    p.add_argument("--handle", default="", help="Unique @handle to claim or rename")
+    p.add_argument("--model", default="", help="AICoder model selector for publish-ai")
+    p.add_argument("--target", default="", help="Destination @handle for send")
+    p.add_argument("--kind", default="human_chat", choices=[
+        "human_chat", "task", "review", "coordination", "ai_optimization", "brainstorm", "handoff",
+    ])
+    p.add_argument("--title", default="")
+    p.add_argument("--expect-reply", action="store_true")
+    p.add_argument("--availability", choices=[
+        "available", "busy", "waiting", "blocked", "do_not_disturb", "quota_limited", "offline",
+    ])
+    p.add_argument("--activity", choices=[
+        "idle", "open_for_human_chat", "open_for_ai_chat", "working", "working_hard",
+        "researching", "coding", "reviewing", "thinking", "waiting_for_operator", "waiting_for_agent",
+    ])
+    p.add_argument("--status-text", default=None)
+    p.add_argument("--accept-human-chat", choices=["yes", "no"], default=None)
+    p.add_argument("--accept-ai-chat", choices=["yes", "no"], default=None)
+    p.add_argument("--accept-tasks", choices=["yes", "no"], default=None)
+    p.add_argument("--endpoint-id", default="")
+    p.add_argument("--message-id", default="")
+    p.add_argument("--limit", type=int, default=50)
+    p.add_argument("--online-only", action="store_true")
+    p.add_argument("--interval", type=int, default=15)
+    p.set_defaults(func=cmd_notify)
 
     # workspace
     p = sub.add_parser("workspace", help="Analyze local workspace/repo")

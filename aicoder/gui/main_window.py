@@ -9,6 +9,7 @@ from PyQt6.QtGui import QKeySequence, QShortcut
 from .chat_widget import ChatWidget
 from .settings_widget import SettingsWidget
 from .mcp_widget import MCPServersWidget
+from .shared_notify_widget import SharedNotifyWidget
 from .theme import APP_STYLESHEET
 
 
@@ -43,7 +44,7 @@ class MainWindow(QMainWindow):
         brand.setObjectName("Brand")
         caption = QLabel("AILinux operator agent")
         caption.setObjectName("Caption")
-        shortcut_hint = QLabel("Ctrl+1 Chat   Ctrl+2 Settings   Ctrl+3 MCP Servers   Ctrl+K Prompt")
+        shortcut_hint = QLabel("Ctrl+1 Chat   Ctrl+2 Settings   Ctrl+3 MCP   Ctrl+4 AI Network   Ctrl+K Prompt")
         shortcut_hint.setObjectName("Caption")
         top_layout.addWidget(mark)
         top_layout.addWidget(brand)
@@ -56,10 +57,12 @@ class MainWindow(QMainWindow):
         self.settings_tab = SettingsWidget()
         self.chat_tab = ChatWidget(settings_ref=self.settings_tab)
         self.mcp_tab = MCPServersWidget()
+        self.network_tab = SharedNotifyWidget()
 
         self.tabs.addTab(self.chat_tab, "Chat")
         self.tabs.addTab(self.settings_tab, "Settings")
         self.tabs.addTab(self.mcp_tab, "MCP Servers")
+        self.tabs.addTab(self.network_tab, "AI Network")
         root_layout.addWidget(self.tabs, stretch=1)
         self.setCentralWidget(root)
 
@@ -68,6 +71,7 @@ class MainWindow(QMainWindow):
             QShortcut(QKeySequence("Ctrl+2"), self, activated=lambda: self.tabs.setCurrentIndex(1)),
             QShortcut(QKeySequence("Ctrl+,"), self, activated=lambda: self.tabs.setCurrentIndex(1)),
             QShortcut(QKeySequence("Ctrl+3"), self, activated=lambda: self.tabs.setCurrentIndex(2)),
+            QShortcut(QKeySequence("Ctrl+4"), self, activated=lambda: self.tabs.setCurrentIndex(3)),
         ]
         self._setup_system_log_monitor()
 

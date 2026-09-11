@@ -14,6 +14,8 @@ from aicoder.account_providers import (
     MistralAccountTransport,
     account_model_id,
     account_status,
+    antigravity_quota_status,
+    reroute_account_model_if_unavailable,
     available_account_models,
     is_account_model,
     parse_account_model,
@@ -56,6 +58,75 @@ class AccountProviderIdTests(unittest.TestCase):
         self.assertFalse(is_account_model("openrouter/test"))
         with self.assertRaises(ClientError):
             parse_account_model("openrouter/test")
+
+
+class AccountQuotaRoutingTests(unittest.TestCase):
+    def test_antigravity_quota_status_reads_active_reset_window(self):
+        from datetime import datetime
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "cli-20260911_095719.log"
+            log.write_text(
+                "I0911 09:57:22.671014 626 run.go:387] Run failed "
+                "(RESOURCE_EXHAUSTED (code 429): Individual quota reached. "
+                "Please upgrade. Resets in 139h55m52s.)\n"
+            )
+            status = antigravity_quota_status(
+                log_dir=tmp, now=datetime.fromisoformat("2026-09-11T10:00:00+02:00")
+            )
+        self.assertTrue(status["quota_exhausted"])
+        self.assertGreater(status["quota_retry_after_seconds"], 139 * 3600)
+        self.assertIn("2026-09-17", status["quota_reset_at"])
+
+    def test_antigravity_quota_status_ignores_expired_window(self):
+        from datetime import datetime
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "cli-20260911_095719.log"
+            log.write_text(
+                "I0911 09:57:22.671014 626 run.go:387] "
+                "RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 2s.\n"
+            )
+            status = antigravity_quota_status(
+                log_dir=tmp, now=datetime.fromisoformat("2026-09-11T10:00:00+02:00")
+            )
+        self.assertFalse(status["quota_exhausted"])
+
+    def test_quota_exhausted_gemini_reroutes_to_authenticated_claude(self):
+        def status(provider):
+            if provider == "gemini":
+                return {
+                    "provider": provider, "installed": True, "linked": True,
+                    "authenticated": True, "quota_exhausted": True,
+                    "quota_retry_after_seconds": 3600, "quota_reset_at": "later",
+                }
+            if provider == "claude":
+                return {
+                    "provider": provider, "installed": True, "linked": True,
+                    "authenticated": True, "quota_exhausted": False,
+                }
+            return {
+                "provider": provider, "installed": False, "linked": False,
+                "authenticated": False, "quota_exhausted": False,
+            }
+        with patch("aicoder.account_providers.account_status", side_effect=status):
+            model, info = reroute_account_model_if_unavailable(
+                "account:gemini/gemini-3.8-flash-high"
+            )
+        self.assertEqual(model, "account:claude/sonnet")
+        self.assertEqual(info["reason"], "quota_exhausted")
+        self.assertEqual(info["from_model"], "account:gemini/gemini-3.8-flash-high")
+
+    def test_non_quota_failure_is_not_hidden_by_reroute(self):
+        with patch("aicoder.account_providers.account_status", return_value={
+            "provider": "gemini", "installed": True, "linked": False,
+            "authenticated": False, "quota_exhausted": False,
+        }):
+            model, info = reroute_account_model_if_unavailable(
+                "account:gemini/gemini-3.8-flash-high"
+            )
+        self.assertEqual(model, "account:gemini/gemini-3.8-flash-high")
+        self.assertIsNone(info)
 
 
 class AccountRoutingTests(unittest.TestCase):
