@@ -6,10 +6,11 @@ import shlex
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QFormLayout, QGridLayout, QGroupBox,
-    QHBoxLayout, QLabel, QLineEdit, QListWidget, QMessageBox, QPushButton,
+    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPushButton,
     QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+from .. import shared_notify as shared_notify
 from ..mcp_registry import MCPServerConfig, normalize_server_name
 from ..mcp_service import (
     authentication_status, authorize_and_save_server, authorize_oauth, get_server,
@@ -138,6 +139,29 @@ class MCPServersWidget(QWidget):
             buttons.addWidget(button, index // 4, index % 4)
         right.addLayout(buttons)
 
+        share_box = QGroupBox("MCP Sharing via Shared Notify")
+        share_layout = QVBoxLayout(share_box)
+        self.share_status = QLabel("Select an enabled local MCP server to share it with your AILinux account.")
+        self.share_status.setWordWrap(True)
+        share_layout.addWidget(self.share_status)
+        share_buttons = QHBoxLayout()
+        self.share_button = QPushButton("Share selected MCP")
+        self.unshare_button = QPushButton("Unshare selected MCP")
+        self.shared_refresh_button = QPushButton("Refresh Shared")
+        share_buttons.addWidget(self.share_button)
+        share_buttons.addWidget(self.unshare_button)
+        share_buttons.addWidget(self.shared_refresh_button)
+        share_layout.addLayout(share_buttons)
+        self.shared_servers = QListWidget()
+        self.shared_servers.setMinimumHeight(90)
+        self.shared_servers.setToolTip("MCP shares visible through Shared Notify. 'Mine' runs on this client; 'Remote' is provided by another client.")
+        share_layout.addWidget(self.shared_servers)
+        right.addWidget(share_box)
+
+        self.share_button.clicked.connect(self.share_selected)
+        self.unshare_button.clicked.connect(self.unshare_selected)
+        self.shared_refresh_button.clicked.connect(self.refresh_shared)
+
         self.status = QLabel("Secrets are stored only in the operating-system keyring.")
         self.status.setWordWrap(True)
         right.addWidget(self.status)
@@ -238,6 +262,8 @@ class MCPServersWidget(QWidget):
             self.servers.setCurrentItem(target_item)
         elif not self._selected_name:
             self.clear()
+        self.refresh_shared(silent=True)
+        self._update_share_controls()
 
     def clear(self) -> None:
         self._selected_name = ""
@@ -267,6 +293,7 @@ class MCPServersWidget(QWidget):
         self.oauth_client_secret.clear()
         self.status.setText("New MCP server · default trust: untrusted")
         self._transport_changed(self.transport.currentText())
+        self._update_share_controls()
 
     def _load(self, name: str) -> None:
         if not name:
@@ -285,6 +312,7 @@ class MCPServersWidget(QWidget):
             self.refresh_button.setEnabled(True)
             self.new_button.setEnabled(True)
             self.status.setText("Built-in TriForce MCP · read-only here · authentication remains managed by AICoder login/RBAC/recovery.")
+            self._update_share_controls()
             return
         self._set_editor_enabled(True)
         config = get_server(name)
@@ -316,6 +344,79 @@ class MCPServersWidget(QWidget):
         self.status.setText(f"Loaded {name} · authentication {auth_text} · secret fields are intentionally blank")
         self._transport_changed(config.transport)
         self._auth_changed(config.auth_type)
+        self._update_share_controls()
+
+    def _update_share_controls(self) -> None:
+        name = self._selected_name or self.name.text().strip()
+        config = get_server(name) if name and name != "triforce" else None
+        state = shared_notify.load_shared_notify_state(create_identity=False)
+        shared_row = next((row for row in state.published_mcp.values() if row.get("server") == name), None) if config else None
+        can_share = bool(config and config.enabled and state.enabled and state.endpoint_id)
+        self.share_button.setEnabled(can_share and shared_row is None)
+        self.unshare_button.setEnabled(bool(shared_row))
+        if name == "triforce":
+            self.share_status.setText("Built-in TriForce is already the backend MCP and is not shareable from this panel.")
+        elif config is None:
+            self.share_status.setText("Select an enabled local MCP server to share it with your AILinux account.")
+        elif not config.enabled:
+            self.share_status.setText(f"{name} is disabled. Enable it before sharing.")
+        elif not state.enabled or not state.endpoint_id:
+            self.share_status.setText("Shared Notify is disabled. Enable Shared Notify in AI Network before sharing MCP servers.")
+        elif shared_row:
+            self.share_status.setText(f"{name} is shared as {shared_row.get('handle') or 'an MCP endpoint'}.")
+        else:
+            self.share_status.setText(f"{name} is ready to share. Credentials and local start parameters stay on this machine.")
+
+    def refresh_shared(self, _checked: bool = False, *, silent: bool = False) -> None:
+        self.shared_servers.clear()
+        try:
+            state = shared_notify.load_shared_notify_state(create_identity=False)
+            local_ids = set(state.published_mcp)
+            rows = shared_notify.shared_mcp_directory() if state.enabled else []
+            for row in rows:
+                endpoint_id = str(row.get("endpoint_id") or "")
+                scope = "Mine" if endpoint_id in local_ids else "Remote"
+                online = "●" if row.get("online") else "○"
+                handle = str(row.get("handle") or "")
+                label = str(row.get("label") or "Shared MCP")
+                item = QListWidgetItem(f"{online} [{scope}] {handle} · {label}")
+                item.setData(Qt.ItemDataRole.UserRole, dict(row))
+                self.shared_servers.addItem(item)
+            if not rows and not silent:
+                self.share_status.setText("No shared MCP servers are currently visible.")
+        except Exception as exc:
+            if not silent:
+                self.share_status.setText(f"Shared MCP refresh failed: {type(exc).__name__}: {exc}")
+
+    def share_selected(self) -> None:
+        name = self._selected_name or self.name.text().strip()
+        if not name or name == "triforce":
+            return
+        try:
+            config = get_server(name)
+            if config is None:
+                raise ValueError(f"unknown MCP server: {name}")
+            if not config.enabled:
+                raise ValueError(f"MCP server is disabled: {name}")
+            endpoint = shared_notify.publish_mcp(name)
+            self.share_status.setText(f"Shared {name} as {endpoint.get('handle','')} · {endpoint.get('tool_count', 0)} tools")
+            self.refresh_shared(silent=True)
+            self._update_share_controls()
+        except Exception as exc:
+            QMessageBox.critical(self, "MCP Sharing", f"{type(exc).__name__}: {exc}")
+
+    def unshare_selected(self) -> None:
+        name = self._selected_name or self.name.text().strip()
+        if not name or name == "triforce":
+            return
+        try:
+            if not shared_notify.unpublish_mcp(name):
+                raise ValueError(f"MCP server is not shared: {name}")
+            self.share_status.setText(f"Share disabled for {name}")
+            self.refresh_shared(silent=True)
+            self._update_share_controls()
+        except Exception as exc:
+            QMessageBox.critical(self, "MCP Sharing", f"{type(exc).__name__}: {exc}")
 
     def _config(self) -> MCPServerConfig:
         try:

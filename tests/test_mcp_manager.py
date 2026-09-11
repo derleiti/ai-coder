@@ -14,6 +14,7 @@ from contextlib import redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlencode, urlsplit
 from urllib.request import urlopen
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from aicoder.cli import build_parser, cmd_mcp
@@ -594,3 +595,36 @@ class SurfaceIntegrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(os.environ.get("QT_QPA_PLATFORM") == "offscreen", "GUI test is run in the offscreen verification pass")
+def test_gui_mcp_share_controls_and_publish():
+    from PyQt6.QtWidgets import QApplication
+    import aicoder.gui.mcp_widget as widget_module
+    app = QApplication.instance() or QApplication([])
+    demo = MCPServerConfig(name="GIMP MCP", command=sys.executable, enabled=True)
+    state = SimpleNamespace(enabled=True, endpoint_id="ep_client", published_mcp={})
+    shared_rows = [{"endpoint_id":"ep_share","handle":"@mcp-zombie-gimp","label":"Shared MCP: GIMP MCP","online":True,"kind":"mcp"}]
+    with (
+        patch.object(widget_module, "list_servers", return_value=[{"name":"GIMP MCP","builtin":False,"transport":"stdio","enabled":True,"trust":"untrusted"}]),
+        patch.object(widget_module, "get_server", return_value=demo),
+        patch.object(widget_module, "authentication_status", return_value={"configured":True,"credential_status":{}}),
+        patch.object(widget_module.shared_notify, "load_shared_notify_state", return_value=state),
+        patch.object(widget_module.shared_notify, "shared_mcp_directory", return_value=shared_rows),
+        patch.object(widget_module.shared_notify, "publish_mcp") as publish,
+    ):
+        def publish_side_effect(name):
+            state.published_mcp["ep_share"] = {"endpoint_id":"ep_share", "handle":"@mcp-zombie-gimp", "server":name}
+            return {"handle":"@mcp-zombie-gimp","tool_count":27}
+        publish.side_effect = publish_side_effect
+        widget = widget_module.MCPServersWidget()
+        widget._load("GIMP MCP")
+        assert widget.share_button.isEnabled()
+        widget.share_selected()
+        publish.assert_called_once_with("GIMP MCP")
+        assert "shared as @mcp-zombie-gimp" in widget.share_status.text().lower()
+        widget.refresh_shared()
+        assert widget.shared_servers.count() == 1
+        assert "Mine" in widget.shared_servers.item(0).text()
+        widget.deleteLater()
+        app.processEvents()
