@@ -7,7 +7,7 @@ a = Analysis(
     ['aicoder_main.py'],
     pathex=['.'],
     binaries=[],
-    datas=copy_metadata('aicoder') + copy_metadata('keyring'),
+    datas=copy_metadata('aicoder') + copy_metadata('keyring') + copy_metadata('huggingface_hub'),
     hiddenimports=[
         'aicoder.cli',
         'aicoder.client',
@@ -72,6 +72,7 @@ a = Analysis(
         'json',
         'shutil',
         *collect_submodules('keyring'),
+        *collect_submodules('huggingface_hub'),
         *collect_submodules('secretstorage'),
         *collect_submodules('jeepney'),
     ],

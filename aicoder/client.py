@@ -7,7 +7,7 @@ import threading
 import time
 from typing import Any, Dict, Optional
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin
+from urllib.parse import urljoin, quote
 from urllib.request import Request, urlopen
 
 from . import __version__
@@ -604,6 +604,24 @@ class TriForceClient:
 
     def notify_status(self) -> Dict[str, Any]:
         return self._request("GET", "/v1/notify-network/status", require_auth=True, _label="notify-status", _retries=0)
+
+    def notify_conversations(self, endpoint_id: str = "") -> Dict[str, Any]:
+        suffix = f"?endpoint_id={quote(str(endpoint_id))}" if endpoint_id else ""
+        return self._request("GET", f"/v1/notify-network/conversations{suffix}", require_auth=True, _label="notify-conversations", _retries=0)
+
+    def notify_conversation_create(self, title: str, created_by_endpoint_id: str, member_handles: list[str], kind: str = "group") -> Dict[str, Any]:
+        return self._request("POST", "/v1/notify-network/conversations", {
+            "title": title, "created_by_endpoint_id": created_by_endpoint_id,
+            "member_handles": member_handles, "kind": kind,
+        }, require_auth=True, _label="notify-conversation-create", _retries=0)
+
+    def notify_conversation_history(self, conversation_id: str, limit: int = 200) -> Dict[str, Any]:
+        cid = quote(str(conversation_id), safe="")
+        return self._request("GET", f"/v1/notify-network/conversations/{cid}/history?limit={max(1, min(int(limit), 500))}", require_auth=True, _label="notify-conversation-history", _retries=0)
+
+    def notify_conversation_send(self, conversation_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        cid = quote(str(conversation_id), safe="")
+        return self._request("POST", f"/v1/notify-network/conversations/{cid}/send", payload, require_auth=True, _label="notify-conversation-send", _retries=0)
 
     def notify_disable(self, endpoint_id: str) -> Dict[str, Any]:
         return self._request("DELETE", f"/v1/notify-network/endpoints/{endpoint_id}", require_auth=True, _label="notify-disable", _retries=0)

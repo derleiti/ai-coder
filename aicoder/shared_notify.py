@@ -11,6 +11,7 @@ import json
 import os
 import secrets
 import socket
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,6 +21,41 @@ from .config import CONFIG_DIR, atomic_write_private, ensure_config_dir, load_se
 from .client import TriForceClient
 
 STATE_FILE = CONFIG_DIR / "shared_notify.json"
+
+_received_lock = threading.Lock()
+_received_messages: list[dict[str, Any]] = []
+_received_ids: set[str] = set()
+
+
+def _queue_received(message: dict[str, Any]) -> bool:
+    """Keep one process-local durable-enough handoff before server ACK.
+
+    The GUI drains this queue on its timer. ACK happens only after the message
+    has been copied here, so the background worker does not silently eat human
+    chat while AI endpoint dispatch remains independent.
+    """
+    message_id = str(message.get("message_id") or "")
+    if not message_id:
+        return False
+    with _received_lock:
+        if message_id in _received_ids:
+            return False
+        _received_ids.add(message_id)
+        _received_messages.append(dict(message))
+        if len(_received_messages) > 500:
+            old = _received_messages.pop(0)
+            _received_ids.discard(str(old.get("message_id") or ""))
+    return True
+
+
+def drain_received_messages() -> list[dict[str, Any]]:
+    with _received_lock:
+        rows = list(_received_messages)
+        _received_messages.clear()
+        for row in rows:
+            _received_ids.discard(str(row.get("message_id") or ""))
+        return rows
+
 
 
 def _slug(value: str) -> str:
@@ -291,6 +327,13 @@ def poll_once(*, dispatch_ai: bool = True) -> dict[str, Any]:
         total += len(rows)
         for msg in rows:
             message_id = str(msg.get("message_id") or "")
+            if endpoint_id == state.endpoint_id and message_id:
+                try:
+                    if _queue_received(msg):
+                        client.notify_ack(endpoint_id, message_id)
+                except Exception as exc:
+                    errors.append(f"client-inbox:{endpoint_id}:{type(exc).__name__}")
+                continue
             if endpoint_id in state.published_ai and dispatch_ai:
                 model = str(state.published_ai[endpoint_id].get("model") or "")
                 try:

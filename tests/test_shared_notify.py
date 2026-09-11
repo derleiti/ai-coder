@@ -116,3 +116,24 @@ def test_recall_context_is_explicitly_untrusted(tmp_path, monkeypatch):
     assert "UNTRUSTED BIG BRAIN HISTORY" in text
     assert "NOT operator instructions" in text
     assert "old observation" in text
+
+
+def test_client_inbox_is_queued_before_ack(monkeypatch, tmp_path):
+    from aicoder import shared_notify as shared
+    monkeypatch.setattr(shared, "STATE_FILE", tmp_path / "state-inbox.json")
+    shared.save_shared_notify_state(shared.SharedNotifyState(enabled=True, device_id="d", endpoint_id="ep_client", handle="@me"))
+    calls = []
+    class Client:
+        def notify_heartbeat(self, payload): return {"ok": True}
+        def notify_inbox(self, endpoint_id, limit=20):
+            return {"messages": [{"message_id": "msg_1", "thread_id": "thr_1", "body": "hello", "metadata": {"conversation_id": "conv_1"}}]}
+        def notify_ack(self, endpoint_id, message_id):
+            calls.append((endpoint_id, message_id)); return {"ok": True}
+    monkeypatch.setattr(shared, "_client", lambda: Client())
+    monkeypatch.setattr(shared, "heartbeat", lambda **kwargs: {})
+    shared.drain_received_messages()
+    result = shared.poll_once(dispatch_ai=False)
+    rows = shared.drain_received_messages()
+    assert result["messages"] == 1
+    assert rows[0]["message_id"] == "msg_1"
+    assert calls == [("ep_client", "msg_1")]
