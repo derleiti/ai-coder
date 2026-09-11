@@ -126,7 +126,22 @@ class NotifyConversationWidget(QWidget):
 
     def _show_history(self, result: dict[str, Any]):
         messages = list((result or {}).get("messages") or [])
-        signature = tuple(str(m.get("correlation_id") or m.get("message_id") or "") for m in messages)
+        # correlation_id is causal tracing, not message identity. A reply may
+        # intentionally reuse its parent's correlation_id, so cache the actual
+        # message IDs plus mutable display fields instead.
+        signature = tuple(
+            "\x1f".join(
+                (
+                    str(m.get("message_id") or ""),
+                    str(m.get("status") or ""),
+                    str(m.get("sender_handle") or ""),
+                    str(m.get("kind") or ""),
+                    str(m.get("title") or ""),
+                    str(m.get("body") or ""),
+                )
+            )
+            for m in messages
+        )
         if signature == self._last_signature:
             self.status.setText(f"{len(messages)} messages · synced")
             return

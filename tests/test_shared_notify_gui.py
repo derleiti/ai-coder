@@ -82,3 +82,34 @@ def test_main_window_routes_notify_conversation_to_chat_hub(monkeypatch, tmp_pat
     assert window.chat_tab.tabs.count() == 2
     assert window.chat_tab.tabs.tabText(1) == "Architecture"
     window.close(); app.processEvents()
+
+
+def test_notify_chat_renders_reply_reusing_parent_correlation(monkeypatch, tmp_path):
+    from aicoder import shared_notify as shared
+    from aicoder.gui.notify_chat_widget import NotifyConversationWidget
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(shared, "STATE_FILE", tmp_path / "state-notify-chat.json")
+    shared.save_shared_notify_state(shared.SharedNotifyState(enabled=False, device_id="dev_chat", handle="@zombie"))
+    monkeypatch.setattr(NotifyConversationWidget, "refresh", lambda self: None)
+    widget = NotifyConversationWidget({
+        "conversation_id": "conv_direct",
+        "kind": "direct",
+        "members": [{"handle": "@zombie"}, {"handle": "@ailinux-ollama-kimi-k3"}],
+    })
+    parent = {
+        "message_id": "msg_parent", "correlation_id": "grp_same", "sender_handle": "@zombie",
+        "kind": "human_chat", "body": "sag nur notify funktioniert.", "status": "acknowledged",
+    }
+    reply = {
+        "message_id": "msg_reply", "correlation_id": "grp_same", "sender_handle": "@ailinux-ollama-kimi-k3",
+        "kind": "ai_optimization", "body": "notify funktioniert.", "status": "acknowledged",
+    }
+    widget._show_history({"messages": [parent]})
+    widget._show_history({"messages": [parent, reply]})
+    assert len(widget._last_signature) == 2
+    assert widget._last_signature[0] != widget._last_signature[1]
+    text = widget.log.toPlainText()
+    assert "sag nur notify funktioniert." in text
+    assert "notify funktioniert." in text
+    assert "@ailinux-ollama-kimi-k3" in text
+    widget.close(); app.processEvents()
