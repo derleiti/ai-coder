@@ -48,6 +48,10 @@ class LocalModelsWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._worker = None
+        # Keep finished QThread wrappers alive until Qt has delivered every
+        # queued signal. Replacing the sole reference from inside a completion
+        # callback can otherwise destroy the emitting QThread and abort Qt.
+        self._workers = set()
         self._repos = []
         self._files = []
         self._build_ui()
@@ -125,16 +129,28 @@ class LocalModelsWidget(QWidget):
         hf_layout.addWidget(self.status)
         layout.addWidget(hf)
 
-    def _start(self, fn, callback, *args):
-        if self._worker and self._worker.isRunning():
-            return
+    def _start(self, fn, callback, *args, **kwargs):
+        # One operation at a time keeps repository/file selections coherent.
+        if any(worker.isRunning() for worker in self._workers):
+            return False
         self.setEnabled(False)
-        worker = _Worker(fn, *args)
+        worker = _Worker(fn, *args, **kwargs)
         self._worker = worker
+        self._workers.add(worker)
         worker.done.connect(callback)
         worker.error.connect(self._error)
-        worker.finished.connect(lambda: self.setEnabled(True))
+        worker.finished.connect(lambda w=worker: self._worker_finished(w))
         worker.start()
+        return True
+
+    def _worker_finished(self, worker):
+        self.setEnabled(True)
+        # deleteLater is safe now that QThread has emitted finished; retain the
+        # Python wrapper until this slot runs so it cannot be collected early.
+        self._workers.discard(worker)
+        if self._worker is worker:
+            self._worker = None
+        worker.deleteLater()
 
     def _error(self, text: str):
         self.status.setText(text)
