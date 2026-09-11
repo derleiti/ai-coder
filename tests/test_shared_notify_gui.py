@@ -26,47 +26,59 @@ def test_big_brain_status_renders_metrics(monkeypatch, tmp_path):
     app.processEvents()
 
 
-def test_messenger_renders_filters_and_history(monkeypatch, tmp_path):
+def test_network_filters_and_opens_conversation_in_main_chat(monkeypatch, tmp_path):
     from aicoder import shared_notify as shared
     app = QApplication.instance() or QApplication([])
-    monkeypatch.setattr(shared, "STATE_FILE", tmp_path / "state-messenger.json")
-    shared.save_shared_notify_state(shared.SharedNotifyState(enabled=False, device_id="dev_messenger"))
+    monkeypatch.setattr(shared, "STATE_FILE", tmp_path / "state-network.json")
+    shared.save_shared_notify_state(shared.SharedNotifyState(enabled=False, device_id="dev_network", handle="@zombie"))
     widget = SharedNotifyWidget()
     widget._show_directory({"endpoints": [
         {"handle": "@claude-zombie", "label": "Claude", "kind": "ai", "online": True, "availability": "available", "activity": "idle", "accept_human_chat": True, "accept_ai_chat": True, "capabilities": ["chat"]},
-        {"handle": "@markus", "label": "Human", "kind": "client", "online": True, "availability": "available", "activity": "idle", "accept_human_chat": True, "accept_ai_chat": False, "capabilities": ["chat"]},
+        {"handle": "@zombie", "label": "Human", "kind": "client", "online": True, "availability": "available", "activity": "idle", "accept_human_chat": True, "accept_ai_chat": False, "capabilities": ["chat"]},
     ]})
-    widget._show_conversations({"conversations": [{
-        "conversation_id": "conv_1", "title": "Architecture", "members": [
-            {"handle": "@markus"}, {"handle": "@claude-zombie"},
-        ],
-    }]})
+    conversation = {"conversation_id": "conv_1", "title": "Architecture", "kind": "group", "members": [{"handle": "@zombie"}, {"handle": "@claude-zombie"}]}
+    widget._show_conversations({"conversations": [conversation]})
     assert widget.directory.rowCount() == 2
-    assert widget.conversations.count() == 1
+    assert widget.directory.item(0, 0).text().startswith("● @claude-zombie")
     widget.network_filter.setText("claude")
     assert widget.directory.rowCount() == 1
-    assert widget.conversations.count() == 1
-    widget._active_conversation_id = "conv_1"
-    widget._show_conversation_history({"messages": [{
-        "sender_handle": "@markus", "kind": "human_chat", "body": "Hallo Team", "delivery_count": 2,
-    }]})
-    assert "Architecture" in widget.conversation_title.text()
-    assert "Hallo Team" in widget.conversation_log.toPlainText()
-    assert "2 deliveries" in widget.conversation_log.toPlainText()
-    widget.close()
-    app.processEvents()
-
-
-def test_messenger_unread_badge_and_online_marker(monkeypatch, tmp_path):
-    from aicoder import shared_notify as shared
-    app = QApplication.instance() or QApplication([])
-    monkeypatch.setattr(shared, "STATE_FILE", tmp_path / "state-unread.json")
-    shared.save_shared_notify_state(shared.SharedNotifyState(enabled=False, device_id="dev_u", handle="@markus"))
-    widget = SharedNotifyWidget()
-    widget._show_directory({"endpoints": [{"handle":"@claude","kind":"ai","online":True,"availability":"available","activity":"idle","capabilities":[]}]})
-    assert widget.directory.item(0, 0).text().startswith("● @claude")
-    widget._show_conversations({"conversations":[{"conversation_id":"conv_u","title":"Team","members":[{"handle":"@markus"},{"handle":"@claude"}]}]})
-    monkeypatch.setattr(shared, "drain_received_messages", lambda: [{"message_id":"m1","metadata":{"conversation_id":"conv_u"}}])
-    widget._refresh_if_visible()
-    assert "[1]" in widget.conversations.item(0).text()
+    opened = []
+    widget.conversation_open_requested.connect(opened.append)
+    widget.conversations.setCurrentRow(0)
+    widget._open_selected_conversation()
+    assert opened[0]["conversation_id"] == "conv_1"
     widget.close(); app.processEvents()
+
+
+def test_chat_hub_opens_named_notify_tab(monkeypatch, tmp_path):
+    from aicoder import shared_notify as shared
+    from aicoder.gui.chat_hub_widget import ChatHubWidget
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(shared, "STATE_FILE", tmp_path / "state-hub.json")
+    shared.save_shared_notify_state(shared.SharedNotifyState(enabled=False, device_id="dev_hub", handle="@zombie"))
+    monkeypatch.setattr("aicoder.gui.notify_chat_widget.NotifyConversationWidget.refresh", lambda self: None)
+    hub = ChatHubWidget(settings_ref=None)
+    conversation = {"conversation_id":"conv_direct","kind":"direct","title":"","members":[{"handle":"@zombie"},{"handle":"@claude"}]}
+    hub.open_conversation(conversation)
+    assert hub.tabs.count() == 2
+    assert hub.tabs.tabText(1) == "@claude"
+    hub.open_conversation(conversation)
+    assert hub.tabs.count() == 2
+    hub.close(); app.processEvents()
+
+
+def test_main_window_routes_notify_conversation_to_chat_hub(monkeypatch, tmp_path):
+    from aicoder import shared_notify as shared
+    from aicoder.gui.main_window import MainWindow
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(shared, "STATE_FILE", tmp_path / "state-main-window.json")
+    shared.save_shared_notify_state(shared.SharedNotifyState(enabled=False, device_id="dev_main", handle="@zombie"))
+    monkeypatch.setattr("aicoder.gui.notify_chat_widget.NotifyConversationWidget.refresh", lambda self: None)
+    monkeypatch.setattr(MainWindow, "_setup_system_log_monitor", lambda self: None)
+    window = MainWindow()
+    conversation = {"conversation_id":"conv_arch","kind":"group","title":"Architecture","members":[{"handle":"@zombie"},{"handle":"@claude"}]}
+    window.network_tab.conversation_open_requested.emit(conversation)
+    assert window.tabs.currentWidget() is window.chat_tab
+    assert window.chat_tab.tabs.count() == 2
+    assert window.chat_tab.tabs.tabText(1) == "Architecture"
+    window.close(); app.processEvents()

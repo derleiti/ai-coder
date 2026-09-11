@@ -30,7 +30,9 @@ class _NetworkWorker(QThread):
 
 
 class SharedNotifyWidget(QWidget):
-    """Manage stable handles, human presence and locally published AI endpoints."""
+    """Manage stable handles, presence and open conversations in the main chat hub."""
+
+    conversation_open_requested = pyqtSignal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -39,8 +41,6 @@ class SharedNotifyWidget(QWidget):
         self._directory_rows: list[dict[str, Any]] = []
         self._conversation_rows: list[dict[str, Any]] = []
         self._active_conversation_id = ""
-        self._unread: dict[str, int] = {}
-        self._last_history_signature: dict[str, tuple[str, ...]] = {}
         self._build()
         self._load_local_state()
         self._timer = QTimer(self)
@@ -142,40 +142,15 @@ class SharedNotifyWidget(QWidget):
         dlayout.addWidget(self.directory)
         root.addWidget(directory_box, 1)
 
-        messenger_box = QGroupBox("Messenger · Shared Notify")
-        messenger = QVBoxLayout(messenger_box)
-        tools = QHBoxLayout()
+        conversations_box = QGroupBox("Conversations")
+        conversations_layout = QVBoxLayout(conversations_box)
         self.network_filter = QLineEdit()
         self.network_filter.setPlaceholderText("Filter endpoints or conversations…")
-        self.open_chat_button = QPushButton("Open Chat")
-        self.create_group_button = QPushButton("Create Group")
-        tools.addWidget(self.network_filter, 1)
-        tools.addWidget(self.open_chat_button)
-        tools.addWidget(self.create_group_button)
-        messenger.addLayout(tools)
-        split = QSplitter(Qt.Orientation.Horizontal)
+        conversations_layout.addWidget(self.network_filter)
         self.conversations = QListWidget()
-        self.conversations.setMinimumWidth(220)
-        split.addWidget(self.conversations)
-        chat_side = QWidget()
-        chat_layout = QVBoxLayout(chat_side)
-        chat_layout.setContentsMargins(0, 0, 0, 0)
-        self.conversation_title = QLabel("No conversation selected")
-        self.conversation_log = QTextEdit()
-        self.conversation_log.setReadOnly(True)
-        send_row = QHBoxLayout()
-        self.conversation_input = QLineEdit()
-        self.conversation_input.setPlaceholderText("Message to this conversation…")
-        self.conversation_send_button = QPushButton("Send")
-        send_row.addWidget(self.conversation_input, 1)
-        send_row.addWidget(self.conversation_send_button)
-        chat_layout.addWidget(self.conversation_title)
-        chat_layout.addWidget(self.conversation_log, 1)
-        chat_layout.addLayout(send_row)
-        split.addWidget(chat_side)
-        split.setStretchFactor(1, 1)
-        messenger.addWidget(split, 1)
-        root.addWidget(messenger_box, 2)
+        self.conversations.setToolTip("Double-click a conversation to open it in the main Chat tab")
+        conversations_layout.addWidget(self.conversations)
+        root.addWidget(conversations_box, 1)
 
         self.enable_button.clicked.connect(self.enable)
         self.disable_button.clicked.connect(self.disable)
@@ -185,12 +160,8 @@ class SharedNotifyWidget(QWidget):
         self.brain_refresh_button.clicked.connect(self.refresh_big_brain)
         self.refresh_button.clicked.connect(self.refresh_directory)
         self.network_filter.textChanged.connect(self._apply_filter)
-        self.open_chat_button.clicked.connect(self.open_selected_chat)
         self.directory.cellDoubleClicked.connect(lambda _row, _column: self.open_selected_chat())
-        self.create_group_button.clicked.connect(self.create_group)
-        self.conversations.itemSelectionChanged.connect(self._conversation_selected)
-        self.conversation_send_button.clicked.connect(self.send_conversation_message)
-        self.conversation_input.returnPressed.connect(self.send_conversation_message)
+        self.conversations.itemDoubleClicked.connect(lambda _item: self._open_selected_conversation())
 
     def _load_local_state(self):
         state = shared.load_shared_notify_state(create_identity=True)
@@ -348,9 +319,7 @@ class SharedNotifyWidget(QWidget):
         for row in rows:
             members = [str(m.get("handle") or "") for m in row.get("members") or []]
             title = str(row.get("title") or "").strip() or ", ".join(members)
-            unread = int(self._unread.get(str(row.get("conversation_id") or ""), 0))
-            badge = f"  [{unread}]" if unread else ""
-            item = QListWidgetItem(f"{title}  ·  {len(members)}{badge}")
+            item = QListWidgetItem(f"{title}  ·  {len(members)}")
             item.setData(Qt.ItemDataRole.UserRole, str(row.get("conversation_id") or ""))
             item.setToolTip(" · ".join(members))
             self.conversations.addItem(item)
@@ -386,20 +355,23 @@ class SharedNotifyWidget(QWidget):
 
     def open_selected_chat(self):
         handles = self._selected_endpoint_handles()
-        if len(handles) != 1:
-            QMessageBox.information(self, "Messenger", "Select exactly one endpoint in the AI Network table.")
-            return
-        self._create_conversation(handles, kind="direct")
-
-    def create_group(self):
-        handles = self._selected_endpoint_handles()
         if not handles:
-            QMessageBox.information(self, "Messenger", "Select one or more endpoints in the AI Network table.")
+            return
+        if len(handles) == 1:
+            self._create_conversation(handles, kind="direct")
             return
         title, ok = QInputDialog.getText(self, "Create Group", "Conversation title:")
-        if not ok:
+        if ok:
+            self._create_conversation(handles, kind="group", title=title.strip())
+
+    def _open_selected_conversation(self):
+        item = self.conversations.currentItem()
+        if item is None:
             return
-        self._create_conversation(handles, kind="group", title=title.strip())
+        cid = str(item.data(Qt.ItemDataRole.UserRole) or "")
+        row = next((r for r in self._conversation_rows if str(r.get("conversation_id") or "") == cid), None)
+        if row:
+            self.conversation_open_requested.emit(dict(row))
 
     def _create_conversation(self, handles, *, kind, title=""):
         state = shared.load_shared_notify_state(create_identity=False)
@@ -418,80 +390,10 @@ class SharedNotifyWidget(QWidget):
 
     def _after_conversation_created(self, result):
         created = ((result or {}).get("created") or {}).get("conversation") or {}
-        self._active_conversation_id = str(created.get("conversation_id") or "")
         self._show_conversations((result or {}).get("conversations") or {})
-        self._load_active_conversation()
-
-    def _conversation_selected(self):
-        item = self.conversations.currentItem()
-        if item is None:
-            return
-        self._active_conversation_id = str(item.data(Qt.ItemDataRole.UserRole) or "")
-        self._unread.pop(self._active_conversation_id, None)
-        self._render_conversations(self._conversation_rows)
-        self._load_active_conversation()
-
-    def _load_active_conversation(self):
-        cid = self._active_conversation_id
-        if not cid:
-            return
-        self._run(lambda: shared._client().notify_conversation_history(cid), self._show_conversation_history)
-
-    def _show_conversation_history(self, result):
-        import html
-        messages = list((result or {}).get("messages") or [])
-        cid = self._active_conversation_id
-        signature = tuple(str(m.get("message_id") or m.get("correlation_id") or "") for m in messages)
-        self._last_history_signature[cid] = signature
-        row = next((r for r in self._conversation_rows if str(r.get("conversation_id") or "") == cid), {})
-        members = ", ".join(str(m.get("handle") or "") for m in row.get("members") or [])
-        self.conversation_title.setText(f"{row.get('title') or 'Conversation'} · {members}")
-        self.conversation_log.clear()
-        for message in messages:
-            sender = str(message.get("sender_handle") or "@unknown")
-            kind = str(message.get("kind") or "chat")
-            title = str(message.get("title") or "")
-            body = str(message.get("body") or "")
-            count = int(message.get("delivery_count") or 1)
-            prefix = f"{sender} [{kind}]" + (f" · {count} deliveries" if count > 1 else "")
-            if title:
-                prefix += f" · {title}"
-            safe_body = html.escape(body).replace("\n", "<br>")
-            state = shared.load_shared_notify_state(create_identity=False)
-            me = str(state.handle or "").lstrip("@")
-            if me:
-                safe_body = safe_body.replace(f"@{html.escape(me)}", f"<b>@{html.escape(me)}</b>")
-            self.conversation_log.append(f"<b>{html.escape(prefix)}</b><br>{safe_body}")
-
-    def send_conversation_message(self):
-        cid = self._active_conversation_id
-        body = self.conversation_input.text().strip()
-        if not cid or not body:
-            return
-        state = shared.load_shared_notify_state(create_identity=False)
-        payload = {"sender_endpoint_id": state.endpoint_id, "kind": "human_chat", "body": body}
-        def operation():
-            client = shared._client()
-            client.notify_conversation_send(cid, payload)
-            return client.notify_conversation_history(cid)
-        self.conversation_input.clear()
-        self._run(operation, self._show_conversation_history)
+        if created:
+            self.conversation_open_requested.emit(dict(created))
 
     def _refresh_if_visible(self):
-        incoming = shared.drain_received_messages()
-        active_changed = False
-        for message in incoming:
-            metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
-            cid = str(metadata.get("conversation_id") or "")
-            if not cid:
-                continue
-            if cid == self._active_conversation_id and self.isVisible():
-                active_changed = True
-            else:
-                self._unread[cid] = self._unread.get(cid, 0) + 1
-        if incoming:
-            self._render_conversations(self._conversation_rows)
-        if active_changed and not self._busy:
-            self._load_active_conversation()
-        elif self.isVisible() and not self._busy:
+        if self.isVisible() and not self._busy:
             self.refresh_directory()

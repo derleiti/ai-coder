@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QSize, QObject, pyqtSignal
 from PyQt6.QtGui import QKeySequence, QShortcut
 
-from .chat_widget import ChatWidget
+from .chat_hub_widget import ChatHubWidget
 from .settings_widget import SettingsWidget
 from .mcp_widget import MCPServersWidget
 from .shared_notify_widget import SharedNotifyWidget
@@ -55,7 +55,7 @@ class MainWindow(QMainWindow):
 
         self.tabs = QTabWidget()
         self.settings_tab = SettingsWidget()
-        self.chat_tab = ChatWidget(settings_ref=self.settings_tab)
+        self.chat_tab = ChatHubWidget(settings_ref=self.settings_tab)
         self.mcp_tab = MCPServersWidget()
         self.network_tab = SharedNotifyWidget()
 
@@ -63,6 +63,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.settings_tab, "Settings")
         self.tabs.addTab(self.mcp_tab, "MCP Servers")
         self.tabs.addTab(self.network_tab, "AI Network")
+        self.network_tab.conversation_open_requested.connect(self._open_notify_conversation)
         root_layout.addWidget(self.tabs, stretch=1)
         self.setCentralWidget(root)
 
@@ -75,6 +76,10 @@ class MainWindow(QMainWindow):
         ]
         self._setup_system_log_monitor()
 
+
+    def _open_notify_conversation(self, conversation):
+        self.chat_tab.open_conversation(conversation)
+        self.tabs.setCurrentWidget(self.chat_tab)
 
     def _setup_system_log_monitor(self):
         from ..session_state import get_state
