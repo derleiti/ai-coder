@@ -636,11 +636,24 @@ def poll_once(*, dispatch_ai: bool = True) -> dict[str, Any]:
     return {"enabled": True, "messages": total, "dispatched": dispatched, "errors": errors}
 
 
+def _next_poll_delay(result: dict[str, Any], idle_interval: int) -> int:
+    """Poll quickly after traffic, slowly while idle.
+
+    A reply can target an endpoint that was already visited earlier in the same
+    poll pass. A short follow-up pass avoids a full idle interval of latency
+    without turning the mailbox into permanent high-frequency polling.
+    """
+    idle = max(5, min(int(idle_interval), 300))
+    if int(result.get("messages") or 0) > 0 or int(result.get("dispatched") or 0) > 0:
+        return 5
+    return idle
+
+
 def serve(*, interval: int = 15) -> None:
     interval = max(5, min(int(interval), 300))
     while True:
-        poll_once(dispatch_ai=True)
-        time.sleep(interval)
+        result = poll_once(dispatch_ai=True)
+        time.sleep(_next_poll_delay(result, interval))
 
 _background_thread = None
 _background_stop = None
@@ -659,12 +672,14 @@ def start_background(*, interval: int = 15) -> bool:
     _background_stop = stop
 
     def worker() -> None:
+        idle_interval = max(5, min(int(interval), 300))
         while not stop.is_set():
+            result: dict[str, Any] = {}
             try:
-                poll_once(dispatch_ai=True)
+                result = poll_once(dispatch_ai=True)
             except Exception:
                 pass
-            stop.wait(max(5, min(int(interval), 300)))
+            stop.wait(_next_poll_delay(result, idle_interval))
         try:
             set_presence(availability="offline", activity="idle", status_text="")
         except Exception:

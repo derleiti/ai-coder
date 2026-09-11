@@ -191,6 +191,22 @@ def cmd_notify(args: argparse.Namespace) -> int:
     raise ClientError(f"Unknown notify action: {action}")
 
 
+def cmd_future_lab(args: argparse.Namespace) -> int:
+    from dataclasses import asdict
+    from .future_lab import FutureLabConfig, run_future_lab
+    topic = " ".join(getattr(args, "topic", []) or []).strip()
+    config = FutureLabConfig(
+        topic=topic,
+        participants=list(getattr(args, "participant", []) or []),
+        rounds=getattr(args, "rounds", 3),
+        response_timeout=getattr(args, "response_timeout", 120.0),
+        include_smalltalk=not bool(getattr(args, "no_smalltalk", False)),
+    )
+    run = run_future_lab(config)
+    print_json(asdict(run))
+    return 0
+
+
 def cmd_workspace(args: argparse.Namespace) -> int:
     root = activate_workspace(args.path)
     set_workspace(str(root))
@@ -1647,6 +1663,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--online-only", action="store_true")
     p.add_argument("--interval", type=int, default=15)
     p.set_defaults(func=cmd_notify)
+
+    # structured multi-AI future lab
+    p = sub.add_parser("future-lab", help="Run a bounded advisory multi-AI discussion over Shared Notify")
+    p.add_argument("topic", nargs="+", help="Discussion topic")
+    p.add_argument("--participant", action="append", default=[], help="AI @handle to include; repeatable, defaults to all eligible online AI endpoints")
+    p.add_argument("--rounds", type=int, default=3, help="Discussion rounds (2-6)")
+    p.add_argument("--response-timeout", type=float, default=120.0, help="Seconds to wait for each round")
+    p.add_argument("--no-smalltalk", action="store_true", help="Skip the brief natural warm-up in round one")
+    p.set_defaults(func=cmd_future_lab)
 
     # workspace
     p = sub.add_parser("workspace", help="Analyze local workspace/repo")

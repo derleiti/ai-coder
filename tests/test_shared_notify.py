@@ -277,3 +277,10 @@ def test_poll_does_not_heartbeat_retired_mcp(tmp_path, monkeypatch):
     sn.poll_once(dispatch_ai=False)
     assert disabled == ["ep_gone"]
     assert not any(row.get("endpoint_id") == "ep_gone" for row in fake.presence)
+
+
+def test_notify_poll_delay_is_fast_after_traffic_and_idle_otherwise():
+    assert sn._next_poll_delay({"messages": 1, "dispatched": 0}, 15) == 5
+    assert sn._next_poll_delay({"messages": 0, "dispatched": 1}, 15) == 5
+    assert sn._next_poll_delay({"messages": 0, "dispatched": 0}, 15) == 15
+    assert sn._next_poll_delay({}, 2) == 5
