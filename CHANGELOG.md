@@ -1,3 +1,8 @@
+## v1.2.5 (2026-09-11)
+
+- Shared Notify/MCP sharing, main-chat integration, Future Lab, browser authentication and local Hugging Face hosting consolidated for the current stack release.
+- Hardened provider execution and release packaging.
+
 ## v1.2.4 (2026-09-10)
 
 - Add official account-backed model routing for ChatGPT/Codex, Claude, Mistral Vibe, and Google Antigravity with provider-aware login/status handling and fail-fast Team preflight checks.
