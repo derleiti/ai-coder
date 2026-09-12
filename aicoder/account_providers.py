@@ -7,6 +7,7 @@ clients.  Each provider keeps ownership of its credentials:
 * Claude: Claude Code's `claude auth` commands and non-interactive print mode.
 * Mistral: Vibe's setup/login and programmatic mode.
 * Google: Antigravity CLI (`agy`) Google OAuth and headless mode.
+* Grok: Grok Build CLI (`grok`) xAI OAuth and headless single-turn mode.
 
 AICoder stores only provider IDs in ``linked_account_providers``.  Account model
 IDs use ``account:<provider>/<model>``.  Once such a model is selected routing is
@@ -72,6 +73,9 @@ ACCOUNT_PROVIDERS: tuple[AccountProviderSpec, ...] = (
     AccountProviderSpec(
         "gemini", "Google Antigravity", "agy", dynamic_models=True,
     ),
+    AccountProviderSpec(
+        "grok", "Grok / xAI", "grok", auth_verifiable=True, dynamic_models=True,
+    ),
 )
 
 _PROVIDER_MAP = {item.id: item for item in ACCOUNT_PROVIDERS}
@@ -81,12 +85,13 @@ _PROVIDER_MAP = {item.id: item for item in ACCOUNT_PROVIDERS}
 # provider is known to be temporarily unavailable (currently Antigravity quota),
 # the caller may explicitly choose another authenticated account provider before
 # starting the request.
-_ACCOUNT_REROUTE_ORDER = ("claude", "chatgpt", "mistral", "gemini")
+_ACCOUNT_REROUTE_ORDER = ("claude", "chatgpt", "mistral", "grok", "gemini")
 _ACCOUNT_REROUTE_PREFERRED_MODELS = {
     "claude": ("sonnet", "haiku", "opus"),
     "chatgpt": ("gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.5"),
     "mistral": ("mistral-large-latest", "mistral-medium-latest", "codestral-latest"),
     "gemini": ("gemini-3.8-flash-high", "gemini-3.8-flash-medium", "gemini-3.1-pro-low"),
+    "grok": ("grok-4.6", "grok-4.5"),
 }
 _ANTIGRAVITY_QUOTA_RE = re.compile(
     r"RESOURCE_EXHAUSTED.*?Individual quota reached.*?Resets in\s+"
@@ -741,6 +746,36 @@ def reroute_account_model_if_unavailable(model: str | None) -> tuple[str | None,
     return model, None
 
 
+def _grok_models(executable: str, *, timeout: int = 20) -> list[dict[str, str]]:
+    try:
+        proc = subprocess.run(
+            [executable, "models"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=timeout, env=_external_cli_env(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ClientError("Could not query Grok models") from exc
+    text = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    if proc.returncode != 0 or "not authenticated" in text.lower():
+        raise ClientError("Grok is not authenticated")
+    models: list[dict[str, str]] = []
+    for line in proc.stdout.splitlines():
+        raw = line.strip().lstrip("*- ").strip()
+        if not raw or raw.lower().startswith(("default model:", "available models:")):
+            continue
+        slug = raw.split()[0]
+        if slug.startswith("grok-"):
+            models.append({"model": slug, "display": raw})
+    return models
+
+
+def _grok_authenticated(executable: str, *, timeout: int = 20) -> bool:
+    try:
+        _grok_models(executable, timeout=timeout)
+        return True
+    except ClientError:
+        return False
+
+
 def account_status(provider: str) -> dict[str, Any]:
     spec = provider_spec(provider)
     if spec.id == "chatgpt":
@@ -791,6 +826,22 @@ def account_status(provider: str) -> dict[str, Any]:
             "linked": bool(authenticated), "authenticated": authenticated, "detail": detail,
             **quota,
         }
+    if spec.id == "grok":
+        authenticated = False
+        executable = _which(spec) if installed else ""
+        if executable:
+            authenticated = _grok_authenticated(executable, timeout=8)
+        if authenticated and not marked:
+            set_provider_linked(spec.id, True)
+            marked = True
+        elif marked and not authenticated:
+            set_provider_linked(spec.id, False)
+            marked = False
+        detail = "Verbunden" if authenticated else (
+            f"{spec.display_name}-CLI fehlt" if not installed else "Nicht verbunden · Mit Grok verbinden"
+        )
+        return {"provider": spec.id, "display": spec.display_name, "installed": installed,
+                "linked": authenticated, "authenticated": authenticated, "detail": detail}
     authenticated: bool | None = None
     detail = "Verknüpft · Login vom offiziellen Client verwaltet" if marked and installed else (
         f"{spec.display_name}-CLI fehlt" if not installed else "Nicht verbunden"
@@ -831,6 +882,19 @@ def available_account_models(provider: str) -> list[dict[str, Any]]:
                 "is_default": bool(item.get("isDefault")),
             })
         return result
+    if spec.id == "grok":
+        executable = _which(spec)
+        if not executable:
+            return []
+        try:
+            rows = _grok_models(executable, timeout=20)
+        except ClientError:
+            return []
+        return [
+            {"provider": spec.id, "model": row["model"],
+             "id": account_model_id(spec.id, row["model"]), "display": row["display"]}
+            for row in rows
+        ]
     if spec.id == "gemini":
         executable = _which(spec)
         if not executable:
@@ -1126,6 +1190,18 @@ def connect_account(provider: str, *, open_browser: bool = True) -> dict[str, An
         raise ClientError(
             "Antigravity login timed out after 5 minutes. Finish the Google login and press Connect again."
         )
+    if spec.id == "grok":
+        if _grok_authenticated(executable, timeout=8):
+            set_provider_linked(spec.id, True)
+            return {"provider": spec.id, "started": False, "authenticated": True}
+        exit_code = _launch_terminal(
+            [executable, "login", "--oauth"], title="AICoder · Grok Login", wait=True
+        )
+        if exit_code not in (0, None) or not _grok_authenticated(executable, timeout=15):
+            set_provider_linked(spec.id, False)
+            raise ClientError("Grok login finished but the account is not authenticated")
+        set_provider_linked(spec.id, True)
+        return {"provider": spec.id, "started": True, "authenticated": True}
     raise ClientError(f"Unsupported account provider: {spec.id}")
 
 
@@ -1143,6 +1219,15 @@ def disconnect_account(provider: str) -> None:
         try:
             subprocess.run(
                 [executable, "auth", "logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=15, env=_external_cli_env(),
+            )
+        finally:
+            set_provider_linked(spec.id, False)
+        return
+    if spec.id == "grok" and executable:
+        try:
+            subprocess.run(
+                [executable, "logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 timeout=15, env=_external_cli_env(),
             )
         finally:
@@ -1366,6 +1451,40 @@ class GeminiAccountTransport(_SubprocessAccountTransport):
                 "_transport_telemetry": {"transport": "account-antigravity", "elapsed_s": round(elapsed, 3), "request_id": request_id or ""}}
 
 
+class GrokAccountTransport(_SubprocessAccountTransport):
+    provider = "grok"
+
+    def chat(self, message: str = "", model: str | None = None, system_prompt: str | None = None,
+             temperature: float = 0.7, max_tokens: int = 4096, fallback_model: str | None = None,
+             messages: list | None = None, tools: list | None = None, tool_choice: Any = "auto",
+             request_id: str | None = None, reasoning_effort: str | None = None) -> dict[str, Any]:
+        provider, provider_model = parse_account_model(model)
+        if provider != self.provider:
+            raise ClientError("Grok account transport received the wrong provider")
+        executable = _which_executable("grok")
+        if not executable:
+            raise ClientError("Grok Build CLI is not installed")
+        if not _grok_authenticated(executable, timeout=min(8, self.timeout)):
+            raise ClientError("Grok login required")
+        transcript = _conversation_text(message=message, messages=messages, system_prompt=system_prompt)
+        with tempfile.TemporaryDirectory(prefix="aicoder-grok-") as tmp:
+            args = [
+                executable, "--single", transcript, "--model", provider_model,
+                "--output-format", "plain", "--permission-mode", "plan",
+                "--tools", "", "--disable-web-search", "--no-subagents",
+                "--cwd", tmp,
+            ]
+            started = time.monotonic()
+            stdout, _ = self._run(args, request_id=request_id, cwd=tmp, env=_external_cli_env())
+        text = stdout.strip()
+        if not text:
+            raise ClientError("Grok account client returned an empty response", retryable=True)
+        elapsed = time.monotonic() - started
+        return {"response": text, "model": str(model), "provider": self.provider,
+                "backend": "account-grok", "latency_ms": int(elapsed * 1000),
+                "_transport_telemetry": {"transport": "account-grok", "elapsed_s": round(elapsed, 3), "request_id": request_id or ""}}
+
+
 class ChatGPTAccountTransport:
     provider = "chatgpt"
 
@@ -1527,6 +1646,7 @@ class AccountRoutingTransport:
             "claude": ClaudeAccountTransport,
             "mistral": MistralAccountTransport,
             "gemini": GeminiAccountTransport,
+            "grok": GrokAccountTransport,
         }
         transport = classes[provider](timeout=self.timeout)
         self._transports[provider] = transport

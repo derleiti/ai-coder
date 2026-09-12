@@ -198,6 +198,17 @@ class OpenAICompatibleTransportTests(unittest.TestCase):
         self.assertEqual(router._direct["google"].base_url, "https://generativelanguage.googleapis.com/v1beta/openai")
         direct_chat.assert_called_once()
 
+    @patch("aicoder.model_transport.provider_api_key", return_value=("stored-key", "keyring"))
+    def test_provider_router_routes_xai_directly(self, key_lookup):
+        default = MagicMock(); default.timeout = 55
+        router = ProviderRoutingTransport(default)
+        with patch.object(OpenAICompatibleTransport, "chat", return_value={"response": "OK"}) as direct_chat:
+            result = router.chat(message="x", model="grok/grok-4.6")
+        self.assertEqual(result["response"], "OK")
+        default.chat.assert_not_called()
+        self.assertEqual(router._direct["xai"].base_url, "https://api.x.ai/v1")
+        direct_chat.assert_called_once()
+
     @patch("aicoder.model_transport.provider_api_key", return_value=("", "none"))
     def test_provider_router_falls_back_to_triforce_without_own_key(self, key_lookup):
         default = MagicMock()

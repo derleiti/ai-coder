@@ -91,3 +91,22 @@ class ProviderCredentialDirectSupportTests(unittest.TestCase):
             summary = credential_summary("anthropic", environ={})
         self.assertTrue(summary["direct_supported"])
         self.assertNotIn("secret", repr(summary))
+
+
+class XAIProviderCredentialTests(unittest.TestCase):
+    def test_xai_is_direct_supported(self):
+        from aicoder.provider_credentials import credential_summary, direct_provider_spec
+        spec = direct_provider_spec("grok")
+        self.assertIsNotNone(spec)
+        self.assertEqual(spec.id, "xai")
+        self.assertEqual(spec.base_url, "https://api.x.ai/v1")
+        with patch("aicoder.provider_credentials.get_stored_provider_key", return_value="secret"):
+            summary = credential_summary("xai", environ={})
+        self.assertTrue(summary["direct_supported"])
+        self.assertNotIn("secret", repr(summary))
+
+    def test_grok_model_alias_resolves_to_xai(self):
+        from aicoder.provider_credentials import canonical_provider, provider_for_model, transport_model_id
+        self.assertEqual(canonical_provider("grok"), "xai")
+        self.assertEqual(provider_for_model("grok/grok-4.6"), "xai")
+        self.assertEqual(transport_model_id("grok/grok-4.6", "xai"), "grok-4.6")
