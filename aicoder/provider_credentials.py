@@ -53,6 +53,7 @@ DIRECT_PROVIDERS: tuple[DirectProviderSpec, ...] = (
     DirectProviderSpec("openrouter", (), "https://openrouter.ai/api/v1"),
     DirectProviderSpec("mistral", ("codestral",), "https://api.mistral.ai/v1"),
     DirectProviderSpec("groq", (), "https://api.groq.com/openai/v1"),
+    DirectProviderSpec("xai", ("grok",), "https://api.x.ai/v1"),
     DirectProviderSpec("cerebras", (), "https://api.cerebras.ai/v1"),
     DirectProviderSpec("nvidia", (), "https://integrate.api.nvidia.com/v1"),
     DirectProviderSpec("anthropic", (), "https://api.anthropic.com/v1"),

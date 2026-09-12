@@ -11,6 +11,7 @@ from aicoder.account_providers import (
     ChatGPTAccountTransport,
     ClaudeAccountTransport,
     GeminiAccountTransport,
+    GrokAccountTransport,
     MistralAccountTransport,
     account_model_id,
     account_status,
@@ -274,6 +275,44 @@ class ProviderTransportTests(unittest.TestCase):
         self.assertEqual(models[0]["id"], "account:chatgpt/gpt-test")
         self.assertEqual(models[0]["display"], "GPT Test")
         self.assertTrue(models[0]["is_default"])
+
+    def test_grok_runs_headless_plan_without_tools(self):
+        transport = GrokAccountTransport(timeout=30)
+        with patch("aicoder.account_providers._which_executable", return_value="/usr/bin/grok"), \
+             patch("aicoder.account_providers._grok_authenticated", return_value=True), \
+             patch.object(transport, "_run", return_value=("OK\n", "")) as run:
+            result = transport.chat(model="account:grok/grok-4.6", message="hello")
+        argv = run.call_args.args[0]
+        self.assertIn("--single", argv)
+        self.assertIn("--permission-mode", argv)
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "plan")
+        self.assertIn("--tools", argv)
+        self.assertEqual(argv[argv.index("--tools") + 1], "")
+        self.assertIn("--disable-web-search", argv)
+        self.assertIn("--no-subagents", argv)
+        self.assertEqual(result["backend"], "account-grok")
+
+    def test_grok_fast_fails_when_login_required(self):
+        transport = GrokAccountTransport(timeout=30)
+        with patch("aicoder.account_providers._which_executable", return_value="/usr/bin/grok"), \
+             patch("aicoder.account_providers._grok_authenticated", return_value=False), \
+             patch.object(transport, "_run") as run:
+            with self.assertRaisesRegex(ClientError, "^Grok login required$"):
+                transport.chat(model="account:grok/grok-4.6", message="hello")
+        run.assert_not_called()
+
+    @patch("aicoder.account_providers.account_status", return_value={
+        "provider": "grok", "linked": True, "installed": True, "authenticated": True,
+    })
+    def test_grok_catalog_comes_from_cli_models(self, _status):
+        with patch("aicoder.account_providers._which", return_value="/usr/bin/grok"), \
+             patch("aicoder.account_providers._grok_models", return_value=[
+                 {"model": "grok-4.6", "display": "grok-4.6 (default)"},
+                 {"model": "grok-4.5", "display": "grok-4.5"},
+             ]):
+            models = available_account_models("grok")
+        self.assertEqual([m["model"] for m in models], ["grok-4.6", "grok-4.5"])
+        self.assertEqual(models[0]["id"], "account:grok/grok-4.6")
 
 
 class ChatGPTTransportTests(unittest.TestCase):

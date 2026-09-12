@@ -24,6 +24,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
     ProviderSpec("google", aliases=("gemini",), credential_vars=("GOOGLE_API_KEY", "GEMINI_API_KEY"), legacy_vars=("GOOGLE_AI_STUDIO_KEY", "GOOGLE_GEMINI_KEY")),
     ProviderSpec("mistral", aliases=("codestral",), credential_vars=("MISTRAL_API_KEY",), legacy_vars=("MIXTRAL_API_KEY", "CODESTRAL_API_KEY")),
     ProviderSpec("groq", credential_vars=("GROQ_API_KEY",)),
+    ProviderSpec("xai", aliases=("grok",), credential_vars=("XAI_API_KEY",)),
     ProviderSpec("openrouter", credential_vars=("OPENROUTER_API_KEY",)),
     ProviderSpec("cerebras", credential_vars=("CEREBRAS_API_KEY",)),
     ProviderSpec("together", credential_vars=("TOGETHER_API_KEY",)),

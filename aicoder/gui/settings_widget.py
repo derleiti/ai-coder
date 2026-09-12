@@ -347,6 +347,7 @@ class SettingsWidget(QWidget):
             ("openai", "OpenAI"),
             ("anthropic", "Anthropic"),
             ("mistral", "Mistral"),
+            ("xai", "xAI / Grok"),
             ("groq", "Groq"),
             ("cerebras", "Cerebras"),
             ("nvidia", "NVIDIA"),
