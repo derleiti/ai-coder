@@ -33,6 +33,7 @@ from typing import Any
 
 from . import __version__
 from .client import ClientError
+from .config import CONFIG_DIR, atomic_write_private
 from .session_state import get_state, set_linked_account_providers
 
 ACCOUNT_PREFIX = "account:"
@@ -92,6 +93,7 @@ _ANTIGRAVITY_QUOTA_RE = re.compile(
     r"(?:(?P<hours>\d+)h)?(?:(?P<minutes>\d+)m)?(?:(?P<seconds>\d+(?:\.\d+)?)s)?",
     re.IGNORECASE,
 )
+_ANTIGRAVITY_QUOTA_CACHE_FILE = CONFIG_DIR / "antigravity-quota.json"
 _ANTIGRAVITY_LOG_TIME_RE = re.compile(
     r"^[A-Z](?P<month>\d{2})(?P<day>\d{2})\s+"
     r"(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})(?:\.(?P<micro>\d{1,6}))?"
@@ -569,22 +571,65 @@ def _antigravity_log_event_time(line: str, *, now: datetime) -> datetime | None:
     return event
 
 
+def _active_antigravity_quota_cache(path: Path, *, now: datetime) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        reset_raw = str(payload.get("quota_reset_at") or "").strip()
+        reset_at = datetime.fromisoformat(reset_raw)
+        if reset_at.tzinfo is None:
+            reset_at = reset_at.replace(tzinfo=now.tzinfo)
+        retry_after = max(0, int((reset_at - now).total_seconds()))
+        if retry_after > 0 and payload.get("quota_exhausted") is True:
+            return {
+                "quota_exhausted": True,
+                "quota_retry_after_seconds": retry_after,
+                "quota_reset_at": reset_at.isoformat(),
+            }
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return None
+
+
+def _cache_antigravity_quota(path: Path, payload: dict[str, Any]) -> None:
+    try:
+        atomic_write_private(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    except OSError:
+        # Health detection must stay best-effort; a read-only config directory
+        # may not turn an otherwise valid account session into a hard failure.
+        pass
+
+
 def antigravity_quota_status(
-    *, log_dir: str | Path | None = None, now: datetime | None = None, max_logs: int = 5,
+    *, log_dir: str | Path | None = None, now: datetime | None = None, max_logs: int = 64,
+    cache_file: str | Path | None = None,
 ) -> dict[str, Any]:
     """Read provider-owned agy logs for an active individual-quota window.
 
     This is intentionally observational: no probe request is sent, so checking
     health cannot consume quota or stall an agent. agy currently exposes no
     documented quota-status command, but records the authoritative 429 plus its
-    reset countdown in its own CLI log.
+    reset countdown in its own CLI log. A positive result is cached until the
+    provider-declared reset time because auth/status probes create many harmless
+    log files and can otherwise push the useful 429 out of the recent-log window.
     """
     current = now or datetime.now().astimezone()
     root = Path(log_dir).expanduser() if log_dir is not None else Path.home() / ".gemini" / "antigravity-cli" / "log"
+    cache_path = (
+        Path(cache_file).expanduser() if cache_file is not None
+        else (_ANTIGRAVITY_QUOTA_CACHE_FILE if log_dir is None else None)
+    )
+    if cache_path is not None:
+        cached = _active_antigravity_quota_cache(cache_path, now=current)
+        if cached is not None:
+            return cached
     if not root.is_dir():
         return {"quota_exhausted": False, "quota_retry_after_seconds": 0, "quota_reset_at": ""}
     try:
-        logs = sorted(root.glob("cli-*.log"), key=lambda item: item.stat().st_mtime, reverse=True)[:max_logs]
+        logs = sorted(root.glob("cli-*.log"), key=lambda item: item.stat().st_mtime, reverse=True)[:max(1, int(max_logs))]
     except OSError:
         logs = []
     for path in logs:
@@ -619,11 +664,14 @@ def antigravity_quota_status(
             retry_after = max(0, int((reset_at - current).total_seconds()))
             if retry_after <= 0:
                 continue
-            return {
+            payload = {
                 "quota_exhausted": True,
                 "quota_retry_after_seconds": retry_after,
                 "quota_reset_at": reset_at.isoformat(),
             }
+            if cache_path is not None:
+                _cache_antigravity_quota(cache_path, payload)
+            return payload
     return {"quota_exhausted": False, "quota_retry_after_seconds": 0, "quota_reset_at": ""}
 
 

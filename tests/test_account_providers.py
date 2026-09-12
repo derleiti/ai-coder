@@ -78,6 +78,56 @@ class AccountQuotaRoutingTests(unittest.TestCase):
         self.assertGreater(status["quota_retry_after_seconds"], 139 * 3600)
         self.assertIn("2026-09-17", status["quota_reset_at"])
 
+    def test_antigravity_quota_status_sees_quota_beyond_five_newer_logs(self):
+        from datetime import datetime
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            quota = root / "cli-20260911_095719.log"
+            quota.write_text(
+                "I0911 09:57:22.671014 626 run.go:387] "
+                "RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 139h55m52s.\n"
+            )
+            os.utime(quota, (1, 1))
+            for idx in range(8):
+                log = root / f"cli-20260911_100{idx:02d}.log"
+                log.write_text("authenticated status probe\n")
+                os.utime(log, (10 + idx, 10 + idx))
+            status = antigravity_quota_status(
+                log_dir=tmp, now=datetime.fromisoformat("2026-09-11T10:00:00+02:00")
+            )
+        self.assertTrue(status["quota_exhausted"])
+
+    def test_antigravity_quota_cache_survives_log_rollover(self):
+        from datetime import datetime
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache = root / "quota-cache.json"
+            quota = root / "cli-20260911_095719.log"
+            quota.write_text(
+                "I0911 09:57:22.671014 626 run.go:387] "
+                "RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 139h55m52s.\n"
+            )
+            first = antigravity_quota_status(
+                log_dir=tmp, cache_file=cache, max_logs=1,
+                now=datetime.fromisoformat("2026-09-11T10:00:00+02:00"),
+            )
+            self.assertTrue(first["quota_exhausted"])
+            os.utime(quota, (1, 1))
+            for idx in range(10):
+                log = root / f"cli-20260911_101{idx:02d}.log"
+                log.write_text("authenticated status probe\n")
+                os.utime(log, (20 + idx, 20 + idx))
+            cached = antigravity_quota_status(
+                log_dir=tmp, cache_file=cache, max_logs=2,
+                now=datetime.fromisoformat("2026-09-11T10:05:00+02:00"),
+            )
+        self.assertTrue(cached["quota_exhausted"])
+        self.assertGreater(cached["quota_retry_after_seconds"], 139 * 3600)
+
     def test_antigravity_quota_status_ignores_expired_window(self):
         from datetime import datetime
         import tempfile
