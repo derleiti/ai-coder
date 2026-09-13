@@ -442,8 +442,30 @@ class _AgentWorker(QThread):
                     self.msg.emit("thought", str(payload.get("text") or ""), meta)
                 elif event == "tool_call":
                     name = str(payload.get("name") or "?")
-                    self.activity.emit(f"Team · {role} · running tool · {name}")
+                    self.activity.emit(f"Team · {role} · preparing tool · {name}")
                     self.msg.emit("tool", f">> {role}:{name}({_full_json(payload.get('arguments') or {})})", meta)
+                elif event == "tool_phase":
+                    name = str(payload.get("name") or "?")
+                    phase = str(payload.get("phase") or "execute")
+                    labels = {
+                        "approval": "approval",
+                        "backup": "creating fallback backup",
+                        "execute": "running",
+                        "record": "recording result",
+                    }
+                    self.activity.emit(f"Team · {role} · {labels.get(phase, phase)} · {name}")
+                elif event == "hard_tool_timeout":
+                    name = str(payload.get("name") or "?")
+                    self.activity.emit(f"Team · {role} · hard timeout recovered · {name}")
+                    self.msg.emit(
+                        "error",
+                        f"[E_TOOL_TIMEOUT] {role} · {name} process tree terminated; identical retry blocked\n"
+                        f"{_full_json(payload)}",
+                        meta,
+                    )
+                elif event == "run_terminal":
+                    status = str(payload.get("status") or "finished")
+                    self.activity.emit(f"Team · {role} · runtime terminal · {status}")
                 elif event == "tool_result":
                     name = str(payload.get("name") or "?")
                     result_text = str(payload.get("result") or "")

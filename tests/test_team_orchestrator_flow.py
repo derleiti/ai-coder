@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 from aicoder.agent_runtime import AgentRunResult
 from aicoder.team_orchestrator import (
     AgentStageResult, CandidateResult, _acceptance_artifact_paths, _acceptance_artifact_snapshots, _candidate_execution_handoff, _candidate_has_production_delta, _extract_adaptive_work_units, _work_unit_implementer_budget, CodingWorkUnit, _candidate_test_mutation, _command_matches_acceptance, _external_failed_acceptance_commands, _failed_task_acceptance_commands, _is_incomplete_envelope_reason, _redact_debug_value,
-    _call_stage_agent_core, _run_candidate, _run_researcher, evaluate_candidate, run_team,
+    _call_stage_agent_core, _run_candidate, _run_researcher, _worker_event_forwarder, evaluate_candidate, run_team,
 )
 from aicoder.team_runtime import config_from_state
 from aicoder.task_contract import compile_task_contract
@@ -26,6 +26,20 @@ def _result(text: str, model: str = "test/model") -> AgentRunResult:
 
 
 
+
+
+class TeamRuntimeForwardingTests(unittest.TestCase):
+    def test_worker_forwarder_keeps_runtime_sync_events(self):
+        events = []
+        forward = _worker_event_forwarder(lambda kind, payload: events.append((kind, payload)), "coder-1")
+        forward("tool_phase", {"name": "binary_exec", "phase": "execute", "run_id": "run-1"})
+        forward("hard_tool_timeout", {"name": "binary_exec", "retry_blocked": True, "run_id": "run-1"})
+        forward("run_terminal", {"status": "paused", "run_id": "run-1"})
+        self.assertEqual([payload.get("event") for kind, payload in events], [
+            "tool_phase", "hard_tool_timeout", "run_terminal"
+        ])
+        self.assertTrue(all(kind == "team_worker_event" for kind, _ in events))
+        self.assertTrue(all(payload.get("role") == "coder-1" for _, payload in events))
 
 
 class AdaptiveCodingPlanTests(unittest.TestCase):

@@ -463,7 +463,8 @@ def _emit(fn: EventFn | None, kind: str, **payload: Any) -> None:
 def _worker_event_forwarder(fn: EventFn | None, role: str) -> EventFn:
     """Forward useful worker-runtime telemetry without exposing model/provider identity to peers."""
     allowed = {
-        "model_start", "model_response", "thought", "tool_call", "tool_result",
+        "model_start", "model_response", "thought", "tool_call", "tool_phase", "tool_result",
+        "hard_tool_timeout", "run_terminal",
         "error", "paused", "performance_warning", "performance_summary", "final",
         "verification_required", "completion_audit", "runtime_status", "final_response_repair",
         "loop_prevented", "completion_signal",
