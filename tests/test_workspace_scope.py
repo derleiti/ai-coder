@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -224,6 +225,33 @@ class WorkspaceEscapeTests(unittest.TestCase):
             self.assertIn("exit_code=0", result)
             self.assertEqual(approvals[0][0], "binary_exec")
 
+    @unittest.skipIf(sys.platform == "win32", "POSIX process-group regression")
+    def test_binary_exec_timeout_kills_grandchildren_without_pipe_hang(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            script = (
+                "import pathlib, subprocess, sys, time; "
+                "child=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+                "pathlib.Path('child.pid').write_text(str(child.pid)); "
+                "print(child.pid, flush=True); time.sleep(30)"
+            )
+            started = time.monotonic()
+            result, is_error = run_tool(
+                MagicMock(), "binary_exec",
+                {"program": sys.executable, "arguments": ["-c", script], "work_dir": ".", "timeout": 1},
+                approval_fn=lambda *_: True, allowed_tools={"binary_exec"}, workspace_root=root,
+            )
+            elapsed = time.monotonic() - started
+            self.assertTrue(is_error, result)
+            self.assertIn("hard timeout after", result)
+            self.assertLess(elapsed, 5.0, f"timeout leaked through child pipes: {elapsed:.2f}s")
+            child_pid = int((root / "child.pid").read_text(encoding="utf-8"))
+            stat = Path(f"/proc/{child_pid}/stat")
+            if stat.exists():
+                fields = stat.read_text(encoding="utf-8", errors="replace").split()
+                self.assertGreaterEqual(len(fields), 3)
+                self.assertEqual(fields[2], "Z", f"grandchild {child_pid} still running after timeout")
+
     def test_local_execution_outside_workspace_requires_scope_approval(self):
         with tempfile.TemporaryDirectory() as temp:
             base = Path(temp)
@@ -241,6 +269,36 @@ class WorkspaceEscapeTests(unittest.TestCase):
             self.assertFalse(is_error, result)
             self.assertIn(str(outside.resolve()), result)
             self.assertEqual(approvals[0][1]["_workspace_escape"], str(outside.resolve()))
+
+    def test_file_read_tail_lines_is_bounded_and_does_not_need_binary_exec(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = root / "audit.jsonl"
+            target.write_text("\n".join(f"line-{i}" for i in range(20)) + "\n", encoding="utf-8")
+            result, is_error = run_tool(
+                MagicMock(), "file_read", {"path": "audit.jsonl", "tail_lines": 3},
+                approval_fn=lambda *_: True, allowed_tools={"file_read"}, workspace_root=root,
+            )
+            self.assertFalse(is_error, result)
+            self.assertEqual(result.splitlines(), ["line-17", "line-18", "line-19"])
+
+    def test_audit_recent_is_typed_read_only_tool(self):
+        rows = [
+            {"tool": "file_read", "error": False, "result": "ok"},
+            {"tool": "binary_exec", "error": True, "result": "timeout"},
+        ]
+        phases = []
+        with patch("aicoder.executor.audit.get_recent", return_value=rows):
+            result, is_error = run_tool(
+                MagicMock(), "audit_recent", {"limit": 10, "errors_only": True},
+                approval_fn=lambda *_: self.fail("read-only audit_recent requested approval"),
+                allowed_tools={"audit_recent"}, workspace_root=Path.cwd(),
+                phase_fn=phases.append,
+            )
+        self.assertFalse(is_error, result)
+        self.assertIn('"tool": "binary_exec"', result)
+        self.assertNotIn('"tool": "file_read"', result)
+        self.assertEqual(phases, ["execute", "record"])
 
     def test_binary_file_read_is_rejected_without_dumping_contents(self):
         with tempfile.TemporaryDirectory() as temp:

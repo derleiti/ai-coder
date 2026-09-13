@@ -62,6 +62,16 @@ class GuiApprovalMetadataTests(unittest.TestCase):
         requester.set_approval.assert_called_once_with(True, "")
         current.set_approval.assert_not_called()
 
+    def test_worker_thread_exit_clears_stale_activity_state(self):
+        widget = MagicMock()
+        widget._worker.isRunning.return_value = False
+        widget._activity_timer.isActive.return_value = True
+        ChatWidget._on_worker_thread_finished(widget)
+        widget._stop_activity.assert_called_once_with()
+        widget.send_btn.setEnabled.assert_called_once_with(True)
+        widget.stop_btn.setEnabled.assert_called_once_with(False)
+        widget._update_status_idle.assert_called_once_with("Runtime finished")
+
     def test_duplicate_send_is_ignored_while_worker_is_running(self):
         widget = MagicMock()
         widget._worker.isRunning.return_value = True

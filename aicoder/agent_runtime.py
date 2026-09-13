@@ -1958,6 +1958,9 @@ class NativeLightRuntime:
                             allowed_tools=allowed_tool_names,
                             workspace_root=self.workspace_root,
                             protected_workspace_root=self.protected_workspace_root,
+                            phase_fn=lambda phase, _name=name: self._emit(
+                                "tool_phase", name=_name, phase=phase, iteration=i + 1, request_id=request_id
+                            ),
                         )
                     elapsed = time.monotonic() - started_tool
                 if not is_error and state_mutation:
@@ -2025,8 +2028,20 @@ class NativeLightRuntime:
                             evidence_store.remember_failure(failure.category, failure.signature, failure.count)
                         except Exception as exc:
                             self._emit("evidence_record_failed", evidence_kind="failure", error=f"{type(exc).__name__}: {exc}")
-                    if failure.count >= 3 and not failure.retryable and not state_mutation:
+                    hard_command_timeout = bool(
+                        name in _COMMAND_EXECUTION_TOOLS
+                        and "hard timeout" in str(tool_result).casefold()
+                    )
+                    if (
+                        hard_command_timeout
+                        or (failure.count >= 3 and not failure.retryable and not state_mutation)
+                    ):
                         blocked_failure_calls[cache_key] = failure.signature
+                        if hard_command_timeout:
+                            self._emit(
+                                "hard_tool_timeout", name=name, iteration=i + 1,
+                                signature=failure.signature, retry_blocked=True,
+                            )
                     if failure.count > batch_failure_repeats:
                         batch_failure_repeats = failure.count
                         batch_failure_category = failure.category

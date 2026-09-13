@@ -833,7 +833,7 @@ class NativeLightGuiTests(unittest.TestCase):
                 load_tools_on_start=True,
             )
             finished = []
-            worker.finished.connect(lambda text, model: finished.append((text, model)))
+            worker.response_ready.connect(lambda text, model: finished.append((text, model)))
             state = {
                 "runtime_mode": "native-light",
                 "workspace_root": str(workspace),

@@ -6,6 +6,8 @@ command, result, duration, and error status.
 Storage: ~/.config/ai-coder/audit.jsonl (append-only, one JSON per line)
 """
 from __future__ import annotations
+
+from collections import deque
 import json
 import os
 from datetime import datetime, timezone
@@ -105,9 +107,11 @@ def get_recent(n: int = 50) -> list[Dict[str, Any]]:
     if not AUDIT_FILE.exists():
         return []
     try:
-        lines = AUDIT_FILE.read_text(encoding="utf-8").strip().split("\n")
+        limit = max(1, min(1000, int(n)))
+        with AUDIT_FILE.open("r", encoding="utf-8", errors="replace") as handle:
+            lines = deque(handle, maxlen=limit)
         entries = []
-        for line in lines[-n:]:
+        for line in lines:
             try:
                 entries.append(json.loads(line))
             except Exception:

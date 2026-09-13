@@ -394,7 +394,9 @@ LOCAL_BINARY_EXEC_SCHEMA = {
     "name": "binary_exec",
     "description": (
         "Execute one LOCAL program with structured arguments and no shell parsing. "
-        "Prefer this for Python programs, test binaries, compilers and other direct executables."
+        "Use this only when executable behavior is actually required (tests, compilers, CLIs). "
+        "Do NOT use Python/shell through binary_exec merely to read, tail, parse, filter, or summarize text/JSON/JSONL; "
+        "use file_read, code_grep, audit_recent, or the relevant typed diagnostic tool instead."
     ),
     "inputSchema": {
         "type": "object",
@@ -476,6 +478,7 @@ LOCAL_FILE_READ_SCHEMA = {
             "path": {"type": "string", "description": "Workspace-relative file path"},
             "start_line": {"type": "integer", "minimum": 1},
             "end_line": {"type": "integer", "minimum": 1},
+            "tail_lines": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Read only the last N lines; cannot be combined with start_line/end_line"},
         },
         "required": ["path"]
     }
@@ -662,6 +665,22 @@ LOCAL_CLIPBOARD_WRITE_SCHEMA = {
     }
 }
 
+LOCAL_AUDIT_RECENT_SCHEMA = {
+    "name": "audit_recent",
+    "description": (
+        "Read recent sanitized AICoder tool audit records directly. Use this instead of binary_exec/Python "
+        "against ~/.config/ai-coder/audit.jsonl."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+            "tool": {"type": "string", "description": "Optional exact tool-name filter"},
+            "errors_only": {"type": "boolean"},
+        },
+    },
+}
+
 LOCAL_WEB_FETCH_SCHEMA = {
     "name": "web_fetch_local",
     "description": "Fetch and extract text from a URL locally.",
@@ -695,6 +714,7 @@ LOCAL_TOOL_SCHEMAS = [
     LOCAL_TEST_SCHEMA,
     LOCAL_CLIPBOARD_READ_SCHEMA,
     LOCAL_CLIPBOARD_WRITE_SCHEMA,
+    LOCAL_AUDIT_RECENT_SCHEMA,
     LOCAL_WEB_FETCH_SCHEMA,
 ]
 
@@ -753,7 +773,7 @@ You are ai-coder — an autonomous AILinux operator agent for coding, DevOps, sy
 
 ## Tool Model:
 - Typed local tools default to the active workspace. Leaving it requires explicit one-time approval.
-- shell, binary_exec and task_runner execute on the LOCAL AICoder machine, not on the TriForce backend. Prefer binary_exec when shell syntax is unnecessary.
+- shell, binary_exec and task_runner execute on the LOCAL AICoder machine, not on the TriForce backend. binary_exec is for real executable behavior, not for reading/parsing files.
 - skill_read loads bounded workflow guidance from the discovered AICoder skill catalog.
 - feature_memory_search recalls prior verified feature implementation experience for the active workspace.
 - subagent_run delegates focused work. analyze/review/plan are advisory; debug/task may use the active parent tool subset.
@@ -765,6 +785,7 @@ You are ai-coder — an autonomous AILinux operator agent for coding, DevOps, sy
 - CREATE DIRECTORIES: use directory_create. Never use file_edit on a directory path.
 - WRITE/MODIFY FILES: use file_edit with path + operation + typed content fields.
 - BACKEND/SYSTEM STATUS: status (READ-ONLY); use log_viewer for bounded diagnostic logs when status is insufficient.
+- AICODER AUDIT: use audit_recent for recent local tool history. Never spawn Python/binary_exec just to inspect audit.jsonl.
 - SKILLS: when a catalogued skill matches the task, call skill_read(name) before acting.
 - SUBAGENTS: use subagent_run for bounded analysis/review/planning or focused debug/task work.
   Tool-capable subagents inherit only the active parent tools, cannot recurse into subagent_run, and remain subject to the same approvals and workspace policy.
@@ -774,7 +795,7 @@ You are ai-coder — an autonomous AILinux operator agent for coding, DevOps, sy
 
 ## SECURITY MODEL:
 - MCP read tools provide coding, documentation, search, memory, and model information.
-- Never place shell commands in read-tool fields. Use binary_exec for direct programs and shell/task_runner only when shell composition is required.
+- Never place shell commands in read-tool fields. Prefer typed read tools for evidence. Use binary_exec only for an actual direct program execution and shell/task_runner only when shell composition is required.
 - A working-directory boundary is not a complete filesystem sandbox: shell commands can name absolute paths. Treat scope escape, elevation, package/service changes and destructive actions as separate approval boundaries.
 - Typed Git remains conservative. Remote/admin/service/DevOps actions may target explicitly authorized systems, but never the TriForce backend host itself. TriForce host/admin/code capabilities are filtered and transport-blocked.
 - Never ask for, print, store, or transmit a password or access token.
@@ -1560,6 +1581,16 @@ def run_file_read(args: dict) -> Tuple[str, bool]:
         sample = path.read_bytes()[:4096]
         if b"\x00" in sample:
             return f"file_read error: binary file; textual read not supported: {path}", True
+        tail_lines = args.get("tail_lines")
+        if tail_lines is not None:
+            if args.get("start_line") is not None or args.get("end_line") is not None:
+                return "file_read error: tail_lines cannot be combined with start_line/end_line", True
+            from collections import deque
+            limit = max(1, min(1000, int(tail_lines)))
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                lines = [line.rstrip("\n") for line in deque(handle, maxlen=limit)]
+            output = "\n".join(lines)
+            return output[:12000] + ("…" if len(output) > 12000 else ""), False
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         start = max(1, int(args.get("start_line") or 1))
         end = min(len(lines), int(args.get("end_line") or len(lines)))
@@ -2111,6 +2142,70 @@ def _format_process_result(completed: subprocess.CompletedProcess[str]) -> str:
     return text[:12000] + ("…" if len(text) > 12000 else "")
 
 
+def _terminate_process_tree(proc: subprocess.Popen[str]) -> None:
+    """Best-effort termination of the full local subprocess tree."""
+    if proc.poll() is not None:
+        return
+    try:
+        if IS_WINDOWS:
+            proc.terminate()
+        else:
+            import signal
+            os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.terminate()
+        except (ProcessLookupError, OSError):
+            return
+    try:
+        proc.wait(timeout=1.5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        if IS_WINDOWS:
+            proc.kill()
+        else:
+            import signal
+            os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except (ProcessLookupError, OSError):
+            pass
+
+
+def _run_local_process(
+    argv: list[str], *, cwd: Path, env: dict[str, str] | None, timeout: int,
+    stdin_data: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run a process with a hard deadline and process-tree cleanup."""
+    popen_kwargs: dict[str, Any] = {
+        "cwd": str(cwd), "env": env,
+        "stdin": subprocess.PIPE if stdin_data is not None else None,
+        "stdout": subprocess.PIPE, "stderr": subprocess.PIPE,
+        "text": True, "shell": False,
+    }
+    if IS_WINDOWS:
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        popen_kwargs["start_new_session"] = True
+    proc = subprocess.Popen(argv, **popen_kwargs)
+    try:
+        stdout, stderr = proc.communicate(input=stdin_data, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        _terminate_process_tree(proc)
+        try:
+            stdout, stderr = proc.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            _terminate_process_tree(proc)
+            stdout, stderr = "", ""
+        exc.output = stdout
+        exc.stderr = stderr
+        raise
+    return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
+
+
 def _elevated_shell_command(command: str, strategy: str) -> str:
     stripped = re.sub(r"^\s*(?:sudo|doas|pkexec)(?:\s+--)?\s+", "", command, count=1, flags=re.IGNORECASE).strip()
     if strategy == "sudo":
@@ -2194,13 +2289,16 @@ def run_local_binary(args: dict) -> Tuple[str, bool]:
         stdin_data = args.get("stdin_data") if isinstance(args.get("stdin_data"), str) else None
         completed = _loom_container_exec(cwd, argv, timeout=timeout, stdin_data=stdin_data)
         if completed is None:
-            completed = subprocess.run(
-                argv, shell=False, cwd=str(cwd), env=env, input=stdin_data,
-                capture_output=True, text=True, timeout=timeout,
+            completed = _run_local_process(
+                argv, cwd=cwd, env=env, stdin_data=stdin_data, timeout=timeout,
             )
         return _format_process_result(completed), completed.returncode != 0
     except subprocess.TimeoutExpired as exc:
-        return f"binary_exec error: timed out after {exc.timeout}s", True
+        return (
+            f"binary_exec error: hard timeout after {exc.timeout}s; process tree terminated. "
+            "Do not retry this identical call unchanged; inspect why it blocked, split the operation, "
+            "or use test/task_runner with an explicit longer timeout when the work is intentionally long."
+        ), True
     except Exception as exc:
         return f"binary_exec error: {exc}", True
 
@@ -2318,6 +2416,7 @@ def run_tool(
     allowed_tools: Optional[set[str]] = None,
     workspace_root: str | Path | None = None,
     protected_workspace_root: str | Path | None = None,
+    phase_fn: Optional[Callable[[str], None]] = None,
 ) -> Tuple[str, bool]:
     token = _RUNTIME_WORKSPACE_ROOT.set(
         str(Path(workspace_root).expanduser().resolve(strict=False)) if workspace_root is not None else None
@@ -2328,7 +2427,7 @@ def run_tool(
     try:
         return _run_tool_impl(
             client, name, args, approval_fn=approval_fn, model=model, iteration=iteration,
-            allowed_tools=allowed_tools,
+            allowed_tools=allowed_tools, phase_fn=phase_fn,
         )
     finally:
         _RUNTIME_PROTECTED_ROOT.reset(protected_token)
@@ -2343,6 +2442,7 @@ def _run_tool_impl(
     model: str = "",
     iteration: int = 0,
     allowed_tools: Optional[set[str]] = None,
+    phase_fn: Optional[Callable[[str], None]] = None,
 ) -> Tuple[str, bool]:
     """
     Execute a tool with audit logging and optional approval.
@@ -2351,6 +2451,14 @@ def _run_tool_impl(
       If it returns False, execution is aborted.
       If None, risky writes and privilege requests are blocked.
     """
+    def _phase(value: str) -> None:
+        if phase_fn is None:
+            return
+        try:
+            phase_fn(value)
+        except Exception:
+            pass
+
     allowed, policy_error = require_allowed_tool(name, allowed_tools)
     if not allowed:
         result = f"{name}: blocked — {policy_error}"
@@ -2441,6 +2549,7 @@ def _run_tool_impl(
         and getattr(approval_fn, "_aicoder_enforce_all_tools", False)
     )
     if risk.needs_approval or needs_scope_approval or enforce_stage_policy:
+        _phase("approval")
         if approval_fn is not None:
             if not approval_fn(name, approval_args):
                 autonomous_policy = bool(getattr(approval_fn, "_aicoder_autonomous_policy", False))
@@ -2485,6 +2594,7 @@ def _run_tool_impl(
     change_journal = None
     restore_metadata = None
     if risk.mutation or risk.destructive:
+        _phase("backup")
         try:
             change_journal, restore_metadata = _prepare_change_restore(name, execution_args)
         except Exception as exc:
@@ -2499,6 +2609,7 @@ def _run_tool_impl(
     _provider = discover_plugins(_workspace_root()).provider_for_tool(name)
     _is_local = name in LOCAL_TOOL_NAMES or _provider is not None
 
+    _phase("execute")
     t_start = time.time()
 
     if name == "shell":
@@ -2618,6 +2729,19 @@ def _run_tool_impl(
         result, is_error = run_git_read(execution_args)
     elif name in {"lint", "test"}:
         result, is_error = run_checked_project_command(name, execution_args)
+    elif name == "audit_recent":
+        try:
+            limit = max(1, min(200, int(execution_args.get("limit") or 50)))
+            tool_filter = str(execution_args.get("tool") or "").strip()
+            errors_only = bool(execution_args.get("errors_only"))
+            rows = audit.get_recent(max(limit, 200 if (tool_filter or errors_only) else limit))
+            if tool_filter:
+                rows = [row for row in rows if str(row.get("tool") or "") == tool_filter]
+            if errors_only:
+                rows = [row for row in rows if bool(row.get("error"))]
+            result, is_error = json.dumps(rows[-limit:], ensure_ascii=False, indent=2, default=str), False
+        except Exception as exc:
+            result, is_error = f"audit_recent error: {type(exc).__name__}: {exc}", True
     elif name == "clipboard_read":
         from .clipboard import clipboard_read
         result, is_error = clipboard_read()
@@ -2665,6 +2789,7 @@ def _run_tool_impl(
 
     duration = time.time() - t_start
 
+    _phase("record")
     # Audit log — always, for every tool call
     audit.log_tool(
         tool_name=name,

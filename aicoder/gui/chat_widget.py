@@ -76,7 +76,7 @@ class _AgentWorker(QThread):
     """Background thread: agent loop with approval support and stop."""
     msg = pyqtSignal(str, str, str)          # (role, text, meta)
     activity = pyqtSignal(str)
-    finished = pyqtSignal(str, str)           # (final_text, model)
+    response_ready = pyqtSignal(str, str)     # (final_text, model)
     error = pyqtSignal(str)
     messages_updated = pyqtSignal(list)
     approval_needed = pyqtSignal(str, object)  # tool, complete approval arguments
@@ -252,9 +252,20 @@ class _AgentWorker(QThread):
                 self.msg.emit("thought", str(payload.get("text") or ""), f"step {payload.get('iteration', '?')}")
             elif kind == "tool_call":
                 name = str(payload.get("name") or "?")
-                self.activity.emit(f"Running tool · {name}")
+                self.activity.emit(f"Preparing tool · {name}")
                 args = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
                 self.msg.emit("tool", f">> {name}({_full_json(args)})", "")
+            elif kind == "tool_phase":
+                name = str(payload.get("name") or "?")
+                phase = str(payload.get("phase") or "execute")
+                labels = {
+                    "approval": "Approval", "backup": "Creating fallback backup",
+                    "execute": "Running", "record": "Recording result",
+                }
+                self.activity.emit(f"{labels.get(phase, phase)} · {name}")
+            elif kind == "run_terminal":
+                status = str(payload.get("status") or "finished")
+                self.activity.emit(f"Runtime terminal · {status}")
             elif kind == "tool_result":
                 name = str(payload.get("name") or "?")
                 result = str(payload.get("result") or "")
@@ -336,7 +347,7 @@ class _AgentWorker(QThread):
         if result.status == "failed":
             self.error.emit(result.error or f"{runtime_label} runtime failed")
             return
-        self.finished.emit(result.response, result.model)
+        self.response_ready.emit(result.response, result.model)
 
     def _run_team_impl(self, initial_prompt: str):
         from ..model_transport import native_model_transport_from_env
@@ -539,7 +550,7 @@ class _AgentWorker(QThread):
             return
         self.messages.append({"role": "assistant", "content": result.response})
         self.messages_updated.emit(self.messages)
-        self.finished.emit(result.response, result.model)
+        self.response_ready.emit(result.response, result.model)
 
     def _run_impl(self):
         state = get_state()
@@ -1030,10 +1041,11 @@ class ChatWidget(QWidget):
             session_id=self._session_id, evidence_context=evidence_context,
         )
         self._worker.msg.connect(self._on_agent_msg)
-        self._worker.finished.connect(self._on_response)
+        self._worker.response_ready.connect(self._on_response)
         self._worker.activity.connect(self._on_worker_activity)
         self._worker.messages_updated.connect(self._on_messages_updated)
         self._worker.error.connect(self._on_error)
+        self._worker.finished.connect(self._on_worker_thread_finished)
         self._worker.approval_needed.connect(
             self._on_approval_needed, Qt.ConnectionType.QueuedConnection
         )
@@ -1045,6 +1057,20 @@ class ChatWidget(QWidget):
         # complete text without truncation, but keep them out of model context.
         if self._session_id and role not in {"user", "assistant"}:
             chat_history.save_message(self._session_id, role, text, meta)
+
+    def _on_worker_thread_finished(self):
+        """Fail-safe GUI cleanup when the QThread exits for any reason.
+
+        The runtime response/error handlers normally settle the UI first. This hook
+        guarantees that a vanished worker can never leave a stale Working/tool state.
+        """
+        if self._worker and self._worker.isRunning():
+            return
+        if self._activity_timer.isActive():
+            self._stop_activity()
+            self.send_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
+            self._update_status_idle("Runtime finished")
 
     def _on_response(self, text: str, model_used: str):
         self._stop_activity()

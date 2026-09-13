@@ -63,7 +63,7 @@ CAPABILITIES = frozenset({
 # One centralized compatibility map while legacy schemas are migrated to explicit
 # capability metadata. Unknown tools are not guessed into privileged groups.
 TOOL_CAPABILITIES: dict[str, tuple[str, ...]] = {
-    "file_read": ("local_code_read",), "file_tree": ("local_code_read",),
+    "file_read": ("local_code_read",), "file_tree": ("local_code_read",), "audit_recent": ("system_diagnostics", "debug"),
     "code_grep": ("local_code_read",), "file_edit": ("local_code_write",),
     "directory_create": ("local_code_write",), "shell": ("local_code_write", "debug"),
     "binary_exec": ("local_code_write", "testing"), "task_runner": ("local_code_write", "testing"),
