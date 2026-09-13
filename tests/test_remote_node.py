@@ -113,7 +113,7 @@ class RemoteNodeTests(unittest.TestCase):
             target.write_text("before\nneedle\nafter\n", encoding="utf-8")
             with (
                 patch("aicoder.executor.get_state", return_value={"workspace_root": temp}),
-                patch("aicoder.remote_node.CONFIG_DIR", Path(config)),
+                patch.dict(os.environ, {"AILINUX_WORKSPACE_BACKUP_ROOT": config}),
             ):
                 result = execute_remote_tool(
                     "client_file_edit",
@@ -127,7 +127,7 @@ class RemoteNodeTests(unittest.TestCase):
                 )
             self.assertFalse(result["isError"])
             self.assertEqual(target.read_text(), "before\nreplacement\nafter\n")
-            backups = list((Path(config) / "backups" / "remote").rglob("app.py"))
+            backups = list(Path(config).rglob("app.py"))
             self.assertEqual(len(backups), 1)
             self.assertEqual(backups[0].read_text(), "before\nneedle\nafter\n")
             self.assertFalse(str(backups[0]).startswith(str(root)))
