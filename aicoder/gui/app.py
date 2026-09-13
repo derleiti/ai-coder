@@ -18,6 +18,7 @@ from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QAction
 from PyQt6.QtCore import Qt
 
 from .autostart import is_autostart_enabled, toggle_autostart
+from ..helper_control import helper_status, open_helper, start_helper, stop_managed_helper
 
 
 def _make_icon() -> QIcon:
@@ -67,6 +68,47 @@ def run_gui() -> int:
 
     tray_menu.addSeparator()
 
+    # Independent AILinux Helper companion.  AICoder is the primary app; the
+    # helper remains a separate process and can also be run on its own.
+    helper_menu = tray_menu.addMenu("AILinux Helper")
+    helper_state_action = QAction("Status", tray)
+    helper_state_action.setEnabled(False)
+    helper_menu.addAction(helper_state_action)
+
+    def _refresh_helper_state():
+        state = helper_status()
+        if state["managed_running"]:
+            text = "Status: läuft (AICoder)"
+        elif state["available"]:
+            text = f"Status: verfügbar ({state['source']})"
+        else:
+            text = "Status: nicht gefunden"
+        helper_state_action.setText(text)
+
+    def _helper_message(result):
+        ok, message = result
+        tray.showMessage(
+            "AILinux Helper", message,
+            tray.MessageIcon.Information if ok else tray.MessageIcon.Warning, 3000,
+        )
+        _refresh_helper_state()
+
+    helper_start_action = QAction("Im Hintergrund starten", tray)
+    helper_start_action.triggered.connect(lambda: _helper_message(start_helper()))
+    helper_menu.addAction(helper_start_action)
+
+    helper_open_action = QAction("Öffnen", tray)
+    helper_open_action.triggered.connect(lambda: _helper_message(open_helper()))
+    helper_menu.addAction(helper_open_action)
+
+    helper_stop_action = QAction("Von AICoder gestarteten Helper stoppen", tray)
+    helper_stop_action.triggered.connect(lambda: _helper_message(stop_managed_helper()))
+    helper_menu.addAction(helper_stop_action)
+    helper_menu.aboutToShow.connect(_refresh_helper_state)
+    _refresh_helper_state()
+
+    tray_menu.addSeparator()
+
     # Start with OS (toggle)
     autostart_action = QAction("Mit System starten", tray)
     autostart_action.setCheckable(True)
@@ -95,7 +137,7 @@ def run_gui() -> int:
         if reason == QSystemTrayIcon.ActivationReason.Trigger
         else None
     ))
-    tray.setToolTip("ai-coder — Terminal Coding Agent")
+    tray.setToolTip("AILinux App · AICoder")
     tray.show()
 
     window.tray = tray
