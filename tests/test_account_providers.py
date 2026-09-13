@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import queue
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -393,6 +395,24 @@ class ProviderTransportTests(unittest.TestCase):
             models = available_account_models("grok")
         self.assertEqual([m["model"] for m in models], ["grok-4.6", "grok-4.5"])
         self.assertEqual(models[0]["id"], "account:grok/grok-4.6")
+
+
+class CodexAppServerFailureTests(unittest.TestCase):
+    def test_receive_surfaces_immediate_app_server_exit_without_waiting_for_timeout(self):
+        from aicoder.account_providers import CodexAppServer
+
+        server = object.__new__(CodexAppServer)
+        server.timeout = 30
+        server._queue = queue.Queue()
+        server._stderr_lines = ["failed to initialize sqlite state runtime under /home/test/.codex"]
+        server.proc = MagicMock()
+        server.proc.poll.return_value = 1
+        server.proc.returncode = 1
+
+        started = time.monotonic()
+        with self.assertRaisesRegex(ClientError, "sqlite state runtime"):
+            server._receive(timeout=30)
+        self.assertLess(time.monotonic() - started, 1.0)
 
 
 class ChatGPTTransportTests(unittest.TestCase):

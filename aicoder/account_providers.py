@@ -308,8 +308,11 @@ class CodexAppServer:
             self.close()
             raise ClientError("Codex App Server stdio transport is unavailable")
         self._queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._stderr_lines: list[str] = []
         self._reader = threading.Thread(target=self._read_stdout, daemon=True)
+        self._stderr_reader = threading.Thread(target=self._read_stderr, daemon=True)
         self._reader.start()
+        self._stderr_reader.start()
         self._next_id = 1
         self._initialize()
 
@@ -323,6 +326,21 @@ class CodexAppServer:
             if isinstance(message, dict):
                 self._queue.put(message)
 
+    def _read_stderr(self) -> None:
+        if self.proc.stderr is None:
+            return
+        for line in self.proc.stderr:
+            text = line.strip()
+            if text:
+                self._stderr_lines.append(text)
+                if len(self._stderr_lines) > 20:
+                    del self._stderr_lines[:-20]
+
+    def _process_error(self) -> ClientError:
+        detail = self._stderr_lines[-1] if self._stderr_lines else ""
+        suffix = f": {detail[:500]}" if detail else ""
+        return ClientError(f"Codex App Server exited unexpectedly (code {self.proc.returncode}){suffix}")
+
     def _send(self, payload: dict[str, Any]) -> None:
         if self.proc.poll() is not None:
             raise ClientError(f"Codex App Server exited unexpectedly (code {self.proc.returncode})")
@@ -335,10 +353,17 @@ class CodexAppServer:
 
     def _receive(self, *, timeout: float | None = None) -> dict[str, Any]:
         wait = self.timeout if timeout is None else max(0.1, float(timeout))
-        try:
-            return self._queue.get(timeout=wait)
-        except queue.Empty as exc:
-            raise ClientError("Codex App Server timed out") from exc
+        deadline = time.monotonic() + wait
+        while True:
+            if self.proc.poll() is not None:
+                raise self._process_error()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ClientError("Codex App Server timed out")
+            try:
+                return self._queue.get(timeout=min(0.1, remaining))
+            except queue.Empty:
+                continue
 
     def _request(self, method: str, params: dict[str, Any] | None = None, *, timeout: float | None = None) -> dict[str, Any]:
         request_id = self._next_id
