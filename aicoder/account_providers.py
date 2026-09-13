@@ -99,6 +99,9 @@ _ANTIGRAVITY_QUOTA_RE = re.compile(
     re.IGNORECASE,
 )
 _ANTIGRAVITY_QUOTA_CACHE_FILE = CONFIG_DIR / "antigravity-quota.json"
+_CHATGPT_QUOTA_CACHE_FILE = CONFIG_DIR / "chatgpt-quota.json"
+_CHATGPT_QUOTA_TTL_SECONDS = max(60, int(os.getenv("AICODER_CHATGPT_QUOTA_TTL_SECONDS", "300")))
+_CHATGPT_QUOTA_CODES = {"usagelimitexceeded", "insufficient_quota"}
 _ANTIGRAVITY_LOG_TIME_RE = re.compile(
     r"^[A-Z](?P<month>\d{2})(?P<day>\d{2})\s+"
     r"(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})(?:\.(?P<micro>\d{1,6}))?"
@@ -477,6 +480,67 @@ class CodexAppServer:
         self.close()
 
 
+def _chatgpt_quota_status(
+    *, cache_file: str | Path | None = None, now: float | None = None,
+) -> dict[str, Any]:
+    """Return a short-lived ChatGPT/Codex credit-limit observation.
+
+    Codex currently exposes ``usageLimitExceeded`` only on a failed turn and
+    does not provide an account quota-status endpoint or reset timestamp. Cache
+    the authoritative failure briefly so subsequent agent starts can use the
+    existing account-to-account quota reroute instead of hammering the same
+    exhausted workspace.
+    """
+    path = Path(cache_file) if cache_file is not None else _CHATGPT_QUOTA_CACHE_FILE
+    current = time.time() if now is None else float(now)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {"quota_exhausted": False, "quota_retry_after_seconds": 0, "quota_reset_at": ""}
+    try:
+        expires_at = float(payload.get("expires_at") or 0)
+    except (TypeError, ValueError):
+        expires_at = 0
+    remaining = max(0, int(expires_at - current))
+    if remaining <= 0:
+        return {"quota_exhausted": False, "quota_retry_after_seconds": 0, "quota_reset_at": ""}
+    reset_at = datetime.fromtimestamp(expires_at).astimezone().isoformat()
+    return {
+        "quota_exhausted": True,
+        "quota_retry_after_seconds": remaining,
+        "quota_reset_at": reset_at,
+    }
+
+
+def _mark_chatgpt_quota_exhausted(
+    *, cache_file: str | Path | None = None, now: float | None = None,
+    ttl_seconds: int | None = None,
+) -> dict[str, Any]:
+    path = Path(cache_file) if cache_file is not None else _CHATGPT_QUOTA_CACHE_FILE
+    current = time.time() if now is None else float(now)
+    ttl = max(60, int(_CHATGPT_QUOTA_TTL_SECONDS if ttl_seconds is None else ttl_seconds))
+    payload = {
+        "quota_exhausted": True,
+        "observed_at": current,
+        "expires_at": current + ttl,
+        "reason": "usageLimitExceeded",
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_private(path, json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    return _chatgpt_quota_status(cache_file=path, now=current)
+
+
+def _is_chatgpt_quota_error(message: str, error_code: str = "") -> bool:
+    code = str(error_code or "").strip().lower()
+    text = str(message or "").strip().lower()
+    return bool(
+        code in _CHATGPT_QUOTA_CODES
+        or "workspace is out of credits" in text
+        or "usage limit exceeded" in text
+        or "insufficient quota" in text
+    )
+
+
 def _chatgpt_status() -> dict[str, Any]:
     spec = provider_spec("chatgpt")
     installed = bool(_which(spec))
@@ -494,10 +558,17 @@ def _chatgpt_status() -> dict[str, Any]:
     detail = "ChatGPT nicht angemeldet"
     plan = str(account.get("planType") or "").strip()
     email = str(account.get("email") or "").strip()
-    if authenticated:
+    quota = _chatgpt_quota_status() if authenticated else {
+        "quota_exhausted": False, "quota_retry_after_seconds": 0, "quota_reset_at": "",
+    }
+    if authenticated and quota.get("quota_exhausted"):
+        retry_s = int(quota.get("quota_retry_after_seconds") or 0)
+        detail = "Verbunden · Credits/Quota erschöpft" + (f" · retry in ~{max(1, retry_s // 60)}m" if retry_s else "")
+    elif authenticated:
         detail = "Verbunden" + (f" · {plan}" if plan else "") + (f" · {email}" if email else "")
     return {"provider": spec.id, "display": spec.display_name, "installed": True,
-            "linked": authenticated, "authenticated": authenticated, "detail": detail, "plan": plan, "email": email}
+            "linked": authenticated, "authenticated": authenticated, "detail": detail, "plan": plan, "email": email,
+            **quota}
 
 
 def _claude_status() -> dict[str, Any]:
@@ -1593,6 +1664,14 @@ class ChatGPTAccountTransport:
                             if not detail:
                                 detail = provider_error
                             suffix = f": {detail[:500]}" if detail else ""
+                            if _is_chatgpt_quota_error(message_text or provider_error, error_code):
+                                quota = _mark_chatgpt_quota_exhausted()
+                                raise ClientError(
+                                    f"ChatGPT account quota exhausted{suffix}",
+                                    retryable=False,
+                                    retry_after=int(quota.get("quota_retry_after_seconds") or 0) or None,
+                                    payload={"provider": "chatgpt", "reason": "quota_exhausted", "codexErrorInfo": error_code or "usageLimitExceeded"},
+                                )
                             raise ClientError(f"ChatGPT account turn ended with status {status or 'unknown'}{suffix}")
                         break
                 if not answer:

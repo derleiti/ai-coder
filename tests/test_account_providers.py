@@ -16,6 +16,7 @@ from aicoder.account_providers import (
     account_model_id,
     account_status,
     antigravity_quota_status,
+    _chatgpt_quota_status,
     reroute_account_model_if_unavailable,
     available_account_models,
     is_account_model,
@@ -167,6 +168,35 @@ class AccountQuotaRoutingTests(unittest.TestCase):
         self.assertEqual(model, "account:claude/sonnet")
         self.assertEqual(info["reason"], "quota_exhausted")
         self.assertEqual(info["from_model"], "account:gemini/gemini-3.8-flash-high")
+
+
+    def test_chatgpt_quota_cache_is_short_lived(self):
+        import tempfile
+        from aicoder.account_providers import _mark_chatgpt_quota_exhausted
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "chatgpt-quota.json"
+            marked = _mark_chatgpt_quota_exhausted(cache_file=cache, now=1000, ttl_seconds=300)
+            active = _chatgpt_quota_status(cache_file=cache, now=1100)
+            expired = _chatgpt_quota_status(cache_file=cache, now=1400)
+        self.assertTrue(marked["quota_exhausted"])
+        self.assertTrue(active["quota_exhausted"])
+        self.assertGreaterEqual(active["quota_retry_after_seconds"], 199)
+        self.assertFalse(expired["quota_exhausted"])
+
+    def test_quota_exhausted_chatgpt_reroutes_to_authenticated_claude(self):
+        def status(provider):
+            if provider == "chatgpt":
+                return {"provider": provider, "installed": True, "linked": True, "authenticated": True,
+                        "quota_exhausted": True, "quota_retry_after_seconds": 300, "quota_reset_at": "soon"}
+            if provider == "claude":
+                return {"provider": provider, "installed": True, "linked": True, "authenticated": True,
+                        "quota_exhausted": False}
+            return {"provider": provider, "installed": False, "linked": False, "authenticated": False,
+                    "quota_exhausted": False}
+        with patch("aicoder.account_providers.account_status", side_effect=status):
+            model, info = reroute_account_model_if_unavailable("account:chatgpt/gpt-5.6-terra")
+        self.assertEqual(model, "account:claude/sonnet")
+        self.assertEqual(info["reason"], "quota_exhausted")
 
     def test_non_quota_failure_is_not_hidden_by_reroute(self):
         with patch("aicoder.account_providers.account_status", return_value={
@@ -409,9 +439,15 @@ class ChatGPTTransportTests(unittest.TestCase):
                           "codexErrorInfo": "usageLimitExceeded"},
             }}},
         ]
-        with patch("aicoder.account_providers.CodexAppServer", return_value=server):
-            with self.assertRaisesRegex(ClientError, "out of credits.*usageLimitExceeded"):
-                ChatGPTAccountTransport(timeout=30).chat(model="account:chatgpt/gpt-test", message="hello")
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "chatgpt-quota.json"
+            with patch("aicoder.account_providers.CodexAppServer", return_value=server), \
+                 patch("aicoder.account_providers._CHATGPT_QUOTA_CACHE_FILE", cache):
+                with self.assertRaisesRegex(ClientError, "quota exhausted.*usageLimitExceeded") as raised:
+                    ChatGPTAccountTransport(timeout=30).chat(model="account:chatgpt/gpt-test", message="hello")
+            self.assertFalse(raised.exception.retryable)
+            self.assertTrue(_chatgpt_quota_status(cache_file=cache)["quota_exhausted"])
 
     def test_codex_provider_side_item_fails_closed(self):
         server = MagicMock()
