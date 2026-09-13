@@ -32,3 +32,6 @@ package-dir = {"" = "."}
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["aicoder*"]
+
+[tool.setuptools.package-data]
+"aicoder.gui" = ["design_tokens.json"]

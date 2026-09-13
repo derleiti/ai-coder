@@ -1,0 +1,41 @@
+{
+  "fingerprint": "f171badcd5e1f1a35929188fab4acd896c06e0b7fe25bc2e981311f8be480fe8",
+  "modes": {
+    "dark": {
+      "accent": "#55e7d0",
+      "accent-hover": "#79f0dc",
+      "background": "#071018",
+      "error": "#ff7f96",
+      "glass": "rgba(17,33,44,0.80)",
+      "glass-border": "rgba(126,220,255,0.19)",
+      "radius": "14px",
+      "shadow": "0 16px 48px rgba(0,0,0,0.24)",
+      "spacing": "12px",
+      "success": "#69e5b1",
+      "surface": "#0a151e",
+      "text": "#e9f3ff",
+      "text-muted": "#7996a9",
+      "typography": "Inter, Noto Sans, sans-serif",
+      "warning": "#ffd27a"
+    },
+    "light": {
+      "accent": "#18b7a6",
+      "accent-hover": "#119d90",
+      "background": "#eafcff",
+      "error": "#c53a57",
+      "glass": "rgba(255,255,255,0.78)",
+      "glass-border": "rgba(66,155,190,0.25)",
+      "radius": "14px",
+      "shadow": "0 16px 44px rgba(42,111,135,0.15)",
+      "spacing": "12px",
+      "success": "#087e69",
+      "surface": "#f7fdff",
+      "text": "#173846",
+      "text-muted": "#6b8a98",
+      "typography": "Inter, Noto Sans, sans-serif",
+      "warning": "#a26700"
+    }
+  },
+  "schema_version": 1,
+  "source": "AILinux Loom / src/ailinux_suite/design_tokens.json"
+}

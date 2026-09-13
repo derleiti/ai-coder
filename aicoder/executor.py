@@ -701,6 +701,38 @@ LOCAL_TOOL_SCHEMAS = [
 # Names of all local tools (for dispatch in run_tool)
 LOCAL_TOOL_NAMES = {t["name"] for t in LOCAL_TOOL_SCHEMAS}
 
+
+def project_local_tool_schemas(canonical_tools: list[dict]) -> list[dict]:
+    """Bind local execution handlers to canonical TriForce schemas by tool name.
+
+    Local-vs-remote is an execution target decision, not permission to redefine a
+    shared tool contract. AICoder-only capabilities keep their local schema; a
+    name also present in TriForce inherits the canonical description/inputSchema
+    and safety annotations while remaining dispatched by AICoder's local handler.
+    """
+    canonical = {
+        str(tool.get("name") or ""): tool
+        for tool in canonical_tools
+        if isinstance(tool, dict) and str(tool.get("name") or "")
+    }
+    projected: list[dict] = []
+    for local in LOCAL_TOOL_SCHEMAS:
+        name = str(local.get("name") or "")
+        source = canonical.get(name)
+        if source is None:
+            projected.append(copy.deepcopy(local))
+            continue
+        tool = copy.deepcopy(source)
+        # AICoder metadata may describe the local execution adapter, but semantic
+        # schema/description remain canonical. Never copy a second inputSchema.
+        for key, value in local.items():
+            if key.startswith("x-aicoder-"):
+                tool[key] = copy.deepcopy(value)
+        tool["x_execution"] = "local_aicoder"
+        projected.append(tool)
+    return projected
+
+
 # User-facing backend services are allowed even when the task forbids targeting
 # TriForce itself as an administrative/system object.
 _TRIFORCE_USER_SERVICE_TOOLS = {
@@ -984,13 +1016,16 @@ def load_tools(client: TriForceClient, force_refresh: bool = False) -> list[dict
     except Exception:
         # A broken optional external server must not take down the built-in agent.
         external_tools = []
+    # Shared names keep the canonical TriForce semantic schema even when their
+    # execution target is local. The live MCP catalogue is the schema authority.
+    local_tools = project_local_tool_schemas(catalog if catalog_loaded else [])
     reserved_names = (
         LOCAL_TOOL_NAMES
         | {str(tool.get("name") or "") for tool in provider_tools}
         | {str(tool.get("name") or "") for tool in external_tools}
     )
     mcp_tools = [tool for tool in mcp_tools if tool.get("name") not in reserved_names]
-    result = LOCAL_TOOL_SCHEMAS + provider_tools + external_tools + mcp_tools
+    result = local_tools + provider_tools + external_tools + mcp_tools
     _tool_security_hints = {
         str(tool.get("name", "")): _tool_security_metadata(tool)
         for tool in result
@@ -1839,39 +1874,56 @@ def run_code_grep(args: dict) -> Tuple[str, bool]:
 
 
 def run_git_read(args: dict) -> Tuple[str, bool]:
-    action = str(args.get("action") or "").lower()
-    supported = {"status", "diff", "log", "show", "branch", "blame"}
-    if action not in supported:
-        return "git error: supported read-only actions are status, diff, log, show, branch, and blame", True
-    raw_args = args.get("args") or []
-    if not isinstance(raw_args, list) or not all(isinstance(item, str) for item in raw_args):
-        return "git error: args must be a string array", True
-    denied = ("--output", "--exec", "--upload-pack", "--receive-pack", "-d", "-D", "-m", "-M")
-    if any(item in denied or item.startswith("--output=") for item in raw_args):
-        return "git error: mutating or output-writing argument rejected", True
+    """Execute the canonical TriForce git contract against the local workspace.
+
+    The historical ``action``/``cwd``/string-array ``args`` shape remains accepted
+    for existing callers, but model-facing discovery uses TriForce's canonical
+    ``mode``/``path``/string ``args`` contract. Mutating modes are approved and
+    backed up by ``_run_tool_impl`` before this handler is entered.
+    """
+    mode = str(args.get("mode") or args.get("action") or "status").strip().lower()
+    supported = {"status", "diff", "commit", "branch", "log", "push", "pull", "stash", "add", "show", "blame"}
+    if mode not in supported:
+        return f"git error: unsupported mode: {mode}", True
+
+    raw_extra = args.get("args") or ""
+    if isinstance(raw_extra, str):
+        import shlex
+        try:
+            extra_args = shlex.split(raw_extra)
+        except ValueError as exc:
+            return f"git error: invalid args: {exc}", True
+    elif isinstance(raw_extra, list) and all(isinstance(item, str) for item in raw_extra):
+        # Backward compatibility for pre-canonical AICoder calls.
+        extra_args = list(raw_extra)
+    else:
+        return "git error: args must be a shell-style string", True
+
+    # Block argument-level escape hatches; canonical modes already cover every
+    # supported mutation explicitly and all execution stays inside the workspace.
+    denied = ("--exec", "--upload-pack", "--receive-pack", "--config-env")
+    if any(item in denied or any(item.startswith(prefix + "=") for prefix in denied) for item in extra_args):
+        return "git error: unsafe argument rejected", True
+
     try:
-        cwd = _workspace_path(args.get("cwd") or ".", allow_outside=bool(args.get("_workspace_escape_approved")))
-        # Tolerate a common model shape for blame: cwd points at the file and args
-        # is empty. Resolve the enclosing repository and supply the file path.
-        if action == "blame" and cwd.is_file() and not raw_args:
-            file_path = cwd
-            probe = file_path.parent
-            repo = None
-            for parent in (probe, *probe.parents):
-                if (parent / ".git").exists():
-                    repo = parent
-                    break
-            if repo is None:
-                return f"git error: no repository found for blame target: {file_path}", True
-            raw_args = [str(file_path.relative_to(repo))]
-            cwd = repo
-        # A brand-new workspace is a valid read-only Git state. Treat repository
-        # inspection as an empty/new-project result instead of surfacing Git's
-        # fatal "not a git repository" as a tool failure. This keeps planning
-        # stages from wasting recovery turns before a repository is initialized.
-        if action in {"status", "diff", "log", "show", "branch"}:
-            probe = cwd if cwd.is_dir() else cwd.parent
-            has_git_marker = any((parent / ".git").exists() for parent in (probe, *probe.parents))
+        cwd = _workspace_path(
+            args.get("path") or args.get("cwd") or ".",
+            allow_outside=bool(args.get("_workspace_escape_approved")),
+        )
+        if cwd.is_file():
+            if mode == "blame" and not extra_args:
+                file_path = cwd
+                probe = file_path.parent
+                repo = next((parent for parent in (probe, *probe.parents) if (parent / ".git").exists()), None)
+                if repo is None:
+                    return f"git error: no repository found for blame target: {file_path}", True
+                extra_args = [str(file_path.relative_to(repo))]
+                cwd = repo
+            else:
+                return "git error: path must be a directory", True
+
+        if mode in {"status", "diff", "log", "show", "branch"}:
+            has_git_marker = any((parent / ".git").exists() for parent in (cwd, *cwd.parents))
             if not has_git_marker:
                 return json.dumps({
                     "status": "not_git_repository",
@@ -1879,35 +1931,55 @@ def run_git_read(args: dict) -> Tuple[str, bool]:
                     "message": "workspace has no Git repository yet",
                 }, ensure_ascii=False), False
 
-        # Normalize accidental leading slashes in Git pathspecs only when the
-        # absolute path is absent and the workspace-relative file really exists.
-        normalized_args: list[str] = []
-        for item in raw_args:
-            if item.startswith("/") and not Path(item).exists():
-                candidate = (cwd / item.lstrip("/")).resolve(strict=False)
-                if candidate.exists() and _inside(candidate, cwd):
-                    normalized_args.append(item.lstrip("/"))
-                    continue
-            normalized_args.append(item)
-        raw_args = normalized_args
-        command = [
+        base = [
             "git", "--no-pager",
             "-c", "diff.external=",
             "-c", "core.hooksPath=/dev/null",
             "-c", "core.fsmonitor=false",
             "-c", "submodule.recurse=false",
-            action,
         ]
-        if action in {"diff", "show"}:
-            command.extend(["--no-ext-diff", "--no-textconv"])
-        command.extend(raw_args[:30])
-        env = {**os.environ, "GIT_PAGER": "cat", "GIT_EXTERNAL_DIFF": ""}
-        completed = subprocess.run(
-            command, cwd=str(cwd), env=env,
-            capture_output=True, text=True, timeout=60,
-        )
+        message = str(args.get("message") or "")
+        branch = str(args.get("branch") or "")
+        if mode == "status":
+            command = [*base, "status", "--short", "--branch", *extra_args]
+        elif mode == "diff":
+            command = [*base, "diff", "--no-ext-diff", "--no-textconv", *extra_args]
+        elif mode == "log":
+            command = [*base, "log", "--oneline", "-20", *extra_args]
+        elif mode == "show":
+            command = [*base, "show", "--no-ext-diff", "--no-textconv", *extra_args]
+        elif mode == "blame":
+            command = [*base, "blame", *extra_args]
+        elif mode == "commit":
+            if not message:
+                return "git error: message is required for commit mode", True
+            add = subprocess.run([*base, "add", "-A"], cwd=str(cwd), capture_output=True, text=True, timeout=60)
+            if add.returncode != 0:
+                output = (add.stdout or "") + (add.stderr or "")
+                return output[:12000] or "git add failed", True
+            command = [*base, "commit", "-m", message, *extra_args]
+        elif mode == "branch" and branch:
+            create = subprocess.run([*base, "branch", branch], cwd=str(cwd), capture_output=True, text=True, timeout=60)
+            if create.returncode != 0:
+                output = (create.stdout or "") + (create.stderr or "")
+                return output[:12000] or "git branch failed", True
+            command = [*base, "checkout", branch]
+        elif mode == "branch":
+            command = [*base, "branch", "-a", *extra_args]
+        elif mode == "push":
+            command = [*base, "push", *extra_args]
+        elif mode == "pull":
+            command = [*base, "pull", *extra_args]
+        elif mode == "stash":
+            command = [*base, "stash", *extra_args]
+        else:  # add
+            command = [*base, "add", *(extra_args or ["."])]
+
+        completed = subprocess.run(command, cwd=str(cwd), capture_output=True, text=True, timeout=120)
         output = (completed.stdout or "") + (completed.stderr or "")
         return output[:12000] or "(no output)", completed.returncode != 0
+    except subprocess.TimeoutExpired as exc:
+        return f"git error: timed out after {exc.timeout}s", True
     except Exception as exc:
         return f"git error: {exc}", True
 
@@ -2047,6 +2119,35 @@ def _elevated_shell_command(command: str, strategy: str) -> str:
         return f"pkexec /bin/bash -lc {shlex.quote(stripped)}"
     return command
 
+def _loom_container_exec(cwd: Path, argv: list[str], *, timeout: int, stdin_data: str | None = None) -> subprocess.CompletedProcess[str] | None:
+    """Route an approved local command into a Loom-assigned disposable container.
+
+    The AI never receives Docker socket access. Loom creates the container and passes
+    only its name plus the protected workspace root through environment variables.
+    If no Loom target is assigned, callers fall back to the existing local runtime.
+    """
+    container = str(os.environ.get("AILINUX_LOOM_CONTAINER") or "").strip()
+    workspace = str(os.environ.get("AILINUX_LOOM_WORKSPACE") or "").strip()
+    if not container:
+        return None
+    if not re.fullmatch(r"ailinux-run-[a-zA-Z0-9_.-]+", container):
+        raise ValueError("invalid AILINUX_LOOM_CONTAINER target")
+    root = Path(workspace or _workspace_root()).expanduser().resolve(strict=False)
+    current = cwd.expanduser().resolve(strict=False)
+    try:
+        rel = current.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("Loom execution target refuses cwd outside assigned workspace") from exc
+    container_cwd = "/workspace" if str(rel) == "." else "/workspace/" + rel.as_posix()
+    command = ["docker", "exec"]
+    if stdin_data is not None:
+        command.append("-i")
+    command += ["-w", container_cwd, container, *argv]
+    return subprocess.run(
+        command, input=stdin_data, capture_output=True, text=True, timeout=timeout, check=False,
+    )
+
+
 def run_local_shell(args: dict, *, task_runner: bool = False) -> Tuple[str, bool]:
     command = str(args.get("command") or "").strip()
     if not command:
@@ -2061,10 +2162,14 @@ def run_local_shell(args: dict, *, task_runner: bool = False) -> Tuple[str, bool
         )
         timeout = _bounded_timeout(args, 120 if task_runner else 60, 300 if task_runner else 120)
         _, env = _disk_backed_project_environment(cwd, [])
-        completed = subprocess.run(
-            ["/bin/bash", "-o", "pipefail", "-c", command], cwd=str(cwd), env=env,
-            capture_output=True, text=True, timeout=timeout,
+        completed = _loom_container_exec(
+            cwd, ["/bin/bash", "-o", "pipefail", "-c", command], timeout=timeout
         )
+        if completed is None:
+            completed = subprocess.run(
+                ["/bin/bash", "-o", "pipefail", "-c", command], cwd=str(cwd), env=env,
+                capture_output=True, text=True, timeout=timeout,
+            )
         return _format_process_result(completed), completed.returncode != 0
     except subprocess.TimeoutExpired as exc:
         return f"{'task_runner' if task_runner else 'shell'} error: timed out after {exc.timeout}s", True
@@ -2086,11 +2191,13 @@ def run_local_binary(args: dict) -> Tuple[str, bool]:
         )
         timeout = _bounded_timeout(args, 60, 120)
         argv, env = _disk_backed_project_environment(cwd, [program, *arguments])
-        completed = subprocess.run(
-            argv, shell=False, cwd=str(cwd), env=env,
-            input=args.get("stdin_data") if isinstance(args.get("stdin_data"), str) else None,
-            capture_output=True, text=True, timeout=timeout,
-        )
+        stdin_data = args.get("stdin_data") if isinstance(args.get("stdin_data"), str) else None
+        completed = _loom_container_exec(cwd, argv, timeout=timeout, stdin_data=stdin_data)
+        if completed is None:
+            completed = subprocess.run(
+                argv, shell=False, cwd=str(cwd), env=env, input=stdin_data,
+                capture_output=True, text=True, timeout=timeout,
+            )
         return _format_process_result(completed), completed.returncode != 0
     except subprocess.TimeoutExpired as exc:
         return f"binary_exec error: timed out after {exc.timeout}s", True
@@ -2194,7 +2301,7 @@ def _prepare_change_restore(tool_name: str, args: dict):
             allow_outside=bool(args.get("_workspace_escape_approved")),
         )
         return journal, journal.prepare_directory_create(target, _workspace_root())
-    if tool_name in {"shell", "binary_exec", "task_runner"}:
+    if tool_name in {"shell", "binary_exec", "task_runner", "git"}:
         return journal, journal.prepare_workspace_change(_workspace_root(), source=tool_name)
     if tool_name in {"settings_apply_patch", "settings_reset"}:
         return journal, _prepare_settings_restore(tool_name, args)
@@ -2294,6 +2401,10 @@ def _run_tool_impl(
         approval_args["_mutating"] = True
         if security_change_requested(name, args):
             approval_args["_security_change"] = True
+    if name == "git":
+        git_mode = str(args.get("mode") or args.get("action") or "status").strip().lower()
+        if git_mode not in {"status", "diff", "log", "show", "blame"}:
+            approval_args["_mutating"] = True
     provider = discover_plugins(_workspace_root()).provider_for_tool(name)
     if provider is not None:
         provider_security = provider.security_for(name, args)
