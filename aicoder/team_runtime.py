@@ -351,11 +351,16 @@ def config_from_state(state: dict[str, Any]) -> TeamConfig:
 
 
 def should_use_team(task: str, mode: str) -> bool:
-    """Use the expensive team path only for substantive coding/action work in auto mode."""
+    """Route only genuinely substantive work to the expensive team runtime.
+
+    Explicit ``on`` remains authoritative.  In ``auto`` mode an explicitly
+    lightweight read/grep/one-file/simple-fix request stays on the normal agent
+    even when the user provides a long explanation.
+    """
     normalized = str(mode or "off").strip().lower()
     if normalized == "off":
         return False
-    text = str(task or "").lower()
+    text = " ".join(str(task or "").lower().split())
     coding_signals = (
         "implement", "fix", "bug", "refactor", "code", "coding", "feature", "build",
         "test", "repository", "repo", "architecture", "workflow", "package", "gui",
@@ -364,4 +369,20 @@ def should_use_team(task: str, mode: str) -> bool:
     has_coding_signal = any(signal in text for signal in coding_signals)
     if normalized == "on":
         return has_coding_signal or len(text) >= 80
+
+    lightweight_signals = (
+        "simple fix", "small fix", "kleiner fix", "kleinen fix", "einfacher fix",
+        "kleine änderung", "kleine aenderung", "one-line", "one line", "einzeilig",
+        "typo", "nur lesen", "only read", "read only", "nur grep", "just grep",
+        "nur suchen", "only search", "single file", "eine datei", "one file",
+    )
+    complexity_signals = (
+        "architecture", "architektur", "multi-agent", "team run", "mehrere projekte",
+        "cross-project", "project-wide", "projektweit", "end-to-end", "e2e",
+        "migration", "distributed", "packaging matrix", "release pipeline",
+    )
+    explicitly_light = any(signal in text for signal in lightweight_signals)
+    clearly_complex = any(signal in text for signal in complexity_signals)
+    if explicitly_light and not clearly_complex:
+        return False
     return len(text) >= 120 and has_coding_signal

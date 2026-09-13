@@ -40,20 +40,19 @@ class FailureTrackerTests(unittest.TestCase):
         self.assertEqual(cli.signature, exc.signature)
         self.assertEqual(exc.count, 2)
 
-    def test_transient_provider_failure_is_retryable(self):
+    def test_provider_unavailable_is_retryable(self):
         failure = FailureTracker().observe("HTTP 503 temporarily unavailable", True)
-        self.assertEqual(failure.category, "transient")
+        self.assertEqual(failure.category, "provider_unavailable")
         self.assertTrue(failure.retryable)
 
-
-    def test_transient_retry_budget_opens_circuit_after_two_failures(self):
+    def test_retry_budget_opens_circuit_after_two_provider_failures(self):
         tracker = FailureTracker(transient_retry_budget=2)
         first = tracker.observe("HTTP 503 temporarily unavailable", True)
         second = tracker.observe("HTTP 503 temporarily unavailable", True)
         third = tracker.observe("HTTP 503 temporarily unavailable", True)
-        self.assertEqual(first.category, "transient")
+        self.assertEqual(first.category, "provider_unavailable")
         self.assertTrue(first.retryable)
-        self.assertEqual(second.category, "transient")
+        self.assertEqual(second.category, "provider_unavailable")
         self.assertTrue(second.retryable)
         self.assertEqual(third.category, "persistent_dependency")
         self.assertFalse(third.retryable)
@@ -64,6 +63,34 @@ class FailureTrackerTests(unittest.TestCase):
         failure = FailureTracker().observe("file_edit: aborted by user", True)
         self.assertEqual(failure.category, "permission")
         self.assertFalse(failure.retryable)
+
+    def test_provider_failure_classes_are_not_coding_failures(self):
+        cases = [
+            ("HTTP 401 unauthorized - token expired", "authentication", False),
+            ("429 Too Many Requests: rate limit exceeded", "rate_limited", True),
+            ("usageLimitExceeded: quota exhausted", "quota_exhausted", True),
+            ("request timed out after 120s", "timeout", True),
+            ("provider unavailable: connection reset", "provider_unavailable", True),
+            ("malformed response: unexpected response envelope", "malformed_response", False),
+            ("Transient incomplete chat response", "malformed_response", True),
+        ]
+        for text, category, retryable in cases:
+            with self.subTest(text=text):
+                failure = FailureTracker().observe(text, True)
+                self.assertEqual(failure.category, category)
+                self.assertEqual(failure.retryable, retryable)
+
+    def test_code_test_and_runtime_failures_are_distinct(self):
+        cases = [
+            ("failed_checks=python-tests", "test_failure"),
+            ("internal runtime failure: tool lifecycle mismatch", "internal_runtime_failure"),
+            ("NameError: widget is not defined", "coding_failure"),
+        ]
+        for text, category in cases:
+            with self.subTest(text=text):
+                failure = FailureTracker().observe(text, True)
+                self.assertEqual(failure.category, category)
+                self.assertFalse(failure.retryable)
 
     def test_success_is_not_failure(self):
         self.assertIsNone(FailureTracker().observe("ok", False))

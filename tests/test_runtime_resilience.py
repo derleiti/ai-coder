@@ -57,7 +57,7 @@ class RuntimeResilienceTests(unittest.TestCase):
         )
         result = runtime.run()
         self.assertEqual(result.status, "paused")
-        self.assertEqual(result.failure_category, "transient")
+        self.assertEqual(result.failure_category, "provider_unavailable")
         self.assertEqual(result.retry_after, 120)
 
     def test_permanent_client_error_still_fails(self):

@@ -482,8 +482,8 @@ def _worker_event_forwarder(fn: EventFn | None, role: str) -> EventFn:
 def _advisor_retryable(reason: str, exc: Exception | None = None) -> bool:
     if exc is not None and bool(getattr(exc, "retryable", False)):
         return True
-    category, _signature, retryable = FailureTracker.classify(reason)
-    return category == "transient" and retryable
+    _category, _signature, retryable = FailureTracker.classify(reason)
+    return retryable
 
 
 def _call_advisor(

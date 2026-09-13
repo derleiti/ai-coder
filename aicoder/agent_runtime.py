@@ -1222,9 +1222,9 @@ class NativeLightRuntime:
                 reason = str(exc)
                 category, _signature, retryable = FailureTracker.classify(reason)
                 typed_retryable = bool(getattr(exc, "retryable", False))
-                if typed_retryable and category != "transient":
-                    category = "transient"; retryable = True
-                if retryable and category == "transient":
+                if typed_retryable:
+                    retryable = True
+                if retryable:
                     retry_after = getattr(exc, "retry_after", None)
                     wait_hint = (
                         f" Recommended retry delay: {int(retry_after)}s."

@@ -57,6 +57,21 @@ class TeamConfigurationTests(unittest.TestCase):
         prompt = "Implementiere eine robuste neue Architektur im Repository, füge Tests hinzu und verifiziere die Änderungen vollständig. " * 2
         self.assertTrue(should_use_team(prompt, "auto"))
 
+    def test_auto_team_keeps_explicitly_lightweight_work_single_agent(self):
+        verbose_small_fix = (
+            "Mach nur einen kleinen Fix in einer Datei: ändere exakt den falschen Timeout-Wert. "
+            "Lies den vorhandenen Code zuerst, ändere nichts anderes und führe den betroffenen Test aus. "
+        ) * 3
+        self.assertFalse(should_use_team(verbose_small_fix, "auto"))
+        self.assertTrue(should_use_team(verbose_small_fix, "on"))
+
+    def test_auto_team_complexity_overrides_incidental_lightweight_words(self):
+        task = (
+            "Implementiere eine projektweite Architektur-Migration end-to-end. Lies zuerst eine Datei und "
+            "baue danach die verteilte Runtime, Tests und Release Pipeline über mehrere Komponenten um. "
+        ) * 2
+        self.assertTrue(should_use_team(task, "auto"))
+
 
 class RamCandidateIsolationTests(unittest.TestCase):
     def test_two_candidates_can_diverge_from_same_source(self):

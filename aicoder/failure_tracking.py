@@ -46,17 +46,69 @@ class FailureTracker:
         text = cls._clean(raw)
         lower = text.lower()
 
-        if any(token in lower for token in ("aborted by user", "rejected by user", "explicit approval")):
+        # Infrastructure/provider failures must be distinguished from bad code.
+        # Ordering matters: quota-specific 429s are quota, generic 429s are rate
+        # limits, while provider 5xx/network outages remain separately retryable.
+        if any(token in lower for token in (
+            "aborted by user", "rejected by user", "explicit approval",
+        )):
             category = "permission"
             retryable = False
-        elif "429" in lower or _HTTP_5XX_RE.search(text) or any(
-            token in lower for token in ("timed out", "timeout", "temporarily unavailable", "connection reset")
-        ):
-            category = "transient"
+        elif any(token in lower for token in (
+            "insufficient_quota", "usage limit exceeded", "usagelimitexceeded",
+            "quota exhausted", "quota_exhausted", "quota exceeded",
+            "credit balance", "credits exhausted", "out of credits",
+            "resource_exhausted", "individual quota reached",
+        )):
+            category = "quota_exhausted"
             retryable = True
         elif any(token in lower for token in (
-            "importerror", "modulenotfounderror", "no module named", "abi", "partially initialized module",
-            "unsupported python", "version mismatch",
+            "not authenticated", "authentication failed", "authentication required",
+            "login required", "please re-login", "token expired", "invalid api key",
+            "invalid_api_key", "unauthorized", "http 401", "status 401",
+        )):
+            category = "authentication"
+            retryable = False
+        elif "429" in lower or any(token in lower for token in (
+            "rate limit", "rate_limit", "too many requests", "retry-after",
+        )):
+            category = "rate_limited"
+            retryable = True
+        elif any(token in lower for token in (
+            "timed out", "timeout", "deadline exceeded", "liveness timeout",
+        )):
+            category = "timeout"
+            retryable = True
+        elif _HTTP_5XX_RE.search(text) or any(token in lower for token in (
+            "temporarily unavailable", "service unavailable", "provider unavailable",
+            "provider_unavailable", "connection reset", "connection refused",
+            "connection aborted", "upstream unavailable", "overloaded",
+        )):
+            category = "provider_unavailable"
+            retryable = True
+        elif any(token in lower for token in (
+            "transient incomplete chat response", "malformed response",
+            "malformed_response", "invalid response envelope",
+            "unexpected response envelope", "provider returned malformed",
+        )):
+            category = "malformed_response"
+            retryable = "transient incomplete" in lower
+        elif any(token in lower for token in (
+            "failed_checks=", "test failure", "tests failed", "pytest failed",
+            "verification failed", "regression test failed",
+        )) or re.search(r"(?m)^FAILED\s+tests?[/\\]", raw):
+            category = "test_failure"
+            retryable = False
+        elif any(token in lower for token in (
+            "internal runtime failure", "internal_runtime_failure",
+            "runtime state mismatch", "runtime and ai", "runtime desync",
+            "tool lifecycle mismatch", "binary_exec stuck",
+        )):
+            category = "internal_runtime_failure"
+            retryable = False
+        elif any(token in lower for token in (
+            "importerror", "modulenotfounderror", "no module named", "abi",
+            "partially initialized module", "unsupported python", "version mismatch",
         )):
             category = "environment"
             retryable = False
@@ -67,7 +119,7 @@ class FailureTracker:
             category = "usage"
             retryable = False
         else:
-            category = "code"
+            category = "coding_failure"
             retryable = False
 
         exception = _EXCEPTION_RE.findall(raw)
@@ -89,7 +141,7 @@ class FailureTracker:
         category, signature, retryable = self.classify(result)
         count = self._counts.get(signature, 0) + 1
         self._counts[signature] = count
-        if category == "transient" and count > self.transient_retry_budget:
+        if retryable and count > self.transient_retry_budget:
             # Preserve the underlying signature/count so the same dependency is
             # tracked as one failure family, but stop advertising it as retryable.
             category = "persistent_dependency"
