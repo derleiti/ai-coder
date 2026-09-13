@@ -102,6 +102,7 @@ _ANTIGRAVITY_QUOTA_CACHE_FILE = CONFIG_DIR / "antigravity-quota.json"
 _CHATGPT_QUOTA_CACHE_FILE = CONFIG_DIR / "chatgpt-quota.json"
 _CHATGPT_QUOTA_TTL_SECONDS = max(60, int(os.getenv("AICODER_CHATGPT_QUOTA_TTL_SECONDS", "300")))
 _CHATGPT_QUOTA_CODES = {"usagelimitexceeded", "insufficient_quota"}
+_CHATGPT_CONNECT_LOCK = threading.Lock()
 _ANTIGRAVITY_LOG_TIME_RE = re.compile(
     r"^[A-Z](?P<month>\d{2})(?P<day>\d{2})\s+"
     r"(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})(?:\.(?P<micro>\d{1,6}))?"
@@ -1196,20 +1197,51 @@ def _mistral_authenticated() -> bool:
     return False
 
 
+def _read_authenticated_chatgpt_account(*, timeout: int = 15) -> dict[str, Any] | None:
+    """Read Codex-owned ChatGPT auth without exposing provider credentials."""
+    try:
+        with CodexAppServer(timeout=timeout) as server:
+            account = server.account_read().get("account")
+    except Exception:
+        return None
+    if isinstance(account, dict) and account.get("type") == "chatgpt":
+        return account
+    return None
+
+
 def connect_account(provider: str, *, open_browser: bool = True) -> dict[str, Any]:
+    spec = provider_spec(provider)
+    if spec.id != "chatgpt":
+        return _connect_account_once(provider, open_browser=open_browser)
+
+    if not _CHATGPT_CONNECT_LOCK.acquire(blocking=False):
+        # Single-flight: another caller already owns the browser/device login.
+        # Wait for that attempt, then observe its authoritative Codex account
+        # state instead of opening a second browser/terminal login.
+        with _CHATGPT_CONNECT_LOCK:
+            pass
+        account = _read_authenticated_chatgpt_account()
+        if account is not None:
+            set_provider_linked(spec.id, True)
+            return {"provider": spec.id, "started": False, "authenticated": True, "account": account}
+        raise ClientError("A ChatGPT login attempt already finished without authentication. Retry Connect explicitly.")
+
+    try:
+        return _connect_account_once(provider, open_browser=open_browser)
+    finally:
+        _CHATGPT_CONNECT_LOCK.release()
+
+
+def _connect_account_once(provider: str, *, open_browser: bool = True) -> dict[str, Any]:
     spec = provider_spec(provider)
     executable = ensure_provider_client(spec.id)
     if spec.id == "chatgpt":
         # Reuse a valid official Codex/ChatGPT session without forcing another
         # browser round-trip. Otherwise start the App Server OAuth flow.
-        try:
-            with CodexAppServer(timeout=15) as server:
-                existing = server.account_read().get("account")
-            if isinstance(existing, dict) and existing.get("type") == "chatgpt":
-                set_provider_linked(spec.id, True)
-                return {"provider": spec.id, "started": False, "authenticated": True, "account": existing}
-        except Exception:
-            pass
+        existing = _read_authenticated_chatgpt_account(timeout=15)
+        if existing is not None:
+            set_provider_linked(spec.id, True)
+            return {"provider": spec.id, "started": False, "authenticated": True, "account": existing}
         # Preferred integration: official Codex App Server ChatGPT OAuth.
         try:
             with CodexAppServer(timeout=30) as server:
@@ -1217,6 +1249,14 @@ def connect_account(provider: str, *, open_browser: bool = True) -> dict[str, An
             set_provider_linked(spec.id, True)
             return {"provider": spec.id, "started": True, "authenticated": True, "account": result.get("account")}
         except ClientError as primary_error:
+            # A browser callback can persist a valid Codex session even if the
+            # completion notification is lost or the App Server exits. Re-read
+            # the provider-owned account before starting a second login flow.
+            account = _read_authenticated_chatgpt_account(timeout=15)
+            if account is not None:
+                set_provider_linked(spec.id, True)
+                return {"provider": spec.id, "started": True, "authenticated": True, "account": account}
+
             # Official Codex CLI exposes device auth specifically for environments
             # where the localhost browser callback is unavailable/unreliable.
             exit_code = _launch_terminal(
@@ -1224,12 +1264,8 @@ def connect_account(provider: str, *, open_browser: bool = True) -> dict[str, An
             )
             if exit_code not in (0, None):
                 raise primary_error
-            try:
-                with CodexAppServer(timeout=15) as server:
-                    account = server.account_read().get("account")
-            except Exception as exc:
-                raise ClientError("ChatGPT device login finished but Codex still reports no authenticated account") from exc
-            if not isinstance(account, dict) or account.get("type") != "chatgpt":
+            account = _read_authenticated_chatgpt_account(timeout=15)
+            if account is None:
                 raise ClientError("ChatGPT device login did not produce an authenticated ChatGPT account")
             set_provider_linked(spec.id, True)
             return {"provider": spec.id, "started": True, "authenticated": True, "account": account}

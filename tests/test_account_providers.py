@@ -4,6 +4,7 @@ import json
 import os
 import queue
 import time
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -620,9 +621,13 @@ class AccountInstallAndLoginTests(unittest.TestCase):
         third = MagicMock()
         third.__enter__.return_value = third
         third.__exit__.return_value = None
-        third.account_read.return_value = {"account": {"type": "chatgpt", "planType": "plus"}}
+        third.account_read.return_value = {"account": None}
+        fourth = MagicMock()
+        fourth.__enter__.return_value = fourth
+        fourth.__exit__.return_value = None
+        fourth.account_read.return_value = {"account": {"type": "chatgpt", "planType": "plus"}}
         with patch("aicoder.account_providers.ensure_provider_client", return_value="/home/test/.local/bin/codex"), \
-             patch("aicoder.account_providers.CodexAppServer", side_effect=[first, second, third]), \
+             patch("aicoder.account_providers.CodexAppServer", side_effect=[first, second, third, fourth]), \
              patch("aicoder.account_providers._launch_terminal", return_value=0) as terminal, \
              patch("aicoder.account_providers.set_provider_linked") as linked:
             result = connect_account("chatgpt")
@@ -632,6 +637,67 @@ class AccountInstallAndLoginTests(unittest.TestCase):
         )
         linked.assert_called_once_with("chatgpt", True)
         self.assertTrue(result["authenticated"])
+
+    def test_chatgpt_browser_success_state_prevents_second_device_login(self):
+        first = MagicMock()
+        first.__enter__.return_value = first
+        first.__exit__.return_value = None
+        first.account_read.return_value = {"account": None}
+        second = MagicMock()
+        second.__enter__.return_value = second
+        second.__exit__.return_value = None
+        second.login_chatgpt.side_effect = ClientError("browser callback notification timed out")
+        third = MagicMock()
+        third.__enter__.return_value = third
+        third.__exit__.return_value = None
+        third.account_read.return_value = {"account": {"type": "chatgpt", "planType": "plus"}}
+        with patch("aicoder.account_providers.ensure_provider_client", return_value="/home/test/.local/bin/codex"), \
+             patch("aicoder.account_providers.CodexAppServer", side_effect=[first, second, third]), \
+             patch("aicoder.account_providers._launch_terminal") as terminal, \
+             patch("aicoder.account_providers.set_provider_linked") as linked:
+            result = connect_account("chatgpt")
+        terminal.assert_not_called()
+        linked.assert_called_once_with("chatgpt", True)
+        self.assertTrue(result["authenticated"])
+
+    def test_chatgpt_connect_is_single_flight(self):
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+        results = []
+        errors = []
+
+        def one_login(provider, *, open_browser=True):
+            calls.append((provider, open_browser))
+            entered.set()
+            release.wait(timeout=2)
+            return {"provider": "chatgpt", "started": True, "authenticated": True,
+                    "account": {"type": "chatgpt", "planType": "plus"}}
+
+        def invoke():
+            try:
+                results.append(connect_account("chatgpt"))
+            except Exception as exc:
+                errors.append(exc)
+
+        with patch("aicoder.account_providers._connect_account_once", side_effect=one_login), \
+             patch("aicoder.account_providers._read_authenticated_chatgpt_account",
+                   return_value={"type": "chatgpt", "planType": "plus"}), \
+             patch("aicoder.account_providers.set_provider_linked"):
+            first = threading.Thread(target=invoke)
+            second = threading.Thread(target=invoke)
+            first.start()
+            self.assertTrue(entered.wait(timeout=1))
+            second.start()
+            time.sleep(0.05)
+            release.set()
+            first.join(timeout=2)
+            second.join(timeout=2)
+
+        self.assertFalse(errors)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(item["authenticated"] for item in results))
 
     def test_antigravity_models_are_dynamic_from_agy_models(self):
         completed = MagicMock(
