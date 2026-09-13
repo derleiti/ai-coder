@@ -1,10 +1,10 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
-Upstream-Name: ai-coder
-Upstream-Contact: admin@ailinux.me
+Upstream-Name: AICoder
 Source: https://github.com/derleiti/ai-coder
 
-License: MIT
- Copyright (c) 2026 Markus Leitermann
- Permission is hereby granted, free of charge, to any person obtaining a copy
- of this software and associated documentation files (the "Software"), to deal
- in the Software without restriction.
+Files: *
+Copyright: 2026 Markus Leitermann / AILinux
+License: AILinux-Proprietary-Source-License
+ See /usr/share/doc/aicoder/LICENSE or the upstream repository LICENSE file.
+ Historical AICoder versions published under MIT remain under the MIT terms
+ that accompanied those versions.

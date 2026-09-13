@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security report
+    url: mailto:support@ailinux.me
+    about: Report vulnerabilities privately.
+  - name: AILinux
+    url: https://ailinux.me
+    about: Product and project information.

@@ -348,7 +348,7 @@ jobs:
           pkgdesc="Terminal Coding & DevOps Agent for AILinux/TriForce — 659+ models, GUI, System Tray"
           arch=('x86_64')
           url="https://github.com/derleiti/ai-coder"
-          license=('MIT')
+          license=('custom:AILinux-Proprietary-Source-License')
           depends=('glibc')
           optdepends=('git: workspace support' 'python-pyqt6: GUI mode (aicoder gui)')
           source=("aicoder-\${pkgver}::https://github.com/derleiti/ai-coder/releases/download/v\${pkgver}/aicoder-\${pkgver}-x86_64-linux")
@@ -357,7 +357,7 @@ jobs:
           package() {
               install -Dm755 "\$srcdir/aicoder-\${pkgver}" "\$pkgdir/usr/bin/aicoder"
               install -Dm644 /dev/stdin "\$pkgdir/usr/share/licenses/\$pkgname/LICENSE" << 'EOF'
-          MIT License — Copyright (c) 2026 Markus Leitermann / AILinux
+          AILinux Proprietary Source License — Copyright (c) 2026 Markus Leitermann / AILinux
           EOF
           }
           PKGEOF

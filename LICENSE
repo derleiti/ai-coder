@@ -1,21 +1,55 @@
-MIT License
+AILinux Proprietary Source License
+Version 1.0 - 2026-09-13
 
-Copyright (c) 2026 Markus Leitermann / AILinuX <support@ailinux.me>
+Copyright (c) 2026 Markus Leitermann / AILinux. All rights reserved.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+1. Ownership
+The original AILinux-authored source code, documentation, artwork, product
+names, release assets, and other materials covered by this file are owned by
+Markus Leitermann / AILinux unless a file or bundled component states another
+copyright or license.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+2. Permission required
+No permission is granted to copy, modify, redistribute, sublicense, sell,
+publish, host as a competing service, or create derivative commercial products
+from the covered AILinux material without prior written permission from the
+copyright holder.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+3. Evaluation and personal review
+You may inspect the source code on GitHub and may make private local copies only
+as reasonably necessary to evaluate, audit, test, or contribute changes back to
+AILinux. This limited permission does not include redistribution or public
+hosting of modified copies.
+
+4. Contributions
+Unless a separate written contributor agreement applies, submitting a pull
+request or other contribution grants Markus Leitermann / AILinux a perpetual,
+worldwide, irrevocable, royalty-free right to use, modify, relicense,
+distribute, sublicense, and commercialize that contribution as part of AILinux
+products. Contributors retain copyright in their own contributions.
+
+5. Third-party material
+Third-party libraries, generated notices, submodules, vendored components,
+icons, themes, and other material with their own license remain governed by
+those licenses. Nothing in this license overrides third-party rights or
+obligations.
+
+6. Historical releases
+If this repository or a portion of it was previously published under another
+license, rights already granted for those historical versions remain governed
+by the license that accompanied those versions. This license applies
+prospectively to covered AILinux-authored material first published under this
+license, except where another license notice expressly applies.
+
+7. Commercial and redistribution licenses
+Commercial use, redistribution, OEM/white-label use, hosted-service use, and
+other permissions are available under a separate written license from AILinux.
+Contact: support@ailinux.me
+Website: https://ailinux.me
+
+8. No warranty
+THE COVERED MATERIAL IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT. TO THE MAXIMUM
+EXTENT PERMITTED BY LAW, THE COPYRIGHT HOLDER SHALL NOT BE LIABLE FOR ANY CLAIM,
+DAMAGES, OR OTHER LIABILITY ARISING FROM USE OF THE MATERIAL.
