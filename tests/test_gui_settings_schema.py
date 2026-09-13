@@ -29,6 +29,7 @@ class GuiSettingsSchemaTests(unittest.TestCase):
             patch.object(settings_widget, "load_session", side_effect=RuntimeError("offline")),
             patch.object(settings_widget.settings_core, "STORE", self.store),
             patch.object(settings_widget, "get_state", side_effect=lambda: self.store.load()),
+            patch.object(settings_widget, "linked_account_catalog", return_value={"providers": [], "models": []}),
         ]
         for item in self.patches:
             item.start()

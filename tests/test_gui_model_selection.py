@@ -26,6 +26,7 @@ class ChatModelRoutingTests(unittest.TestCase):
         with (
             patch.object(settings_widget, "load_session", side_effect=RuntimeError("offline")),
             patch.object(settings_widget, "get_state", return_value={}),
+            patch.object(settings_widget, "linked_account_catalog", return_value={"providers": [], "models": []}),
         ):
             widget = settings_widget.SettingsWidget()
         self.addCleanup(widget.close)

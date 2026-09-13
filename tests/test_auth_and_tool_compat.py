@@ -574,7 +574,13 @@ class ReplRegressionTests(unittest.TestCase):
             "operator", [{"name": "health", "inputSchema": {}}], "simple",
             load_tools_on_start=True,
         )
-        with patch("aicoder.agent_runtime.run_tool", return_value=("same result", False)):
+        with (
+            patch("aicoder.agent_runtime.run_tool", return_value=("same result", False)),
+            patch("aicoder.gui.chat_widget.get_state", return_value={
+                "workspace_root": ".", "workspace_mode": "disk", "request_timeout": 30,
+                "runtime_mode": "classic", "team_runtime_mode": "off",
+            }),
+        ):
             worker.run()
         self.assertEqual(client.chat.call_count, 3)
         self.assertTrue(all(call.kwargs["model"] == "operator" for call in client.chat.call_args_list))
