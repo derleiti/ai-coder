@@ -13,11 +13,13 @@ from pathlib import Path
 from typing import Any
 
 from .config import CONFIG_DIR, atomic_write_private
+from .workspace import active_workspace
+from .workspace_backup import shared_backup_root, snapshot_absence, snapshot_file, snapshot_workspace
 
 _SECRET = re.compile(r"(?:^|[_-])(?:password|passwd|token|secret|api[_-]?key|authorization|cookie)(?:$|[_-])", re.I)
 _ID = re.compile(r"^[A-Za-z0-9_.-]+$")
 _INLINE = re.compile(r"(?i)\b(password|passwd|token|bearer|secret|api[_-]?key|authorization)\b(\s*[:=]\s*|\s+)([^\s,;]+)")
-_ROLLBACK_KINDS = {"restore_file", "remove_created_file", "remove_created_dir", "settings_patch"}
+_ROLLBACK_KINDS = {"restore_file", "remove_created_file", "remove_created_dir", "settings_patch", "workspace_snapshot"}
 
 
 def _text(value: Any, limit: int = 1000) -> str:
@@ -82,18 +84,20 @@ class ChangeJournal:
     def _save(self, data: dict[str, Any]) -> None:
         atomic_write_private(self._path(str(data["id"])), json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
 
-    def prepare_file_change(self, target: str | Path) -> dict[str, Any]:
+    def prepare_file_change(self, target: str | Path, workspace: str | Path | None = None) -> dict[str, Any]:
         """Snapshot an existing file, or describe safe removal of a newly created file."""
         path = Path(target).expanduser().resolve(strict=False)
+        workspace_root = Path(workspace).expanduser().resolve(strict=False) if workspace is not None else active_workspace()
         if not path.exists():
-            return {"kind": "remove_created_file", "target": str(path)}
+            marker = snapshot_absence(workspace_root, path, source="change-journal-file", kind="file-absent")
+            return {"kind": "remove_created_file", "target": str(path), "backup_path": str(marker)}
         if not path.is_file():
             raise ValueError(f"rollback snapshot requires a regular file: {path}")
         self._ensure_snapshots()
-        backup = self.snapshot_root / f"file-{uuid.uuid4().hex}.bak"
-        shutil.copy2(path, backup)
+        backup = snapshot_file(workspace_root, path, source="change-journal-file")
+        if backup is None:
+            raise RuntimeError(f"failed to create recovery snapshot for {path}")
         mode = path.stat().st_mode & 0o777
-        os.chmod(backup, 0o600)
         return {
             "kind": "restore_file",
             "target": str(path),
@@ -102,11 +106,24 @@ class ChangeJournal:
             "mode": mode,
         }
 
-    def prepare_directory_create(self, target: str | Path) -> dict[str, Any] | None:
+    def prepare_directory_create(
+        self, target: str | Path, workspace: str | Path | None = None
+    ) -> dict[str, Any] | None:
         path = Path(target).expanduser().resolve(strict=False)
         if path.exists():
             return None
-        return {"kind": "remove_created_dir", "target": str(path)}
+        workspace_root = Path(workspace).expanduser().resolve(strict=False) if workspace is not None else active_workspace()
+        marker = snapshot_absence(workspace_root, path, source="change-journal-directory", kind="directory-absent")
+        return {"kind": "remove_created_dir", "target": str(path), "backup_path": str(marker)}
+
+    def prepare_workspace_change(self, workspace: str | Path, *, source: str) -> dict[str, Any]:
+        root = Path(workspace).expanduser().resolve(strict=True)
+        archive = snapshot_workspace(root, source=source)
+        return {
+            "kind": "workspace_snapshot",
+            "target": str(root),
+            "backup_path": str(archive),
+        }
 
     def finalize_restore_metadata(self, metadata: dict[str, Any] | None) -> dict[str, Any] | None:
         if not metadata:
@@ -119,14 +136,8 @@ class ChangeJournal:
         return result
 
     def discard_restore_metadata(self, metadata: dict[str, Any] | None) -> None:
-        if not metadata or metadata.get("kind") != "restore_file":
-            return
-        try:
-            backup = Path(str(metadata.get("backup_path") or "")).resolve(strict=False)
-            if backup.is_file() and backup.is_relative_to(self.snapshot_root.resolve(strict=False)):
-                backup.unlink()
-        except (OSError, ValueError):
-            pass
+        """Persistent recovery backups are intentionally retained for fallback."""
+        return None
 
     def record(
         self, *, tool: str, arguments: dict[str, Any], risk: str, approved: bool,
@@ -135,7 +146,9 @@ class ChangeJournal:
     ) -> dict[str, Any]:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         ident = f"{stamp}-{uuid.uuid4().hex[:8]}"
-        restore = dict(reversible or {}) if not is_error else {}
+        # A failed mutating tool may have changed state before reporting failure.
+        # Retain the pre-change fallback in both success and error records.
+        restore = dict(reversible or {})
         data = {
             "id": ident,
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -189,9 +202,9 @@ class ChangeJournal:
 
     def _validated_snapshot(self, raw: str) -> Path:
         backup = Path(raw).expanduser().resolve(strict=False)
-        root = self.snapshot_root.resolve(strict=False)
+        root = shared_backup_root().resolve(strict=False)
         if not backup.is_file() or not backup.is_relative_to(root):
-            raise ValueError("rollback backup is missing or outside the private snapshot store")
+            raise ValueError("rollback backup is missing or outside the shared workspace backup store")
         return backup
 
     @staticmethod
@@ -246,6 +259,36 @@ class ChangeJournal:
                 if not target.is_dir():
                     raise ValueError("created directory no longer exists")
                 target.rmdir()  # deliberately fails if later work made it non-empty
+            elif kind == "workspace_snapshot":
+                target = Path(str(metadata.get("target") or "")).expanduser().resolve(strict=True)
+                archive = self._validated_snapshot(str(metadata.get("backup_path") or ""))
+                backup_root = shared_backup_root().resolve(strict=False)
+                # Restore exact pre-change contents while never deleting the shared backup store itself.
+                def remove_except_backup(path: Path) -> None:
+                    resolved = path.resolve(strict=False)
+                    if resolved == backup_root:
+                        return
+                    try:
+                        backup_root.relative_to(resolved)
+                    except ValueError:
+                        if path.is_dir() and not path.is_symlink():
+                            shutil.rmtree(path)
+                        else:
+                            path.unlink(missing_ok=True)
+                        return
+                    for nested in list(path.iterdir()):
+                        remove_except_backup(nested)
+
+                for child in list(target.iterdir()):
+                    remove_except_backup(child)
+                import tarfile
+                with tarfile.open(archive, "r:gz") as tar:
+                    members = tar.getmembers()
+                    for member in members:
+                        pure = Path(member.name)
+                        if pure.is_absolute() or ".." in pure.parts:
+                            raise ValueError("unsafe path in workspace recovery archive")
+                    tar.extractall(target, members=members, filter="data")
             elif kind == "settings_patch":
                 from . import settings
                 previous = metadata.get("previous")

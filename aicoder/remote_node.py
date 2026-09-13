@@ -12,14 +12,11 @@ before mutation so the remote model cannot rewrite its own rollback copy.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import os
 import platform
-import shutil
 import socket
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode, urlsplit, urlunsplit
@@ -38,6 +35,7 @@ from .executor import (
 )
 from .session_state import get_state
 from .workspace import active_workspace
+from .workspace_backup import snapshot_file
 
 REMOTE_READ_TOOLS = {
     "client_file_read",
@@ -164,20 +162,12 @@ def _private_dir(path: Path) -> None:
 
 
 def _backup_existing_remote_file(path: Path) -> Path:
-    """Copy an existing workspace file to a model-inaccessible rollback area."""
+    """Copy an existing remote-edit target into the shared recovery store."""
     root = _workspace_root()
-    relative = path.relative_to(root)
-    workspace_key = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:16]
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-    backup_root = CONFIG_DIR / "backups" / "remote" / workspace_key / stamp
-    backup_path = backup_root / relative
-    _private_dir(backup_path.parent)
-    shutil.copy2(path, backup_path)
-    try:
-        os.chmod(backup_path, 0o600)
-    except OSError:
-        pass
-    return backup_path
+    backup = snapshot_file(root, path, source="remote-file-edit")
+    if backup is None:
+        raise RuntimeError(f"remote backup source disappeared: {path}")
+    return backup
 
 
 def _execute_remote_write(arguments: dict[str, Any]) -> dict[str, Any]:

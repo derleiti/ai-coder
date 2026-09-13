@@ -159,7 +159,7 @@ def _has_mutation_effect(name: str, args: dict) -> bool:
 
 _INSPECTION_TOOLS = {
     "git", "file_read", "code_grep", "code_read", "code_search",
-    "file_tree", "code_tree",
+    "file_tree", "code_tree", "feature_memory_search",
 }
 
 _VERIFICATION_REQUIRED_PROMPT = (
@@ -846,6 +846,58 @@ class NativeLightRuntime:
         self._save_plan(plan)
         self._clear_journal(plan)
 
+    def _remember_feature_experience(
+        self,
+        store: ProjectEvidenceStore | None,
+        response: str,
+        journal_batches: list[dict[str, Any]],
+        *,
+        mutation_seen: bool,
+        verification_seen: bool,
+        test_verification_seen: bool,
+    ) -> None:
+        if store is None or not mutation_seen or not verification_seen:
+            return
+        tools: list[str] = []
+        paths: list[str] = []
+        for batch in journal_batches[-20:]:
+            calls = batch.get("calls") if isinstance(batch, dict) else []
+            for call in calls if isinstance(calls, list) else []:
+                if not isinstance(call, dict) or call.get("is_error"):
+                    continue
+                name = str(call.get("name") or "")
+                if name and name not in tools:
+                    tools.append(name)
+                args = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
+                for key in ("path", "cwd", "root", "work_dir"):
+                    value = str(args.get(key) or "").strip()
+                    if value and value not in paths:
+                        paths.append(value)
+        architecture = (
+            f"workspace={self.workspace_root}; tools={','.join(tools[:20]) or 'n/a'}; "
+            f"paths={','.join(paths[:30]) or 'n/a'}"
+        )
+        verification = (
+            "post-change verification observed; "
+            + ("regression test observed" if test_verification_seen else "non-test executable/artifact verification observed")
+        )
+        lessons = (
+            "Implementation completed only after pre-change recovery backup, coherent architecture inspection, "
+            "mutation and fresh verification. Re-inspect current state before reusing this experience."
+        )
+        future = (
+            "Use this implementation history to identify adjacent integration, observability, recovery, "
+            "automation and regression-hardening features when the same subsystem is changed again."
+        )
+        try:
+            memory_id = store.remember_feature_experience(
+                task=self.initial_prompt, summary=response, architecture=architecture,
+                verification=verification, lessons=lessons, future_features=future,
+            )
+            self._emit("feature_memory_saved", memory_id=memory_id, architecture=architecture[:1000])
+        except Exception as exc:
+            self._emit("evidence_record_failed", evidence_kind="feature", error=f"{type(exc).__name__}: {exc}")
+
     def _pause_plan(self, plan: AgentPlan | None, reason: str, response: str = "") -> None:
         if plan is None:
             return
@@ -1428,6 +1480,10 @@ class NativeLightRuntime:
                     mutation_seen=mutation_seen,
                     verification_seen=verification_seen,
                 )
+                self._remember_feature_experience(
+                    evidence_store, response, journal_batches, mutation_seen=mutation_seen,
+                    verification_seen=verification_seen, test_verification_seen=test_verification_seen,
+                )
                 perf = performance_snapshot()
                 self._emit("performance_summary", **perf)
                 self._emit(
@@ -1635,6 +1691,10 @@ class NativeLightRuntime:
                         self._complete_plan(
                             plan, final_response, mutation_seen=mutation_seen,
                             verification_seen=verification_seen,
+                        )
+                        self._remember_feature_experience(
+                            evidence_store, final_response, journal_batches, mutation_seen=mutation_seen,
+                            verification_seen=verification_seen, test_verification_seen=test_verification_seen,
                         )
                         perf = performance_snapshot()
                         self._emit("performance_summary", **perf)
@@ -2294,6 +2354,10 @@ class NativeLightRuntime:
                     plan, visible or response,
                     mutation_seen=mutation_seen,
                     verification_seen=verification_seen,
+                )
+                self._remember_feature_experience(
+                    evidence_store, visible or response, journal_batches, mutation_seen=mutation_seen,
+                    verification_seen=verification_seen, test_verification_seen=test_verification_seen,
                 )
                 perf = performance_snapshot()
                 self._emit("performance_summary", **perf)

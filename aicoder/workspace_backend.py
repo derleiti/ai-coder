@@ -23,6 +23,7 @@ from typing import Any, Iterable
 import uuid
 
 from .config import CONFIG_DIR
+from .workspace_backup import snapshot_workspace
 
 WORKSPACE_MODES = frozenset({"auto", "ram", "disk"})
 _MANIFEST_FILE = ".aicoder-checkpoint.json"
@@ -741,6 +742,8 @@ class RamWorkspace(WorkspaceBackend):
             self.abort()
             return
         self._assert_source_unchanged(affected, current)
+        # Keep a persistent cross-app fallback before the verified RAM result touches disk.
+        snapshot_workspace(self._source, source="ram-finalize")
 
         txn = self._source.parent / f".aicoder-txn-{uuid.uuid4().hex}"
         backup = txn / "backup"

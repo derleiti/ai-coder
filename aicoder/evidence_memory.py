@@ -47,6 +47,18 @@ class FileEvidence:
     updated_at: str
 
 
+@dataclass(frozen=True)
+class FeatureExperience:
+    id: int
+    task: str
+    summary: str
+    architecture: str
+    verification: str
+    lessons: str
+    future_features: str
+    updated_at: str
+
+
 class ProjectEvidenceStore:
     """Fast per-run cache backed by a private project-scoped SQLite store."""
 
@@ -100,6 +112,25 @@ class ProjectEvidenceStore:
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_failure_evidence_recent
                 ON failure_evidence(workspace_key, updated_at DESC)
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS feature_experience (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    workspace_key TEXT NOT NULL,
+                    task TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    architecture TEXT NOT NULL,
+                    verification TEXT NOT NULL,
+                    lessons TEXT NOT NULL,
+                    future_features TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (workspace_key, fingerprint)
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_feature_experience_recent
+                ON feature_experience(workspace_key, updated_at DESC)
             """)
             conn.commit()
         finally:
@@ -198,6 +229,64 @@ class ProjectEvidenceStore:
         finally:
             conn.close()
 
+    @staticmethod
+    def _bounded_text(value: str, limit: int) -> str:
+        return " ".join(str(value or "").split())[: max(0, int(limit))]
+
+    def remember_feature_experience(
+        self, *, task: str, summary: str, architecture: str, verification: str,
+        lessons: str = "", future_features: str = "",
+    ) -> int:
+        task_text = self._bounded_text(task, 1200)
+        summary_text = self._bounded_text(summary, 4000)
+        architecture_text = self._bounded_text(architecture, 3000)
+        verification_text = self._bounded_text(verification, 1800)
+        lessons_text = self._bounded_text(lessons, 1800)
+        future_text = self._bounded_text(future_features, 1800)
+        fingerprint = hashlib.sha256(
+            (task_text + "\n" + summary_text + "\n" + architecture_text).encode("utf-8", errors="replace")
+        ).hexdigest()
+        conn = self._connect()
+        try:
+            conn.execute(
+                """INSERT INTO feature_experience
+                   (workspace_key,task,summary,architecture,verification,lessons,future_features,fingerprint,updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(workspace_key,fingerprint) DO UPDATE SET
+                     verification=excluded.verification,lessons=excluded.lessons,
+                     future_features=excluded.future_features,updated_at=excluded.updated_at""",
+                (self.workspace_key, task_text, summary_text, architecture_text, verification_text,
+                 lessons_text, future_text, fingerprint, _now()),
+            )
+            row = conn.execute(
+                "SELECT id FROM feature_experience WHERE workspace_key=? AND fingerprint=?",
+                (self.workspace_key, fingerprint),
+            ).fetchone()
+            conn.commit()
+            return int(row[0]) if row else 0
+        finally:
+            conn.close()
+
+    def search_feature_experience(self, query: str = "", limit: int = 8) -> list[FeatureExperience]:
+        terms = [term.lower() for term in self._bounded_text(query, 500).split() if len(term) >= 2]
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """SELECT id,task,summary,architecture,verification,lessons,future_features,updated_at
+                   FROM feature_experience WHERE workspace_key=? ORDER BY updated_at DESC LIMIT 200""",
+                (self.workspace_key,),
+            ).fetchall()
+        finally:
+            conn.close()
+        items = [FeatureExperience(*row) for row in rows]
+        if terms:
+            def score(item: FeatureExperience) -> tuple[int, str]:
+                haystack = " ".join((item.task, item.summary, item.architecture, item.lessons, item.future_features)).lower()
+                return (sum(haystack.count(term) for term in terms), item.updated_at)
+            items = [item for item in items if score(item)[0] > 0]
+            items.sort(key=score, reverse=True)
+        return items[: max(1, min(50, int(limit)))]
+
     def recent_files(self, limit: int = 20) -> list[FileEvidence]:
         return sorted(self._files.values(), key=lambda item: item.updated_at, reverse=True)[:max(0, int(limit))]
 
@@ -212,6 +301,10 @@ class ProjectEvidenceStore:
                 "SELECT COUNT(*) FROM failure_evidence WHERE workspace_key=?",
                 (self.workspace_key,),
             ).fetchone()[0]
+            features = conn.execute(
+                "SELECT COUNT(*) FROM feature_experience WHERE workspace_key=?",
+                (self.workspace_key,),
+            ).fetchone()[0]
         finally:
             conn.close()
         return {
@@ -219,6 +312,7 @@ class ProjectEvidenceStore:
             "hot_files": len(self._files),
             "persisted_files": int(files),
             "persisted_failures": int(failures),
+            "persisted_features": int(features),
         }
 
     def close(self) -> None:

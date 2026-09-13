@@ -3,6 +3,8 @@ import hashlib, os, re, subprocess, time
 from pathlib import Path
 from typing import Any, Dict
 
+from .workspace_backup import ensure_workspace_layout, shared_backup_root
+
 IGNORE_DIRS = {".git", ".venv", "__pycache__", "node_modules", ".mypy_cache", ".pytest_cache"}
 
 ACTIVE_WORKSPACE_ENV = "AICODER_ACTIVE_WORKSPACE"
@@ -10,9 +12,15 @@ DEFAULT_PROJECTS_ROOT = Path.home() / "workspace"
 
 
 def projects_root(configured: str | Path | None = None) -> Path:
-    """Return the project-container directory; it is not itself an active project."""
-    raw = configured or DEFAULT_PROJECTS_ROOT
-    return Path(raw).expanduser().resolve(strict=False)
+    """Return the project container and ensure the shared recovery layout exists."""
+    if configured is None:
+        root, _ = ensure_workspace_layout()
+        return root
+    raw = configured
+    root = Path(raw).expanduser().resolve(strict=False)
+    root.mkdir(parents=True, exist_ok=True)
+    shared_backup_root()
+    return root
 
 
 def active_workspace(configured: str | None = None) -> Path:

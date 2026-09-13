@@ -2458,3 +2458,10 @@ AICoder v1.2 should follow these principles:
 17. **Benchmark agent architecture decisions instead of assuming them.**
 
 These principles should guide implementation decisions when the earlier sections leave room for interpretation.
+
+## Shared workspace fallback backups
+All mutating AICoder interactions must have a persistent pre-change fallback. The default shared layout is `~/workspace` with recovery data under `~/workspace/.workspacebackup`; participating TriForce/MCP clients use the same convention. First startup creates the layout. File edits back up the affected path, while shell/task/binary operations and final RAM-to-disk integration take a workspace snapshot before mutation. Backup failure blocks the write, and successful backups are retained rather than discarded as transaction scratch data.
+
+
+### Destructive workflow and implementation experience memory
+The runtime sequence for mutating work is: persistent recovery fallback -> coherent architecture analysis -> reflected implementation -> focused test/log verification -> successful completion -> reusable Feature Experience Memory. Each recovery action writes `backup.md` and is indexed in the shared `.workspacebackup/INDEX.md`. Runtime guards are authoritative: if backup creation fails, the mutation must not execute. After a verified feature implementation, AICoder stores a bounded workspace-scoped record of the task, touched architecture, verification, lessons and future-feature directions. `feature_memory_search` exposes that prior implementation experience read-only so a later agent can learn from the actual application history without replaying raw sensitive transcripts.

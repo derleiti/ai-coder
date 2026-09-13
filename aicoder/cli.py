@@ -15,6 +15,7 @@ from .session_state import (
 from .status import Spinner, phase_label
 from . import settings as settings_core
 from .workspace import activate_workspace, active_workspace, workspace_snapshot
+from .workspace_backup import ensure_workspace_layout
 from .tool_policy import (
     filter_tool_catalog,
     require_allowed_tool,
@@ -2229,6 +2230,8 @@ def _activate_startup_workspace(argv: list[str] | None = None) -> Path:
 
 def main() -> int:
     from .team_orchestrator import reset_team_debug_log
+    # First startup establishes the shared workspace and cross-app recovery store.
+    ensure_workspace_layout()
     reset_team_debug_log()
     # CLI/REPL intentionally use the launch cwd as workspace. GUI launchers often
     # start from the source/install directory, so GUI must honor persisted settings.

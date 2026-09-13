@@ -440,6 +440,21 @@ LOCAL_SUBAGENT_SCHEMA = {
     }
 }
 
+LOCAL_FEATURE_MEMORY_SEARCH_SCHEMA = {
+    "name": "feature_memory_search",
+    "description": (
+        "Recall prior verified feature implementations, architecture notes, lessons and future-feature ideas "
+        "from the active workspace evidence memory. Read-only; use this when previous implementation experience may matter."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Terms describing the feature, subsystem or prior change"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+        },
+    },
+}
+
 LOCAL_SKILL_READ_SCHEMA = {
     "name": "skill_read",
     "description": "Load one discovered AICoder workflow skill by name (read-only).",
@@ -665,6 +680,7 @@ LOCAL_TOOL_SCHEMAS = [
     LOCAL_BINARY_EXEC_SCHEMA,
     LOCAL_TASK_RUNNER_SCHEMA,
     LOCAL_SUBAGENT_SCHEMA,
+    LOCAL_FEATURE_MEMORY_SEARCH_SCHEMA,
     LOCAL_SKILL_READ_SCHEMA,
     LOCAL_FILE_READ_SCHEMA,
     LOCAL_FILE_EDIT_SCHEMA,
@@ -707,6 +723,7 @@ You are ai-coder — an autonomous AILinux operator agent for coding, DevOps, sy
 - Typed local tools default to the active workspace. Leaving it requires explicit one-time approval.
 - shell, binary_exec and task_runner execute on the LOCAL AICoder machine, not on the TriForce backend. Prefer binary_exec when shell syntax is unnecessary.
 - skill_read loads bounded workflow guidance from the discovered AICoder skill catalog.
+- feature_memory_search recalls prior verified feature implementation experience for the active workspace.
 - subagent_run delegates focused work. analyze/review/plan are advisory; debug/task may use the active parent tool subset.
 - MCP tools expose user-facing TriForce backend SERVICES under authenticated RBAC. TriForce itself is never an operator target: do not inspect or modify its host, repository, processes, services, containers, or federation nodes.
 
@@ -743,7 +760,11 @@ You are ai-coder — an autonomous AILinux operator agent for coding, DevOps, sy
 - NO PROGRESS = RESEARCH: check runtime/dependency versions, official docs, release notes and upstream issues.
 - VERIFY THE ORIGINAL FAILURE: never claim fixed until the original reproducer succeeds.
 - Read before write. Diagnose before patch.
-- Smallest effective change first.
+- Before every mutating interaction, require a persistent fallback backup in the shared per-user recovery store (default: ~/workspace/.workspacebackup). Runtime enforcement is authoritative; never bypass it. Every backup has backup.md recovery instructions and is indexed by the shared INDEX.md.
+- Before mutation, inspect the relevant subsystem as one coherent architecture slice: callers, control/data flow, configuration, tests, failure paths and integration boundaries. Reflect on that evidence before editing.
+- Smallest effective change first, but it must fit the surrounding architecture rather than patching an isolated symptom.
+- After mutation, run focused tests plus the relevant reproducer/log checks. Do not finish until the original acceptance condition is verified.
+- After a verified feature change, preserve reusable implementation experience: architecture touched, outcome, verification, lessons and plausible future features. Use feature_memory_search when prior implementation history can improve a new task.
 - A short confirmation such as "ja klar", "mach es" or "continue" refers to the
   preceding REPL task. Continue that task from conversation context.
 - For an actionable local task, inspect with tools and perform it; do not merely
@@ -2166,13 +2187,15 @@ def _prepare_change_restore(tool_name: str, args: dict):
             args.get("path"), must_exist=False,
             allow_outside=bool(args.get("_workspace_escape_approved")),
         )
-        return journal, journal.prepare_file_change(target)
+        return journal, journal.prepare_file_change(target, _workspace_root())
     if tool_name == "directory_create":
         target = _workspace_path(
             args.get("path"), must_exist=False,
             allow_outside=bool(args.get("_workspace_escape_approved")),
         )
-        return journal, journal.prepare_directory_create(target)
+        return journal, journal.prepare_directory_create(target, _workspace_root())
+    if tool_name in {"shell", "binary_exec", "task_runner"}:
+        return journal, journal.prepare_workspace_change(_workspace_root(), source=tool_name)
     if tool_name in {"settings_apply_patch", "settings_reset"}:
         return journal, _prepare_settings_restore(tool_name, args)
     return journal, None
@@ -2354,15 +2377,12 @@ def _run_tool_impl(
         try:
             change_journal, restore_metadata = _prepare_change_restore(name, execution_args)
         except Exception as exc:
-            # A file edit must never proceed when its required pre-write snapshot failed.
-            if name == "file_edit":
-                result = f"{name}: blocked — pre-change rollback snapshot failed: {type(exc).__name__}: {exc}"
-                audit.log_tool(
-                    tool_name=name, arguments=args, result=result, duration_s=0,
-                    is_error=True, model=model, iteration=iteration,
-                )
-                return result, True
-            restore_metadata = None
+            result = f"{name}: blocked — required pre-change fallback backup failed: {type(exc).__name__}: {exc}"
+            audit.log_tool(
+                tool_name=name, arguments=args, result=result, duration_s=0,
+                is_error=True, model=model, iteration=iteration,
+            )
+            return result, True
 
     # Route local tools (all execute via subprocess on client machine)
     _provider = discover_plugins(_workspace_root()).provider_for_tool(name)
@@ -2400,6 +2420,23 @@ def _run_tool_impl(
             approval_fn=approval_fn,
             enabled_tool_names=(sorted(allowed_tools) if allowed_tools is not None else None),
         )
+    elif name == "feature_memory_search":
+        from .evidence_memory import ProjectEvidenceStore
+        try:
+            store = ProjectEvidenceStore(str(_workspace_root()))
+            rows = store.search_feature_experience(str(args.get("query") or ""), int(args.get("limit") or 8))
+            payload = [
+                {
+                    "id": row.id, "task": row.task, "summary": row.summary,
+                    "architecture": row.architecture, "verification": row.verification,
+                    "lessons": row.lessons, "future_features": row.future_features,
+                    "updated_at": row.updated_at,
+                }
+                for row in rows
+            ]
+            result, is_error = json.dumps(payload, ensure_ascii=False, indent=2), False
+        except Exception as exc:
+            result, is_error = f"feature_memory_search error: {type(exc).__name__}: {exc}", True
     elif name == "skill_read":
         from .skills import read_skill
         result, is_error = read_skill(_workspace_root(), str(args.get("name") or ""))
@@ -2531,10 +2568,7 @@ def _run_tool_impl(
         try:
             from .change_journal import ChangeJournal
             journal = change_journal or ChangeJournal()
-            if is_error:
-                journal.discard_restore_metadata(restore_metadata)
-                restore_metadata = None
-            else:
+            if not is_error:
                 restore_metadata = journal.finalize_restore_metadata(restore_metadata)
             try:
                 session_id = str(load_session().client_id or "")

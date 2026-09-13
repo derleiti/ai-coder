@@ -90,3 +90,18 @@ Swarm (swarm_mode: off | auto | on | review)
 2. docs/architecture.md
 3. docs/security.md
 4. README.md
+
+## Shared Workspace Recovery Policy
+- On startup ensure `~/workspace` and `~/workspace/.workspacebackup` exist. Overrides: `AILINUX_WORKSPACE_ROOT` and `AILINUX_WORKSPACE_BACKUP_ROOT`.
+- Every mutating interaction requires a persistent pre-change fallback. Targeted file edits snapshot the target; shell, binary and task-runner actions snapshot the active workspace because their write scope is not reliably knowable in advance.
+- Remote file edits and verified RAM-workspace finalization use the same shared backup store.
+- Never recursively include `.workspacebackup` in a snapshot and never delete successful recovery backups as normal cleanup.
+- If the required fallback backup cannot be created, block the mutation. Runtime enforcement wins over model/prompt behavior.
+
+## Destructive Change Workflow
+1. Create the persistent `.workspacebackup` fallback before any mutation. A backup failure blocks the write.
+2. Require a self-contained `backup.md` in every action backup and append it to the shared `INDEX.md`; recovery instructions must identify the original source and safe restore procedure.
+3. Analyze the affected subsystem as a coherent architecture slice before editing: callers, control/data flow, configuration, tests, failure paths and integrations.
+4. Reflect on the evidence and implement the smallest architecture-correct change without overwriting unrelated work.
+5. Verify with focused tests plus relevant reproducer/log evidence. A successful edit alone is not completion.
+6. On verified feature completion, store bounded Feature Experience Memory (architecture touched, result, verification, lessons and plausible next features). Recall it with `feature_memory_search` on related future work.

@@ -79,6 +79,25 @@ class ProjectEvidenceStoreTests(unittest.TestCase):
             self.assertNotIn("do-not-store-this", row[1])
             self.assertNotIn(b"do-not-store-this", db.read_bytes())
 
+    def test_feature_experience_is_stored_and_searchable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            store = ProjectEvidenceStore(str(root), root / "evidence.db")
+            memory_id = store.remember_feature_experience(
+                task="Add workspace recovery index",
+                summary="Implemented backup.md and shared index",
+                architecture="workspace_backup -> change_journal -> executor",
+                verification="pytest passed",
+                lessons="Backups must precede mutation",
+                future_features="Add recovery browser",
+            )
+            self.assertGreater(memory_id, 0)
+            rows = store.search_feature_experience("recovery backup", limit=4)
+            self.assertEqual(len(rows), 1)
+            self.assertIn("workspace_backup", rows[0].architecture)
+            self.assertIn("recovery browser", rows[0].future_features.lower())
+            self.assertEqual(store.health()["persisted_features"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

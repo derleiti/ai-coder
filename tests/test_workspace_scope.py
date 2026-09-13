@@ -522,3 +522,40 @@ class RuntimeWorkspaceOverrideTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SharedWorkspaceBackupTests(unittest.TestCase):
+    def test_first_startup_layout_uses_shared_workspace_backup_folder(self):
+        from aicoder.workspace_backup import ensure_workspace_layout
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            workspace = base / 'workspace'
+            backup = workspace / '.workspacebackup'
+            with patch.dict(os.environ, {
+                'AILINUX_WORKSPACE_ROOT': str(workspace),
+                'AILINUX_WORKSPACE_BACKUP_ROOT': str(backup),
+            }, clear=False):
+                actual_workspace, actual_backup = ensure_workspace_layout()
+            self.assertEqual(actual_workspace, workspace.resolve())
+            self.assertEqual(actual_backup, backup.resolve())
+            self.assertTrue(actual_workspace.is_dir())
+            self.assertTrue(actual_backup.is_dir())
+
+    def test_backup_document_and_index_are_created(self):
+        from aicoder.workspace_backup import snapshot_file
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            workspace = base / "workspace"
+            backup = workspace / ".workspacebackup"
+            workspace.mkdir()
+            target = workspace / "demo.txt"
+            target.write_text("before", encoding="utf-8")
+            with patch.dict(os.environ, {
+                "AILINUX_WORKSPACE_ROOT": str(workspace),
+                "AILINUX_WORKSPACE_BACKUP_ROOT": str(backup),
+            }, clear=False):
+                backup_file = snapshot_file(workspace, target, source="test-edit")
+                action = backup_file.parents[1]
+                self.assertTrue((action / "backup.md").is_file())
+                self.assertIn(str(action), (backup / "INDEX.md").read_text(encoding="utf-8"))
+                self.assertIn("Recovery", (action / "backup.md").read_text(encoding="utf-8"))
