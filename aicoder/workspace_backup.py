@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import shlex
+import subprocess
 import tarfile
 import uuid
 from datetime import datetime, timezone
@@ -161,6 +162,90 @@ def snapshot_file(workspace: Path, target: Path, *, source: str) -> Path:
     return backup
 
 
+
+_LOCAL_CONFIG_SUFFIXES = {".env", ".ini", ".conf", ".cfg", ".toml", ".yaml", ".yml", ".json", ".key", ".crt", ".pem"}
+_LOCAL_CONFIG_BASENAMES = {"wp-config.php"}
+_LOCAL_CONFIG_MAX_BYTES = 2 * 1024 * 1024
+_LOCAL_CONFIG_MAX_DEPTH = 4
+
+
+def _is_local_config_candidate(path: Path, workspace: Path) -> bool:
+    try:
+        rel = path.relative_to(workspace)
+        stat = path.stat()
+    except (OSError, ValueError):
+        return False
+    if len(rel.parts) > _LOCAL_CONFIG_MAX_DEPTH or stat.st_size > _LOCAL_CONFIG_MAX_BYTES:
+        return False
+    if not os.access(path, os.R_OK):
+        return False
+    name = path.name.lower()
+    return (
+        name.startswith(".env")
+        or name.endswith(".env")
+        or path.suffix.lower() in _LOCAL_CONFIG_SUFFIXES
+        or name in _LOCAL_CONFIG_BASENAMES
+    )
+
+
+def _git_snapshot_paths(workspace: Path) -> list[Path] | None:
+    """Return source files plus bounded ignored local configuration for a Git root.
+
+    Tracked and non-ignored untracked files define the recoverable project source.
+    Small configuration-like files are additionally retained even when ignored so
+    local runtime credentials/settings survive rollback. Heavy ignored runtime data,
+    caches, package trees and generated artefacts are intentionally excluded.
+    """
+    try:
+        top = subprocess.check_output(
+            ["git", "-C", str(workspace), "rev-parse", "--show-toplevel"],
+            text=True, stderr=subprocess.DEVNULL, timeout=5,
+        ).strip()
+        if Path(top).resolve(strict=False) != workspace.resolve(strict=False):
+            return None
+        raw = subprocess.check_output(
+            ["git", "-C", str(workspace), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            stderr=subprocess.DEVNULL, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    selected: dict[str, Path] = {}
+    for item in raw.split(b"\0"):
+        if not item:
+            continue
+        rel = item.decode("utf-8", errors="surrogateescape")
+        candidate = workspace / rel
+        if candidate.exists() or candidate.is_symlink():
+            selected[rel] = candidate
+
+    workspace_dev = os.lstat(workspace).st_dev
+    # Recover ignored local configuration without walking into other filesystems.
+    for base, dirnames, filenames in os.walk(workspace, topdown=True, followlinks=False):
+        base_path = Path(base)
+        rel_base = base_path.relative_to(workspace)
+        if len(rel_base.parts) >= _LOCAL_CONFIG_MAX_DEPTH:
+            dirnames[:] = []
+        else:
+            kept = []
+            for name in dirnames:
+                child = base_path / name
+                if name in {".git", ".venv", "venv", "env", "node_modules", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".nox", "dist", "build", "logs", ".workspacebackup"} or name.startswith(".venv-"):
+                    continue
+                try:
+                    if os.lstat(child).st_dev != workspace_dev or child.is_symlink():
+                        continue
+                except OSError:
+                    continue
+                kept.append(name)
+            dirnames[:] = kept
+        for name in filenames:
+            candidate = base_path / name
+            if _is_local_config_candidate(candidate, workspace):
+                selected[candidate.relative_to(workspace).as_posix()] = candidate
+    return list(selected.values())
+
+
 def snapshot_workspace(workspace: Path, *, source: str) -> Path:
     """Create a persistent pre-change archive for commands with unknown write scope."""
     workspace = workspace.expanduser().resolve(strict=True)
@@ -168,20 +253,10 @@ def snapshot_workspace(workspace: Path, *, source: str) -> Path:
     payload = _write_meta(action, workspace=workspace, source=source, kind="workspace")
     archive = action / "workspace.tar.gz"
     backup_root = shared_backup_root().resolve(strict=False)
+    git_paths = _git_snapshot_paths(workspace)
     with tarfile.open(archive, "w:gz") as tar:
-        for base, dirnames, filenames in os.walk(workspace, topdown=True, followlinks=False):
-            base_path = Path(base)
-            kept_dirs = []
-            for name in dirnames:
-                child = base_path / name
-                if child.resolve(strict=False) == backup_root:
-                    continue
-                kept_dirs.append(name)
-            dirnames[:] = kept_dirs
-            if base_path != workspace:
-                tar.add(base_path, arcname=base_path.relative_to(workspace).as_posix(), recursive=False)
-            for name in filenames:
-                child = base_path / name
+        if git_paths is not None:
+            for child in git_paths:
                 try:
                     resolved = child.resolve(strict=False)
                 except OSError:
@@ -189,6 +264,45 @@ def snapshot_workspace(workspace: Path, *, source: str) -> Path:
                 if resolved == backup_root or backup_root in resolved.parents:
                     continue
                 tar.add(child, arcname=child.relative_to(workspace).as_posix(), recursive=False)
+        else:
+            workspace_dev = os.lstat(workspace).st_dev
+            for base, dirnames, filenames in os.walk(workspace, topdown=True, followlinks=False):
+                base_path = Path(base)
+                kept_dirs: list[str] = []
+                for name in dirnames:
+                    child = base_path / name
+                    try:
+                        resolved = child.resolve(strict=False)
+                    except OSError:
+                        resolved = child.absolute()
+                    if resolved == backup_root or backup_root in resolved.parents:
+                        continue
+                    try:
+                        if os.lstat(child).st_dev != workspace_dev:
+                            continue
+                    except OSError:
+                        continue
+                    if child.is_symlink():
+                        tar.add(child, arcname=child.relative_to(workspace).as_posix(), recursive=False)
+                        continue
+                    kept_dirs.append(name)
+                dirnames[:] = kept_dirs
+                if base_path != workspace:
+                    tar.add(base_path, arcname=base_path.relative_to(workspace).as_posix(), recursive=False)
+                for name in filenames:
+                    child = base_path / name
+                    try:
+                        resolved = child.resolve(strict=False)
+                    except OSError:
+                        resolved = child.absolute()
+                    if resolved == backup_root or backup_root in resolved.parents:
+                        continue
+                    try:
+                        if os.lstat(child).st_dev != workspace_dev:
+                            continue
+                    except OSError:
+                        continue
+                    tar.add(child, arcname=child.relative_to(workspace).as_posix(), recursive=False)
     preview = action / "recovery-preview"
     _document(action, payload, [
         f"mkdir -p -- {shlex.quote(str(preview))}",
