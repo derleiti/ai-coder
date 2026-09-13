@@ -27,10 +27,10 @@ Backend: TriForce — FastAPI multi-LLM orchestration, 659+ models, MCP tools, W
 - Backend base URL for external: https://api.ailinux.me
 
 ## Key Paths (Hetzner server)
-- Backend: /home/zombie/triforce/
-- Config: /home/zombie/triforce/config/triforce.env
+- Backend: /home/zombie/workspace/triforce/
+- Config: /home/zombie/workspace/triforce/config/triforce.env
 - Users: /config/users.json
-- WP: /home/zombie/triforce/docker/wordpress/html/
+- WP: /home/zombie/workspace/triforce/docker/wordpress/html/
 
 ## ai-coder Specific
 - Entry point: aicoder/cli.py → main()

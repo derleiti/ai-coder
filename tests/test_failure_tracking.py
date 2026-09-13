@@ -23,7 +23,7 @@ class FailureTrackerTests(unittest.TestCase):
 
     def test_python_cli_no_module_is_environment_failure(self):
         failure = FailureTracker().observe(
-            "/home/zombie/ai-coder/.venv/bin/python: No module named brumos_dungeon",
+            "/home/zombie/workspace/ai-coder/.venv/bin/python: No module named brumos_dungeon",
             True,
         )
         self.assertEqual(failure.category, "environment")

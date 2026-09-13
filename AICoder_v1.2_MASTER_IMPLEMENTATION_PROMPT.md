@@ -15,7 +15,7 @@ This task is a substantial architectural hardening and capability upgrade. Work 
 This section overrides stale status assumptions elsewhere in this document. The remainder of the file is still the architectural target/specification unless explicitly marked otherwise.
 
 Verified repository:
-- source of truth: `/home/zombie/ai-coder`
+- source of truth: `/home/zombie/workspace/ai-coder`
 - verified HEAD during this review: `6b48ecc`
 - working tree was clean before this roadmap-only update
 - `pyproject.toml` version: `0.9.9`
@@ -166,7 +166,7 @@ Follow these rules throughout the task.
 
 3. **Create a timestamped backup before modifications.**
    - Prefer something like:
-     `/home/zombie/ai-coder/.backups/v1.2-agentic-YYYYMMDD-HHMMSS/`
+     `/home/zombie/workspace/ai-coder/.backups/v1.2-agentic-YYYYMMDD-HHMMSS/`
    - Back up every file you intend to modify before the first edit.
    - Report the backup location and rollback command.
 
@@ -204,7 +204,7 @@ Follow these rules throughout the task.
 # 1. CURRENT REPOSITORY / WORKTREE FACTS — VERIFY THEM FIRST
 
 Repository / source of truth:
-`/home/zombie/ai-coder`
+`/home/zombie/workspace/ai-coder`
 
 The self-test target may be copied to:
 `/home/zombie/workspace/ai-coder`
@@ -224,7 +224,7 @@ Verified on 2026-08-22:
 Operating hygiene:
 - Always inspect `git status` and diffs before editing.
 - Preserve unrelated work and create targeted backups before risky changes.
-- Do not overwrite `/home/zombie/ai-coder` from `/home/zombie/workspace/ai-coder`.
+- Do not overwrite `/home/zombie/workspace/ai-coder` from `/home/zombie/workspace/ai-coder`.
 - Do not bump to `1.2.0` until release acceptance tests, packaging smoke tests, and documentation are complete.
 - Keep backend-managed provider secrets on the backend/vault unless a deliberately scoped BYOK/local-provider feature is implemented.
 - A clean unit test suite is necessary but not sufficient; real GUI/model/provider runs are part of acceptance.
@@ -872,9 +872,9 @@ Known aliases/legacy names include examples such as:
 - `CODESTRAL_API_KEY`
 
 There may also be duplicate values across:
-- `/home/zombie/triforce/.env`
-- `/home/zombie/triforce/docker/.env`
-- `/home/zombie/triforce/auth/.env.agents`
+- `/home/zombie/workspace/triforce/.env`
+- `/home/zombie/workspace/triforce/docker/.env`
+- `/home/zombie/workspace/triforce/auth/.env.agents`
 - other service-specific env files.
 
 Do NOT print values.
@@ -1814,7 +1814,7 @@ Especially for OS changes and broad code changes.
 At the beginning of the new session:
 
 ```bash
-cd /home/zombie/ai-coder
+cd /home/zombie/workspace/ai-coder
 git status --short
 git diff -- aicoder/__init__.py aicoder/client.py packaging/aur/aicoder
 find tests -maxdepth 2 -type f -print | sort
