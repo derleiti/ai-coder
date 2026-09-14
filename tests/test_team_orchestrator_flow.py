@@ -1612,6 +1612,8 @@ def test_greenfield_bootstrap_gate_is_conservative(tmp_path):
     external_task = "Check the latest API compatibility and official documentation."
     assert _task_requires_external_research(local_task) is False
     assert _workspace_has_meaningful_project_files(tmp_path) is False
+    (tmp_path / "README.md").write_text("# Bootstrap only\n")
+    assert _workspace_has_meaningful_project_files(tmp_path) is False
     assert _task_requires_external_research(external_task) is True
     (tmp_path / "app.py").write_text("print('x')")
     assert _workspace_has_meaningful_project_files(tmp_path) is True
@@ -2020,3 +2022,13 @@ class TeamProviderPreflightTests(unittest.TestCase):
             self.assertEqual(_team_provider_preflight(config), [])
         status.assert_called_once_with("chatgpt")
         models.assert_called_once_with("chatgpt")
+
+class TeamRunLockProbeTests(unittest.TestCase):
+    def test_team_run_locked_reflects_existing_lock(self):
+        from aicoder.team_orchestrator import _team_run_lock, team_run_locked
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertFalse(team_run_locked(tmp, "Build X"))
+            with _team_run_lock(tmp, "Build X") as acquired:
+                self.assertTrue(acquired)
+                self.assertTrue(team_run_locked(tmp, "build   x"))
+            self.assertFalse(team_run_locked(tmp, "Build X"))

@@ -141,3 +141,36 @@ class CapabilityRuntimeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class InventoryMetaRuntimeTests(unittest.TestCase):
+    def test_toolbox_search_can_list_inventories_without_adding_schema_tool(self):
+        catalog = [
+            {"name": "log_viewer", "description": "logs", "capabilities": ["debug"], "x_inventory": "observability", "x_inventory_groups": ["debug"], "inputSchema": {"type": "object"}},
+            {"name": "computer_screenshot", "description": "screen", "capabilities": ["system_diagnostics"], "x_inventory": "device", "x_inventory_groups": ["vision"], "inputSchema": {"type": "object"}},
+        ]
+        runtime = NativeLightRuntime(
+            client=DummyClient(), initial_prompt="debug", model=None, fallback_model=None,
+            workspace_root=".", persistent_plan=False,
+        )
+        runtime._tool_catalog = list(catalog)
+        result, is_error, changed = runtime._run_meta_tool("toolbox_search", {"mode": "inventories"}, [])
+        self.assertFalse(is_error)
+        self.assertFalse(changed)
+        names = {item["name"] for item in json.loads(result)["inventories"]}
+        self.assertIn("debug", names)
+        self.assertIn("vision", names)
+
+    def test_capability_request_accepts_inventory_name(self):
+        catalog = [
+            {"name": "log_viewer", "description": "logs", "capabilities": ["debug"], "x_inventory": "observability", "x_inventory_groups": ["debug"], "inputSchema": {"type": "object"}},
+        ]
+        runtime = NativeLightRuntime(
+            client=DummyClient(), initial_prompt="debug", model=None, fallback_model=None,
+            workspace_root=".", persistent_plan=False,
+        )
+        runtime._tool_catalog = list(catalog)
+        tools = []
+        result, is_error, changed = runtime._run_meta_tool("capability_request", {"inventories": ["debug"]}, tools)
+        self.assertFalse(is_error)
+        self.assertTrue(changed)
+        self.assertIn("log_viewer", json.loads(result)["added"])

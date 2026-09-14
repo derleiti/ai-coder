@@ -2,6 +2,7 @@
 from __future__ import annotations
 import sys
 import platform
+import os
 
 # Windows: Console-Fenster verstecken wenn GUI startet
 if platform.system() == "Windows":
@@ -43,7 +44,8 @@ def run_gui() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("ai-coder")
     app.setOrganizationName("AILinux")
-    app.setQuitOnLastWindowClosed(False)
+    unified_mode = os.environ.get("AILINUX_LOOM_UNIFIED") == "1" or "--loom-unified" in sys.argv
+    app.setQuitOnLastWindowClosed(unified_mode)
 
     icon = _make_icon()
     app.setWindowIcon(icon)
@@ -138,9 +140,10 @@ def run_gui() -> int:
         else None
     ))
     tray.setToolTip("AILinux App · AICoder")
-    tray.show()
+    if not unified_mode:
+        tray.show()
 
-    window.tray = tray
+    window.tray = None if unified_mode else tray
     window.show()
 
     # Shared Notify is opt-in. Once enabled, the GUI owns a lightweight daemon

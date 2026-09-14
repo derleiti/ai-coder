@@ -240,7 +240,8 @@ class ProviderTransportTests(unittest.TestCase):
     @patch("aicoder.account_providers.shutil.which", return_value="/usr/bin/claude")
     def test_claude_runs_as_tool_free_provider_process(self, _which):
         transport = ClaudeAccountTransport(timeout=30)
-        with patch.object(transport, "_run", return_value=("OK\n", "")) as run:
+        with patch("aicoder.account_providers._claude_status", return_value={"authenticated": True, "detail": "Verbunden"}), \
+             patch.object(transport, "_run", return_value=("OK\n", "")) as run:
             result = transport.chat(
                 model="account:claude/sonnet",
                 messages=[{"role": "system", "content": "sys"}, {"role": "user", "content": "hello"}],
@@ -263,7 +264,8 @@ class ProviderTransportTests(unittest.TestCase):
     def test_claude_filters_known_cli_tool_capability_diagnostic(self, _which):
         transport = ClaudeAccountTransport(timeout=30)
         noisy = "OK\nClient.listTools() called but server does not advertise tools capability - returning empty list\n"
-        with patch.object(transport, "_run", return_value=(noisy, "")):
+        with patch("aicoder.account_providers._claude_status", return_value={"authenticated": True, "detail": "Verbunden"}), \
+             patch.object(transport, "_run", return_value=(noisy, "")):
             result = transport.chat(model="account:claude/sonnet", message="hello")
         self.assertEqual(result["response"], "OK")
 
@@ -485,6 +487,7 @@ class ChatGPTTransportTests(unittest.TestCase):
         transport = ClaudeAccountTransport(timeout=30)
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY":"secret", "ANTHROPIC_AUTH_TOKEN":"gateway", "ANTHROPIC_BASE_URL":"https://example.invalid"}, clear=False), \
              patch("aicoder.account_providers._which_executable", return_value="/usr/bin/claude"), \
+             patch("aicoder.account_providers._claude_status", return_value={"authenticated": True, "detail": "Verbunden"}), \
              patch.object(transport, "_run", return_value=("OK\n", "")) as run:
             result = transport.chat(model="account:claude/claude-opus-5", message="hello")
         env = run.call_args.kwargs["env"]
@@ -508,6 +511,7 @@ class ClaudeAccountStatusTests(unittest.TestCase):
         )
         with patch("aicoder.account_providers._which", return_value="/home/test/.local/bin/claude"), \
              patch("aicoder.account_providers.linked_provider_ids", return_value=[]), \
+             patch("aicoder.account_providers._claude_credentials_expired", return_value=False), \
              patch("aicoder.account_providers.subprocess.run", return_value=completed):
             from aicoder.account_providers import account_status
             status = account_status("claude")
@@ -763,3 +767,32 @@ class AccountInstallAndLoginTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class ClaudeExpiryRegressionTests(unittest.TestCase):
+    def test_expired_provider_owned_claude_access_token_overrides_logged_in_flag(self):
+        completed = MagicMock(
+            returncode=0,
+            stdout=json.dumps({"loggedIn": True, "authMethod": "claude.ai"}),
+            stderr="",
+        )
+        with patch("aicoder.account_providers._which", return_value="/usr/bin/claude"), \
+             patch("aicoder.account_providers.linked_provider_ids", return_value=["claude"]), \
+             patch("aicoder.account_providers.subprocess.run", return_value=completed), \
+             patch("aicoder.account_providers._claude_credentials_expired", return_value=True), \
+             patch("aicoder.account_providers.set_provider_linked") as unlink:
+            status = account_status("claude")
+        self.assertFalse(status["authenticated"])
+        self.assertFalse(status["linked"])
+        self.assertIn("abgelaufen", status["detail"])
+        unlink.assert_called_once_with("claude", False)
+
+    def test_claude_transport_fails_fast_when_expiry_preflight_fails(self):
+        transport = ClaudeAccountTransport(timeout=30)
+        with patch("aicoder.account_providers._which_executable", return_value="/usr/bin/claude"), \
+             patch("aicoder.account_providers._claude_status", return_value={
+                 "authenticated": False, "detail": "Claude OAuth abgelaufen · Neu mit Claude verbinden"
+             }), \
+             patch.object(transport, "_run") as run:
+            with self.assertRaisesRegex(ClientError, "OAuth login expired"):
+                transport.chat(model="account:claude/sonnet", message="hello")
+        run.assert_not_called()

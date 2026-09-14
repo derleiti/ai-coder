@@ -47,3 +47,18 @@ class CapabilityTests(unittest.TestCase):
         self.assertEqual([tool["name"] for tool in active[:3]],list(META_TOOL_NAMES))
 
 if __name__ == '__main__': unittest.main()
+
+class InventoryDisclosureTests(unittest.TestCase):
+    def test_inventory_metadata_is_searchable_and_expandable(self):
+        from aicoder.capabilities import search_toolbox, expansion_tools, inventory_catalog
+        tools = [
+            {"name": "log_viewer", "description": "logs", "capabilities": ["debug"], "x_inventory": "observability", "x_inventory_groups": ["debug"], "x_usage_hint": "debug; read-only"},
+            {"name": "computer_screenshot", "description": "shot", "capabilities": ["system_diagnostics"], "x_inventory": "device", "x_inventory_groups": ["vision"], "x_usage_hint": "vision; read-only"},
+        ]
+        catalog = {row["name"]: row["count"] for row in inventory_catalog(tools)}
+        self.assertEqual(catalog["debug"], 1)
+        self.assertEqual(catalog["vision"], 1)
+        matches = search_toolbox(tools, "vision")
+        self.assertEqual(matches[0]["name"], "computer_screenshot")
+        added = expansion_tools(tools, ["debug"], active_names=(), slots=2)
+        self.assertEqual([tool["name"] for tool in added], ["log_viewer"])
