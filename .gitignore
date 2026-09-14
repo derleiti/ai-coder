@@ -16,3 +16,5 @@ __pycache__/
 packaging/*.deb
 .backups/
 .claude/
+
+.workspacebackup/
