@@ -77,8 +77,12 @@ jobs:
               f.write('\n')
           print(json.dumps(data, indent=2))
           PY
-      - uses: actions/upload-artifact@v4
-        with:
-          name: platform-contract-${{ matrix.platform }}
-          path: platform-contract/${{ matrix.platform }}.json
-          if-no-files-found: error
+      - name: Publish contract in job summary
+        shell: bash
+        run: |
+          {
+            echo '### Platform package contract · ${{ matrix.platform }}'
+            echo '```json'
+            cat 'platform-contract/${{ matrix.platform }}.json'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
