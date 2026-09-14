@@ -259,6 +259,44 @@ jobs:
             aicoder-*-setup.exe
 
   # ════════════════════════════════════════════════════════════
+  # MACOS — standalone CLI/GUI-capable executable
+  # ════════════════════════════════════════════════════════════
+  build-macos:
+    needs: metadata
+    runs-on: macos-15
+    outputs:
+      mac_sha: ${{ steps.sha.outputs.mac_sha }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel pyinstaller
+          python -m pip install -e .
+      - name: Build macOS executable
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          python -m PyInstaller aicoder.spec --distpath dist/ --workpath build/ --noconfirm --clean
+          chmod +x dist/aicoder
+          dist/aicoder --help >/dev/null
+          cp dist/aicoder "aicoder-${VERSION}-macos-universal"
+          MAC_SHA=$(shasum -a 256 "aicoder-${VERSION}-macos-universal" | awk '{print $1}')
+          echo "$MAC_SHA  aicoder-${VERSION}-macos-universal" > SHA256SUMS-macos.txt
+          echo "mac_sha=$MAC_SHA" >> "$GITHUB_OUTPUT"
+        id: sha
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-artifacts
+          if-no-files-found: error
+          path: |
+            aicoder-*-macos-universal
+            SHA256SUMS-macos.txt
+
+  # ════════════════════════════════════════════════════════════
   # ANDROID / TERMUX — installer + source bundle
   # PyInstaller Linux binaries target glibc and cannot run on Android's Bionic.
   # ════════════════════════════════════════════════════════════
@@ -312,7 +350,7 @@ jobs:
   # RELEASE — Upload + AUR PKGBUILD
   # ════════════════════════════════════════════════════════════
   release:
-    needs: [metadata, build-linux, build-windows, build-android]
+    needs: [metadata, build-linux, build-windows, build-macos, build-android]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -330,6 +368,11 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: android-termux-artifacts
+          path: artifacts/
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: macos-artifacts
           path: artifacts/
 
       - name: List artifacts
@@ -376,6 +419,8 @@ jobs:
             artifacts/aicoder_amd64.deb
             artifacts/aicoder.exe
             artifacts/aicoder-*-setup.exe
+            artifacts/aicoder-*-macos-universal
+            artifacts/SHA256SUMS-macos.txt
             artifacts/aicoder-*-termux.tar.gz
             artifacts/aicoder-*-termux-install.sh
             artifacts/PKGBUILD
@@ -391,6 +436,7 @@ jobs:
             | 📦 Debian/Ubuntu | `aicoder_${{ needs.metadata.outputs.version }}_amd64.deb` | `${{ needs.build-linux.outputs.deb_sha }}` |
             | 🪟 Windows Binary | `aicoder.exe` | `${{ needs.build-windows.outputs.exe_sha }}` |
             | 🪟 Windows Installer | `aicoder-${{ needs.metadata.outputs.version }}-setup.exe` | `${{ needs.build-windows.outputs.setup_sha }}` |
+            | 🍎 macOS Binary | `aicoder-${{ needs.metadata.outputs.version }}-macos-universal` | `${{ needs.build-macos.outputs.mac_sha }}` |
             | 🏗️ Arch/AUR | `PKGBUILD` | — |
             | 🤖 Android/Termux | `aicoder-${{ needs.metadata.outputs.version }}-termux.tar.gz` | `${{ needs.build-android.outputs.android_sha }}` |
 

@@ -1,3 +1,7 @@
+## v1.2.7 (2026-09-14)
+
+- Merge offline AILinux/zombie-pc runtime work; harden portable capability execution and Loom integration.
+
 ## v1.2.6 (2026-09-11)
 
 - Align MCP executor regression coverage with the shared MCP service routing layer used by local and Notify-shared servers.

@@ -1,0 +1,84 @@
+name: Platform package contract
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  platform-contract:
+    name: Package contract · ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux, windows, macos, freebsd, android, ios]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve project/version/support
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          project="${GITHUB_REPOSITORY##*/}"
+          if [[ -f VERSION ]]; then
+            version=$(tr -d '\r\n' < VERSION); version=${version#v}
+          elif [[ -f apps/desktop/package.json ]]; then
+            version=$(python3 -c "import json; print(json.load(open('apps/desktop/package.json'))['version'])")
+          elif [[ -f pyproject.toml ]]; then
+            version=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          else
+            version=unknown
+          fi
+          support=unsupported
+          artifact=none
+          reason='No native packaging target is implemented in this repository yet.'
+          case "$project:$PLATFORM" in
+            triforce-dev-mcp:linux) support=supported; artifact='server/control-center packages'; reason='Canonical Linux server/runtime target.' ;;
+            ai-coder:linux) support=supported; artifact='PyInstaller binary + deb'; reason='Native desktop/CLI package.' ;;
+            ai-coder:windows) support=supported; artifact='PyInstaller exe + NSIS'; reason='Native desktop/CLI package.' ;;
+            ai-coder:macos) support=supported; artifact='PyInstaller executable'; reason='Native desktop/CLI package.' ;;
+            ai-coder:android) support=compatibility; artifact='Termux source bundle'; reason='Android uses Termux/Python; glibc desktop binaries are not valid Android binaries.' ;;
+            ailinux-helper:linux) support=supported; artifact='AppImage + deb'; reason='Electron desktop target.' ;;
+            ailinux-helper:windows) support=supported; artifact='NSIS + portable exe'; reason='Electron desktop target.' ;;
+            ailinux-helper:macos) support=supported; artifact='dmg + zip'; reason='Electron desktop target.' ;;
+            ailinux-helper:android) support=supported; artifact='APK'; reason='Native Android Helper target.' ;;
+            ailinux-loom:linux) support=supported; artifact='AppImage + deb + zipapp'; reason='Loom desktop target.' ;;
+            ailinux-loom:windows) support=supported; artifact='PyInstaller exe + portable zip'; reason='Loom desktop target.' ;;
+            ailinux-loom:macos) support=supported; artifact='pkg + dmg'; reason='Loom desktop target.' ;;
+            ailinux-loom:android) support=integration; artifact='pinned Helper APK'; reason='Android capability surface is provided by AILinux Helper.' ;;
+            ailinux-app:linux) support=supported; artifact='composed desktop bundle + Helper packages'; reason='Compatibility/composed desktop target.' ;;
+            ailinux-app:windows) support=supported; artifact='composed desktop bundle + Helper packages'; reason='Compatibility/composed desktop target.' ;;
+            ailinux-app:macos) support=supported; artifact='composed desktop bundle + Helper packages'; reason='Compatibility/composed desktop target.' ;;
+            ailinux-app:android) support=supported; artifact='APK'; reason='Native Android compatibility target.' ;;
+            *:freebsd) reason='GitHub provides no hosted FreeBSD runner and this repository has no verified native FreeBSD packaging target.' ;;
+            *:ios) reason='A signed IPA requires a real Xcode iOS target plus Apple provisioning/signing; this repository does not claim an IPA until that target exists.' ;;
+          esac
+          mkdir -p platform-contract
+          python3 - "$project" "$version" "$PLATFORM" "$support" "$artifact" "$reason" <<'PY'
+          import json, sys
+          project, version, platform, support, artifact, reason = sys.argv[1:]
+          data = {
+              'schema': 1,
+              'project': project,
+              'version': version,
+              'platform': platform,
+              'support': support,
+              'artifact_kind': artifact,
+              'reason': reason,
+              'native_binary': support == 'supported' and platform not in {'android'} or (support == 'supported' and platform == 'android'),
+          }
+          with open(f'platform-contract/{platform}.json', 'w') as f:
+              json.dump(data, f, indent=2, sort_keys=True)
+              f.write('\n')
+          print(json.dumps(data, indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: platform-contract-${{ matrix.platform }}
+          path: platform-contract/${{ matrix.platform }}.json
+          if-no-files-found: error
