@@ -1,3 +1,9 @@
+## v1.2.8 (2026-09-14)
+
+- Consolidate task-oriented MCP tool discovery with canonical `aihelper_*` capability names and compatibility aliases.
+- Add task-grouped GUI tool selection, richer usage tooltips and paired-device safety metadata.
+- Harden executor reflection and portable-device mutation classification for remote Helper operations.
+
 ## v1.2.7 (2026-09-14)
 
 - Merge offline AILinux/zombie-pc runtime work; harden portable capability execution and Loom integration.
