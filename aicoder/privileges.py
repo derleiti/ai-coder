@@ -111,6 +111,21 @@ def _known_read_only_command_runner(canonical_tool: str, args: dict[str, Any], c
     return False
 
 
+def _portable_action_mutates(tool: str, args: dict[str, Any]) -> bool:
+    action = str(args.get("action") or "").strip().lower()
+    if tool == "process_ops":
+        return action == "signal"
+    if tool == "service_ops":
+        return action in {"start", "stop", "restart"}
+    if tool == "app_ops":
+        return action in {"launch", "focus", "close"}
+    if tool == "window_ops":
+        return action in {"focus", "close", "minimize", "maximize"}
+    if tool == "computer_input":
+        return True
+    return False
+
+
 @dataclass(frozen=True)
 class ExecutionRisk:
     needs_approval: bool
@@ -162,10 +177,12 @@ def assess_execution(tool_name: str, args: dict[str, Any], *, destructive: bool 
     protected_path = bool(_PROTECTED_PATH_RE.search(command))
     runner_known_read_only = _known_read_only_command_runner(canonical_tool, args, command)
     runner_default_mutation = canonical_tool in _COMMAND_RUNNER_TOOLS and not runner_known_read_only
+    portable_mutation = _portable_action_mutates(canonical_tool, args)
     mutation = (
         metadata_mutating is True
         or canonical_tool in _MUTATING_TOOL_NAMES
         or runner_default_mutation
+        or portable_mutation
         or deletion
         or bool(_CREATE_OR_WRITE_RE.search(command))
         or bool(_PACKAGE_OR_SERVICE_RE.search(command))

@@ -19,6 +19,14 @@ INTERNAL_MCP_TOOLS = {"swarm_broadcast"}
 # advertise an identically named tool.
 LOCAL_ONLY_TOOLS = frozenset({"shell", "binary_exec", "task_runner"})
 
+# Canonical portable tools execute on an explicitly paired client/device, never
+# on the TriForce backend host. Keep this exception narrow and name-based.
+PAIRED_DEVICE_MCP_TOOLS = frozenset({
+    "device_info", "process_ops", "service_ops", "app_ops", "window_ops",
+    "computer_observe", "computer_screenshot", "computer_input",
+    "clipboard_read", "clipboard_write", "compute_execute",
+})
+
 # TriForce is a backend service, never an operator target. These MCP tools expose
 # the backend host, its repository, local process/container/service state, or
 # remote-node administration. AICoder may have identically named LOCAL tools,
@@ -51,6 +59,8 @@ def triforce_host_forbidden_reason(name: str) -> str | None:
     normalized = str(name or "").strip().lower()
     canonical = canonical_tool_name(name)
     namespace = re.split(r"[./:]", normalized, maxsplit=1)[0] if re.search(r"[./:]", normalized) else ""
+    if canonical in PAIRED_DEVICE_MCP_TOOLS:
+        return None
     if (
         canonical in TRIFORCE_HOST_MCP_TOOLS
         or canonical.startswith(TRIFORCE_HOST_MCP_PREFIXES)

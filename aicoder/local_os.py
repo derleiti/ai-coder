@@ -107,6 +107,9 @@ class LocalOSToolProvider:
         mutate = ToolSecurity(read_only=False, mutating=True, external_side_effect=True)
         root = ToolSecurity(read_only=False, mutating=True, requires_elevation=True, external_side_effect=True)
         return (
+            ToolDefinition(_schema("device_info", "Inspect this local device using the canonical portable MCP contract."), ("system_diagnostics",), ro),
+            ToolDefinition(_schema("process_ops", "Inspect or control a local process using the canonical portable MCP contract.", {"action":{"type":"string","enum":["list","get","signal"]},"pid":{"type":"integer","minimum":1},"signal":{"type":"string","enum":["terminate","kill","interrupt"]},"query":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":500}}, ["action"]), ("system_diagnostics",), mutate),
+            ToolDefinition(_schema("service_ops", "Inspect or control a local service using the canonical portable MCP contract.", {"action":{"type":"string","enum":["list","get","start","stop","restart"]},"service":{"type":"string"},"query":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":500}}, ["action"]), ("services","system_diagnostics"), root),
             ToolDefinition(_schema("os_system_overview", "Read local OS, kernel, CPU/load, memory and package-manager overview."), ("system_diagnostics",), ro),
             ToolDefinition(_schema("os_kernel_info", "Read local kernel and operating-system release information."), ("system_diagnostics",), ro),
             ToolDefinition(_schema("os_process_list", "List local processes with pid, user, CPU/memory and command.", {"limit": {"type":"integer","minimum":1,"maximum":200}}), ("system_diagnostics",), ro),
@@ -141,6 +144,41 @@ class LocalOSToolProvider:
         known = {tool.name for tool in self.tools()}
         if name not in known:
             return json.dumps({"error": f"unknown local OS tool: {name}"}), True
+        if name == "device_info":
+            return json.dumps(_system_overview(), ensure_ascii=False, indent=2), False
+        if name == "process_ops":
+            action = str(args.get("action") or "list").lower()
+            if action == "list":
+                limit = max(1, min(500, int(args.get("limit") or 100)))
+                text, err = _run(["ps", "-eo", "pid,user,pcpu,pmem,stat,comm,args", "--sort=-pcpu"], timeout=8)
+                if err: return text, True
+                data = json.loads(text); lines = data.get("stdout", "").splitlines()
+                query = str(args.get("query") or "").strip().lower()
+                header, body = (lines[:1], lines[1:]) if lines else ([], [])
+                if query: body = [line for line in body if query in line.lower()]
+                data["stdout"] = "\n".join(header + body[:limit]) + ("\n" if lines else "")
+                return json.dumps(data, ensure_ascii=False), False
+            pid = int(args.get("pid") or 0)
+            if pid < 1: return json.dumps({"error":"pid is required"}), True
+            if action == "get": return _run(["ps", "-p", str(pid), "-o", "pid,user,pcpu,pmem,stat,comm,args"], timeout=8)
+            if action == "signal":
+                signal = {"terminate":"TERM","kill":"KILL","interrupt":"INT"}.get(str(args.get("signal") or "terminate"))
+                if not signal: return json.dumps({"error":"invalid signal"}), True
+                return _run(["kill", "-s", signal, str(pid)], timeout=8)
+            return json.dumps({"error":"invalid process action"}), True
+        if name == "service_ops":
+            action = str(args.get("action") or "list").lower()
+            if not shutil.which("systemctl"): return json.dumps({"error":"systemd/systemctl not available"}), True
+            if action == "list":
+                return _run(["systemctl","list-units","--type=service","--all","--no-pager","--no-legend"], timeout=12)
+            service = str(args.get("service") or "")
+            if not _NAME_RE.fullmatch(service): return json.dumps({"error":"invalid service name"}), True
+            if action == "get": return _run(["systemctl","show",service,"--no-pager","--property=Id,Description,LoadState,ActiveState,SubState,UnitFileState,MainPID"], timeout=10)
+            if action in {"start","stop","restart"}:
+                argv, why = _elevated_argv(["systemctl", action, service], args)
+                if argv is None: return json.dumps({"error":why}), True
+                return _run(argv, timeout=60)
+            return json.dumps({"error":"invalid service action"}), True
         if name == "os_system_overview":
             return json.dumps(_system_overview(), ensure_ascii=False, indent=2), False
         if name == "os_kernel_info":

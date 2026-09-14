@@ -73,6 +73,11 @@ TOOL_CAPABILITIES: dict[str, tuple[str, ...]] = {
     "memory_search": ("memory", "research"), "memory_store": ("memory",),
     "models": ("models",), "specialist": ("models",), "health": ("system_diagnostics",),
     "skill_read": ("skills",), "subagent_run": ("subagents",),
+    "device_info": ("system_diagnostics",), "process_ops": ("system_diagnostics",),
+    "service_ops": ("services", "system_diagnostics"), "app_ops": ("system_diagnostics",),
+    "window_ops": ("system_diagnostics",), "computer_observe": ("system_diagnostics",),
+    "computer_screenshot": ("system_diagnostics",), "computer_input": ("system_diagnostics",),
+    "compute_execute": ("containers",),
 }
 
 _URL_RE = re.compile(r"https?://\S+", re.I)

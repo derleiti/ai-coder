@@ -967,6 +967,25 @@ def _client_tool_cache_key(client: TriForceClient) -> tuple[str, str]:
     return base_url, token_id
 
 
+_PORTABLE_READ_ACTIONS = {
+    "device_info": {"get"},
+    "process_ops": {"list", "get"},
+    "service_ops": {"list", "get"},
+    "app_ops": {"list"},
+    "window_ops": {"list"},
+    "computer_input": set(),
+}
+
+
+def _portable_action_mutating(name: str, args: dict) -> bool | None:
+    """Return action-aware mutation state for portable paired-device tools."""
+    actions = _PORTABLE_READ_ACTIONS.get(str(name or ""))
+    if actions is None:
+        return None
+    default = "get" if name == "device_info" else "list"
+    return str(args.get("action") or default).strip().lower() not in actions
+
+
 def _tool_security_metadata(tool: dict) -> tuple[bool | None, bool | None]:
     """Normalize MCP/provider safety annotations for the local approval broker."""
     annotations = tool.get("annotations") if isinstance(tool.get("annotations"), dict) else {}
@@ -2527,6 +2546,9 @@ def _run_tool_impl(
         approval_args["_mutating"] = mutating_hint
     if isinstance(destructive_hint, bool):
         approval_args["_destructive"] = destructive_hint
+    portable_mutating = _portable_action_mutating(name, args)
+    if isinstance(portable_mutating, bool):
+        approval_args["_mutating"] = portable_mutating
     escape_target = _workspace_escape_target(name, args)
     if escape_target is not None:
         protected = _protected_root()
