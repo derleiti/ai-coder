@@ -1032,20 +1032,29 @@ class SettingsWidget(QWidget):
 
     def _on_tools_loaded(self, tools: list):
         self.load_tools_btn.setEnabled(True)
-        self._tools = sorted(tools, key=lambda tool: tool.get("name", ""))
+        self._tools = sorted(
+            tools,
+            key=lambda tool: (
+                str(tool.get("x_task_inventory") or tool.get("x_inventory") or "misc"),
+                str(tool.get("x_display_name") or tool.get("name") or ""),
+            ),
+        )
         saved = get_state().get("enabled_tools")
         selected = None if saved is None else set(saved)
         self.tool_list.clear()
         for tool in self._tools:
-            name = tool.get("name", "?")
-            item = QListWidgetItem(name)
+            name = str(tool.get("name") or "?")
+            display = str(tool.get("x_display_name") or name)
+            task = str(tool.get("x_task_inventory") or tool.get("x_inventory") or "misc")
+            item = QListWidgetItem(f"[{task}] {display}")
+            item.setData(Qt.ItemDataRole.UserRole, name)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             checked = selected is None or name in selected
             item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
-            item.setToolTip(tool.get("description", ""))
+            item.setToolTip(str(tool.get("x_tooltip") or tool.get("x_usage_hint") or tool.get("description") or ""))
             self.tool_list.addItem(item)
         self._filter_tools(self.tool_search.text())
-        self.tool_status.setText(f"{len(self._tools)} available")
+        self.tool_status.setText(f"{len(self._tools)} available · grouped by task inventory")
         self.tool_status.setStyleSheet("color: #00ff88; font-size: 11px;")
 
     def _on_tools_error(self, err: str):
@@ -1090,7 +1099,7 @@ class SettingsWidget(QWidget):
     def _save_tool_config(self):
         mode = self.tool_mode_combo.currentData() or "on_demand"
         names = [
-            self.tool_list.item(row).text()
+            str(self.tool_list.item(row).data(Qt.ItemDataRole.UserRole) or self.tool_list.item(row).text())
             for row in range(self.tool_list.count())
             if self.tool_list.item(row).checkState() == Qt.CheckState.Checked
         ]

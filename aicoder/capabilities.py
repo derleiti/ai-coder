@@ -77,6 +77,15 @@ TOOL_CAPABILITIES: dict[str, tuple[str, ...]] = {
     "memory_search": ("memory", "research"), "memory_store": ("memory",),
     "models": ("models",), "specialist": ("models",), "health": ("system_diagnostics",),
     "skill_read": ("skills",), "subagent_run": ("subagents",),
+    "aihelper_device_info": ("system_diagnostics",), "aihelper_process_ops": ("system_diagnostics",),
+    "aihelper_service_ops": ("services", "system_diagnostics"), "aihelper_app_ops": ("system_diagnostics",),
+    "aihelper_window_ops": ("system_diagnostics",), "aihelper_observe": ("system_diagnostics",),
+    "aihelper_screenshot": ("system_diagnostics",), "aihelper_input": ("system_diagnostics",),
+    "aihelper_vision_start": ("system_diagnostics",), "aihelper_vision_status": ("system_diagnostics",),
+    "aihelper_vision_observe": ("system_diagnostics",), "aihelper_vision_stop": ("system_diagnostics",),
+    "aihelper_clipboard_read": ("system_diagnostics",), "aihelper_clipboard_write": ("system_diagnostics",),
+    "aihelper_pair": ("system_diagnostics",), "aihelper_compute_execute": ("containers",),
+    # Legacy MCP aliases remain accepted while older TriForce/Helper versions roll forward.
     "device_info": ("system_diagnostics",), "process_ops": ("system_diagnostics",),
     "service_ops": ("services", "system_diagnostics"), "app_ops": ("system_diagnostics",),
     "window_ops": ("system_diagnostics",), "computer_observe": ("system_diagnostics",),
@@ -175,6 +184,9 @@ def build_working_set(tools: Iterable[dict], resolution: CapabilityResolution, *
 
 def tool_inventories(tool: dict) -> tuple[str, ...]:
     values: list[str] = []
+    task_inventory = str(tool.get("x_task_inventory") or "").strip()
+    if task_inventory:
+        values.append(task_inventory)
     canonical = str(tool.get("x_inventory") or "").strip()
     if canonical:
         values.append(canonical)
@@ -185,13 +197,13 @@ def tool_inventories(tool: dict) -> tuple[str, ...]:
 
 
 def inventory_catalog(tools: Iterable[dict]) -> list[dict]:
-    """Return a tiny inventory index; no schemas are exposed here."""
-    counts: dict[str, int] = {}
+    """Return compact task inventories with AI-facing usage previews."""
+    grouped: dict[str, list[dict]] = {}
     for tool in tools:
         if not isinstance(tool, dict):
             continue
         for inventory in tool_inventories(tool):
-            counts[inventory] = counts.get(inventory, 0) + 1
+            grouped.setdefault(inventory, []).append(tool)
     descriptions = {
         "debug": "logs, telemetry and failure evidence",
         "code": "source inspection/edit and git",
@@ -201,12 +213,35 @@ def inventory_catalog(tools: Iterable[dict]) -> list[dict]:
         "research": "web/docs plus memory recall",
         "automation": "execution and workflow primitives",
         "communication": "mail, notifications and publishing",
-        "collaboration": "agents and group orchestration",
+        "collaboration": "TriForce agents and group orchestration",
+        "aihelper": "AILinux Helper pairing, vision, device control, clipboard and shared compute",
+        "workspace": "shared workspace and file/code operations",
+        "models": "model discovery and model-runtime operations",
+        "network": "mesh and remote-node operations",
+        "security": "vault/security operations",
+        "admin": "TriForce engine administration",
+        "global": "portable/global AI tools",
+        "triforce_auth": "authenticated TriForce integrations",
+        "triforce_admin": "TriForce engine administration",
     }
-    return [
-        {"name": name, "count": counts[name], "description": descriptions.get(name, "specialized tool inventory")}
-        for name in sorted(counts)
-    ]
+    rows = []
+    for name in sorted(grouped):
+        members = sorted(grouped[name], key=lambda t: str(t.get("x_display_name") or t.get("name") or ""))
+        rows.append({
+            "name": name,
+            "count": len(members),
+            "description": descriptions.get(name, "specialized tool inventory"),
+            "tools": [
+                {
+                    "name": str(tool.get("name") or ""),
+                    "display_name": str(tool.get("x_display_name") or tool.get("name") or ""),
+                    "scope": str(tool.get("x_scope") or tool.get("x_namespace") or ""),
+                    "hint": str(tool.get("x_tooltip") or tool.get("x_usage_hint") or tool.get("description") or ""),
+                }
+                for tool in members[:40]
+            ],
+        })
+    return rows
 
 
 def search_toolbox(tools: Iterable[dict], query: str, *, active_names: Iterable[str] = (), limit: int = 8) -> list[dict]:
@@ -221,16 +256,20 @@ def search_toolbox(tools: Iterable[dict], query: str, *, active_names: Iterable[
         desc = str(tool.get("description") or "")
         caps = tool_capabilities(tool)
         inventories = tool_inventories(tool)
-        hint = str(tool.get("x_usage_hint") or "")
-        haystack = " ".join((name, desc, hint, *caps, *inventories)).lower()
+        hint = str(tool.get("x_tooltip") or tool.get("x_usage_hint") or "")
+        display = str(tool.get("x_display_name") or name)
+        scope = str(tool.get("x_scope") or tool.get("x_namespace") or "")
+        haystack = " ".join((name, display, desc, hint, scope, *caps, *inventories)).lower()
         score = sum(3 if term in name.lower() else 1 for term in terms if term in haystack)
         if score:
             ranked.append((-score, name, tool))
     ranked.sort(key=lambda row: (row[0], row[1]))
     return [{
         "name": row[1],
+        "display_name": str(row[2].get("x_display_name") or row[1]),
         "description": str(row[2].get("description") or ""),
-        "hint": str(row[2].get("x_usage_hint") or ""),
+        "hint": str(row[2].get("x_tooltip") or row[2].get("x_usage_hint") or ""),
+        "scope": str(row[2].get("x_scope") or row[2].get("x_namespace") or ""),
         "capabilities": list(tool_capabilities(row[2])),
         "inventories": list(tool_inventories(row[2])),
     } for row in ranked[:max(1, min(12, int(limit)))] ]

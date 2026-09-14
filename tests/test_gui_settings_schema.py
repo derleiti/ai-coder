@@ -112,3 +112,12 @@ class GuiSettingsSchemaTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_tool_list_uses_task_group_labels_and_canonical_user_role():
+    source = (Path(__file__).resolve().parents[1] / "aicoder/gui/settings_widget.py").read_text(encoding="utf-8")
+    assert 'x_task_inventory' in source
+    assert 'x_display_name' in source
+    assert 'x_tooltip' in source
+    assert 'Qt.ItemDataRole.UserRole' in source
+    assert 'grouped by task inventory' in source

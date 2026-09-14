@@ -62,3 +62,25 @@ class InventoryDisclosureTests(unittest.TestCase):
         self.assertEqual(matches[0]["name"], "computer_screenshot")
         added = expansion_tools(tools, ["debug"], active_names=(), slots=2)
         self.assertEqual([tool["name"] for tool in added], ["log_viewer"])
+
+
+class AILinuxHelperInventoryTests(unittest.TestCase):
+    def test_aihelper_metadata_is_searchable_without_losing_canonical_name(self):
+        from aicoder.capabilities import inventory_catalog, search_toolbox, tool_capabilities
+        tools = [{
+            "name": "aihelper_observe",
+            "x_display_name": "aihelper.observe",
+            "description": "Observe an explicitly shared device",
+            "x_inventory": "aihelper",
+            "x_inventory_groups": ["aihelper", "vision"],
+            "x_scope": "aihelper",
+            "x_tooltip": "aihelper.observe | task=vision | scope=aihelper | read-only",
+        }]
+        catalog = {row["name"]: row for row in inventory_catalog(tools)}
+        self.assertEqual(catalog["aihelper"]["count"], 1)
+        self.assertEqual(catalog["vision"]["tools"][0]["display_name"], "aihelper.observe")
+        hit = search_toolbox(tools, "scope=aihelper")[0]
+        self.assertEqual(hit["name"], "aihelper_observe")
+        self.assertEqual(hit["display_name"], "aihelper.observe")
+        self.assertEqual(hit["scope"], "aihelper")
+        self.assertIn("system_diagnostics", tool_capabilities(tools[0]))

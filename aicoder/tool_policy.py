@@ -22,9 +22,15 @@ LOCAL_ONLY_TOOLS = frozenset({"shell", "binary_exec", "task_runner"})
 # Canonical portable tools execute on an explicitly paired client/device, never
 # on the TriForce backend host. Keep this exception narrow and name-based.
 PAIRED_DEVICE_MCP_TOOLS = frozenset({
+    # Canonical AILinux Helper namespace.
+    "aihelper_pair", "aihelper_device_info", "aihelper_process_ops", "aihelper_service_ops",
+    "aihelper_app_ops", "aihelper_window_ops", "aihelper_observe", "aihelper_screenshot",
+    "aihelper_vision_start", "aihelper_vision_status", "aihelper_vision_observe", "aihelper_vision_stop",
+    "aihelper_input", "aihelper_clipboard_read", "aihelper_clipboard_write", "aihelper_compute_execute",
+    # Legacy wire names remain recognized for cached/older MCP catalogues.
     "device_info", "process_ops", "service_ops", "app_ops", "window_ops",
-    "computer_observe", "computer_screenshot", "computer_input",
-    "clipboard_read", "clipboard_write", "compute_execute",
+    "computer_observe", "computer_screenshot", "computer_input", "vision_start", "vision_status",
+    "vision_observe", "vision_stop", "clipboard_read", "clipboard_write", "compute_execute",
 })
 
 # TriForce is a backend service, never an operator target. These MCP tools expose

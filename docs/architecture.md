@@ -37,6 +37,16 @@ Local-OS-Provider und lokale Runtime-Tools laufen clientseitig. Backend-Tools we
 TriForce ist dabei ausschließlich Backend-Service und niemals Operator-Ziel: Host-/Repository-/Service-/Container-/Remote-Admin-Fähigkeiten des TriForce-Hosts werden aus dem AICoder-Katalog entfernt und am MCP-Transport nochmals blockiert. Lokale gleichnamige Workspace-Tools bleiben verfügbar.
 Lokale und MCP-gestützte Mutationen, Workspace-Escapes, Elevation, destruktive Aktionen und Security-Änderungen werden transportunabhängig vom PrivilegeBroker bzw. der zentralen Approval-Policy klassifiziert.
 
+### Zwei-Pass Evidence Reflection Loop
+
+Der gemeinsame AICoder-Systemprompt wendet nach entscheidungsrelevanter Evidenz — z. B. `code_read`, Datei-Lesen, Search/Crawl, Logs, Diffs, Tests, Screenshots oder Tool-Fehlern — zwei interne Prüfdurchgänge an. Pass 1 trennt Fakten von Annahmen und führt einen Realitäts-/Falsifikationscheck durch. Pass 2 erzeugt nur bei verbleibender Ambiguität mechanistisch unterschiedliche Hypothesen über Implementierung, Integration/Schema/Cache, Policy/Rechte, Lifecycle/Concurrency, Runtime/Netzwerk, Datenform und UX. Ein Reality Gate wählt danach die kleinste evidenzgestützte nächste Aktion. Nach Mutation oder Verifikation wird der Loop auf der neuen Evidenz erneut ausgeführt. Private Chain-of-Thought wird dabei nicht ausgegeben; sichtbar bleiben nur kompakte Schlussfolgerungen, Evidenz und Unsicherheit.
+
+### MCP Tool-Fabric und Auswahl
+
+AICoder übernimmt die kanonischen TriForce-Metadaten `x_scope`, `x_task_inventory`, `x_display_name` und `x_tooltip`. Die Tool-Liste in den Settings bleibt scrollbar, wird nach Aufgabeninventar + Anzeigename sortiert und zeigt den Usage-/Scope-Hinweis als Tooltip. Die sichtbare Bezeichnung darf sich dabei ändern (z. B. `aihelper.observe`), gespeichert und an die Runtime übergeben wird immer der kanonische Tool-Name (`aihelper_observe`). `toolbox_search` durchsucht ebenfalls Display-Name, Scope und Tooltip und liefert kompakte Inventar-Vorschauen.
+
+AILinux-Helper-Werkzeuge verwenden im neuen MCP-Katalog das `aihelper_*`-Namespace. AICoder akzeptiert zusätzlich die historischen Device-Namen als Capability-Aliase, damit gemischte Server-/Client-Versionen während eines Rollouts weiter funktionieren.
+
 ### Tool-Protokoll, Fortsetzung und Verifikation
 
 Das modellseitige Text-Protokoll bevorzugt vollständige `TOOL_CALL ... END_TOOL_CALL`-Blöcke ohne Prosa. Mehrere unabhängige Blöcke dürfen in einem Turn gebündelt werden. Die Runtime toleriert vollständige valide Blöcke mit gewöhnlicher Begleitprosa als Provider-Recovery, führt jedoch keine gefenceten Dokumentationsbeispiele und keine teilweise/malformed Sequenz aus.
@@ -130,3 +140,14 @@ Erfolg enthalten die Terminal-Events `progress=100`; `team_change_manifest` und
 das `performance.change_manifest` des Team-Resultats nennen die persistent
 angelegten, geänderten und gelöschten Dateien. Fehler in reinen UI-/Diagnose-
 Event-Callbacks verändern den Runtime-Ausgang nicht.
+
+## Canonical MCP tool fabric
+
+AICoder consumes TriForce's canonical tool metadata instead of maintaining a
+second semantic catalogue. `x_task_inventory` drives progressive disclosure and
+`x_tooltip` is preferred by toolbox search/UI hints; `x_scope` separates portable
+`global` tools from `aihelper`, `triforce_auth`, and `triforce_admin` ownership.
+Canonical Helper tools use `aihelper_*`; cached legacy device names remain policy-
+recognized during rolling upgrades. TriForce engine-admin tools are never treated
+as an AICoder operator target, while explicitly paired `aihelper_*` device tools
+remain eligible for the share-aware MCP path.

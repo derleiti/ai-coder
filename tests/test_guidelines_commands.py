@@ -77,6 +77,11 @@ class GuidelineTests(unittest.TestCase):
             self.assertIn("GUIDE_MARKER", prompt)
             self.assertIn("AGENTS_MARKER", prompt)
             self.assertLess(prompt.index("GUIDE_MARKER"), prompt.index("AGENTS_MARKER"))
+            self.assertIn("PASS 1 — GROUND + REALITY CHECK", prompt)
+            self.assertIn("PASS 2 — DIVERGE + CHALLENGE", prompt)
+            self.assertIn("REALITY GATE", prompt)
+            self.assertIn("What would prove me wrong?", prompt)
+            self.assertIn("Do not print private chain-of-thought", prompt)
 
 
 class CommandTests(unittest.TestCase):
