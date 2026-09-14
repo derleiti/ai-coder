@@ -161,6 +161,7 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
+          retention-days: 1
           name: linux-artifacts
           if-no-files-found: error
           path: |
@@ -252,6 +253,7 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
+          retention-days: 1
           name: windows-artifacts
           if-no-files-found: error
           path: |
@@ -290,6 +292,7 @@ jobs:
         id: sha
       - uses: actions/upload-artifact@v7
         with:
+          retention-days: 1
           name: macos-artifacts
           if-no-files-found: error
           path: |
@@ -340,6 +343,7 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
+          retention-days: 1
           name: android-termux-artifacts
           if-no-files-found: error
           path: |
