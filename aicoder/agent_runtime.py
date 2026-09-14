@@ -22,7 +22,7 @@ from .agent_plan import AgentPlan, PlanStore, plan_prompt_context, resume_prompt
 from .client import ClientError, TriForceClient
 from .capabilities import (
     DEFAULT_TOOL_BUDGET, MAX_ACTIVE_TOOLS, MAX_EXPANSION_ROUNDS,
-    META_TOOL_NAMES, build_working_set, expansion_tools, improvisation_advice,
+    META_TOOL_NAMES, build_working_set, expansion_tools, improvisation_advice, inventory_catalog,
     resolve_capabilities, search_toolbox,
 )
 from .evidence_memory import ProjectEvidenceStore
@@ -596,8 +596,13 @@ class NativeLightRuntime:
         """Execute stable capability-discovery tools inside the host runtime."""
         active_names = {str(tool.get("name") or "") for tool in tools}
         if name == "toolbox_search":
+            if str(args.get("mode") or "search").strip().lower() == "inventories":
+                return json.dumps({"inventories": inventory_catalog(self._tool_catalog)}, ensure_ascii=False), False, False
+            query = str(args.get("query") or "").strip()
+            if not query:
+                return "toolbox_search: query required in search mode", True, False
             matches = search_toolbox(
-                self._tool_catalog, str(args.get("query") or ""),
+                self._tool_catalog, query,
                 active_names=active_names, limit=int(args.get("limit") or 8),
             )
             return json.dumps({"matches": matches}, ensure_ascii=False), False, False
@@ -609,12 +614,12 @@ class NativeLightRuntime:
             if self._expansion_rounds >= max(0, int(self.max_expansion_rounds)):
                 return "capability_request: expansion limit reached", True, False
             requested: list[str] = []
-            for key in ("capabilities", "tools"):
+            for key in ("capabilities", "inventories", "tools"):
                 value = args.get(key)
                 if isinstance(value, list):
                     requested.extend(str(item).strip() for item in value if str(item).strip())
             if not requested:
-                return "capability_request: provide at least one capability or tool name", True, False
+                return "capability_request: provide at least one inventory, capability or tool name", True, False
             slots = max(0, MAX_ACTIVE_TOOLS - len(active_names))
             additions = expansion_tools(
                 self._tool_catalog, requested, active_names=active_names, slots=slots,

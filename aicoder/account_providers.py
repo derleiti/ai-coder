@@ -597,6 +597,27 @@ def _chatgpt_status() -> dict[str, Any]:
             **quota}
 
 
+def _claude_credentials_expired(*, now_ms: int | None = None) -> bool:
+    """Return True when Claude Code's provider-owned OAuth access token is expired.
+
+    Only expiry metadata is inspected; credential/token values remain provider-owned
+    and are never returned, logged, or copied by AICoder. Claude Code 2.x can report
+    ``loggedIn=true`` even after this timestamp has passed, while inference then
+    fails with OAuth 401.
+    """
+    path = Path.home() / ".claude" / ".credentials.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        oauth = payload.get("claudeAiOauth") if isinstance(payload, dict) else None
+        expires_at = int((oauth or {}).get("expiresAt") or 0) if isinstance(oauth, dict) else 0
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+    if expires_at <= 0:
+        return False
+    current = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    return current >= expires_at
+
+
 def _claude_status() -> dict[str, Any]:
     """Read the official Claude Code auth status JSON.
 
@@ -625,6 +646,10 @@ def _claude_status() -> dict[str, Any]:
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
         authenticated = False
 
+    credentials_expired = authenticated and _claude_credentials_expired()
+    if credentials_expired:
+        authenticated = False
+
     auth_method = str(payload.get("authMethod") or "").strip()
     subscription = str(payload.get("subscriptionType") or "").strip()
     email = str(payload.get("email") or "").strip()
@@ -638,7 +663,10 @@ def _claude_status() -> dict[str, Any]:
             detail_parts.append(email)
         detail = " · ".join(detail_parts)
     else:
-        detail = "Nicht angemeldet · Mit Claude verbinden"
+        detail = (
+            "Claude OAuth abgelaufen · Neu mit Claude verbinden"
+            if credentials_expired else "Nicht angemeldet · Mit Claude verbinden"
+        )
         if marked:
             # Do not preserve a stale AICoder linkage after the official Claude
             # client explicitly reports loggedIn=false.
@@ -1468,6 +1496,11 @@ class ClaudeAccountTransport(_SubprocessAccountTransport):
         executable = _which_executable("claude")
         if not executable:
             raise ClientError("Claude Code CLI is not installed")
+        status = _claude_status()
+        if not status.get("authenticated"):
+            if "abgelaufen" in str(status.get("detail") or "").lower():
+                raise ClientError("Claude OAuth login expired; reconnect the Claude account")
+            raise ClientError("Claude account login required")
         transcript = _conversation_text(message=message, messages=messages, system_prompt=system_prompt)
         args = [
             executable, "--print", "--output-format", "text", "--model", provider_model,

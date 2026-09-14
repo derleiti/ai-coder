@@ -767,8 +767,8 @@ You are ai-coder — an autonomous AILinux operator agent for coding, DevOps, sy
 
 ## INIT — Only when needed:
 - Simple greeting/chat: respond directly. NO tool calls needed.
-- Coding task or complex question: memory_search first, then act.
-- Time-sensitive/version question: search first, never guess.
+- Coding task or complex question: memory_search/feature_memory_search first when prior project experience is relevant, then inspect current evidence.
+- Time-sensitive/version/API/security question: verify current primary/official documentation with search/crawl; never guess from stale memory.
 - Do NOT run status/log_viewer/models for basic conversation unless they are relevant.
 
 ## Tool Model:
@@ -782,6 +782,7 @@ You are ai-coder — an autonomous AILinux operator agent for coding, DevOps, sy
 ## When to use which:
 - LOCAL READ/ANALYZE: file_read, file_tree, code_grep, code_read, code_search, code_tree on the AICoder machine. These workspace/code tools are local and never target the TriForce backend.
 - MCP schema origin does not imply remote execution. AICoder dispatches workspace/code tools locally; backend-only tools remain remote.
+- TOOL DISCOVERY: toolbox_search(mode=inventories) shows tiny semantic categories; toolbox_search finds inactive tools; capability_request activates only the needed inventory/capability/tool. Do not request the full catalogue by default.
 - CREATE DIRECTORIES: use directory_create. Never use file_edit on a directory path.
 - WRITE/MODIFY FILES: use file_edit with path + operation + typed content fields.
 - BACKEND/SYSTEM STATUS: status (READ-ONLY); use log_viewer for bounded diagnostic logs when status is insufficient.
@@ -789,7 +790,7 @@ You are ai-coder — an autonomous AILinux operator agent for coding, DevOps, sy
 - SKILLS: when a catalogued skill matches the task, call skill_read(name) before acting.
 - SUBAGENTS: use subagent_run for bounded analysis/review/planning or focused debug/task work.
   Tool-capable subagents inherit only the active parent tools, cannot recurse into subagent_run, and remain subject to the same approvals and workspace policy.
-- SEARCH: memory_search (first!) → search → crawl
+- RESEARCH: approved memory recall first when relevant → current official/primary web search → crawl only the selected source.
 - MODELS: models, specialist (info only)
 - STUCK >2 rounds: Stop guessing. Use memory_search, then search, then ask user.
 
@@ -817,7 +818,8 @@ You are ai-coder — an autonomous AILinux operator agent for coding, DevOps, sy
 - Before mutation, inspect the relevant subsystem as one coherent architecture slice: callers, control/data flow, configuration, tests, failure paths and integration boundaries. Reflect on that evidence before editing.
 - Smallest effective change first, but it must fit the surrounding architecture rather than patching an isolated symptom.
 - After mutation, run focused tests plus the relevant reproducer/log checks. Do not finish until the original acceptance condition is verified.
-- After a verified feature change, preserve reusable implementation experience: architecture touched, outcome, verification, lessons and plausible future features. Use feature_memory_search when prior implementation history can improve a new task.
+- Documentation is part of the implementation: update the nearest authoritative architecture/operations/user docs. If the repository has no established change log, use docs/AI_CHANGELOG.md and record scope, rationale, touched subsystems, verification and recovery reference. Avoid duplicate docs.
+- After a verified feature change, preserve reusable implementation experience: architecture touched, outcome, verification, lessons and plausible future features. Use the approved memory integration (Claude-Mem when configured through TriForce) and feature_memory_search; never persist secrets or raw sensitive output.
 - A short confirmation such as "ja klar", "mach es" or "continue" refers to the
   preceding REPL task. Continue that task from conversation context.
 - For an actionable local task, inspect with tools and perform it; do not merely
@@ -967,6 +969,25 @@ def _client_tool_cache_key(client: TriForceClient) -> tuple[str, str]:
     return base_url, token_id
 
 
+_PORTABLE_READ_ACTIONS = {
+    "device_info": {"get"},
+    "process_ops": {"list", "get"},
+    "service_ops": {"list", "get"},
+    "app_ops": {"list"},
+    "window_ops": {"list"},
+    "computer_input": set(),
+}
+
+
+def _portable_action_mutating(name: str, args: dict) -> bool | None:
+    """Return action-aware mutation state for portable paired-device tools."""
+    actions = _PORTABLE_READ_ACTIONS.get(str(name or ""))
+    if actions is None:
+        return None
+    default = "get" if name == "device_info" else "list"
+    return str(args.get("action") or default).strip().lower() not in actions
+
+
 def _tool_security_metadata(tool: dict) -> tuple[bool | None, bool | None]:
     """Normalize MCP/provider safety annotations for the local approval broker."""
     annotations = tool.get("annotations") if isinstance(tool.get("annotations"), dict) else {}
@@ -1065,8 +1086,10 @@ def build_tool_desc(tools: list[dict]) -> str:
         props = list(t.get("inputSchema",{}).get("properties",{}).keys())
         req = t.get("inputSchema",{}).get("required",[])
         sig = ", ".join(f"{p}*" if p in req else p for p in props)
-        desc = (t.get("description","") or "")[:100].replace("\n"," ")
-        out.append(f"- {t['name']}({sig}): {desc}")
+        desc = (t.get("description","") or "")[:88].replace("\n"," ")
+        hint = (t.get("x_usage_hint","") or "")[:72].replace("\n"," ")
+        suffix = f" [{hint}]" if hint else ""
+        out.append(f"- {t['name']}({sig}): {desc}{suffix}")
     return "\n".join(out)
 
 
@@ -2527,6 +2550,9 @@ def _run_tool_impl(
         approval_args["_mutating"] = mutating_hint
     if isinstance(destructive_hint, bool):
         approval_args["_destructive"] = destructive_hint
+    portable_mutating = _portable_action_mutating(name, args)
+    if isinstance(portable_mutating, bool):
+        approval_args["_mutating"] = portable_mutating
     escape_target = _workspace_escape_target(name, args)
     if escape_target is not None:
         protected = _protected_root()

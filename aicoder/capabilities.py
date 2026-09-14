@@ -17,11 +17,14 @@ META_TOOL_NAMES = ("toolbox_search", "capability_request", "toolbox_improvise")
 META_TOOL_SCHEMAS = (
     {
         "name": "toolbox_search",
-        "description": "Search inactive AICoder tools/capabilities without exposing the full tool schemas.",
+        "description": "Search inactive tools or list compact semantic inventories without exposing the full tool schemas.",
         "inputSchema": {
             "type": "object",
-            "properties": {"query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 12}},
-            "required": ["query"],
+            "properties": {
+                "query": {"type": "string"},
+                "mode": {"type": "string", "enum": ["search", "inventories"]},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 12},
+            },
         },
         "capabilities": ["research"],
         "annotations": {"readOnlyHint": True},
@@ -33,6 +36,7 @@ META_TOOL_SCHEMAS = (
             "type": "object",
             "properties": {
                 "capabilities": {"type": "array", "items": {"type": "string"}},
+                "inventories": {"type": "array", "items": {"type": "string"}},
                 "tools": {"type": "array", "items": {"type": "string"}},
                 "reason": {"type": "string"},
             },
@@ -73,6 +77,11 @@ TOOL_CAPABILITIES: dict[str, tuple[str, ...]] = {
     "memory_search": ("memory", "research"), "memory_store": ("memory",),
     "models": ("models",), "specialist": ("models",), "health": ("system_diagnostics",),
     "skill_read": ("skills",), "subagent_run": ("subagents",),
+    "device_info": ("system_diagnostics",), "process_ops": ("system_diagnostics",),
+    "service_ops": ("services", "system_diagnostics"), "app_ops": ("system_diagnostics",),
+    "window_ops": ("system_diagnostics",), "computer_observe": ("system_diagnostics",),
+    "computer_screenshot": ("system_diagnostics",), "computer_input": ("system_diagnostics",),
+    "compute_execute": ("containers",),
 }
 
 _URL_RE = re.compile(r"https?://\S+", re.I)
@@ -164,6 +173,42 @@ def build_working_set(tools: Iterable[dict], resolution: CapabilityResolution, *
     return chosen[:limit]
 
 
+def tool_inventories(tool: dict) -> tuple[str, ...]:
+    values: list[str] = []
+    canonical = str(tool.get("x_inventory") or "").strip()
+    if canonical:
+        values.append(canonical)
+    groups = tool.get("x_inventory_groups")
+    if isinstance(groups, (list, tuple)):
+        values.extend(str(item).strip() for item in groups if str(item).strip())
+    return tuple(dict.fromkeys(values))
+
+
+def inventory_catalog(tools: Iterable[dict]) -> list[dict]:
+    """Return a tiny inventory index; no schemas are exposed here."""
+    counts: dict[str, int] = {}
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        for inventory in tool_inventories(tool):
+            counts[inventory] = counts.get(inventory, 0) + 1
+    descriptions = {
+        "debug": "logs, telemetry and failure evidence",
+        "code": "source inspection/edit and git",
+        "files": "general files and directories",
+        "vision": "screen/browser observation",
+        "system": "host, process, service and app operations",
+        "research": "web/docs plus memory recall",
+        "automation": "execution and workflow primitives",
+        "communication": "mail, notifications and publishing",
+        "collaboration": "agents and group orchestration",
+    }
+    return [
+        {"name": name, "count": counts[name], "description": descriptions.get(name, "specialized tool inventory")}
+        for name in sorted(counts)
+    ]
+
+
 def search_toolbox(tools: Iterable[dict], query: str, *, active_names: Iterable[str] = (), limit: int = 8) -> list[dict]:
     """Search the host-side catalogue without exposing every schema to the model."""
     terms = {term for term in re.findall(r"[a-z0-9_.-]+", (query or "").lower()) if len(term) > 1}
@@ -175,12 +220,20 @@ def search_toolbox(tools: Iterable[dict], query: str, *, active_names: Iterable[
         if not name or name in active: continue
         desc = str(tool.get("description") or "")
         caps = tool_capabilities(tool)
-        haystack = " ".join((name, desc, *caps)).lower()
+        inventories = tool_inventories(tool)
+        hint = str(tool.get("x_usage_hint") or "")
+        haystack = " ".join((name, desc, hint, *caps, *inventories)).lower()
         score = sum(3 if term in name.lower() else 1 for term in terms if term in haystack)
         if score:
             ranked.append((-score, name, tool))
     ranked.sort(key=lambda row: (row[0], row[1]))
-    return [{"name": row[1], "description": str(row[2].get("description") or ""), "capabilities": list(tool_capabilities(row[2]))} for row in ranked[:max(1, min(12, int(limit)))] ]
+    return [{
+        "name": row[1],
+        "description": str(row[2].get("description") or ""),
+        "hint": str(row[2].get("x_usage_hint") or ""),
+        "capabilities": list(tool_capabilities(row[2])),
+        "inventories": list(tool_inventories(row[2])),
+    } for row in ranked[:max(1, min(12, int(limit)))] ]
 
 
 def expansion_tools(tools: Iterable[dict], requested: Iterable[str], *, active_names: Iterable[str], slots: int) -> list[dict]:
@@ -193,7 +246,8 @@ def expansion_tools(tools: Iterable[dict], requested: Iterable[str], *, active_n
         name = str(tool.get("name") or "")
         if not name or name in active: continue
         caps = set(tool_capabilities(tool))
-        if name in requested_set or caps.intersection(requested_set):
+        inventories = set(tool_inventories(tool))
+        if name in requested_set or caps.intersection(requested_set) or inventories.intersection(requested_set):
             result.append(tool)
             if len(result) >= max(0, slots): break
     return result

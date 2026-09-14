@@ -1283,14 +1283,26 @@ _planning_approval._aicoder_policy_denial_is_error = False
 
 def _workspace_has_meaningful_project_files(root: str | Path) -> bool:
     base = Path(root)
-    ignored = {".git", ".aicoder-team", ".venv", "node_modules", "__pycache__"}
+    ignored_dirs = {".git", ".aicoder-team", ".venv", "node_modules", "__pycache__"}
+    # Repository metadata and top-level prose do not constitute an implementation.
+    # Treating README-only/bootstrap repositories as implemented forces expensive
+    # multi-provider research before there is any code to inspect.
+    bootstrap_names = {
+        "readme", "readme.md", "readme.rst", "readme.txt",
+        "license", "license.md", "license.txt", "copying",
+        "changelog", "changelog.md", "code_of_conduct.md",
+        ".gitignore", ".gitattributes", ".editorconfig",
+    }
     try:
         for path in base.rglob("*"):
             rel = path.relative_to(base)
-            if any(part in ignored for part in rel.parts):
+            if any(part in ignored_dirs for part in rel.parts):
                 continue
-            if path.is_file() or path.is_symlink():
-                return True
+            if not (path.is_file() or path.is_symlink()):
+                continue
+            if len(rel.parts) == 1 and rel.name.lower() in bootstrap_names:
+                continue
+            return True
         return False
     except OSError:
         # If inspection fails, do not assume greenfield; fall back to model research.
@@ -3273,13 +3285,37 @@ def _blind_merge_prompt(task: str, code_plan: str, evidence: list[dict[str, Any]
     )
 
 
-@contextmanager
-def _team_run_lock(workspace: str, task: str):
-    """Best-effort lock preventing duplicate runs of the same normalized task/workspace pair."""
+def team_run_lock_path(workspace: str, task: str) -> Path:
+    """Canonical lock path for a normalized task/workspace pair."""
     normalized_task = " ".join(str(task or "").split()).strip().lower()
     identity = str(Path(workspace).expanduser().resolve(strict=False)) + "\n" + normalized_task
     key = hashlib.sha256(identity.encode("utf-8", errors="replace")).hexdigest()[:20]
-    path = Path("/tmp") / f"aicoder-team-{key}.lock"
+    return Path("/tmp") / f"aicoder-team-{key}.lock"
+
+
+def team_run_locked(workspace: str, task: str) -> bool:
+    """Probe the canonical team lock without stealing or persisting it."""
+    path = team_run_lock_path(workspace, task)
+    handle = path.open("a+", encoding="utf-8")
+    try:
+        try:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (ImportError, BlockingIOError, OSError):
+            return True
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except (ImportError, OSError):
+            pass
+        return False
+    finally:
+        handle.close()
+
+
+@contextmanager
+def _team_run_lock(workspace: str, task: str):
+    """Best-effort lock preventing duplicate runs of the same normalized task/workspace pair."""
+    path = team_run_lock_path(workspace, task)
     handle = path.open("a+", encoding="utf-8")
     locked = False
     try:
