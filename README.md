@@ -3,7 +3,7 @@
 [![CI](https://github.com/derleiti/ai-coder/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/derleiti/ai-coder/actions/workflows/ci.yml)
 [![Security](https://github.com/derleiti/ai-coder/actions/workflows/security.yml/badge.svg?branch=master)](https://github.com/derleiti/ai-coder/actions/workflows/security.yml)
 
-**Current release: 1.2.8** · AILinux coding/DevOps agent for TriForce and the Loom capability fabric.
+**Current release: 1.2.9** · AILinux coding/DevOps agent for TriForce and the Loom capability fabric.
 
 AICoder is the worker-facing client in the AILinux family. It combines a terminal/REPL and PyQt6 desktop UI with a guarded tool loop, local workspace execution, remote MCP capabilities, provider/account integrations, recovery backups, and resumable agent runtime state.
 

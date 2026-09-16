@@ -1,3 +1,9 @@
+## v1.2.9 (2026-09-16)
+
+- Align Claude account authentication with the official CLI and keep reauthentication reachable after revoked OAuth sessions.
+- Harden provider account login-state detection and surface real authentication failures instead of stale signed-in state.
+- Add native cross-platform package CI and keep transient workspace-backup artifacts out of source control.
+
 ## v1.2.8 (2026-09-14)
 
 - Consolidate task-oriented MCP tool discovery with canonical `aihelper_*` capability names and compatibility aliases.
