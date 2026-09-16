@@ -606,9 +606,11 @@ class ClaudeAccountStatusTests(unittest.TestCase):
             "provider": "claude", "linked": True, "installed": True,
             "authenticated": True, "detail": "Verbunden · claude.ai",
         }
+        logout = MagicMock(returncode=0)
         with patch("aicoder.account_providers.ensure_provider_client", return_value="/home/test/.local/bin/claude"), \
-             patch("aicoder.account_providers._claude_status", side_effect=[logged_out, logged_out, logged_in]), \
+             patch("aicoder.account_providers._claude_status", side_effect=[logged_out, logged_in]), \
              patch("aicoder.account_providers._launch_terminal", return_value=None) as terminal, \
+             patch("aicoder.account_providers.subprocess.run", return_value=logout) as run, \
              patch("aicoder.account_providers.time.sleep"), \
              patch("aicoder.account_providers.set_provider_linked") as linked:
             result = connect_account("claude")
@@ -619,9 +621,11 @@ class ClaudeAccountStatusTests(unittest.TestCase):
         self.assertFalse(kwargs["wait"])
         self.assertNotIn("ANTHROPIC_API_KEY", kwargs["env"])
         self.assertNotIn("ANTHROPIC_AUTH_TOKEN", kwargs["env"])
+        self.assertEqual(run.call_args.args[0], ["/home/test/.local/bin/claude", "auth", "logout"])
         self.assertTrue(result["authenticated"])
         self.assertTrue(result["started"])
-        linked.assert_called_once_with("claude", True)
+        self.assertEqual(linked.call_args_list[0].args, ("claude", False))
+        self.assertEqual(linked.call_args_list[-1].args, ("claude", True))
 
     def test_authenticated_claude_exposes_latest_alias_models(self):
         with patch("aicoder.account_providers.account_status", return_value={

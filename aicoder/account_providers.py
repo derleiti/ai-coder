@@ -1112,15 +1112,15 @@ def _launch_terminal(command: list[str], *, title: str, wait: bool = False, time
 
     candidates: list[list[str]] = []
     if shutil.which("konsole"):
-        candidates.append(["konsole", "--new-tab", "-p", f"tabtitle={title}", "-e", "bash", "-lc", script])
+        candidates.append(["konsole", "--new-tab", "-p", f"tabtitle={title}", "-e", "bash", "-c", script])
     if shutil.which("gnome-terminal"):
-        candidates.append(["gnome-terminal", "--title", title, "--", "bash", "-lc", script])
+        candidates.append(["gnome-terminal", "--title", title, "--", "bash", "-c", script])
     if shutil.which("xfce4-terminal"):
-        candidates.append(["xfce4-terminal", "--title", title, "-e", f"bash -lc {shlex.quote(script)}"])
+        candidates.append(["xfce4-terminal", "--title", title, "-e", f"bash -c {shlex.quote(script)}"])
     if shutil.which("x-terminal-emulator"):
-        candidates.append(["x-terminal-emulator", "-T", title, "-e", "bash", "-lc", script])
+        candidates.append(["x-terminal-emulator", "-T", title, "-e", "bash", "-c", script])
     if shutil.which("xterm"):
-        candidates.append(["xterm", "-T", title, "-e", "bash", "-lc", script])
+        candidates.append(["xterm", "-T", title, "-e", "bash", "-c", script])
 
     launched = False
     for argv in candidates:
@@ -1324,15 +1324,23 @@ def _connect_account_once(provider: str, *, open_browser: bool = True) -> dict[s
             set_provider_linked(spec.id, True)
             return {"provider": spec.id, "started": True, "authenticated": True, "account": account}
     if spec.id == "claude":
-        existing = _claude_status()
-        if existing.get("authenticated"):
-            set_provider_linked(spec.id, True)
-            return {"provider": spec.id, "started": False, "authenticated": True, "account": existing}
+        # An explicit Connect action is also the recovery path for a locally
+        # present but server-revoked/expired OAuth session. `claude auth status`
+        # reports local sign-in state and does not prove the access token is still
+        # accepted by Anthropic. Reset the provider-owned session first so the
+        # polling below cannot immediately succeed on stale credentials.
+        try:
+            subprocess.run(
+                [executable, "auth", "logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=15, env=_claude_account_env(),
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        set_provider_linked(spec.id, False)
 
-        # Claude Code may hand browser OAuth off and let `claude auth login`
-        # return before the browser callback has updated the local account.
-        # Keep the terminal shell open and treat the documented auth-status JSON
-        # as the authoritative completion signal instead of terminal exit.
+        # Current Claude Code documentation uses plain `claude auth login` for
+        # subscription sign-in. Keep the terminal open for browser/code fallback
+        # and poll the official status command until the new login is persisted.
         _launch_terminal(
             [executable, "auth", "login"],
             title="AICoder · Claude Login",
