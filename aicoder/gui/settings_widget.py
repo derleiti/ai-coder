@@ -813,7 +813,12 @@ class SettingsWidget(QWidget):
             label.setStyleSheet(f"color: {color}; font-size: 11px;")
             connect_btn, disconnect_btn = self._account_buttons.get(provider, (None, None))
             if connect_btn is not None:
-                connect_btn.setEnabled(not bool(row.get("authenticated") is True))
+                # Keep Claude reauthentication reachable even when the CLI's local
+                # auth status says logged in: server-side token revocation is only
+                # discovered on use. Other providers retain the existing behavior.
+                authenticated = bool(row.get("authenticated") is True)
+                connect_btn.setEnabled(provider == "claude" or not authenticated)
+                connect_btn.setText("Neu verbinden" if provider == "claude" and authenticated else "Verbinden")
             if disconnect_btn is not None:
                 disconnect_btn.setEnabled(linked)
 
