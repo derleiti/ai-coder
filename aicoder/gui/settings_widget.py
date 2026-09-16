@@ -813,11 +813,13 @@ class SettingsWidget(QWidget):
             label.setStyleSheet(f"color: {color}; font-size: 11px;")
             connect_btn, disconnect_btn = self._account_buttons.get(provider, (None, None))
             if connect_btn is not None:
-                # Keep Claude reauthentication reachable even when the CLI's local
-                # auth status says logged in: server-side token revocation is only
-                # discovered on use. Other providers retain the existing behavior.
+                # Provider authentication and AICoder linkage are separate states.
+                # A provider CLI may still have local credentials after an AICoder
+                # unlink, and Claude can report local login even after server-side
+                # OAuth revocation. Keep Connect available whenever AICoder is not
+                # linked; Claude also keeps an explicit reauthentication path.
                 authenticated = bool(row.get("authenticated") is True)
-                connect_btn.setEnabled(provider == "claude" or not authenticated)
+                connect_btn.setEnabled(provider == "claude" or not linked)
                 connect_btn.setText("Neu verbinden" if provider == "claude" and authenticated else "Verbinden")
             if disconnect_btn is not None:
                 disconnect_btn.setEnabled(linked)

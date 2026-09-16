@@ -25,6 +25,7 @@ from aicoder.account_providers import (
     is_account_model,
     parse_account_model,
     connect_account,
+    disconnect_account,
     ensure_provider_client,
     _external_cli_env,
     _claude_account_env,
@@ -281,7 +282,7 @@ class ProviderTransportTests(unittest.TestCase):
     @patch("aicoder.account_providers.shutil.which", return_value="/usr/bin/claude")
     def test_claude_runs_as_tool_free_provider_process(self, _which):
         transport = ClaudeAccountTransport(timeout=30)
-        with patch("aicoder.account_providers._claude_status", return_value={"authenticated": True, "detail": "Verbunden"}), \
+        with patch("aicoder.account_providers._claude_status", return_value={"linked": True, "authenticated": True, "detail": "Verbunden"}), \
              patch.object(transport, "_run", return_value=("OK\n", "")) as run:
             result = transport.chat(
                 model="account:claude/sonnet",
@@ -305,7 +306,7 @@ class ProviderTransportTests(unittest.TestCase):
     def test_claude_filters_known_cli_tool_capability_diagnostic(self, _which):
         transport = ClaudeAccountTransport(timeout=30)
         noisy = "OK\nClient.listTools() called but server does not advertise tools capability - returning empty list\n"
-        with patch("aicoder.account_providers._claude_status", return_value={"authenticated": True, "detail": "Verbunden"}), \
+        with patch("aicoder.account_providers._claude_status", return_value={"linked": True, "authenticated": True, "detail": "Verbunden"}), \
              patch.object(transport, "_run", return_value=(noisy, "")):
             result = transport.chat(model="account:claude/sonnet", message="hello")
         self.assertEqual(result["response"], "OK")
@@ -315,6 +316,7 @@ class ProviderTransportTests(unittest.TestCase):
         transport = MistralAccountTransport(timeout=30)
         help_result = MagicMock(stdout="usage: vibe --model MODEL\n")
         with patch("aicoder.account_providers.subprocess.run", return_value=help_result), \
+             patch("aicoder.account_providers.linked_provider_ids", return_value=["mistral"]), \
              patch("aicoder.account_providers._mistral_authenticated", return_value=True), \
              patch.object(transport, "_run", return_value=("OK\n", "")) as run:
             result = transport.chat(model="account:mistral/mistral-medium-latest", message="hello")
@@ -331,7 +333,9 @@ class ProviderTransportTests(unittest.TestCase):
     def test_mistral_fast_fails_when_login_is_required(self):
         transport = MistralAccountTransport(timeout=60)
         with patch("aicoder.account_providers._which_executable", return_value="/home/test/.local/bin/vibe"), \
+             patch("aicoder.account_providers.linked_provider_ids", return_value=["mistral"]), \
              patch("aicoder.account_providers._mistral_authenticated", return_value=False), \
+             patch("aicoder.account_providers.set_provider_linked"), \
              patch.object(transport, "_run") as run:
             with self.assertRaisesRegex(ClientError, "^Mistral Vibe login required$"):
                 transport.chat(model="account:mistral/mistral-large-latest", message="hello")
@@ -340,17 +344,20 @@ class ProviderTransportTests(unittest.TestCase):
     @patch("aicoder.account_providers._which", return_value="/home/test/.local/bin/vibe")
     def test_mistral_status_distinguishes_linked_from_authenticated(self, _which):
         with patch("aicoder.account_providers.linked_provider_ids", return_value={"mistral"}), \
-             patch("aicoder.account_providers._mistral_authenticated", return_value=False):
+             patch("aicoder.account_providers._mistral_authenticated", return_value=False), \
+             patch("aicoder.account_providers.set_provider_linked") as set_linked:
             status = account_status("mistral")
         self.assertTrue(status["installed"])
-        self.assertTrue(status["linked"])
+        self.assertFalse(status["linked"])
         self.assertFalse(status["authenticated"])
         self.assertEqual(status["detail"], "Mistral Vibe login required")
+        set_linked.assert_called_once_with("mistral", False)
 
     @patch("aicoder.account_providers.shutil.which", return_value="/home/test/.local/bin/agy")
     def test_antigravity_runs_headless_plan_sandbox_with_selected_model(self, _which):
         transport = GeminiAccountTransport(timeout=30)
-        with patch("aicoder.account_providers._antigravity_authenticated", return_value=True), \
+        with patch("aicoder.account_providers.linked_provider_ids", return_value=["gemini"]), \
+             patch("aicoder.account_providers._antigravity_authenticated", return_value=True), \
              patch.object(transport, "_run", return_value=(json.dumps({"response": "OK"}), "")) as run:
             result = transport.chat(model="account:gemini/gemini-3.8-flash-high", message="hello")
         argv = run.call_args.args[0]
@@ -369,6 +376,7 @@ class ProviderTransportTests(unittest.TestCase):
         transport = GeminiAccountTransport(timeout=30)
         payload = json.dumps({"status": "ERROR", "response": "", "error": "The stream was interrupted."})
         with patch("aicoder.account_providers._which_executable", return_value="/usr/bin/agy"), \
+             patch("aicoder.account_providers.linked_provider_ids", return_value=["gemini"]), \
              patch("aicoder.account_providers._antigravity_authenticated", return_value=True), \
              patch.object(transport, "_run", return_value=(payload, "")):
             with self.assertRaisesRegex(ClientError, "Google Antigravity request failed: The stream was interrupted"):
@@ -377,7 +385,9 @@ class ProviderTransportTests(unittest.TestCase):
     def test_antigravity_fast_fails_when_login_is_required(self):
         transport = GeminiAccountTransport(timeout=60)
         with patch("aicoder.account_providers._which_executable", return_value="/home/test/.local/bin/agy"), \
+             patch("aicoder.account_providers.linked_provider_ids", return_value=["gemini"]), \
              patch("aicoder.account_providers._antigravity_authenticated", return_value=False), \
+             patch("aicoder.account_providers.set_provider_linked"), \
              patch.object(transport, "_run") as run:
             with self.assertRaisesRegex(ClientError, "^Antigravity login required$"):
                 transport.chat(model="account:gemini/gemini-3.8-flash-high", message="hello")
@@ -405,6 +415,7 @@ class ProviderTransportTests(unittest.TestCase):
     def test_grok_runs_headless_plan_without_tools(self):
         transport = GrokAccountTransport(timeout=30)
         with patch("aicoder.account_providers._which_executable", return_value="/usr/bin/grok"), \
+             patch("aicoder.account_providers.linked_provider_ids", return_value=["grok"]), \
              patch("aicoder.account_providers._grok_authenticated", return_value=True), \
              patch.object(transport, "_run", return_value=("OK\n", "")) as run:
             result = transport.chat(model="account:grok/grok-4.6", message="hello")
@@ -421,7 +432,9 @@ class ProviderTransportTests(unittest.TestCase):
     def test_grok_fast_fails_when_login_required(self):
         transport = GrokAccountTransport(timeout=30)
         with patch("aicoder.account_providers._which_executable", return_value="/usr/bin/grok"), \
+             patch("aicoder.account_providers.linked_provider_ids", return_value=["grok"]), \
              patch("aicoder.account_providers._grok_authenticated", return_value=False), \
+             patch("aicoder.account_providers.set_provider_linked"), \
              patch.object(transport, "_run") as run:
             with self.assertRaisesRegex(ClientError, "^Grok login required$"):
                 transport.chat(model="account:grok/grok-4.6", message="hello")
@@ -472,7 +485,8 @@ class ChatGPTTransportTests(unittest.TestCase):
             {"method": "item/completed", "params": {"item": {"type": "agentMessage", "text": "OK"}}},
             {"method": "turn/completed", "params": {"turn": {"status": "completed"}}},
         ]
-        with patch("aicoder.account_providers.CodexAppServer", return_value=server):
+        with patch("aicoder.account_providers.linked_provider_ids", return_value=["chatgpt"]), \
+             patch("aicoder.account_providers.CodexAppServer", return_value=server):
             result = ChatGPTAccountTransport(timeout=30).chat(
                 model="account:chatgpt/gpt-test", message="hello", request_id="r1"
             )
@@ -506,7 +520,8 @@ class ChatGPTTransportTests(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             cache = Path(tmp) / "chatgpt-quota.json"
-            with patch("aicoder.account_providers.CodexAppServer", return_value=server), \
+            with patch("aicoder.account_providers.linked_provider_ids", return_value=["chatgpt"]), \
+                 patch("aicoder.account_providers.CodexAppServer", return_value=server), \
                  patch("aicoder.account_providers._CHATGPT_QUOTA_CACHE_FILE", cache):
                 with self.assertRaisesRegex(ClientError, "quota exhausted.*usageLimitExceeded") as raised:
                     ChatGPTAccountTransport(timeout=30).chat(model="account:chatgpt/gpt-test", message="hello")
@@ -520,7 +535,8 @@ class ChatGPTTransportTests(unittest.TestCase):
         server._receive.return_value = {
             "method": "item/started", "params": {"item": {"type": "commandExecution", "id": "x"}}
         }
-        with patch("aicoder.account_providers.CodexAppServer", return_value=server):
+        with patch("aicoder.account_providers.linked_provider_ids", return_value=["chatgpt"]), \
+             patch("aicoder.account_providers.CodexAppServer", return_value=server):
             with self.assertRaisesRegex(ClientError, "provider-side item"):
                 ChatGPTAccountTransport(timeout=30).chat(model="account:chatgpt/gpt-test", message="hello")
 
@@ -528,7 +544,7 @@ class ChatGPTTransportTests(unittest.TestCase):
         transport = ClaudeAccountTransport(timeout=30)
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY":"secret", "ANTHROPIC_AUTH_TOKEN":"gateway", "ANTHROPIC_BASE_URL":"https://example.invalid"}, clear=False), \
              patch("aicoder.account_providers._which_executable", return_value="/usr/bin/claude"), \
-             patch("aicoder.account_providers._claude_status", return_value={"authenticated": True, "detail": "Verbunden"}), \
+             patch("aicoder.account_providers._claude_status", return_value={"linked": True, "authenticated": True, "detail": "Verbunden"}), \
              patch.object(transport, "_run", return_value=("OK\n", "")) as run:
             result = transport.chat(model="account:claude/claude-opus-5", message="hello")
         env = run.call_args.kwargs["env"]
@@ -556,8 +572,8 @@ class ClaudeAccountStatusTests(unittest.TestCase):
             from aicoder.account_providers import account_status
             status = account_status("claude")
         self.assertTrue(status["authenticated"])
-        self.assertTrue(status["linked"])
-        self.assertIn("claude.ai", status["detail"])
+        self.assertFalse(status["linked"])
+        self.assertIn("Mit AICoder neu verbinden", status["detail"])
         self.assertEqual(status["subscription"], "max")
 
     def test_claude_status_trusts_official_logged_in_even_if_access_token_timestamp_is_stale(self):
@@ -577,8 +593,8 @@ class ClaudeAccountStatusTests(unittest.TestCase):
             from aicoder.account_providers import account_status
             status = account_status("claude")
         self.assertTrue(status["authenticated"])
-        self.assertTrue(status["linked"])
-        self.assertIn("claude.ai", status["detail"])
+        self.assertFalse(status["linked"])
+        self.assertIn("Mit AICoder neu verbinden", status["detail"])
 
     def test_stale_claude_link_is_cleared_when_official_client_is_logged_out(self):
         completed = MagicMock(
@@ -616,7 +632,7 @@ class ClaudeAccountStatusTests(unittest.TestCase):
             result = connect_account("claude")
         terminal.assert_called_once()
         args, kwargs = terminal.call_args
-        self.assertEqual(args[0], ["/home/test/.local/bin/claude", "auth", "login"])
+        self.assertEqual(args[0], ["/home/test/.local/bin/claude", "auth", "login", "--claudeai"])
         self.assertEqual(kwargs["title"], "AICoder · Claude Login")
         self.assertFalse(kwargs["wait"])
         self.assertNotIn("ANTHROPIC_API_KEY", kwargs["env"])
@@ -635,6 +651,81 @@ class ClaudeAccountStatusTests(unittest.TestCase):
         self.assertEqual([m["model"] for m in models], ["sonnet", "opus", "fable", "haiku"])
         self.assertTrue(all(m["id"].startswith("account:claude/") for m in models))
         self.assertTrue(all("latest" in m["display"].lower() for m in models))
+
+
+class ProviderFailureClassificationTests(unittest.TestCase):
+    def test_revoked_claude_oauth_is_classified_without_leaking_diagnostics(self):
+        from aicoder.account_providers import _provider_cli_failure
+        exc = _provider_cli_failure(
+            "claude",
+            "Failed to authenticate. API Error: 401 OAuth access token has been revoked. secret-marker",
+            "",
+        )
+        self.assertEqual(exc.payload["reason"], "auth_invalid")
+        self.assertFalse(exc.retryable)
+        self.assertIn("reconnect", str(exc))
+        self.assertNotIn("secret-marker", str(exc))
+
+    def test_grok_rate_limit_is_retryable_and_not_reported_as_auth_failure(self):
+        from aicoder.account_providers import _provider_cli_failure
+        exc = _provider_cli_failure("grok", "", "429 Too Many Requests: resource has been exhausted")
+        self.assertEqual(exc.payload["reason"], "quota_or_rate_limit")
+        self.assertTrue(exc.retryable)
+        self.assertIn("rate limit", str(exc).lower())
+
+    def test_grok_timeout_after_auth_is_provider_timeout(self):
+        from aicoder.account_providers import _provider_cli_failure
+        exc = _provider_cli_failure("grok", timed_out=True)
+        self.assertEqual(exc.payload["reason"], "provider_timeout")
+        self.assertTrue(exc.retryable)
+        self.assertIn("authentication succeeded", str(exc))
+
+
+class ProviderLogoutTests(unittest.TestCase):
+    def test_claude_logout_uses_official_cli_and_clears_link(self):
+        with patch("aicoder.account_providers._which", return_value="/usr/bin/claude"), \
+             patch("aicoder.account_providers.subprocess.run", return_value=MagicMock(returncode=0)) as run, \
+             patch("aicoder.account_providers.set_provider_linked") as linked:
+            disconnect_account("claude")
+        self.assertEqual(run.call_args.args[0], ["/usr/bin/claude", "auth", "logout"])
+        env = run.call_args.kwargs["env"]
+        self.assertNotIn("ANTHROPIC_API_KEY", env)
+        linked.assert_called_once_with("claude", False)
+
+    def test_grok_logout_uses_official_cli_and_clears_link(self):
+        with patch("aicoder.account_providers._which", return_value="/usr/bin/grok"), \
+             patch("aicoder.account_providers.subprocess.run", return_value=MagicMock(returncode=0)) as run, \
+             patch("aicoder.account_providers.set_provider_linked") as linked:
+            disconnect_account("grok")
+        self.assertEqual(run.call_args.args[0], ["/usr/bin/grok", "logout"])
+        linked.assert_called_once_with("grok", False)
+
+    def test_mistral_disconnect_only_removes_aicoder_link(self):
+        with patch("aicoder.account_providers._which", return_value="/usr/bin/vibe"), \
+             patch("aicoder.account_providers.subprocess.run") as run, \
+             patch("aicoder.account_providers.set_provider_linked") as linked:
+            disconnect_account("mistral")
+        run.assert_not_called()
+        linked.assert_called_once_with("mistral", False)
+
+    def test_antigravity_disconnect_only_removes_aicoder_link(self):
+        with patch("aicoder.account_providers._which", return_value="/usr/bin/agy"), \
+             patch("aicoder.account_providers.subprocess.run") as run, \
+             patch("aicoder.account_providers.set_provider_linked") as linked:
+            disconnect_account("gemini")
+        run.assert_not_called()
+        linked.assert_called_once_with("gemini", False)
+
+    def test_chatgpt_logout_uses_codex_app_server(self):
+        server = MagicMock()
+        server.__enter__.return_value = server
+        server.__exit__.return_value = None
+        with patch("aicoder.account_providers._which", return_value="/usr/bin/codex"), \
+             patch("aicoder.account_providers.CodexAppServer", return_value=server), \
+             patch("aicoder.account_providers.set_provider_linked") as linked:
+            disconnect_account("chatgpt")
+        server.logout.assert_called_once_with()
+        linked.assert_called_once_with("chatgpt", False)
 
 
 class AccountInstallAndLoginTests(unittest.TestCase):
@@ -784,15 +875,16 @@ class AccountInstallAndLoginTests(unittest.TestCase):
         self.assertEqual(models[0]["id"], "account:gemini/gemini-3.8-flash-high")
 
 
-    def test_gemini_authentication_self_heals_persisted_link(self):
+    def test_gemini_provider_login_does_not_silently_link_aicoder(self):
         with patch("aicoder.account_providers._which", return_value="/home/test/.local/bin/agy"), \
              patch("aicoder.account_providers.linked_provider_ids", return_value=[]), \
              patch("aicoder.account_providers._antigravity_authenticated", return_value=True), \
              patch("aicoder.account_providers.set_provider_linked") as set_linked:
             status = account_status("gemini")
-        self.assertTrue(status["linked"])
+        self.assertFalse(status["linked"])
         self.assertTrue(status["authenticated"])
-        set_linked.assert_called_once_with("gemini", True)
+        self.assertIn("Mit AICoder verbinden", status["detail"])
+        set_linked.assert_not_called()
 
     def test_stale_gemini_link_is_cleared_when_antigravity_is_logged_out(self):
         with patch("aicoder.account_providers._which", return_value="/home/test/.local/bin/agy"), \

@@ -634,19 +634,25 @@ def _chatgpt_status() -> dict[str, Any]:
                 "linked": False, "authenticated": False, "detail": f"Codex nicht verbunden: {str(exc)[:100]}"}
     account = result.get("account") if isinstance(result.get("account"), dict) else {}
     authenticated = account.get("type") == "chatgpt"
+    marked = spec.id in linked_provider_ids()
+    linked = bool(authenticated and marked)
     detail = "ChatGPT nicht angemeldet"
     plan = str(account.get("planType") or "").strip()
     email = str(account.get("email") or "").strip()
-    quota = _chatgpt_quota_status() if authenticated else {
+    quota = _chatgpt_quota_status() if linked else {
         "quota_exhausted": False, "quota_retry_after_seconds": 0, "quota_reset_at": "",
     }
-    if authenticated and quota.get("quota_exhausted"):
+    if linked and quota.get("quota_exhausted"):
         retry_s = int(quota.get("quota_retry_after_seconds") or 0)
         detail = "Verbunden · Credits/Quota erschöpft" + (f" · retry in ~{max(1, retry_s // 60)}m" if retry_s else "")
-    elif authenticated:
+    elif linked:
         detail = "Verbunden" + (f" · {plan}" if plan else "") + (f" · {email}" if email else "")
+    elif authenticated:
+        detail = "Codex/ChatGPT angemeldet · Mit AICoder verbinden"
+    elif marked:
+        set_provider_linked(spec.id, False)
     return {"provider": spec.id, "display": spec.display_name, "installed": True,
-            "linked": authenticated, "authenticated": authenticated, "detail": detail, "plan": plan, "email": email,
+            "linked": linked, "authenticated": authenticated, "detail": detail, "plan": plan, "email": email,
             **quota}
 
 
@@ -681,7 +687,8 @@ def _claude_status() -> dict[str, Any]:
     auth_method = str(payload.get("authMethod") or "").strip()
     subscription = str(payload.get("subscriptionType") or "").strip()
     email = str(payload.get("email") or "").strip()
-    if authenticated:
+    linked = bool(authenticated and marked)
+    if linked:
         detail_parts = ["Verbunden"]
         if auth_method:
             detail_parts.append(auth_method)
@@ -690,15 +697,19 @@ def _claude_status() -> dict[str, Any]:
         if email:
             detail_parts.append(email)
         detail = " · ".join(detail_parts)
+    elif authenticated:
+        # `claude auth status` proves only that Claude Code has local account
+        # state. A revoked server-side OAuth token can still report loggedIn=true.
+        # Once AICoder invalidates its link after a real request failure, never
+        # silently re-link that stale provider session.
+        detail = "Claude lokal angemeldet · Mit AICoder neu verbinden"
     else:
         detail = "Nicht angemeldet · Mit Claude verbinden"
         if marked:
-            # Do not preserve a stale AICoder linkage after the official Claude
-            # client explicitly reports loggedIn=false.
             set_provider_linked(spec.id, False)
     return {
         "provider": spec.id, "display": spec.display_name, "installed": True,
-        "linked": authenticated, "authenticated": authenticated, "detail": detail,
+        "linked": linked, "authenticated": authenticated, "detail": detail,
         "auth_method": auth_method, "subscription": subscription, "email": email,
     }
 
@@ -936,29 +947,28 @@ def account_status(provider: str) -> dict[str, Any]:
     marked = spec.id in linked_provider_ids()
     if spec.id == "mistral":
         authenticated = bool(installed and _mistral_authenticated())
+        linked = bool(marked and authenticated)
+        if marked and not authenticated:
+            set_provider_linked(spec.id, False)
         detail = (
-            "Verbunden" if authenticated else
+            "Verbunden" if linked else
+            "Vibe angemeldet · Mit AICoder verbinden" if authenticated else
             "Mistral Vibe login required" if installed and marked else
             f"{spec.display_name}-CLI fehlt" if not installed else
             "Nicht verbunden"
         )
         return {"provider": spec.id, "display": spec.display_name, "installed": installed,
-                "linked": bool(marked or authenticated), "authenticated": authenticated, "detail": detail}
+                "linked": linked, "authenticated": authenticated, "detail": detail}
     if spec.id == "gemini":
         authenticated = False
         if installed:
             executable = _which(spec)
             authenticated = bool(executable and _antigravity_authenticated(executable, timeout=8))
-        if authenticated and not marked:
-            # Provider-owned auth is authoritative in both directions: recover
-            # automatically when the user logged in directly with agy.
-            set_provider_linked(spec.id, True)
-            marked = True
-        elif marked and not authenticated:
-            # Do not keep a stale AICoder linkage after the provider session
-            # disappears outside AICoder.
+        if marked and not authenticated:
+            # Provider logout outside AICoder invalidates the local linkage.
             set_provider_linked(spec.id, False)
             marked = False
+        linked = bool(marked and authenticated)
         quota = antigravity_quota_status() if authenticated else {
             "quota_exhausted": False, "quota_retry_after_seconds": 0, "quota_reset_at": "",
         }
@@ -967,13 +977,14 @@ def account_status(provider: str) -> dict[str, Any]:
             detail = f"Verbunden · Quota erschöpft · Reset in ~{retry_h}h"
         else:
             detail = (
-                "Verbunden" if authenticated else
+                "Verbunden" if linked else
+                "Antigravity angemeldet · Mit AICoder verbinden" if authenticated else
                 f"{spec.display_name}-CLI fehlt" if not installed else
                 "Nicht verbunden · Mit Antigravity verbinden"
             )
         return {
             "provider": spec.id, "display": spec.display_name, "installed": installed,
-            "linked": bool(authenticated), "authenticated": authenticated, "detail": detail,
+            "linked": linked, "authenticated": authenticated, "detail": detail,
             **quota,
         }
     if spec.id == "grok":
@@ -981,17 +992,16 @@ def account_status(provider: str) -> dict[str, Any]:
         executable = _which(spec) if installed else ""
         if executable:
             authenticated = _grok_authenticated(executable, timeout=8)
-        if authenticated and not marked:
-            set_provider_linked(spec.id, True)
-            marked = True
-        elif marked and not authenticated:
+        if marked and not authenticated:
             set_provider_linked(spec.id, False)
             marked = False
-        detail = "Verbunden" if authenticated else (
+        linked = bool(marked and authenticated)
+        detail = "Verbunden" if linked else (
+            "Grok angemeldet · Mit AICoder verbinden" if authenticated else
             f"{spec.display_name}-CLI fehlt" if not installed else "Nicht verbunden · Mit Grok verbinden"
         )
         return {"provider": spec.id, "display": spec.display_name, "installed": installed,
-                "linked": authenticated, "authenticated": authenticated, "detail": detail}
+                "linked": linked, "authenticated": authenticated, "detail": detail}
     authenticated: bool | None = None
     detail = "Verknüpft · Login vom offiziellen Client verwaltet" if marked and installed else (
         f"{spec.display_name}-CLI fehlt" if not installed else "Nicht verbunden"
@@ -1213,11 +1223,12 @@ def _clean_account_response_text(provider: str, text: str) -> str:
 
 
 def _mistral_authenticated() -> bool:
-    """Check whether Mistral Vibe can resolve its provider credential.
+    """Check whether the official Mistral Vibe runtime can resolve credentials.
 
-    Vibe 2.x resolves MISTRAL_API_KEY from the process environment, its
-    $VIBE_HOME/.env file, or the provider-owned OS keyring.  Only presence is
-    checked here; secret values never leave their storage backend.
+    Vibe owns its credential resolution and may use an OS-keyring backend that
+    is not importable from AICoder's Python environment. Prefer cheap local
+    checks, then ask Vibe's own Python runtime for a boolean result. The secret
+    itself is never printed, copied, or persisted by AICoder.
     """
     env_key = "MISTRAL_API_KEY"
     if str(os.environ.get(env_key) or "").strip():
@@ -1248,6 +1259,30 @@ def _mistral_authenticated() -> bool:
                 break
     except Exception:
         pass
+
+    # `uv tool install mistral-vibe` gives Vibe its own Python environment.
+    # Query that runtime instead of guessing its keyring implementation. stdout
+    # and stderr are discarded so credential material can never cross the
+    # provider/AICoder boundary.
+    executable = _which_executable("vibe")
+    if executable:
+        resolved = Path(executable).resolve()
+        candidates = (resolved.parent / "python3", resolved.parent / "python")
+        probe = (
+            "from vibe.utils.api_keys import resolve_api_key; "
+            "raise SystemExit(0 if resolve_api_key('MISTRAL_API_KEY') else 1)"
+        )
+        for python in candidates:
+            if not python.is_file():
+                continue
+            try:
+                proc = subprocess.run(
+                    [str(python), "-c", probe], stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, timeout=5, env=_external_cli_env(),
+                )
+                return proc.returncode == 0
+            except (OSError, subprocess.TimeoutExpired):
+                continue
     return False
 
 
@@ -1338,11 +1373,12 @@ def _connect_account_once(provider: str, *, open_browser: bool = True) -> dict[s
             pass
         set_provider_linked(spec.id, False)
 
-        # Current Claude Code documentation uses plain `claude auth login` for
-        # subscription sign-in. Keep the terminal open for browser/code fallback
-        # and poll the official status command until the new login is persisted.
+        # This integration is explicitly the Claude subscription account path,
+        # not Anthropic Console/API billing. Current Claude Code exposes
+        # `--claudeai`; select it explicitly instead of relying on a default that
+        # could change between CLI releases.
         _launch_terminal(
-            [executable, "auth", "login"],
+            [executable, "auth", "login", "--claudeai"],
             title="AICoder · Claude Login",
             wait=False,
             env=_claude_account_env(),
@@ -1360,11 +1396,15 @@ def _connect_account_once(provider: str, *, open_browser: bool = True) -> dict[s
             "Claude login timed out after 5 minutes. Finish the browser login and press Connect again."
         )
     if spec.id == "mistral":
+        if _mistral_authenticated():
+            set_provider_linked(spec.id, True)
+            return {"provider": spec.id, "started": False, "authenticated": True}
         exit_code = _launch_terminal([executable, "--setup"], title="AICoder · Mistral Login", wait=True)
-        if exit_code not in (0, None):
-            raise ClientError("Mistral Vibe setup did not complete successfully")
+        if exit_code not in (0, None) or not _mistral_authenticated():
+            set_provider_linked(spec.id, False)
+            raise ClientError("Mistral Vibe setup finished without a usable provider credential")
         set_provider_linked(spec.id, True)
-        return {"provider": spec.id, "started": True, "authenticated": None}
+        return {"provider": spec.id, "started": True, "authenticated": True}
     if spec.id == "gemini":
         # Antigravity is a long-lived interactive TUI: successful OAuth does not
         # necessarily make the `agy` process exit. Waiting for the terminal
@@ -1462,6 +1502,53 @@ def _conversation_text(*, message: str = "", messages: list | None = None, syste
     return "\n".join(parts)
 
 
+def _provider_cli_failure(provider: str, stdout: str = "", stderr: str = "", *, timed_out: bool = False) -> ClientError:
+    """Classify provider CLI failures without exposing provider diagnostics.
+
+    Official clients sometimes print OAuth URLs, account identifiers, or other
+    sensitive material next to the useful error. We inspect the text locally but
+    return only AICoder-owned, secret-free messages.
+    """
+    text = f"{stdout or ''}\n{stderr or ''}".lower()
+    auth_markers = (
+        "failed to authenticate", "oauth access token has been revoked",
+        "oauth token has been revoked", "not authenticated", "not logged in",
+        "please sign in", "login required", "unauthorized", "status 401", " 401 ",
+    )
+    quota_markers = (
+        "too many requests", "rate limit", "rate-limit", "quota", "usage limit",
+        "resource has been exhausted", "resource_exhausted", "status 429", " 429 ",
+        "payment required", "status 402", " 402 ",
+    )
+    if any(marker in text for marker in auth_markers):
+        label = {
+            "claude": "Claude OAuth session is expired or revoked; reconnect the Claude account",
+            "mistral": "Mistral Vibe authentication is no longer valid; reconnect the Mistral account",
+            "gemini": "Google Antigravity authentication is no longer valid; reconnect the Google account",
+            "grok": "Grok authentication is no longer valid; reconnect the Grok account",
+        }.get(provider, f"{provider} account authentication is no longer valid")
+        return ClientError(label, retryable=False, payload={"provider": provider, "reason": "auth_invalid"})
+    if any(marker in text for marker in quota_markers):
+        label = {
+            "claude": "Claude account usage/rate limit reached; retry after the provider limit resets",
+            "mistral": "Mistral account usage/rate limit reached; retry after the provider limit resets",
+            "gemini": "Google Antigravity usage/rate limit reached; retry after the provider limit resets",
+            "grok": "Grok account usage/rate limit reached; retry after the provider limit resets",
+        }.get(provider, f"{provider} account usage/rate limit reached")
+        return ClientError(label, retryable=True, payload={"provider": provider, "reason": "quota_or_rate_limit"})
+    if timed_out and provider == "grok":
+        # Grok Build may keep retrying a throttled headless request instead of
+        # exiting. Authentication was already verified with `grok models` before
+        # the transport starts, so do not misreport this as a login failure.
+        return ClientError(
+            "Grok account request timed out after authentication succeeded; the provider may be throttling or busy",
+            retryable=True, payload={"provider": provider, "reason": "provider_timeout"},
+        )
+    if timed_out:
+        return ClientError(f"{provider} account request timed out", retryable=True)
+    return ClientError(f"{provider} account client failed; verify the linked account", retryable=False)
+
+
 class _SubprocessAccountTransport:
     provider = ""
 
@@ -1488,16 +1575,18 @@ class _SubprocessAccountTransport:
                 stdout, stderr = proc.communicate(input=stdin, timeout=self.timeout)
             except subprocess.TimeoutExpired as exc:
                 proc.kill()
-                proc.communicate()
-                raise ClientError(f"{self.provider} account request timed out", retryable=True) from exc
+                stdout, stderr = proc.communicate()
+                raise _provider_cli_failure(
+                    self.provider, stdout, stderr, timed_out=True
+                ) from exc
         finally:
             with self._active_lock:
                 if self._active.get(key) is proc:
                     self._active.pop(key, None)
         if proc.returncode != 0:
-            # Do not copy provider stderr into AICoder errors: login diagnostics
-            # can contain authorization URLs or other authentication material.
-            raise ClientError(f"{self.provider} account client failed (exit {proc.returncode}); verify the linked account")
+            # Classify locally, but never copy provider stdout/stderr into the
+            # AICoder error because diagnostics can contain auth material.
+            raise _provider_cli_failure(self.provider, stdout, stderr)
         return stdout, stderr
 
     def cancel_current_request(self, request_id: str | None = None) -> bool:
@@ -1532,9 +1621,9 @@ class ClaudeAccountTransport(_SubprocessAccountTransport):
         if not executable:
             raise ClientError("Claude Code CLI is not installed")
         status = _claude_status()
+        if not status.get("linked"):
+            raise ClientError("Claude account is not linked; reconnect the Claude account")
         if not status.get("authenticated"):
-            if "abgelaufen" in str(status.get("detail") or "").lower():
-                raise ClientError("Claude OAuth login expired; reconnect the Claude account")
             raise ClientError("Claude account login required")
         transcript = _conversation_text(message=message, messages=messages, system_prompt=system_prompt)
         args = [
@@ -1544,7 +1633,12 @@ class ClaudeAccountTransport(_SubprocessAccountTransport):
         ]
         env = _claude_account_env()
         started = time.monotonic()
-        stdout, _ = self._run(args, request_id=request_id, stdin=transcript, env=env)
+        try:
+            stdout, _ = self._run(args, request_id=request_id, stdin=transcript, env=env)
+        except ClientError as exc:
+            if isinstance(exc.payload, dict) and exc.payload.get("reason") == "auth_invalid":
+                set_provider_linked(self.provider, False)
+            raise
         text = _clean_account_response_text(self.provider, stdout)
         if not text:
             raise ClientError("Claude account client returned an empty response", retryable=True)
@@ -1567,7 +1661,10 @@ class MistralAccountTransport(_SubprocessAccountTransport):
         executable = _which_executable("vibe")
         if not executable:
             raise ClientError("Mistral Vibe CLI is not installed")
+        if self.provider not in linked_provider_ids():
+            raise ClientError("Mistral account is not linked in AICoder")
         if not _mistral_authenticated():
+            set_provider_linked(self.provider, False)
             raise ClientError("Mistral Vibe login required")
         transcript = _conversation_text(message=message, messages=messages, system_prompt=system_prompt)
         with tempfile.TemporaryDirectory(prefix="aicoder-vibe-") as tmp:
@@ -1610,7 +1707,10 @@ class GeminiAccountTransport(_SubprocessAccountTransport):
         executable = _which_executable("agy")
         if not executable:
             raise ClientError("Google Antigravity CLI is not installed")
+        if self.provider not in linked_provider_ids():
+            raise ClientError("Google Antigravity account is not linked in AICoder")
         if not _antigravity_authenticated(executable, timeout=min(8, self.timeout)):
+            set_provider_linked(self.provider, False)
             raise ClientError("Antigravity login required")
         transcript = _conversation_text(message=message, messages=messages, system_prompt=system_prompt)
         with tempfile.TemporaryDirectory(prefix="aicoder-antigravity-") as tmp:
@@ -1659,7 +1759,10 @@ class GrokAccountTransport(_SubprocessAccountTransport):
         executable = _which_executable("grok")
         if not executable:
             raise ClientError("Grok Build CLI is not installed")
+        if self.provider not in linked_provider_ids():
+            raise ClientError("Grok account is not linked in AICoder")
         if not _grok_authenticated(executable, timeout=min(8, self.timeout)):
+            set_provider_linked(self.provider, False)
             raise ClientError("Grok login required")
         transcript = _conversation_text(message=message, messages=messages, system_prompt=system_prompt)
         with tempfile.TemporaryDirectory(prefix="aicoder-grok-") as tmp:
@@ -1709,6 +1812,8 @@ class ChatGPTAccountTransport:
         provider, provider_model = parse_account_model(model)
         if provider != self.provider:
             raise ClientError("ChatGPT account transport received the wrong provider")
+        if self.provider not in linked_provider_ids():
+            raise ClientError("ChatGPT account is not linked in AICoder")
         transcript = _conversation_text(message=message, messages=messages, system_prompt=system_prompt)
         key = str(request_id or f"thread-{threading.get_ident()}")
         started = time.monotonic()
