@@ -167,7 +167,7 @@ def _which(spec: AccountProviderSpec) -> str:
 
 _INSTALL_RECIPES: dict[str, tuple[str, ...]] = {
     "chatgpt": ("npm", "install", "-g", "@openai/codex@latest"),
-    "claude": ("npm", "install", "-g", "@anthropic-ai/claude-code@latest"),
+    "claude": ("claude-native-installer",),
     "gemini": ("antigravity-installer",),
     "mistral": ("uv", "tool", "install", "--upgrade", "mistral-vibe"),
 }
@@ -177,8 +177,11 @@ def _augmented_path() -> str:
     """Return PATH including common user-local install locations."""
     home = Path.home()
     parts = [
-        str(home / ".npm-global" / "bin"),
+        # Anthropic recommends the native Claude Code installer, which places
+        # the launcher in ~/.local/bin. Prefer native CLIs over legacy npm-global
+        # shadows when both exist.
         str(home / ".local" / "bin"),
+        str(home / ".npm-global" / "bin"),
         str(home / ".cargo" / "bin"),
         os.environ.get("PATH", ""),
     ]
@@ -219,6 +222,28 @@ def _external_cli_env(*, base: dict[str, str] | None = None) -> dict[str, str]:
     return _external_client_env(base=base)
 
 
+_CLAUDE_ACCOUNT_ENV_OVERRIDES = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+)
+
+
+def _claude_account_env(*, base: dict[str, str] | None = None) -> dict[str, str]:
+    """Environment for Claude subscription/account-backed operations.
+
+    Claude Code gives environment-provided API/gateway credentials precedence over
+    the interactive claude.ai subscription session. AICoder supports both modes,
+    but its ``account:claude/*`` transport must never silently fall through to an
+    API key inherited from TriForce or the desktop session.
+    """
+    env = _external_cli_env(base=base)
+    for name in _CLAUDE_ACCOUNT_ENV_OVERRIDES:
+        env.pop(name, None)
+    return env
+
+
 def ensure_provider_client(provider: str) -> str:
     """Install a missing official provider CLI into the user's normal tool path.
 
@@ -232,6 +257,34 @@ def ensure_provider_client(provider: str) -> str:
     recipe = _INSTALL_RECIPES.get(spec.id)
     if not recipe:
         raise ClientError(f"No supported installer is configured for {spec.display_name}")
+    if recipe[0] == "claude-native-installer":
+        curl = _which_executable("curl")
+        bash = _which_executable("bash")
+        if not curl or not bash:
+            raise ClientError("curl and bash are required to install the official Claude Code client")
+        try:
+            download = subprocess.run(
+                [curl, "-fsSL", "https://claude.ai/install.sh"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, env=_external_cli_env(),
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ClientError("Could not download the official Claude Code installer") from exc
+        if download.returncode != 0 or not download.stdout:
+            raise ClientError("Official Claude Code installer download failed")
+        try:
+            proc = subprocess.run(
+                [bash, "-s", "latest"], input=download.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=300, env=_external_cli_env(),
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ClientError("Could not install the official Claude Code client") from exc
+        if proc.returncode != 0:
+            raise ClientError("Official Claude Code native installation failed")
+        installed = _which_executable(spec.executable)
+        if not installed:
+            raise ClientError("Claude Code installed but 'claude' is not on PATH")
+        return installed
+
     if recipe[0] == "antigravity-installer":
         curl = _which_executable("curl")
         bash = _which_executable("bash")
@@ -597,27 +650,6 @@ def _chatgpt_status() -> dict[str, Any]:
             **quota}
 
 
-def _claude_credentials_expired(*, now_ms: int | None = None) -> bool:
-    """Return True when Claude Code's provider-owned OAuth access token is expired.
-
-    Only expiry metadata is inspected; credential/token values remain provider-owned
-    and are never returned, logged, or copied by AICoder. Claude Code 2.x can report
-    ``loggedIn=true`` even after this timestamp has passed, while inference then
-    fails with OAuth 401.
-    """
-    path = Path.home() / ".claude" / ".credentials.json"
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        oauth = payload.get("claudeAiOauth") if isinstance(payload, dict) else None
-        expires_at = int((oauth or {}).get("expiresAt") or 0) if isinstance(oauth, dict) else 0
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        return False
-    if expires_at <= 0:
-        return False
-    current = int(time.time() * 1000) if now_ms is None else int(now_ms)
-    return current >= expires_at
-
-
 def _claude_status() -> dict[str, Any]:
     """Read the official Claude Code auth status JSON.
 
@@ -636,7 +668,7 @@ def _claude_status() -> dict[str, Any]:
         proc = subprocess.run(
             [executable, "auth", "status", "--json"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=8,
-            env=_external_cli_env(),
+            env=_claude_account_env(),
         )
         if proc.stdout.strip():
             parsed = json.loads(proc.stdout)
@@ -644,10 +676,6 @@ def _claude_status() -> dict[str, Any]:
                 payload = parsed
         authenticated = proc.returncode == 0 and payload.get("loggedIn") is True
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
-        authenticated = False
-
-    credentials_expired = authenticated and _claude_credentials_expired()
-    if credentials_expired:
         authenticated = False
 
     auth_method = str(payload.get("authMethod") or "").strip()
@@ -663,10 +691,7 @@ def _claude_status() -> dict[str, Any]:
             detail_parts.append(email)
         detail = " · ".join(detail_parts)
     else:
-        detail = (
-            "Claude OAuth abgelaufen · Neu mit Claude verbinden"
-            if credentials_expired else "Nicht angemeldet · Mit Claude verbinden"
-        )
+        detail = "Nicht angemeldet · Mit Claude verbinden"
         if marked:
             # Do not preserve a stale AICoder linkage after the official Claude
             # client explicitly reports loggedIn=false.
@@ -1060,7 +1085,8 @@ def linked_account_catalog() -> dict[str, Any]:
     return {"providers": providers, "models": models}
 
 
-def _launch_terminal(command: list[str], *, title: str, wait: bool = False, timeout: int = 360) -> int | None:
+def _launch_terminal(command: list[str], *, title: str, wait: bool = False, timeout: int = 360,
+                     env: dict[str, str] | None = None) -> int | None:
     """Launch an official provider's interactive login without handling credentials.
 
     For synchronous login flows a temporary completion sentinel is written by
@@ -1099,7 +1125,7 @@ def _launch_terminal(command: list[str], *, title: str, wait: bool = False, time
     launched = False
     for argv in candidates:
         try:
-            subprocess.Popen(argv, start_new_session=True, env=_external_cli_env())
+            subprocess.Popen(argv, start_new_session=True, env=env or _external_cli_env())
             launched = True
             break
         except OSError:
@@ -1308,9 +1334,10 @@ def _connect_account_once(provider: str, *, open_browser: bool = True) -> dict[s
         # Keep the terminal shell open and treat the documented auth-status JSON
         # as the authoritative completion signal instead of terminal exit.
         _launch_terminal(
-            [executable, "auth", "login", "--claudeai"],
+            [executable, "auth", "login"],
             title="AICoder · Claude Login",
             wait=False,
+            env=_claude_account_env(),
         )
         deadline = time.monotonic() + 300
         status: dict[str, Any] = {}
@@ -1379,7 +1406,7 @@ def disconnect_account(provider: str) -> None:
         try:
             subprocess.run(
                 [executable, "auth", "logout"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                timeout=15, env=_external_cli_env(),
+                timeout=15, env=_claude_account_env(),
             )
         finally:
             set_provider_linked(spec.id, False)
@@ -1507,12 +1534,7 @@ class ClaudeAccountTransport(_SubprocessAccountTransport):
             "--tools", "", "--disallowed-tools", "*", "--disable-slash-commands",
             "--no-chrome", "--no-session-persistence", "--system-prompt", _MODEL_BACKEND_SYSTEM,
         ]
-        env = _external_cli_env()
-        # Account-backed Claude must use the provider-owned claude.ai session.
-        # API/gateway credentials inherited from the TriForce host take precedence
-        # in Claude Code and can silently route the request to a depleted API balance.
-        for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
-            env.pop(name, None)
+        env = _claude_account_env()
         started = time.monotonic()
         stdout, _ = self._run(args, request_id=request_id, stdin=transcript, env=env)
         text = _clean_account_response_text(self.provider, stdout)

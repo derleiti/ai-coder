@@ -27,6 +27,7 @@ from aicoder.account_providers import (
     connect_account,
     ensure_provider_client,
     _external_cli_env,
+    _claude_account_env,
 )
 from aicoder.client import ClientError
 
@@ -50,6 +51,46 @@ class ExternalCliEnvironmentTests(unittest.TestCase):
             env = _external_cli_env(base=base)
         self.assertNotIn("LD_LIBRARY_PATH", env)
         self.assertEqual(env["PYINSTALLER_RESET_ENVIRONMENT"], "1")
+
+    def test_claude_account_env_removes_api_and_gateway_precedence(self):
+        base = {
+            "PATH": "/usr/bin",
+            "ANTHROPIC_API_KEY": "api-secret",
+            "ANTHROPIC_AUTH_TOKEN": "gateway-secret",
+            "ANTHROPIC_BASE_URL": "https://gateway.invalid",
+            "CLAUDE_CODE_OAUTH_TOKEN": "oauth-override",
+            "KEEP_ME": "yes",
+        }
+        env = _claude_account_env(base=base)
+        for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN"):
+            self.assertNotIn(name, env)
+        self.assertEqual(env["KEEP_ME"], "yes")
+
+
+class ClaudeInstallPreferenceTests(unittest.TestCase):
+    def test_augmented_path_prefers_native_local_bin_over_npm_global(self):
+        from aicoder.account_providers import _augmented_path
+        parts = _augmented_path().split(os.pathsep)
+        self.assertLess(parts.index(str(Path.home() / ".local" / "bin")),
+                        parts.index(str(Path.home() / ".npm-global" / "bin")))
+
+    def test_missing_claude_uses_official_native_installer(self):
+        seen = {"claude": 0}
+        def fake_which(name, path=None):
+            if name == "curl": return "/usr/bin/curl"
+            if name == "bash": return "/usr/bin/bash"
+            if name == "claude":
+                seen["claude"] += 1
+                return None if seen["claude"] == 1 else str(Path.home() / ".local/bin/claude")
+            return None
+        download = MagicMock(returncode=0, stdout=b"#!/bin/sh\nexit 0\n", stderr=b"")
+        install = MagicMock(returncode=0, stdout=b"", stderr=b"")
+        with patch("aicoder.account_providers.shutil.which", side_effect=fake_which), \
+             patch("aicoder.account_providers.subprocess.run", side_effect=[download, install]) as run:
+            path = ensure_provider_client("claude")
+        self.assertEqual(run.call_args_list[0].args[0], ["/usr/bin/curl", "-fsSL", "https://claude.ai/install.sh"])
+        self.assertEqual(run.call_args_list[1].args[0], ["/usr/bin/bash", "-s", "latest"])
+        self.assertTrue(path.endswith("/.local/bin/claude"))
 
 
 class AccountProviderIdTests(unittest.TestCase):
@@ -511,7 +552,6 @@ class ClaudeAccountStatusTests(unittest.TestCase):
         )
         with patch("aicoder.account_providers._which", return_value="/home/test/.local/bin/claude"), \
              patch("aicoder.account_providers.linked_provider_ids", return_value=[]), \
-             patch("aicoder.account_providers._claude_credentials_expired", return_value=False), \
              patch("aicoder.account_providers.subprocess.run", return_value=completed):
             from aicoder.account_providers import account_status
             status = account_status("claude")
@@ -519,6 +559,26 @@ class ClaudeAccountStatusTests(unittest.TestCase):
         self.assertTrue(status["linked"])
         self.assertIn("claude.ai", status["detail"])
         self.assertEqual(status["subscription"], "max")
+
+    def test_claude_status_trusts_official_logged_in_even_if_access_token_timestamp_is_stale(self):
+        completed = MagicMock(
+            returncode=0,
+            stdout=json.dumps({
+                "loggedIn": True,
+                "authMethod": "claude.ai",
+                "subscriptionType": "pro",
+                "email": "user@example.com",
+            }),
+            stderr="",
+        )
+        with patch("aicoder.account_providers._which", return_value="/home/test/.local/bin/claude"), \
+             patch("aicoder.account_providers.linked_provider_ids", return_value=[]), \
+             patch("aicoder.account_providers.subprocess.run", return_value=completed):
+            from aicoder.account_providers import account_status
+            status = account_status("claude")
+        self.assertTrue(status["authenticated"])
+        self.assertTrue(status["linked"])
+        self.assertIn("claude.ai", status["detail"])
 
     def test_stale_claude_link_is_cleared_when_official_client_is_logged_out(self):
         completed = MagicMock(
@@ -552,11 +612,13 @@ class ClaudeAccountStatusTests(unittest.TestCase):
              patch("aicoder.account_providers.time.sleep"), \
              patch("aicoder.account_providers.set_provider_linked") as linked:
             result = connect_account("claude")
-        terminal.assert_called_once_with(
-            ["/home/test/.local/bin/claude", "auth", "login", "--claudeai"],
-            title="AICoder · Claude Login",
-            wait=False,
-        )
+        terminal.assert_called_once()
+        args, kwargs = terminal.call_args
+        self.assertEqual(args[0], ["/home/test/.local/bin/claude", "auth", "login"])
+        self.assertEqual(kwargs["title"], "AICoder · Claude Login")
+        self.assertFalse(kwargs["wait"])
+        self.assertNotIn("ANTHROPIC_API_KEY", kwargs["env"])
+        self.assertNotIn("ANTHROPIC_AUTH_TOKEN", kwargs["env"])
         self.assertTrue(result["authenticated"])
         self.assertTrue(result["started"])
         linked.assert_called_once_with("claude", True)
@@ -767,32 +829,3 @@ class AccountInstallAndLoginTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-class ClaudeExpiryRegressionTests(unittest.TestCase):
-    def test_expired_provider_owned_claude_access_token_overrides_logged_in_flag(self):
-        completed = MagicMock(
-            returncode=0,
-            stdout=json.dumps({"loggedIn": True, "authMethod": "claude.ai"}),
-            stderr="",
-        )
-        with patch("aicoder.account_providers._which", return_value="/usr/bin/claude"), \
-             patch("aicoder.account_providers.linked_provider_ids", return_value=["claude"]), \
-             patch("aicoder.account_providers.subprocess.run", return_value=completed), \
-             patch("aicoder.account_providers._claude_credentials_expired", return_value=True), \
-             patch("aicoder.account_providers.set_provider_linked") as unlink:
-            status = account_status("claude")
-        self.assertFalse(status["authenticated"])
-        self.assertFalse(status["linked"])
-        self.assertIn("abgelaufen", status["detail"])
-        unlink.assert_called_once_with("claude", False)
-
-    def test_claude_transport_fails_fast_when_expiry_preflight_fails(self):
-        transport = ClaudeAccountTransport(timeout=30)
-        with patch("aicoder.account_providers._which_executable", return_value="/usr/bin/claude"), \
-             patch("aicoder.account_providers._claude_status", return_value={
-                 "authenticated": False, "detail": "Claude OAuth abgelaufen · Neu mit Claude verbinden"
-             }), \
-             patch.object(transport, "_run") as run:
-            with self.assertRaisesRegex(ClientError, "OAuth login expired"):
-                transport.chat(model="account:claude/sonnet", message="hello")
-        run.assert_not_called()
