@@ -379,6 +379,9 @@ class NativeLightRuntime:
     model_client: ModelTransport | None = None
     tools: list[dict] | None = None
     system_prompt: str | None = None
+    # Role/stage instructions appended after the dynamically rendered active
+    # tool set. This keeps progressive disclosure compatible with team prompts.
+    system_prompt_suffix: str = ""
     conversation: list[dict] | None = None
     load_tools_on_start: bool = True
     enabled_tool_names: list[str] | None = None
@@ -417,6 +420,9 @@ class NativeLightRuntime:
     enforce_post_mutation_verification: bool = True
     allow_completion_signal: bool = False
     progressive_tool_disclosure: bool = True
+    # Opt-in for callers that pass the full authenticated catalogue via `tools`.
+    # Existing callers treat a preloaded list as an already-selected active set.
+    preloaded_tools_are_catalogue: bool = False
     native_openrouter_tool_calling: bool = False
     # Observational team stages may legitimately quote TOOL_CALL examples inside
     # their structured handoff. When enabled, such mixed text is treated as final
@@ -542,19 +548,38 @@ class NativeLightRuntime:
             )
         return None
 
+    def _render_system_prompt(self, tools: list[dict], workspace: str) -> str:
+        if self.system_prompt is not None:
+            return self.system_prompt
+        base = build_system_prompt(tools, workspace)
+        suffix = str(self.system_prompt_suffix or "").strip()
+        return base.rstrip() + (("\n\n" + suffix) if suffix else "")
+
     def _plan_workspace(self) -> str:
         return str(Path(self.plan_workspace_root or self.workspace_root or ".").expanduser().resolve(strict=False))
 
     def _prepare_tools(self) -> list[dict]:
+        catalogue: list[dict] | None = None
+        started: float | None = None
         if self.tools is None and self.load_tools_on_start:
             started = time.monotonic()
             catalogue = load_tools(self.client)
+        elif self.tools is not None:
+            # A caller may preload the authenticated catalogue (team runtime).
+            # Progressive disclosure still applies: the full set stays host-side
+            # for capability expansion while only a bounded working set is shown.
+            catalogue = [dict(tool) for tool in self.tools]
+
+        if catalogue is not None:
             if self.enabled_tool_names is not None:
                 enabled = set(self.enabled_tool_names)
                 catalogue = [tool for tool in catalogue if tool.get("name") in enabled]
             self._tool_catalog = list(catalogue)
-            if self.progressive_tool_disclosure:
+            if self.progressive_tool_disclosure and (started is not None or self.preloaded_tools_are_catalogue):
                 capability_prompt = self.initial_prompt
+                suffix = str(self.system_prompt_suffix or "").strip()
+                if suffix:
+                    capability_prompt += "\n\n" + suffix
                 if self.resume and self.persistent_plan:
                     try:
                         if self.resume_plan_id == "current":
@@ -568,6 +593,7 @@ class NativeLightRuntime:
                     if resume_plan is not None and resume_plan.task:
                         capability_prompt = (
                             f"{resume_plan.task}\n\nContinuation instruction: {self.initial_prompt}"
+                            + (("\n\n" + suffix) if suffix else "")
                         )
                 resolution = resolve_capabilities(capability_prompt, resume=self.resume)
                 tools = build_working_set(catalogue, resolution, budget=self.tool_budget)
@@ -579,14 +605,15 @@ class NativeLightRuntime:
             else:
                 tools = list(catalogue)
             self.tools = tools
-            self._emit(
-                "tools_ready", count=len(tools), catalogue_count=len(catalogue),
-                elapsed=time.monotonic() - started,
-            )
+            if started is not None:
+                self._emit(
+                    "tools_ready", count=len(tools), catalogue_count=len(catalogue),
+                    elapsed=time.monotonic() - started,
+                )
         elif self.tools is None:
             self.tools = []
-        else:
-            self._tool_catalog = list(self.tools)
+            self._tool_catalog = []
+
         if self.allow_completion_signal and not any(
             str(tool.get("name") or "") == _RUNTIME_COMPLETE_TOOL for tool in self.tools
         ):
@@ -994,7 +1021,7 @@ class NativeLightRuntime:
             )
             if bounded_memory:
                 self.system_prompt = (
-                    self.system_prompt or build_system_prompt(tools, workspace)
+                    self._render_system_prompt(tools, workspace)
                 ).rstrip() + "\n\n## Relevant project memory\n" + bounded_memory
         session_hook = self.hooks.emit("SessionStart", {
             "workspace": workspace, "prompt": self.initial_prompt,
@@ -1003,7 +1030,7 @@ class NativeLightRuntime:
         for diagnostic in session_hook.diagnostics:
             self._emit("hook_diagnostic", event="SessionStart", message=diagnostic)
         if session_hook.context:
-            self.system_prompt = (self.system_prompt or build_system_prompt(tools, workspace)).rstrip() + (
+            self.system_prompt = (self._render_system_prompt(tools, workspace)).rstrip() + (
                 "\n\n## Session hook context\n" + "\n".join(session_hook.context)
             )
         if self.tools_unavailable_reason:
@@ -1011,7 +1038,7 @@ class NativeLightRuntime:
             self._emit("error", message=reason)
             return AgentRunResult(
                 "failed", "", str(self.model or "?"), [], tools,
-                self.system_prompt or build_system_prompt(tools, workspace),
+                self._render_system_prompt(tools, workspace),
                 error=reason,
             )
         try:
@@ -1023,7 +1050,7 @@ class NativeLightRuntime:
                 "failed", "", str(self.model or "?"), [], tools, "",
                 error=reason,
             )
-        base_system = self.system_prompt or build_system_prompt(tools, workspace)
+        base_system = self._render_system_prompt(tools, workspace)
         protocol_system = self._system_for_tool_protocol(
             base_system, native=self._native_tool_calling_enabled(self.model)
         )
@@ -1795,7 +1822,7 @@ class NativeLightRuntime:
                         allowed_tool_names = {
                             str(tool.get("name")) for tool in tools if tool.get("name")
                         }
-                        base_system = self.system_prompt or build_system_prompt(tools, workspace)
+                        base_system = self._render_system_prompt(tools, workspace)
                         protocol_system = self._system_for_tool_protocol(
                             base_system, native=self._native_tool_calling_enabled(active_model)
                         )

@@ -25,7 +25,7 @@ import uuid
 from . import audit
 from .agent_runtime import AgentRunResult, NativeLightRuntime
 from .failure_tracking import FailureTracker
-from .executor import MAX_ITERATIONS, atomic_write_text, build_system_prompt, load_tools, trim_messages
+from .executor import MAX_ITERATIONS, atomic_write_text, load_tools, trim_messages
 from .model_transport import ModelTransport
 from .performance import RuntimePerformance
 from .task_contract import AcceptanceCheck, TaskContract, compile_task_contract
@@ -723,8 +723,9 @@ def _call_stage_agent_core(
 ) -> AgentStageResult:
     """Run a fresh tool-capable stage with bounded provider recovery and contract repair.
 
-    All authenticated tools are visible. Stage policy decides which actions are permitted;
-    capability hiding is not used as a substitute for runtime safety.
+    The authenticated catalogue stays host-side while the model receives a bounded
+    task-specific working set. capability_request may expand it; stage policy still
+    decides which actions are permitted, so disclosure never substitutes for safety.
     """
     started = time.monotonic()
     base_prompt = str(prompt)
@@ -733,9 +734,8 @@ def _call_stage_agent_core(
     repair_attempts = 0
     provider_resumes = 0
     last_error = ""
-    stage_system = (
-        build_system_prompt(tools, workspace_root).rstrip()
-        + "\n\n## CURRENT TEAM STAGE\n" + system.strip()
+    stage_system_suffix = (
+        "## CURRENT TEAM STAGE\n" + system.strip()
         + _USER_CONSTRAINT_DISCIPLINE
         + _OBSERVATIONAL_STAGE_DISCIPLINE
     )
@@ -746,8 +746,9 @@ def _call_stage_agent_core(
             client=client, model_client=model_client, initial_prompt=current_prompt,
             model=model, fallback_model=None, workspace_root=workspace_root,
             plan_workspace_root=workspace_root, protected_workspace_root=None,
-            tools=[dict(tool) for tool in tools], system_prompt=stage_system,
+            tools=[dict(tool) for tool in tools], system_prompt_suffix=stage_system_suffix,
             conversation=conversation, load_tools_on_start=True, quick_chat=False,
+            progressive_tool_disclosure=True, preloaded_tools_are_catalogue=True,
             persistent_plan=False, approval_fn=approval_fn,
             max_iterations=max(1, min(MAX_ITERATIONS, int(max_iterations))),
             max_output_tokens=max_tokens, max_tool_calls_per_turn=4,
@@ -755,7 +756,6 @@ def _call_stage_agent_core(
             stop_requested=stop_requested,
             base_timeout=max(10, min(300, int(request_timeout))),
             event_fn=_worker_event_forwarder(event_fn, role),
-            progressive_tool_disclosure=False,
             native_openrouter_tool_calling=bool(native_openrouter_tool_calling),
             allow_mixed_tool_protocol_final=True,
             allow_tool_free_final=True,
@@ -1571,8 +1571,8 @@ def _run_researcher_core(
         + f"Repository root for read-only inspection: {source_workspace}\n\n"
         + RESEARCH_INSTRUCTIONS[role] + "\n\n" + RESEARCH_OUTPUT_CONTRACT
     )
-    system = build_system_prompt(tools, source_workspace).rstrip() + (
-        "\n\n## RESEARCH AGENT ROLE\n" + RESEARCH_INSTRUCTIONS[role] + "\n\n" + RESEARCH_OUTPUT_CONTRACT
+    system_suffix = (
+        "## RESEARCH AGENT ROLE\n" + RESEARCH_INSTRUCTIONS[role] + "\n\n" + RESEARCH_OUTPUT_CONTRACT
         + _USER_CONSTRAINT_DISCIPLINE
         + _OBSERVATIONAL_STAGE_DISCIPLINE
     )
@@ -1599,11 +1599,11 @@ def _run_researcher_core(
             client=client, model_client=model_client, initial_prompt=current_prompt,
             model=model, fallback_model=None, workspace_root=source_workspace,
             plan_workspace_root=source_workspace, protected_workspace_root=None,
-            tools=tools, system_prompt=system, load_tools_on_start=True,
+            tools=tools, system_prompt_suffix=system_suffix, load_tools_on_start=True,
             quick_chat=False, persistent_plan=False, approval_fn=_research_approval_for_task(task),
+            progressive_tool_disclosure=True, preloaded_tools_are_catalogue=True,
             max_iterations=60, max_output_tokens=1200, max_tool_calls_per_turn=4,
             max_context_chars=_TEAM_OBSERVATIONAL_CONTEXT_CHARS, stop_requested=stop_requested,
-            progressive_tool_disclosure=False,
             base_timeout=max(10, min(300, int(request_timeout))), event_fn=research_event,
             native_openrouter_tool_calling=bool(native_openrouter_tool_calling),
             allow_mixed_tool_protocol_final=True,
@@ -2486,9 +2486,8 @@ def _run_final_repair(
     approval._aicoder_autonomous_policy = True
     approval._aicoder_policy_denial_is_error = False
     approval._aicoder_enforce_all_tools = True
-    system = (
-        build_system_prompt(tools, str(workspace.info.execution_root)).rstrip()
-        + "\n\n## FINAL INTEGRATION REPAIR ROLE\n"
+    system_suffix = (
+        "## FINAL INTEGRATION REPAIR ROLE\n"
         "Repair only deterministic final-verification failures in the already integrated candidate. "
         "Do not restart architecture work or broaden scope. TaskContract and executable verification outrank prose. "
         + (
@@ -2502,7 +2501,8 @@ def _run_final_repair(
         client=client, model_client=model_client, initial_prompt=_final_repair_prompt(task, contract, verification),
         model=model, fallback_model=None, workspace_root=str(workspace.info.execution_root),
         plan_workspace_root=source_workspace, protected_workspace_root=source_workspace,
-        tools=tools, system_prompt=system, load_tools_on_start=True, quick_chat=False, persistent_plan=False,
+        tools=tools, system_prompt_suffix=system_suffix, load_tools_on_start=True, quick_chat=False, persistent_plan=False,
+        progressive_tool_disclosure=True, preloaded_tools_are_catalogue=True,
         approval_fn=_approval_with_task_backend_policy(approval, contract), max_iterations=24, max_output_tokens=12000,
         max_context_chars=_TEAM_CANDIDATE_PHASE_CONTEXT_CHARS, stop_requested=stop_requested,
         base_timeout=max(10, min(300, int(request_timeout))), conversation=[], allow_completion_signal=True,
@@ -2674,9 +2674,8 @@ def _run_candidate(
             stage_input, task=task, contract=contract, strategy=strategy,
             scoped_work_unit=(work_unit_id != "full-task"),
         )
-        base_candidate_system = (
-            build_system_prompt(tools, str(backend.info.execution_root)).rstrip()
-            + "\n\n" + CODER_SYSTEM_TEMPLATE.format(slot=slot, strategy=strategy)
+        base_candidate_system_suffix = (
+            CODER_SYSTEM_TEMPLATE.format(slot=slot, strategy=strategy)
             + "\n\n" + contract.prompt_projection()
             + test_runtime_note
         )
@@ -2811,7 +2810,7 @@ def _run_candidate(
             phase_approval._aicoder_policy_denial_is_error = False
             phase_approval._aicoder_enforce_all_tools = True
 
-            phase_system = base_candidate_system + (
+            phase_system_suffix = base_candidate_system_suffix + (
                 "\n\n## AUTHORITATIVE CODER RUN 1 ROLE: IMPLEMENTER\n"
                 "Write production implementation only. Do NOT create, edit, broaden, or replace tests in this model process. "
                 "Existing tests and lightweight compile/import checks may be run as observational feedback, but independent test design belongs to CODER RUN 2. "
@@ -2832,8 +2831,9 @@ def _run_candidate(
                 initial_prompt=prompt,
                 model=model, fallback_model=None, workspace_root=str(backend.info.execution_root),
                 plan_workspace_root=source_workspace, protected_workspace_root=source_workspace,
-                tools=tools, system_prompt=phase_system, load_tools_on_start=True,
+                tools=tools, system_prompt_suffix=phase_system_suffix, load_tools_on_start=True,
                 quick_chat=False, persistent_plan=False, approval_fn=_approval_with_task_backend_policy(phase_approval, contract),
+                progressive_tool_disclosure=True, preloaded_tools_are_catalogue=True,
                 max_iterations=phase_iteration_limit, max_output_tokens=12000,
                 max_context_chars=_TEAM_CANDIDATE_PHASE_CONTEXT_CHARS,
                 stop_requested=lambda: bool(
@@ -3444,9 +3444,9 @@ def _run_team_pipeline(
     except OSError:
         pass
     all_tools = load_tools(client)
-    # Every team worker sees the same authenticated runtime tool catalogue.
-    # Role prompts and execution-risk policy control HOW tools are used; we do not
-    # hide capabilities per role because that causes inconsistent model behavior.
+    # Every team worker shares the same authenticated host-side catalogue. Each
+    # runtime progressively discloses a bounded task-specific working set and can
+    # expand it via capability_request; approval/risk policy remains authoritative.
     research_tools = [dict(tool) for tool in all_tools]
     coder_tools = [dict(tool) for tool in all_tools]
     _emit(event_fn, "team_start", agents=config.active_count, research=len(config.research), coders=len(config.coders))
@@ -4111,7 +4111,7 @@ def _run_team_pipeline(
                 )
                 + "Do not assume any prior model conversation."
             )
-            merge_system = build_system_prompt(coder_tools, str(integration.info.execution_root)).rstrip()+"\n\n"+MERGE_SYSTEM_PROMPT+"\n\n"+task_contract.prompt_projection()
+            merge_system_suffix = MERGE_SYSTEM_PROMPT + "\n\n" + task_contract.prompt_projection()
             merge_conversation: list[dict[str, Any]] = []
             merge_auto_resumes = 0
             merge_run: AgentRunResult | None = None
@@ -4122,8 +4122,9 @@ def _run_team_pipeline(
                     initial_prompt=merge_prompt,
                     model=merge_model, fallback_model=None, workspace_root=str(integration.info.execution_root),
                     plan_workspace_root=source_workspace, protected_workspace_root=source_workspace,
-                    tools=coder_tools, system_prompt=merge_system,
+                    tools=coder_tools, system_prompt_suffix=merge_system_suffix,
                     load_tools_on_start=True, quick_chat=False, persistent_plan=False,
+                    progressive_tool_disclosure=True, preloaded_tools_are_catalogue=True,
                     approval_fn=_approval_with_task_backend_policy(_candidate_approval, task_contract), max_iterations=14, max_output_tokens=10000, stop_requested=stop_requested,
                     base_timeout=request_timeout, conversation=merge_conversation, allow_completion_signal=True,
                     event_fn=_worker_event_forwarder(event_fn, "merge"),

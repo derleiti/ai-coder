@@ -41,6 +41,29 @@ class CapabilityRuntimeTests(unittest.TestCase):
         self.assertNotIn("shell",names)
         self.assertEqual(len(runtime._tool_catalog),len(CATALOG))
 
+    def test_preloaded_catalog_uses_progressive_working_set(self):
+        runtime = self.runtime(
+            prompt="Implement src/app.py and run tests",
+            tools=list(CATALOG),
+            system_prompt_suffix="Coding role: implement and verify the change",
+            preloaded_tools_are_catalogue=True, tool_budget=6,
+        )
+        tools = runtime._prepare_tools()
+        names = {tool["name"] for tool in tools}
+        self.assertTrue(set(META_TOOL_NAMES).issubset(names))
+        self.assertIn("file_read", names)
+        self.assertIn("shell", names)
+        self.assertNotIn("docker_list", names)
+        self.assertEqual(len(runtime._tool_catalog), len(CATALOG))
+
+    def test_preloaded_active_tools_remain_unfiltered_without_catalogue_opt_in(self):
+        runtime = self.runtime(
+            prompt="Implement src/app.py", tools=list(CATALOG), tool_budget=4,
+        )
+        tools = runtime._prepare_tools()
+        self.assertEqual([tool["name"] for tool in tools], [tool["name"] for tool in CATALOG])
+        self.assertEqual(len(runtime._tool_catalog), len(CATALOG))
+
     def test_always_mode_keeps_full_catalog(self):
         runtime=self.runtime(progressive_tool_disclosure=False)
         with patch("aicoder.agent_runtime.load_tools", return_value=list(CATALOG)):
@@ -105,6 +128,24 @@ class CapabilityRuntimeTests(unittest.TestCase):
         self.assertIn("docker_list", result.system_prompt)
         self.assertIn("capability_request", result.system_prompt)
 
+
+    def test_system_prompt_suffix_survives_capability_expansion(self):
+        runtime = self.runtime(
+            prompt="Inspect https://example.com/docs",
+            tools=list(CATALOG), tool_budget=5, preloaded_tools_are_catalogue=True,
+            system_prompt_suffix="TEAM ROLE: preserve this instruction",
+        )
+        tools = runtime._prepare_tools()
+        before = runtime._render_system_prompt(tools, ".")
+        self.assertIn("TEAM ROLE: preserve this instruction", before)
+        _, is_error, changed = runtime._run_meta_tool(
+            "capability_request", {"tools": ["docker_list"]}, tools
+        )
+        self.assertFalse(is_error)
+        self.assertTrue(changed)
+        after = runtime._render_system_prompt(tools, ".")
+        self.assertIn("docker_list", after)
+        self.assertIn("TEAM ROLE: preserve this instruction", after)
 
     def test_resume_capabilities_use_original_plan_task(self):
         import tempfile
