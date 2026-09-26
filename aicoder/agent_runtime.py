@@ -160,6 +160,7 @@ def _has_mutation_effect(name: str, args: dict) -> bool:
 _INSPECTION_TOOLS = {
     "git", "file_read", "code_grep", "code_read", "code_search",
     "file_tree", "code_tree", "feature_memory_search",
+    "project_memory_search", "project_memory_list",
 }
 
 _VERIFICATION_REQUIRED_PROMPT = (
@@ -958,6 +959,44 @@ class NativeLightRuntime:
         workspace = str(Path(self.workspace_root or ".").resolve())
         self.workspace_root = workspace
         tools = self._prepare_tools()
+
+        # Local-first Project Memory: a bounded relevant slice only. Sync is
+        # best-effort so network/auth failures can never prevent local coding.
+        if is_action_request(self.initial_prompt):
+            memory_context = ""
+            feature_context = ""
+            try:
+                from .project_memory import LocalProjectMemory
+                project_memory = LocalProjectMemory(workspace)
+                try:
+                    project_memory.sync(self.client)
+                except Exception:
+                    pass
+                memory_context = project_memory.context(self.initial_prompt, limit=6, max_chars=5000)
+            except Exception:
+                memory_context = ""
+            try:
+                from .evidence_memory import ProjectEvidenceStore
+                feature_rows = ProjectEvidenceStore(workspace).search_feature_experience(
+                    self.initial_prompt, limit=3
+                )
+                if feature_rows:
+                    feature_context = (
+                        "VERIFIED FEATURE EXPERIENCE (historical implementation experience; current evidence wins):\n"
+                        + "\n".join(
+                            f"- {row.task}: {row.summary} | lessons={row.lessons}"
+                            for row in feature_rows
+                        )[:3000]
+                    )
+            except Exception:
+                feature_context = ""
+            bounded_memory = "\n\n".join(
+                part for part in (memory_context, feature_context) if part
+            )
+            if bounded_memory:
+                self.system_prompt = (
+                    self.system_prompt or build_system_prompt(tools, workspace)
+                ).rstrip() + "\n\n## Relevant project memory\n" + bounded_memory
         session_hook = self.hooks.emit("SessionStart", {
             "workspace": workspace, "prompt": self.initial_prompt,
             "model": self.model or "", "tool_count": len(tools),

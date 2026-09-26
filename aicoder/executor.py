@@ -457,6 +457,52 @@ LOCAL_FEATURE_MEMORY_SEARCH_SCHEMA = {
     },
 }
 
+LOCAL_PROJECT_MEMORY_SEARCH_SCHEMA = {
+    "name": "project_memory_search",
+    "description": "Search current structured Project Memory for the active project. Current code/runtime evidence remains higher priority.",
+    "inputSchema": {"type": "object", "properties": {
+        "query": {"type": "string"},
+        "kinds": {"type": "array", "items": {"type": "string"}},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+    }},
+}
+LOCAL_PROJECT_MEMORY_STORE_SCHEMA = {
+    "name": "project_memory_store",
+    "description": "Store a short structured current-state memory entry locally; it remains usable offline and syncs later.",
+    "inputSchema": {"type": "object", "properties": {
+        "kind": {"type": "string", "enum": ["todo","idea","decision","architecture","bug","lesson","feature","project_summary","documentation"]},
+        "title": {"type": "string"},
+        "content": {"type": "string"},
+        "status": {"type": "string"},
+    }, "required": ["kind","title"]},
+}
+LOCAL_PROJECT_MEMORY_UPDATE_SCHEMA = {
+    "name": "project_memory_update",
+    "description": "Update or tombstone an existing Project Memory entry.",
+    "inputSchema": {"type": "object", "properties": {
+        "entity_id": {"type": "string"},
+        "kind": {"type": "string"},
+        "title": {"type": "string"},
+        "content": {"type": "string"},
+        "status": {"type": "string"},
+        "deleted": {"type": "boolean"},
+    }, "required": ["entity_id"]},
+}
+LOCAL_PROJECT_MEMORY_LIST_SCHEMA = {
+    "name": "project_memory_list",
+    "description": "List current Project Memory entries for the active project.",
+    "inputSchema": {"type": "object", "properties": {
+        "kind": {"type": "string"},
+        "include_deleted": {"type": "boolean"},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+    }},
+}
+LOCAL_PROJECT_MEMORY_SYNC_SCHEMA = {
+    "name": "project_memory_sync",
+    "description": "Fail-open push/pull of local Project Memory using the active AILinux login session.",
+    "inputSchema": {"type": "object", "properties": {}},
+}
+
 LOCAL_SKILL_READ_SCHEMA = {
     "name": "skill_read",
     "description": "Load one discovered AICoder workflow skill by name (read-only).",
@@ -700,6 +746,11 @@ LOCAL_TOOL_SCHEMAS = [
     LOCAL_TASK_RUNNER_SCHEMA,
     LOCAL_SUBAGENT_SCHEMA,
     LOCAL_FEATURE_MEMORY_SEARCH_SCHEMA,
+    LOCAL_PROJECT_MEMORY_SEARCH_SCHEMA,
+    LOCAL_PROJECT_MEMORY_STORE_SCHEMA,
+    LOCAL_PROJECT_MEMORY_UPDATE_SCHEMA,
+    LOCAL_PROJECT_MEMORY_LIST_SCHEMA,
+    LOCAL_PROJECT_MEMORY_SYNC_SCHEMA,
     LOCAL_SKILL_READ_SCHEMA,
     LOCAL_FILE_READ_SCHEMA,
     LOCAL_FILE_EDIT_SCHEMA,
@@ -2694,6 +2745,45 @@ def _run_tool_impl(
             result, is_error = json.dumps(payload, ensure_ascii=False, indent=2), False
         except Exception as exc:
             result, is_error = f"feature_memory_search error: {type(exc).__name__}: {exc}", True
+    elif name in {"project_memory_search", "project_memory_store", "project_memory_update", "project_memory_list", "project_memory_sync"}:
+        from .project_memory import LocalProjectMemory
+        try:
+            memory = LocalProjectMemory(str(_workspace_root()))
+            if name == "project_memory_search":
+                payload = memory.search(
+                    str(args.get("query") or ""),
+                    kinds=list(args.get("kinds") or []) or None,
+                    limit=int(args.get("limit") or 8),
+                )
+            elif name == "project_memory_store":
+                payload = memory.store(
+                    kind=str(args.get("kind") or ""),
+                    title=str(args.get("title") or ""),
+                    content=str(args.get("content") or ""),
+                    status=str(args.get("status") or "active"),
+                )
+            elif name == "project_memory_update":
+                changes = {k: args[k] for k in ("kind","title","content","status","deleted") if k in args}
+                payload = memory.update(str(args.get("entity_id") or ""), **changes)
+            elif name == "project_memory_list":
+                payload = memory.list(
+                    kind=str(args.get("kind") or ""),
+                    include_deleted=bool(args.get("include_deleted", False)),
+                    limit=int(args.get("limit") or 100),
+                )
+            else:
+                try:
+                    payload = memory.sync(client)
+                except Exception as exc:
+                    payload = {
+                        "status": "offline",
+                        "project_key": memory.project_key,
+                        "dirty": len(memory.dirty_changes()),
+                        "error_type": type(exc).__name__,
+                    }
+            result, is_error = json.dumps(payload, ensure_ascii=False, indent=2), False
+        except Exception as exc:
+            result, is_error = f"{name} error: {type(exc).__name__}: {exc}", True
     elif name == "skill_read":
         from .skills import read_skill
         result, is_error = read_skill(_workspace_root(), str(args.get("name") or ""))

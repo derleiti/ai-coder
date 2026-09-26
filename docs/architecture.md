@@ -151,3 +151,34 @@ Canonical Helper tools use `aihelper_*`; cached legacy device names remain polic
 recognized during rolling upgrades. TriForce engine-admin tools are never treated
 as an AICoder operator target, while explicitly paired `aihelper_*` device tools
 remain eligible for the share-aware MCP path.
+
+
+## Project Memory: local-first + TriForce Sync
+
+AICoder erweitert die bestehende `~/.config/ai-coder/evidence.db`; es gibt keine zweite lokale Memory-Datenbank. Zusätzlich zu `file_evidence`, `failure_evidence` und `feature_experience` existieren:
+
+- `project_memory` — aktueller lokaler Arbeitsstand plus `dirty`/`clean`/`conflict`
+- `project_memory_sync_state` — serverseitiger Pull-Cursor je Project Identity
+- `project_memory_conflicts` — lokale und serverseitige Konfliktfassungen
+
+`feature_experience` bleibt kompatibel und `feature_memory_search` unverändert nutzbar.
+
+### Identität
+
+1. normalisierte + gehashte Git `remote.origin`
+2. persistente Repository-UUID unter `.git/ailinux-project-id`
+3. persistente Workspace-UUID
+4. Pfad-Hash nur als Fallback
+
+Damit bleibt Project Memory bei einem Repository-Pfadwechsel stabil.
+
+### Agent-Kontext
+
+Vor action-/coding-orientierten Runs versucht AICoder fail-open zu synchronisieren und lädt anschließend nur einen kleinen relevanzbasierten Project-Memory-Ausschnitt sowie wenige passende `feature_experience`-Einträge. Die Priorität bleibt:
+
+1. aktueller Code / Runtime Evidence
+2. aktuelles Project Memory
+3. Curated / verifizierte Feature Experience
+4. Episodic History
+
+Die lokalen Tools `project_memory_search`, `project_memory_store`, `project_memory_update`, `project_memory_list` und `project_memory_sync` erlauben kurze strukturierte Einträge ohne erneutes Durchsuchen eines kompletten Chats. `project_memory_sync` ist fail-open; bei Netzwerkfehlern bleiben Dirty-Daten unverändert lokal erhalten.

@@ -571,6 +571,13 @@ class TriForceClient:
     def verify(self) -> Dict[str, Any]:
         return self._request("GET", "/v1/auth/verify", require_auth=True, _label="verify")
 
+    def project_memory_sync(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Push local Project Memory changes and pull accepted server revisions."""
+        return self._request(
+            "POST", "/v1/project-memory/sync", payload,
+            require_auth=True, _label="project-memory-sync", _retries=0,
+        )
+
     def handshake(self) -> Dict[str, Any]:
         return self._request("GET", "/v1/auth/client/handshake", require_auth=True, _label="handshake")
 
