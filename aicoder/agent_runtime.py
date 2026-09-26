@@ -2235,10 +2235,11 @@ class NativeLightRuntime:
                 else:
                     tool_results.append(STALL_RECOVERY_PROMPT)
 
+            implementation_nudge_just_sent = False
             if (
                 self.require_mutation_or_explicit_no_change
                 and not mutation_seen
-                and pre_mutation_inspection_count >= 8
+                and pre_mutation_inspection_count >= 4
                 and not implementation_nudge_sent
             ):
                 tool_results.append(
@@ -2248,12 +2249,17 @@ class NativeLightRuntime:
                     "If no repository change is actually justified, finish with `DONE: no change justified` and cite the evidence."
                 )
                 implementation_nudge_sent = True
+                implementation_nudge_just_sent = True
                 self._emit(
                     "implementation_required", iteration=i + 1,
                     reason="inspection_without_mutation", inspections=pre_mutation_inspection_count,
                 )
 
-            if semantic_stall_repeats >= 4 and not batch_verification_stall_reason:
+            if (
+                semantic_stall_repeats >= 4
+                and not batch_verification_stall_reason
+                and not implementation_nudge_just_sent
+            ):
                 batch_verification_stall_reason = (
                     "Agent paused because the same semantic no-progress outcome repeated at least four times "
                     "without an effective mutation (for example identical verification failure, reused read, or no-effect edit). "
