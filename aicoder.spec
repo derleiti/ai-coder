@@ -22,6 +22,8 @@ a = Analysis(
         'aicoder.agent_runtime',
         'aicoder.agent_plan',
         'aicoder.agent_journal',
+        'aicoder.evidence_memory',
+        'aicoder.project_memory',
         'aicoder.capabilities',
         'aicoder.change_journal',
         'aicoder.hooks',

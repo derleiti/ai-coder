@@ -1,3 +1,10 @@
+## v1.3.0 (2026-09-26)
+
+- Add local-first synchronized Project Memory backed by the existing evidence database, with offline dirty state, cursor sync, conflict preservation and tombstones.
+- Add project-memory agent tools and bounded pre-coding memory context while keeping current code/runtime evidence authoritative.
+- Sync accepted Project Memory revisions through TriForce and mirror history to Claude-Mem without making Claude-Mem the current-state authority.
+- Preserve existing feature-experience memory and reject secret-like Project Memory content before sync.
+
 ## v1.2.9 (2026-09-16)
 
 - Align Claude account authentication with the official CLI and keep reauthentication reachable after revoked OAuth sessions.
