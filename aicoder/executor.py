@@ -2605,7 +2605,15 @@ def _run_tool_impl(
             approval_args["sudo"] = True
         if provider_security.security_boundary:
             approval_args["_security_change"] = True
-    mutating_hint, destructive_hint = _tool_security_hints.get(name, (None, None))
+    # Canonical MCP schemas are also projected onto local AICoder handlers.
+    # Their remote annotations are semantic catalogue metadata, not authority
+    # over local execution risk. Local handlers have more precise action-aware
+    # classification (for example file_tree and git status are read-only), so
+    # only non-local tools may contribute catalogue security hints here.
+    if name in LOCAL_TOOL_NAMES:
+        mutating_hint, destructive_hint = (None, None)
+    else:
+        mutating_hint, destructive_hint = _tool_security_hints.get(name, (None, None))
     if isinstance(mutating_hint, bool):
         approval_args["_mutating"] = mutating_hint
     if isinstance(destructive_hint, bool):

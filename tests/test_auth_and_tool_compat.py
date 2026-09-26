@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import os
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -705,6 +706,59 @@ class ToolSecurityHardeningTests(unittest.TestCase):
     def test_dynamic_mutating_hint_requires_approval(self):
         self.assertTrue(assess_execution("future_tool", {"_mutating": True}).needs_approval)
         self.assertFalse(assess_execution("future_tool", {"_mutating": False}).needs_approval)
+
+    def test_remote_schema_hint_cannot_mark_local_read_tool_as_mutating(self):
+        with tempfile.TemporaryDirectory() as temp:
+            phases = []
+            registry = MagicMock()
+            registry.provider_for_tool.return_value = None
+            approval = MagicMock(return_value=True)
+            with (
+                patch.object(executor, "_tool_security_hints", {"file_tree": (True, None)}),
+                patch.object(executor, "discover_plugins", return_value=registry),
+                patch.object(executor, "_prepare_change_restore") as prepare_backup,
+                patch.object(executor.audit, "log_tool"),
+            ):
+                result, is_error = executor.run_tool(
+                    MagicMock(),
+                    "file_tree",
+                    {"path": ".", "max_depth": 1, "max_entries": 20},
+                    approval_fn=approval,
+                    allowed_tools={"file_tree"},
+                    workspace_root=temp,
+                    phase_fn=phases.append,
+                )
+            self.assertFalse(is_error, result)
+            self.assertNotIn("backup", phases)
+            prepare_backup.assert_not_called()
+
+    def test_remote_schema_hint_cannot_suppress_local_write_risk(self):
+        with tempfile.TemporaryDirectory() as temp:
+            phases = []
+            registry = MagicMock()
+            registry.provider_for_tool.return_value = None
+            journal = MagicMock()
+            journal.finalize_restore_metadata.return_value = None
+            approval = MagicMock(return_value=True)
+            with (
+                patch.object(executor, "_tool_security_hints", {"file_edit": (False, None)}),
+                patch.object(executor, "discover_plugins", return_value=registry),
+                patch.object(executor, "_prepare_change_restore", return_value=(journal, None)) as prepare_backup,
+                patch.object(executor.audit, "log_tool"),
+            ):
+                result, is_error = executor.run_tool(
+                    MagicMock(),
+                    "file_edit",
+                    {"path": "result.txt", "operation": "create", "content": "ok\n"},
+                    approval_fn=approval,
+                    allowed_tools={"file_edit"},
+                    workspace_root=temp,
+                    phase_fn=phases.append,
+                )
+            self.assertFalse(is_error, result)
+            self.assertIn("backup", phases)
+            prepare_backup.assert_called_once()
+            self.assertEqual((Path(temp) / "result.txt").read_text(), "ok\n")
 
     def test_tool_cache_is_scoped_per_authenticated_client(self):
         class FakeClient:

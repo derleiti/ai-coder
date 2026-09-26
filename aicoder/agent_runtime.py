@@ -1569,17 +1569,38 @@ class NativeLightRuntime:
                         )
                         if autonomous_loop_recovery:
                             messages.append({"role": "assistant", "content": response})
-                            current_input = (
-                                "AUTONOMOUS LOOP RECOVERY: the identical read-only tool request was already executed "
-                                "successfully and its result is present in context. Do NOT request it again. Use the cached "
-                                "evidence, choose a different tool or arguments only if new evidence is required, otherwise "
-                                "finish the current task/contract now."
+                            implementation_recovery = bool(
+                                self.require_mutation_or_explicit_no_change
+                                and not mutation_seen
+                                and not implementation_nudge_sent
                             )
+                            if implementation_recovery:
+                                current_input = (
+                                    "IMPLEMENTATION REQUIRED: the identical read-only request already succeeded and its "
+                                    "result is present in context. Stop rereading it. On this turn, implement the best-supported "
+                                    "repository change with an enabled write tool (normally file_edit), then run focused "
+                                    "verification. Only inspect a different fact if one exact missing fact blocks the edit."
+                                )
+                                implementation_nudge_sent = True
+                                self._emit(
+                                    "implementation_required", iteration=i + 1,
+                                    reason="duplicate_inspection_loop",
+                                    inspections=max(pre_mutation_inspection_count, consecutive_call_batches),
+                                )
+                                recovery_action = "autonomous_implementation"
+                            else:
+                                current_input = (
+                                    "AUTONOMOUS LOOP RECOVERY: the identical read-only tool request was already executed "
+                                    "successfully and its result is present in context. Do NOT request it again. Use the cached "
+                                    "evidence, choose a different tool or arguments only if new evidence is required, otherwise "
+                                    "finish the current task/contract now."
+                                )
+                                recovery_action = "autonomous_replan"
                             loop_guard.reset()
                             self._save_journal(plan, messages, pending_input=current_input, tool_batches=journal_batches)
                             self._emit(
                                 "loop_prevented", iteration=i + 1, repeats=consecutive_call_batches,
-                                action="autonomous_replan",
+                                action=recovery_action,
                             )
                             continue
                         reason = (
@@ -1876,6 +1897,16 @@ class NativeLightRuntime:
                         "metadata": call.get("metadata") if isinstance(call.get("metadata"), dict) else {},
                         "arguments": args, "is_error": False, "reused": True,
                     })
+                    # Reused reads are still inspection attempts. Count them toward
+                    # the coding-candidate progress threshold so an agent looping on
+                    # the same cached evidence receives one explicit implementation
+                    # turn before the semantic-stall guard pauses the run.
+                    if (
+                        self.require_mutation_or_explicit_no_change
+                        and not mutation_seen
+                        and name in _INSPECTION_TOOLS
+                    ):
+                        pre_mutation_inspection_count += 1
                     continue
                 pre_hook = self.hooks.emit("PreToolUse", {
                     "name": name, "arguments": dict(args), "workspace": workspace,

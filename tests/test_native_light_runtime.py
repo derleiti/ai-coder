@@ -107,6 +107,97 @@ class NativeLightPlanTests(unittest.TestCase):
             self.assertTrue(any(kind == "implementation_required" for kind, _ in events))
             self.assertFalse(any(kind == "semantic_progress_stalled" for kind, _ in events))
 
+    def test_cached_repeated_reads_get_write_turn_before_semantic_stall_pause(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = MagicMock()
+            client.timeout = 30
+            read_a = '<tool_call>{"name":"file_read","arguments":{"path":"a.txt"}}</tool_call>'
+            read_b = '<tool_call>{"name":"file_read","arguments":{"path":"b.txt"}}</tool_call>'
+            client.chat.side_effect = [
+                {"response": read_a, "model": "test/model"},
+                {"response": read_b, "model": "test/model"},
+                {"response": read_a, "model": "test/model"},
+                {"response": read_b, "model": "test/model"},
+            ] + [
+                {"response": '<tool_call>{"name":"file_edit","arguments":{"path":"result.txt","operation":"create","content":"ok"}}</tool_call>', "model": "test/model"},
+                {"response": "DONE: implementation completed", "model": "test/model"},
+            ]
+            events = []
+            runtime = NativeLightRuntime(
+                client=client, initial_prompt="Implement the requested repository change", model="test/model",
+                fallback_model=None, workspace_root=temp,
+                tools=[LOCAL_FILE_READ_SCHEMA, LOCAL_FILE_EDIT_SCHEMA],
+                load_tools_on_start=True, persistent_plan=False, base_timeout=30,
+                require_mutation_or_explicit_no_change=True,
+                event_fn=lambda kind, payload: events.append((kind, payload)),
+            )
+
+            def fake_tool(_client, name, _args, **_kwargs):
+                if name == "file_edit":
+                    return "updated result.txt; verified exact content", False
+                return "same repository evidence", False
+
+            with patch("aicoder.agent_runtime.run_tool", side_effect=fake_tool) as run_tool:
+                result = runtime.run()
+
+            self.assertEqual(result.status, "completed")
+            # The first A/B reads execute, the repeated A/B reads are served from
+            # cache, and the final write executes.
+            self.assertEqual(run_tool.call_count, 3)
+            progress = [payload for kind, payload in events if kind == "implementation_required"]
+            self.assertTrue(any(item.get("reason") == "inspection_without_mutation" for item in progress))
+            self.assertFalse(any(kind == "semantic_progress_stalled" for kind, _ in events))
+
+    def test_autonomous_duplicate_read_loop_gets_implementation_turn(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = MagicMock()
+            client.timeout = 30
+            repeated = '<tool_call>{"name":"file_read","arguments":{"path":"README.md"}}</tool_call>'
+            client.chat.side_effect = [
+                {"response": repeated, "model": "test/model"},
+                {"response": repeated, "model": "test/model"},
+                {"response": repeated, "model": "test/model"},
+                {"response": '<tool_call>{"name":"file_edit","arguments":{"path":"result.txt","operation":"create","content":"ok"}}</tool_call>', "model": "test/model"},
+                {"response": "DONE: implementation completed", "model": "test/model"},
+            ]
+
+            def autonomous_approval(_name, _args):
+                return True
+            autonomous_approval._aicoder_autonomous_policy = True
+            autonomous_approval._aicoder_policy_denial_is_error = False
+
+            events = []
+            runtime = NativeLightRuntime(
+                client=client, initial_prompt="Implement the requested repository change", model="test/model",
+                fallback_model=None, workspace_root=temp,
+                tools=[LOCAL_FILE_READ_SCHEMA, LOCAL_FILE_EDIT_SCHEMA],
+                load_tools_on_start=True, persistent_plan=False, base_timeout=30,
+                require_mutation_or_explicit_no_change=True, approval_fn=autonomous_approval,
+                event_fn=lambda kind, payload: events.append((kind, payload)),
+            )
+
+            def fake_tool(_client, name, _args, **_kwargs):
+                if name == "file_edit":
+                    return "updated result.txt; verified exact content", False
+                return "README contents", False
+
+            with patch("aicoder.agent_runtime.run_tool", side_effect=fake_tool) as run_tool:
+                result = runtime.run()
+
+            self.assertEqual(result.status, "completed")
+            # First read executes, the duplicate is reused, the third identical
+            # request is intercepted by the loop guard, then file_edit executes.
+            self.assertEqual(run_tool.call_count, 2)
+            self.assertTrue(any(
+                kind == "implementation_required" and payload.get("reason") == "duplicate_inspection_loop"
+                for kind, payload in events
+            ))
+            self.assertTrue(any(
+                kind == "loop_prevented" and payload.get("action") == "autonomous_implementation"
+                for kind, payload in events
+            ))
+            self.assertFalse(any(kind == "semantic_progress_stalled" for kind, _ in events))
+
     def test_compatibility_runtime_does_not_create_persistent_plan(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
