@@ -380,11 +380,13 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
         class RepairRuntime:
             calls = 0
             prompts = []
+            tool_budgets = []
 
             def __init__(self, *, workspace_root: str, initial_prompt: str, model: str, **kwargs):
                 self.workspace_root = Path(workspace_root)
                 self.initial_prompt = initial_prompt
                 self.model = model
+                type(self).tool_budgets.append(kwargs.get("tool_budget"))
 
             def run(self):
                 type(self).calls += 1
@@ -406,6 +408,7 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
 
         RepairRuntime.calls = 0
         RepairRuntime.prompts = []
+        RepairRuntime.tool_budgets = []
         with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as ram_dir:
             source = Path(source_dir)
             (source / "app.py").write_text("value = 0\n", encoding="utf-8")
@@ -435,6 +438,7 @@ class TeamOrchestratorFlowTests(unittest.TestCase):
 
             self.assertEqual(candidate.run.status, "completed")
             self.assertEqual(RepairRuntime.calls, 2)
+            self.assertEqual(RepairRuntime.tool_budgets, [14, 14])
             self.assertIn("FRESH TEST + REPAIR CODER PROCESS", RepairRuntime.prompts[1])
             self.assertIn("GEGEBEN", RepairRuntime.prompts[1])
             self.assertIn("FERTIG", RepairRuntime.prompts[1])

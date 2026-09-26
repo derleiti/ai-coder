@@ -2072,6 +2072,10 @@ _candidate_approval._aicoder_policy_denial_is_error = False
 _candidate_approval._aicoder_enforce_all_tools = True
 
 _TEAM_CANDIDATE_MAX_AUTO_RESUMES = 2
+# Mutating phases need file_edit + test in the same initial working set. Fourteen
+# is the smallest live-validated budget that preserves both while still keeping
+# the 233-tool authenticated catalogue host-side for capability expansion.
+_TEAM_MUTATING_TOOL_BUDGET = 14
 # Coding candidates deliberately use two bounded model phases. The first process
 # implements; the second starts with a compact machine-grounded handoff and
 # finishes/verifies from the authoritative workspace without inheriting chat history.
@@ -2503,6 +2507,7 @@ def _run_final_repair(
         plan_workspace_root=source_workspace, protected_workspace_root=source_workspace,
         tools=tools, system_prompt_suffix=system_suffix, load_tools_on_start=True, quick_chat=False, persistent_plan=False,
         progressive_tool_disclosure=True, preloaded_tools_are_catalogue=True,
+        tool_budget=_TEAM_MUTATING_TOOL_BUDGET,
         approval_fn=_approval_with_task_backend_policy(approval, contract), max_iterations=24, max_output_tokens=12000,
         max_context_chars=_TEAM_CANDIDATE_PHASE_CONTEXT_CHARS, stop_requested=stop_requested,
         base_timeout=max(10, min(300, int(request_timeout))), conversation=[], allow_completion_signal=True,
@@ -2834,6 +2839,7 @@ def _run_candidate(
                 tools=tools, system_prompt_suffix=phase_system_suffix, load_tools_on_start=True,
                 quick_chat=False, persistent_plan=False, approval_fn=_approval_with_task_backend_policy(phase_approval, contract),
                 progressive_tool_disclosure=True, preloaded_tools_are_catalogue=True,
+                tool_budget=_TEAM_MUTATING_TOOL_BUDGET,
                 max_iterations=phase_iteration_limit, max_output_tokens=12000,
                 max_context_chars=_TEAM_CANDIDATE_PHASE_CONTEXT_CHARS,
                 stop_requested=lambda: bool(
@@ -4125,6 +4131,7 @@ def _run_team_pipeline(
                     tools=coder_tools, system_prompt_suffix=merge_system_suffix,
                     load_tools_on_start=True, quick_chat=False, persistent_plan=False,
                     progressive_tool_disclosure=True, preloaded_tools_are_catalogue=True,
+                    tool_budget=_TEAM_MUTATING_TOOL_BUDGET,
                     approval_fn=_approval_with_task_backend_policy(_candidate_approval, task_contract), max_iterations=14, max_output_tokens=10000, stop_requested=stop_requested,
                     base_timeout=request_timeout, conversation=merge_conversation, allow_completion_signal=True,
                     event_fn=_worker_event_forwarder(event_fn, "merge"),
