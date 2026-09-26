@@ -976,7 +976,6 @@ class NativeLightRuntime:
             except Exception:
                 memory_context = ""
             try:
-                from .evidence_memory import ProjectEvidenceStore
                 feature_rows = ProjectEvidenceStore(workspace).search_feature_experience(
                     self.initial_prompt, limit=3
                 )
