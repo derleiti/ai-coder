@@ -1290,7 +1290,7 @@ def _workspace_has_meaningful_project_files(root: str | Path) -> bool:
     bootstrap_names = {
         "readme", "readme.md", "readme.rst", "readme.txt",
         "license", "license.md", "license.txt", "copying",
-        "changelog", "changelog.md", "code_of_conduct.md",
+        "changelog", "changelog.md", "code_of_conduct.md", "agents.md",
         ".gitignore", ".gitattributes", ".editorconfig",
     }
     try:

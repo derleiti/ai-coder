@@ -1614,6 +1614,8 @@ def test_greenfield_bootstrap_gate_is_conservative(tmp_path):
     assert _workspace_has_meaningful_project_files(tmp_path) is False
     (tmp_path / "README.md").write_text("# Bootstrap only\n")
     assert _workspace_has_meaningful_project_files(tmp_path) is False
+    (tmp_path / "AGENTS.md").write_text("# Repository instructions\n")
+    assert _workspace_has_meaningful_project_files(tmp_path) is False
     assert _task_requires_external_research(external_task) is True
     (tmp_path / "app.py").write_text("print('x')")
     assert _workspace_has_meaningful_project_files(tmp_path) is True
