@@ -1,3 +1,9 @@
+## v1.4.1 (2026-09-27)
+
+- Fix standalone GUI startup on Linux and Windows by bundling `aicoder/gui/design_tokens.json` into the PyInstaller application image.
+- Add packaging regression coverage for the shared GUI design-token asset in both release specs.
+- Verify the Linux onefile binary contains the token file and that `aicoder gui` reaches the Qt event loop in an offscreen smoke test.
+
 ## v1.4.0 (2026-09-27)
 
 - Fix Team Runtime coding candidates getting trapped in read-only inspection loops before they could mutate the workspace; implementation nudges now happen before semantic-stall pauses.
