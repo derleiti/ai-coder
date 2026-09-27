@@ -4,6 +4,7 @@
 
 import sys
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_data_files
 
 block_cipher = None
 
@@ -15,11 +16,13 @@ try:
 except ImportError:
     platform_datas = []
 
+gui_datas = collect_data_files('aicoder.gui', includes=['design_tokens.json'])
+
 a = Analysis(
     ['aicoder_main.py'],
     pathex=['.'],
     binaries=[],
-    datas=platform_datas,
+    datas=platform_datas + gui_datas,
     hiddenimports=[
         'aicoder.cli',
         'aicoder.client',
