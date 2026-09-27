@@ -55,3 +55,42 @@ def test_journalctl_uses_external_system_environment():
     assert events == []
     assert cursor is None
     assert run.call_args.kwargs["env"] is fake_env
+
+
+def test_apparmor_audit_duplicates_group_by_semantic_access():
+    calls=[]
+    def model(prompt):
+        calls.append(prompt)
+        return {"severity":"security","notify":True,"title":"x","summary":"x","reason":"x","recommended_action":"x","confidence":0.9}
+    first=LogEvent(
+        "2026-09-27T05:05:15+00:00", "kernel",
+        'audit: type=1400 audit(1790485515.581:318): apparmor="DENIED" operation="open" class="file" profile="who" name="/etc/nsswitch.conf" pid=103694 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0', 4
+    )
+    duplicate=LogEvent(
+        "2026-09-27T05:05:15+00:00", "kernel",
+        'audit: type=1400 audit(1790485515.581:320): apparmor="DENIED" operation="open" class="file" profile="who" name="/etc/nsswitch.conf" pid=103799 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0', 4
+    )
+    other=LogEvent(
+        "2026-09-27T05:05:15+00:00", "kernel",
+        'audit: type=1400 audit(1790485515.581:321): apparmor="DENIED" operation="open" class="file" profile="who" name="/etc/passwd" pid=103694 comm="who" requested_mask="r" denied_mask="r" fsuid=0 ouid=0', 4
+    )
+    rows=SystemLogAnalyzer(model).analyze_events([first, duplicate, other])
+    assert len(calls)==2
+    assert sorted(row.occurrences for row in rows)==[1,2]
+
+
+def test_automatic_event_sink_honors_fingerprint_cooldown():
+    from unittest.mock import patch
+    calls=[]
+    def model(_prompt):
+        return {"severity":"warning","notify":True,"title":"x","summary":"x","reason":"x","recommended_action":"x","confidence":0.8}
+    analysis=SystemLogAnalyzer(model).analyze_events([ev("service failed")])[0]
+    monitor=SystemLogMonitor(
+        source=None, analyzer=SystemLogAnalyzer(model), config=MonitorConfig(cooldown_seconds=900),
+        event_sink=lambda kind,payload: calls.append((kind,payload)),
+    )
+    with patch("aicoder.system_log_monitor.time.monotonic", side_effect=[100.0, 101.0]):
+        monitor._emit([analysis], automatic=True)
+        monitor._emit([analysis], automatic=True)
+    assert len(calls)==1
+    assert calls[0][0]=="system_log_analysis"

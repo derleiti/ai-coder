@@ -13,6 +13,7 @@ import shutil
 import shlex
 import subprocess
 import tarfile
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -246,67 +247,84 @@ def _git_snapshot_paths(workspace: Path) -> list[Path] | None:
     return list(selected.values())
 
 
-def snapshot_workspace(workspace: Path, *, source: str) -> Path:
-    """Create a persistent pre-change archive for commands with unknown write scope."""
+def snapshot_workspace(workspace: Path, *, source: str, timeout_s: float | None = None) -> Path:
+    """Create a persistent pre-change archive with an optional fail-closed deadline."""
     workspace = workspace.expanduser().resolve(strict=True)
     action = _action_dir(workspace, source)
-    payload = _write_meta(action, workspace=workspace, source=source, kind="workspace")
-    archive = action / "workspace.tar.gz"
-    backup_root = shared_backup_root().resolve(strict=False)
-    git_paths = _git_snapshot_paths(workspace)
-    with tarfile.open(archive, "w:gz") as tar:
-        if git_paths is not None:
-            for child in git_paths:
-                try:
-                    resolved = child.resolve(strict=False)
-                except OSError:
-                    resolved = child.absolute()
-                if resolved == backup_root or backup_root in resolved.parents:
-                    continue
-                tar.add(child, arcname=child.relative_to(workspace).as_posix(), recursive=False)
-        else:
-            workspace_dev = os.lstat(workspace).st_dev
-            for base, dirnames, filenames in os.walk(workspace, topdown=True, followlinks=False):
-                base_path = Path(base)
-                kept_dirs: list[str] = []
-                for name in dirnames:
-                    child = base_path / name
+    deadline = None if timeout_s is None else time.monotonic() + max(1.0, float(timeout_s))
+
+    def check_deadline() -> None:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError(f"workspace fallback backup timed out after {float(timeout_s):.1f}s")
+
+    try:
+        payload = _write_meta(action, workspace=workspace, source=source, kind="workspace")
+        archive = action / "workspace.tar.gz"
+        backup_root = shared_backup_root().resolve(strict=False)
+        check_deadline()
+        git_paths = _git_snapshot_paths(workspace)
+        check_deadline()
+        with tarfile.open(archive, "w:gz") as tar:
+            if git_paths is not None:
+                for child in git_paths:
+                    check_deadline()
                     try:
                         resolved = child.resolve(strict=False)
                     except OSError:
                         resolved = child.absolute()
                     if resolved == backup_root or backup_root in resolved.parents:
-                        continue
-                    try:
-                        if os.lstat(child).st_dev != workspace_dev:
-                            continue
-                    except OSError:
-                        continue
-                    if child.is_symlink():
-                        tar.add(child, arcname=child.relative_to(workspace).as_posix(), recursive=False)
-                        continue
-                    kept_dirs.append(name)
-                dirnames[:] = kept_dirs
-                if base_path != workspace:
-                    tar.add(base_path, arcname=base_path.relative_to(workspace).as_posix(), recursive=False)
-                for name in filenames:
-                    child = base_path / name
-                    try:
-                        resolved = child.resolve(strict=False)
-                    except OSError:
-                        resolved = child.absolute()
-                    if resolved == backup_root or backup_root in resolved.parents:
-                        continue
-                    try:
-                        if os.lstat(child).st_dev != workspace_dev:
-                            continue
-                    except OSError:
                         continue
                     tar.add(child, arcname=child.relative_to(workspace).as_posix(), recursive=False)
-    preview = action / "recovery-preview"
-    _document(action, payload, [
-        f"mkdir -p -- {shlex.quote(str(preview))}",
-        f"tar -xzf {shlex.quote(str(archive))} -C {shlex.quote(str(preview))}",
-        f"diff -ruN -- {shlex.quote(str(workspace))} {shlex.quote(str(preview))}  # inspect before restore",
-    ])
-    return archive
+            else:
+                workspace_dev = os.lstat(workspace).st_dev
+                for base, dirnames, filenames in os.walk(workspace, topdown=True, followlinks=False):
+                    check_deadline()
+                    base_path = Path(base)
+                    kept_dirs: list[str] = []
+                    for name in dirnames:
+                        check_deadline()
+                        child = base_path / name
+                        try:
+                            resolved = child.resolve(strict=False)
+                        except OSError:
+                            resolved = child.absolute()
+                        if resolved == backup_root or backup_root in resolved.parents:
+                            continue
+                        try:
+                            if os.lstat(child).st_dev != workspace_dev:
+                                continue
+                        except OSError:
+                            continue
+                        if child.is_symlink():
+                            tar.add(child, arcname=child.relative_to(workspace).as_posix(), recursive=False)
+                            continue
+                        kept_dirs.append(name)
+                    dirnames[:] = kept_dirs
+                    if base_path != workspace:
+                        tar.add(base_path, arcname=base_path.relative_to(workspace).as_posix(), recursive=False)
+                    for name in filenames:
+                        check_deadline()
+                        child = base_path / name
+                        try:
+                            resolved = child.resolve(strict=False)
+                        except OSError:
+                            resolved = child.absolute()
+                        if resolved == backup_root or backup_root in resolved.parents:
+                            continue
+                        try:
+                            if os.lstat(child).st_dev != workspace_dev:
+                                continue
+                        except OSError:
+                            continue
+                        tar.add(child, arcname=child.relative_to(workspace).as_posix(), recursive=False)
+        check_deadline()
+        preview = action / "recovery-preview"
+        _document(action, payload, [
+            f"mkdir -p -- {shlex.quote(str(preview))}",
+            f"tar -xzf {shlex.quote(str(archive))} -C {shlex.quote(str(preview))}",
+            f"diff -ruN -- {shlex.quote(str(workspace))} {shlex.quote(str(preview))}  # inspect before restore",
+        ])
+        return archive
+    except Exception:
+        shutil.rmtree(action, ignore_errors=True)
+        raise

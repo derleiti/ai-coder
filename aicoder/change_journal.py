@@ -116,9 +116,11 @@ class ChangeJournal:
         marker = snapshot_absence(workspace_root, path, source="change-journal-directory", kind="directory-absent")
         return {"kind": "remove_created_dir", "target": str(path), "backup_path": str(marker)}
 
-    def prepare_workspace_change(self, workspace: str | Path, *, source: str) -> dict[str, Any]:
+    def prepare_workspace_change(
+        self, workspace: str | Path, *, source: str, timeout_s: float | None = None
+    ) -> dict[str, Any]:
         root = Path(workspace).expanduser().resolve(strict=True)
-        archive = snapshot_workspace(root, source=source)
+        archive = snapshot_workspace(root, source=source, timeout_s=timeout_s)
         return {
             "kind": "workspace_snapshot",
             "target": str(root),

@@ -17,6 +17,7 @@ import ast
 import platform
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -2355,6 +2356,25 @@ def run_local_shell(args: dict, *, task_runner: bool = False) -> Tuple[str, bool
         return f"{'task_runner' if task_runner else 'shell'} error: {exc}", True
 
 
+_STANDARD_SYSTEM_BINARY_DIRS = ("/usr/local/sbin", "/usr/sbin", "/sbin")
+
+
+def _resolve_binary_program(program: str, env: dict[str, str]) -> str:
+    """Resolve binary names without depending on an interactive shell PATH."""
+    value = str(program or "").strip()
+    if not value or os.path.isabs(value) or os.sep in value or (os.altsep and os.altsep in value):
+        return value
+    resolved = shutil.which(value, path=env.get("PATH"))
+    if resolved:
+        return resolved
+    if not IS_WINDOWS:
+        for directory in _STANDARD_SYSTEM_BINARY_DIRS:
+            candidate = Path(directory) / value
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+    return value
+
+
 def run_local_binary(args: dict) -> Tuple[str, bool]:
     program = str(args.get("program") or "").strip()
     if not program:
@@ -2369,6 +2389,8 @@ def run_local_binary(args: dict) -> Tuple[str, bool]:
         )
         timeout = _bounded_timeout(args, 60, 120)
         argv, env = _disk_backed_project_environment(cwd, [program, *arguments])
+        if argv:
+            argv[0] = _resolve_binary_program(argv[0], env)
         stdin_data = args.get("stdin_data") if isinstance(args.get("stdin_data"), str) else None
         completed = _loom_container_exec(cwd, argv, timeout=timeout, stdin_data=stdin_data)
         if completed is None:
@@ -2483,7 +2505,10 @@ def _prepare_change_restore(tool_name: str, args: dict):
         )
         return journal, journal.prepare_directory_create(target, _workspace_root())
     if tool_name in {"shell", "binary_exec", "task_runner", "git"}:
-        return journal, journal.prepare_workspace_change(_workspace_root(), source=tool_name)
+        backup_timeout = _bounded_timeout(args, 60, 120)
+        return journal, journal.prepare_workspace_change(
+            _workspace_root(), source=tool_name, timeout_s=backup_timeout,
+        )
     if tool_name in {"settings_apply_patch", "settings_reset"}:
         return journal, _prepare_settings_restore(tool_name, args)
     return journal, None

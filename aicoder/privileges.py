@@ -51,9 +51,10 @@ _DESTRUCTIVE_TOOL_NAMES = {"memory_clear", "ollama_delete", "wp_delete_post"}
 
 _COMMAND_RUNNER_TOOLS = {"shell", "task_runner", "custom_exec", "binary_exec", "local_exec"}
 _READ_ONLY_PROGRAMS = {
-    "cat", "cut", "df", "du", "env", "false", "find", "getprop", "grep", "head",
-    "hostname", "id", "ip", "ls", "lsblk", "printf", "ps", "pwd", "readlink", "realpath",
-    "sed", "ss", "stat", "tail", "termux-info", "true", "uname", "uptime", "wc", "which",
+    "aa-status", "apparmor_status", "cat", "cut", "df", "du", "env", "false", "find",
+    "getprop", "grep", "head", "hostname", "id", "ip", "ls", "lsblk", "printf", "ps", "pwd",
+    "readlink", "realpath", "sed", "ss", "stat", "tail", "termux-info", "true", "uname", "uptime",
+    "wc", "which",
 }
 
 def _binary_exec_command(args: dict[str, Any]) -> str:

@@ -73,8 +73,22 @@ class MonitorConfig:
     notify_errors: bool = True
 
 
+_APPARMOR_FIELD_RE = re.compile(r'([A-Za-z_]+)="([^"]*)"')
+
+
 def _fingerprint(event: LogEvent) -> str:
-    msg = re.sub(r"\b\d{4,}\b", "<n>", redact_text(event.message).casefold())
+    msg = redact_text(event.message).casefold()
+    if 'apparmor="denied"' in msg:
+        fields = {key.casefold(): value.casefold() for key, value in _APPARMOR_FIELD_RE.findall(msg)}
+        stable = "|".join(
+            f"{key}={fields.get(key, '')}"
+            for key in ("apparmor", "operation", "class", "profile", "name", "comm", "requested_mask", "denied_mask")
+        )
+        if fields.get("profile") or fields.get("name"):
+            return hashlib.sha256(f"{event.source.casefold()}\n{stable}".encode()).hexdigest()[:24]
+    msg = re.sub(r"audit\([^)]*\):", "audit(<id>):", msg)
+    msg = re.sub(r"\b(?:pid|ppid|uid|gid|auid)=\d+\b", lambda m: m.group(0).split("=")[0] + "=<n>", msg)
+    msg = re.sub(r"\b\d{4,}\b", "<n>", msg)
     msg = re.sub(r"\s+", " ", msg).strip()
     return hashlib.sha256(f"{event.source.casefold()}\n{msg}".encode()).hexdigest()[:24]
 
@@ -201,6 +215,7 @@ class SystemLogMonitor:
         self.notify, self.event_sink = notify, event_sink
         self._cursor: str | None = None
         self._sent_at: dict[str, float] = {}
+        self._emitted_at: dict[str, float] = {}
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -221,8 +236,14 @@ class SystemLogMonitor:
         now = time.monotonic()
         for item in analyses:
             payload = item.__dict__.copy()
-            if self.event_sink:
+            emit_allowed = True
+            if automatic:
+                previous_emit = self._emitted_at.get(item.fingerprint, -1e30)
+                emit_allowed = now - previous_emit >= max(0, self.config.cooldown_seconds)
+            if self.event_sink and emit_allowed:
                 self.event_sink("system_log_analysis", payload)
+                if automatic:
+                    self._emitted_at[item.fingerprint] = now
             if not automatic or not item.notify or SEVERITY_ORDER[item.severity] < SEVERITY_ORDER.get(self.config.min_severity, 2):
                 continue
             if item.severity == "security" and not self.config.notify_security:

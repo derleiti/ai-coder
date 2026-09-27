@@ -111,7 +111,10 @@ class PrivilegeBrokerPolicyTests(unittest.TestCase):
         self.assertEqual(local.call_args.args[0]["_elevation_strategy"], "sudo")
 
     def test_known_read_only_binary_exec_does_not_require_approval(self):
-        for program, arguments in (("uname", ["-a"]), ("cat", ["/proc/cpuinfo"]), ("git", ["--version"]), ("df", ["-h"])):
+        for program, arguments in (
+            ("uname", ["-a"]), ("cat", ["/proc/cpuinfo"]), ("git", ["--version"]), ("df", ["-h"]),
+            ("aa-status", []), ("/usr/sbin/aa-status", []), ("apparmor_status", []),
+        ):
             with self.subTest(program=program):
                 risk = assess_execution("binary_exec", {"program": program, "arguments": arguments})
                 self.assertFalse(risk.needs_approval)

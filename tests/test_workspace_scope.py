@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from aicoder import cli
+import aicoder.executor as executor
 from aicoder.agent import _cli_approval, _headless_approval
 from aicoder.executor import run_tool
 from aicoder.workspace import ACTIVE_WORKSPACE_ENV, activate_workspace, active_workspace
@@ -208,6 +209,47 @@ class WorkspaceEscapeTests(unittest.TestCase):
         with patch("aicoder.agent.get_state", return_value={"approval_mode": "all"}):
             self.assertFalse(_headless_approval("file_read", args))
 
+
+    def test_aa_status_binary_exec_is_read_only_and_skips_backup(self):
+        with tempfile.TemporaryDirectory() as temp:
+            phases = []
+            approval_calls = []
+            def approval(name, args):
+                approval_calls.append((name, dict(args)))
+                return True
+            registry = MagicMock()
+            registry.provider_for_tool.return_value = None
+            with (
+                patch.object(executor, "discover_plugins", return_value=registry),
+                patch.object(executor, "run_local_binary", return_value=("ok", False)),
+                patch.object(executor, "_prepare_change_restore") as prepare_backup,
+                patch.object(executor.audit, "log_tool"),
+            ):
+                result, is_error = executor.run_tool(
+                    MagicMock(), "binary_exec",
+                    {"program": "/usr/sbin/aa-status", "arguments": [], "work_dir": ".", "timeout": 30},
+                    approval_fn=approval, allowed_tools={"binary_exec"}, workspace_root=temp,
+                    phase_fn=phases.append,
+                )
+            self.assertFalse(is_error, result)
+            self.assertEqual(result, "ok")
+            self.assertEqual(approval_calls, [])
+            prepare_backup.assert_not_called()
+            self.assertNotIn("approval", phases)
+            self.assertNotIn("backup", phases)
+            self.assertIn("execute", phases)
+
+    def test_binary_resolver_falls_back_to_standard_sbin_directories(self):
+        with tempfile.TemporaryDirectory() as temp:
+            binary = Path(temp) / "aa-status"
+            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binary.chmod(0o755)
+            with (
+                patch.object(executor, "_STANDARD_SYSTEM_BINARY_DIRS", (temp,)),
+                patch.object(executor.shutil, "which", return_value=None),
+            ):
+                resolved = executor._resolve_binary_program("aa-status", {"PATH": "/usr/bin"})
+            self.assertEqual(resolved, str(binary))
 
     def test_local_binary_exec_runs_in_workspace_and_reports_exit_code(self):
         with tempfile.TemporaryDirectory() as temp:
