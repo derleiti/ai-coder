@@ -28,6 +28,7 @@ from .failure_tracking import FailureTracker
 from .executor import MAX_ITERATIONS, atomic_write_text, load_tools, trim_messages
 from .model_transport import ModelTransport
 from .performance import RuntimePerformance
+from .project_memory import LocalProjectMemory
 from .task_contract import AcceptanceCheck, TaskContract, compile_task_contract
 from .stage_context import build_runtime_truth, build_stage_initialization, mark_persistent_write_completed, runtime_completion_summary
 from .team_runtime import (
@@ -74,6 +75,122 @@ def _team_provider_concurrency(state: dict[str, Any]) -> int:
         return max(1, min(8, int(raw)))
     except (TypeError, ValueError):
         return 1
+
+
+class _TeamMemoryTracker:
+    """Mirror one team run into canonical Project Memory without affecting execution."""
+
+    def __init__(
+        self, *, workspace: str, client: Any, run_id: str, task: str,
+        event_fn: EventFn | None = None,
+    ) -> None:
+        self.workspace = str(workspace or ".")
+        self.client = client
+        self.run_id = str(run_id)
+        self.task = str(task or "")
+        self.event_fn = event_fn
+        self.entity_id = self.run_id
+        self.memory: LocalProjectMemory | None = None
+        self.completed_stages: list[str] = []
+        self.checkpoint = "created"
+
+    def _content(self, *, status: str, error: str = "", ledger: dict[str, Any] | None = None) -> str:
+        completed = list((ledger or {}).get("completed") or self.completed_stages)
+        payload = {
+            "schema": "aicoder-teamrun-memory-v1",
+            "run_id": self.run_id,
+            "task": self.task[:3000],
+            "workspace": str(Path(self.workspace).expanduser().resolve(strict=False)),
+            "checkpoint": self.checkpoint,
+            "completed_stages": completed,
+            "status": status,
+        }
+        if error:
+            payload["error"] = str(error)[:2000]
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+    def _ensure(self) -> LocalProjectMemory:
+        if self.memory is None:
+            self.memory = LocalProjectMemory(self.workspace)
+            self.memory.store(
+                kind="project_summary",
+                title=f"Teamrun {self.run_id}: {self.task[:180]}",
+                content=self._content(status="running"),
+                status="active",
+                entity_id=self.entity_id,
+                source="aicoder-teamrun",
+            )
+        return self.memory
+
+    def _sync(self, memory: LocalProjectMemory) -> None:
+        try:
+            result = memory.sync(self.client)
+            _emit(
+                self.event_fn, "team_memory", status="synced", run_id=self.run_id,
+                entity_id=self.entity_id, project_key=memory.project_key, checkpoint=self.checkpoint,
+                accepted=int(result.get("accepted") or 0), conflicts=int(result.get("conflicts") or 0),
+            )
+        except Exception as exc:
+            _emit(
+                self.event_fn, "team_memory", status="sync_failed", run_id=self.run_id,
+                entity_id=self.entity_id, project_key=getattr(memory, "project_key", ""),
+                checkpoint=self.checkpoint, error=f"{type(exc).__name__}: {exc}",
+            )
+
+    def checkpoint_stage(self, stage: str, ledger: dict[str, Any] | None = None) -> None:
+        try:
+            self.checkpoint = str(stage or "unknown")
+            completed = list((ledger or {}).get("completed") or [])
+            if completed:
+                self.completed_stages = completed
+            memory = self._ensure()
+            memory.update(
+                self.entity_id, content=self._content(status="running", ledger=ledger),
+                status="active", source="aicoder-teamrun",
+            )
+            self._sync(memory)
+        except Exception as exc:
+            _emit(
+                self.event_fn, "team_memory", status="write_failed", run_id=self.run_id,
+                entity_id=self.entity_id, checkpoint=self.checkpoint,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+    def finalize(self, status: str, *, ledger: dict[str, Any] | None = None, error: str = "") -> None:
+        try:
+            self.checkpoint = "run_completed" if status == "completed" else f"run_{status}"
+            memory = self._ensure()
+            memory.update(
+                self.entity_id, content=self._content(status=status, error=error, ledger=ledger),
+                status=str(status or "failed"), source="aicoder-teamrun",
+            )
+            self._sync(memory)
+        except Exception as exc:
+            _emit(
+                self.event_fn, "team_memory", status="write_failed", run_id=self.run_id,
+                entity_id=self.entity_id, checkpoint=self.checkpoint,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+    def observe(self, kind: str, payload: dict[str, Any]) -> None:
+        if kind == "team_project_workspace" and payload.get("path") and self.memory is None:
+            self.workspace = str(payload["path"])
+            return
+        if kind == "team_start":
+            self.checkpoint_stage("run_start")
+            return
+        if kind == "team_pipeline" and payload.get("status") == "completed":
+            self.checkpoint_stage(str(payload.get("stage") or "unknown"), payload.get("ledger") or {})
+
+    def wrap(self, fn: EventFn | None) -> EventFn:
+        def wrapped(kind: str, payload: dict[str, Any]) -> None:
+            if fn is not None:
+                try:
+                    fn(kind, payload)
+                except Exception:
+                    pass
+            self.observe(kind, payload)
+        return wrapped
 
 
 class _TeamProviderLimiter:
@@ -3418,6 +3535,10 @@ def run_team(
     run_id = f"team-{uuid.uuid4().hex[:16]}"
     run_started = time.monotonic()
     events = _event_with_debug(event_fn, _TeamDebugLog(run_id))
+    memory_tracker = _TeamMemoryTracker(
+        workspace=source_workspace, client=client, run_id=run_id, task=task, event_fn=events,
+    )
+    tracked_events = memory_tracker.wrap(events)
     try:
         with _team_run_lock(source_workspace, task) as lock_acquired:
             if not lock_acquired:
@@ -3425,13 +3546,13 @@ def run_team(
                     "failed", "", "", [], [], {},
                     "another AICoder team run is already active for this workspace",
                 )
-                _emit(events, "team_run_lock", status="rejected", workspace=source_workspace)
+                _emit(tracked_events, "team_run_lock", status="rejected", workspace=source_workspace)
             else:
-                _emit(events, "team_run_lock", status="acquired", workspace=source_workspace)
+                _emit(tracked_events, "team_run_lock", status="acquired", workspace=source_workspace)
                 result = _run_team_pipeline(
                     task=task, state=state, config=config, client=client,
                     model_client=model_client, source_workspace=source_workspace,
-                    event_fn=events, stop_requested=stop_requested, run_id=run_id,
+                    event_fn=tracked_events, stop_requested=stop_requested, run_id=run_id,
                 )
         if result.status != "completed" and stop_requested is not None and stop_requested():
             result.status = "cancelled"
@@ -3446,8 +3567,9 @@ def run_team(
         )
     elapsed_ms = int((time.monotonic() - run_started) * 1000)
     ledger = result.performance.get("ledger", {}) if isinstance(result.performance, dict) else {}
+    memory_tracker.finalize(result.status, ledger=ledger, error=result.error)
     _emit(
-        events, "team_terminal", status=result.status,
+        tracked_events, "team_terminal", status=result.status,
         progress=100 if result.status == "completed" else None,
         elapsed_ms=elapsed_ms, error=result.error, ledger=ledger,
     )

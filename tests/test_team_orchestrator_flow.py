@@ -1985,6 +1985,81 @@ def test_final_repair_runtime_is_fresh_and_failure_focused():
         integration.abort()
 
 
+class TeamMemoryTrackerTests(unittest.TestCase):
+    def test_team_memory_tracks_workspace_checkpoints_and_terminal_status(self):
+        from aicoder.team_orchestrator import _TeamMemoryTracker
+
+        instances = []
+        events = []
+
+        class FakeMemory:
+            def __init__(self, workspace):
+                self.workspace = workspace
+                self.project_key = "project:test"
+                self.rows = {}
+                self.sync_calls = 0
+                instances.append(self)
+
+            def store(self, **kwargs):
+                self.rows[kwargs["entity_id"]] = dict(kwargs)
+                return dict(kwargs)
+
+            def update(self, entity_id, **changes):
+                self.rows.setdefault(entity_id, {}).update(changes)
+                return dict(self.rows[entity_id])
+
+            def sync(self, client):
+                self.sync_calls += 1
+                return {"accepted": 1, "conflicts": 0}
+
+        with patch("aicoder.team_orchestrator.LocalProjectMemory", FakeMemory):
+            tracker = _TeamMemoryTracker(
+                workspace="/old", client=MagicMock(), run_id="team-test", task="Implement feature",
+                event_fn=lambda kind, payload: events.append((kind, payload)),
+            )
+            wrapped = tracker.wrap(lambda kind, payload: events.append((kind, payload)))
+            wrapped("team_project_workspace", {"path": "/resolved", "auto_selected": True})
+            wrapped("team_start", {"agents": 3})
+            wrapped("team_pipeline", {"stage": "research", "status": "completed", "ledger": {"completed": ["plan_research", "research"]}})
+            tracker.finalize("completed", ledger={"completed": ["plan_research", "research"]})
+
+        self.assertEqual(len(instances), 1)
+        self.assertEqual(instances[0].workspace, "/resolved")
+        row = instances[0].rows["team-test"]
+        payload = json.loads(row["content"])
+        self.assertEqual(payload["checkpoint"], "run_completed")
+        self.assertEqual(payload["status"], "completed")
+        self.assertEqual(payload["completed_stages"], ["plan_research", "research"])
+        self.assertEqual(instances[0].sync_calls, 3)
+        self.assertTrue(any(kind == "team_memory" and data.get("status") == "synced" for kind, data in events))
+
+    def test_team_memory_sync_failure_is_fail_open(self):
+        from aicoder.team_orchestrator import _TeamMemoryTracker
+
+        events = []
+
+        class FailingMemory:
+            project_key = "project:test"
+            def __init__(self, workspace):
+                pass
+            def store(self, **kwargs):
+                return kwargs
+            def update(self, entity_id, **changes):
+                return changes
+            def sync(self, client):
+                raise RuntimeError("offline")
+
+        with patch("aicoder.team_orchestrator.LocalProjectMemory", FailingMemory):
+            tracker = _TeamMemoryTracker(
+                workspace=".", client=MagicMock(), run_id="team-offline", task="Task",
+                event_fn=lambda kind, payload: events.append((kind, payload)),
+            )
+            tracker.checkpoint_stage("research", {"completed": ["research"]})
+            tracker.finalize("failed", ledger={"completed": ["research"]}, error="boom")
+
+        self.assertTrue(any(kind == "team_memory" and data.get("status") == "sync_failed" for kind, data in events))
+
+
 class TeamProviderConcurrencyTests(unittest.TestCase):
     def test_provider_key_groups_models_by_transport_provider(self):
         from aicoder.team_orchestrator import _team_provider_key
