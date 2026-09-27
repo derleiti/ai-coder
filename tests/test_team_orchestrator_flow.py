@@ -1985,6 +1985,75 @@ def test_final_repair_runtime_is_fresh_and_failure_focused():
         integration.abort()
 
 
+class TeamProviderConcurrencyTests(unittest.TestCase):
+    def test_provider_key_groups_models_by_transport_provider(self):
+        from aicoder.team_orchestrator import _team_provider_key
+
+        self.assertEqual(_team_provider_key("cloudflare/@cf/meta/llama"), "cloudflare")
+        self.assertEqual(_team_provider_key("nvidia/openai/gpt-oss-20b"), "nvidia")
+        self.assertEqual(_team_provider_key("account:chatgpt/gpt-6-sol"), "account:chatgpt")
+        self.assertEqual(_team_provider_key("gpt-oss:20b-cloud"), "default")
+
+    def test_same_provider_is_serialized(self):
+        from aicoder.team_orchestrator import _TeamProviderLimiter
+        import threading
+
+        limiter = _TeamProviderLimiter(1)
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        second_entered = threading.Event()
+
+        def first():
+            with limiter.acquire("cloudflare/model-a", "planner"):
+                first_entered.set()
+                release_first.wait(1)
+
+        def second():
+            with limiter.acquire("cloudflare/model-b", "merge"):
+                second_entered.set()
+
+        a = threading.Thread(target=first)
+        b = threading.Thread(target=second)
+        a.start(); self.assertTrue(first_entered.wait(1)); b.start()
+        self.assertFalse(second_entered.wait(0.05))
+        release_first.set()
+        self.assertTrue(second_entered.wait(1))
+        a.join(1); b.join(1)
+
+    def test_different_providers_remain_parallel(self):
+        from aicoder.team_orchestrator import _TeamProviderLimiter
+        import threading
+
+        limiter = _TeamProviderLimiter(1)
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        second_entered = threading.Event()
+
+        def first():
+            with limiter.acquire("cloudflare/model-a", "planner"):
+                first_entered.set()
+                release_first.wait(1)
+
+        def second():
+            with limiter.acquire("nvidia/model-b", "coordinator"):
+                second_entered.set()
+
+        a = threading.Thread(target=first)
+        b = threading.Thread(target=second)
+        a.start(); self.assertTrue(first_entered.wait(1)); b.start()
+        self.assertTrue(second_entered.wait(1))
+        release_first.set()
+        a.join(1); b.join(1)
+
+    def test_provider_concurrency_defaults_to_one_and_is_configurable(self):
+        from aicoder.team_orchestrator import _team_provider_concurrency
+
+        with patch.dict("os.environ", {}, clear=False):
+            self.assertEqual(_team_provider_concurrency({}), 1)
+        self.assertEqual(_team_provider_concurrency({"team_provider_max_concurrency": "2"}), 2)
+        self.assertEqual(_team_provider_concurrency({"team_provider_max_concurrency": "999"}), 8)
+
+
 class TeamProviderPreflightTests(unittest.TestCase):
     def test_unauthed_antigravity_role_fails_before_pipeline_stage(self):
         from aicoder.team_orchestrator import _team_provider_preflight

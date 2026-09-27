@@ -55,6 +55,72 @@ EventFn = Callable[[str, dict[str, Any]], None]
 StopFn = Callable[[], bool]
 
 
+def _team_provider_key(model: str) -> str:
+    value = str(model or "").strip().lower()
+    if not value:
+        return "unknown"
+    if value.startswith("account:"):
+        return value.split("/", 1)[0]
+    if "/" in value:
+        return value.split("/", 1)[0]
+    return "default"
+
+
+def _team_provider_concurrency(state: dict[str, Any]) -> int:
+    raw = state.get("team_provider_max_concurrency")
+    if raw in (None, ""):
+        raw = os.getenv("AICODER_TEAM_PROVIDER_MAX_CONCURRENCY", "1")
+    try:
+        return max(1, min(8, int(raw)))
+    except (TypeError, ValueError):
+        return 1
+
+
+class _TeamProviderLimiter:
+    def __init__(self, max_per_provider: int = 1) -> None:
+        self.max_per_provider = max(1, int(max_per_provider))
+        self._guard = threading.Lock()
+        self._slots: dict[str, threading.BoundedSemaphore] = {}
+
+    def _slot(self, provider: str) -> threading.BoundedSemaphore:
+        with self._guard:
+            slot = self._slots.get(provider)
+            if slot is None:
+                slot = threading.BoundedSemaphore(self.max_per_provider)
+                self._slots[provider] = slot
+            return slot
+
+    @contextmanager
+    def acquire(self, model: str, role: str, event_fn: EventFn | None = None):
+        provider = _team_provider_key(model)
+        slot = self._slot(provider)
+        started = time.monotonic()
+        acquired_immediately = slot.acquire(blocking=False)
+        if not acquired_immediately:
+            _emit(
+                event_fn, "team_provider_queue", provider=provider, role=role,
+                model=model, status="waiting", max_concurrency=self.max_per_provider,
+            )
+            slot.acquire()
+            _emit(
+                event_fn, "team_provider_queue", provider=provider, role=role,
+                model=model, status="acquired", max_concurrency=self.max_per_provider,
+                waited_ms=int((time.monotonic() - started) * 1000),
+            )
+        try:
+            yield
+        finally:
+            slot.release()
+
+
+def _run_with_provider_limit(
+    limiter: _TeamProviderLimiter, model: str, role: str, event_fn: EventFn | None,
+    fn: Callable[..., Any], kwargs: dict[str, Any],
+):
+    with limiter.acquire(model, role, event_fn):
+        return fn(**kwargs)
+
+
 def _team_role_models(config: TeamConfig) -> list[tuple[str, str]]:
     roles: list[tuple[str, str]] = []
     roles.extend((f"research:{slot.role}", slot.model) for slot in config.research)
@@ -3455,6 +3521,12 @@ def _run_team_pipeline(
     # expand it via capability_request; approval/risk policy remains authoritative.
     research_tools = [dict(tool) for tool in all_tools]
     coder_tools = [dict(tool) for tool in all_tools]
+    provider_limiter = _TeamProviderLimiter(_team_provider_concurrency(state))
+    _emit(
+        event_fn, "team_provider_concurrency",
+        max_per_provider=provider_limiter.max_per_provider,
+        providers=sorted({_team_provider_key(model) for _role, model in _team_role_models(config)}),
+    )
     _emit(event_fn, "team_start", agents=config.active_count, research=len(config.research), coders=len(config.coders))
 
     # 1) plan_research -- coordinator bootstraps cumulative Session Memory / StageOff and research assignments.
@@ -3568,12 +3640,15 @@ def _run_team_pipeline(
         with ThreadPoolExecutor(max_workers=len(config.research), thread_name_prefix="aicoder-research") as pool:
             futures = {
                 pool.submit(
-                    _run_researcher, client=client, model_client=model_client, model=slot.model,
-                    role=slot.role, source_workspace=source_workspace,
-                    tools=research_tools, stop_requested=stop_requested,
-                    stage_input=stageoff_handoff, task=task, research_plan=research_plan.response,
-                    native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)), event_fn=event_fn,
-                    request_timeout=request_timeout,
+                    _run_with_provider_limit, provider_limiter, slot.model, f"research:{slot.role}", event_fn,
+                    _run_researcher, {
+                        "client": client, "model_client": model_client, "model": slot.model,
+                        "role": slot.role, "source_workspace": source_workspace,
+                        "tools": research_tools, "stop_requested": stop_requested,
+                        "stage_input": stageoff_handoff, "task": task, "research_plan": research_plan.response,
+                        "native_openrouter_tool_calling": bool(state.get("native_openrouter_tool_calling", False)),
+                        "event_fn": event_fn, "request_timeout": request_timeout,
+                    },
                 ): slot for slot in config.research
             }
             for future in as_completed(futures):
@@ -3645,26 +3720,31 @@ def _run_team_pipeline(
         with ThreadPoolExecutor(max_workers=len(brainstorm_participants), thread_name_prefix=f"aicoder-brainstorm-r{round_index}") as pool:
             futures = {
                 pool.submit(
-                    _call_stage_agent, client=client, model_client=model_client, model=model, system=system_prompt,
-                    tools=all_tools, workspace_root=source_workspace,
-                    prompt=(
-                        build_stage_initialization(
-                            stage_input=stageoff_handoff, contract=task_contract, current_stage="brainstorm",
-                            sought=f"Generate evidence-grounded implementation alternatives for round {round_index} from the {perspective} perspective; do not implement.",
-                            permissions="- Workspace mutation: forbidden.\n- Observational repository tools: allowed.\n- Read-only web research: allowed only when it materially resolves a factual uncertainty.",
-                        )
-                        + "\n\nPREVIOUS STAGE OUTPUT (authoritative; fresh model process):\n"
-                        + stageoff_handoff.render()
-                        + f"\n\nBRAINSTORM ROUND: {round_index}\nYOUR PERSPECTIVE: {perspective}\n"
-                        + f"TASK SHA256: {task_contract.task_sha256}\n"
-                        + "ANTI-DRIFT RULE: Every direction must directly satisfy the immutable user task above. "
-                          "Do not substitute a familiar framework, database, web app, or unrelated project.\n\n"
-                        + f"CURRENT ANONYMIZED BRAINSTORM STATE:\n{brainstorm_state or '(none - create independent ideas)'}"
-                    ),
-                    required_sections=BRAINSTORM_SECTIONS, max_tokens=4000, max_iterations=35,
-                    event_fn=event_fn, role=f"brainstorm:r{round_index}:{label}", stop_requested=stop_requested,
-                    approval_fn=_brainstorm_approval_for_task(task_contract), request_timeout=request_timeout,
-                    native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
+                    _run_with_provider_limit, provider_limiter, model, f"brainstorm:r{round_index}:{label}", event_fn,
+                    _call_stage_agent, {
+                        "client": client, "model_client": model_client, "model": model, "system": system_prompt,
+                        "tools": all_tools, "workspace_root": source_workspace,
+                        "prompt": (
+                            build_stage_initialization(
+                                stage_input=stageoff_handoff, contract=task_contract, current_stage="brainstorm",
+                                sought=f"Generate evidence-grounded implementation alternatives for round {round_index} from the {perspective} perspective; do not implement.",
+                                permissions="- Workspace mutation: forbidden.\n- Observational repository tools: allowed.\n- Read-only web research: allowed only when it materially resolves a factual uncertainty.",
+                            )
+                            + "\n\nPREVIOUS STAGE OUTPUT (authoritative; fresh model process):\n"
+                            + stageoff_handoff.render()
+                            + f"\n\nBRAINSTORM ROUND: {round_index}\nYOUR PERSPECTIVE: {perspective}\n"
+                            + f"TASK SHA256: {task_contract.task_sha256}\n"
+                            + "ANTI-DRIFT RULE: Every direction must directly satisfy the immutable user task above. "
+                              "Do not substitute a familiar framework, database, web app, or unrelated project.\n\n"
+                            + f"CURRENT ANONYMIZED BRAINSTORM STATE:\n{brainstorm_state or '(none - create independent ideas)'}"
+                        ),
+                        "required_sections": BRAINSTORM_SECTIONS, "max_tokens": 4000, "max_iterations": 35,
+                        "event_fn": event_fn, "role": f"brainstorm:r{round_index}:{label}",
+                        "stop_requested": stop_requested,
+                        "approval_fn": _brainstorm_approval_for_task(task_contract),
+                        "request_timeout": request_timeout,
+                        "native_openrouter_tool_calling": bool(state.get("native_openrouter_tool_calling", False)),
+                    },
                 ): (label, model)
                 for label, model, perspective in brainstorm_participants
             }
@@ -3893,17 +3973,20 @@ def _run_team_pipeline(
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="aicoder-coder") as pool:
             futures = {
                 pool.submit(
-                    _run_candidate, client=client, model_client=model_client, source_workspace=source_workspace,
-                    backend_mode=workspace_plan.backend_mode, slot=index, model=slot.model,
-                    strategy=f"{slot.strategy}; adaptive-unit={unit.unit_id}", stage_input=stageoff_handoff,
-                    task=unit.task_text(task),
-                    tools=coder_tools, stop_requested=candidate_stop_requested,
-                    native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
-                    request_timeout=request_timeout, event_fn=event_fn,
-                    liveness_timeout_s=int(state.get("team_candidate_liveness_timeout_seconds") or 1200),
-                    stage_handoffs=candidate_handoffs, work_unit_id=unit.unit_id,
-                    implementer_token_budget=_work_unit_implementer_budget(unit),
-                    task_contract_override=_work_unit_task_contract(unit, task_contract),
+                    _run_with_provider_limit, provider_limiter, slot.model, f"coder:{index}", event_fn,
+                    _run_candidate, {
+                        "client": client, "model_client": model_client, "source_workspace": source_workspace,
+                        "backend_mode": workspace_plan.backend_mode, "slot": index, "model": slot.model,
+                        "strategy": f"{slot.strategy}; adaptive-unit={unit.unit_id}", "stage_input": stageoff_handoff,
+                        "task": unit.task_text(task), "tools": coder_tools,
+                        "stop_requested": candidate_stop_requested,
+                        "native_openrouter_tool_calling": bool(state.get("native_openrouter_tool_calling", False)),
+                        "request_timeout": request_timeout, "event_fn": event_fn,
+                        "liveness_timeout_s": int(state.get("team_candidate_liveness_timeout_seconds") or 1200),
+                        "stage_handoffs": candidate_handoffs, "work_unit_id": unit.unit_id,
+                        "implementer_token_budget": _work_unit_implementer_budget(unit),
+                        "task_contract_override": _work_unit_task_contract(unit, task_contract),
+                    },
                 ): (unit, slot, index) for index, (unit, slot) in enumerate(coding_assignments, start=1)
             }
             for future in as_completed(futures):
