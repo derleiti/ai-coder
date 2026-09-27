@@ -1,3 +1,11 @@
+## v1.4.3 (2026-09-27)
+
+- Classify AppArmor status diagnostics (`aa-status` / `apparmor_status`) as read-only `binary_exec` operations so log-analysis checks no longer request write approval or create huge fallback workspace backups.
+- Resolve binary names against standard system administration paths such as `/usr/sbin` and `/sbin` when GUI/headless PATH omits them; `aa-status` now resolves without the model retrying an absolute path.
+- Deduplicate AppArmor audit denials semantically by profile, operation, target and command while ignoring audit serial/PID noise, and apply the configured cooldown to automatic GUI log-analysis events as well as notifications.
+- Bound command-runner fallback workspace backups by the tool timeout and fail closed: if a required backup exceeds its budget, the incomplete snapshot is removed and the mutating tool is not executed.
+- Reproduce the original incident end to end: the read-only `aa-status` toolcall now reaches `execute` directly in milliseconds with no approval/backup phase, while five raw AppArmor denials collapse to three meaningful analyses with occurrence counts.
+
 ## v1.4.2 (2026-09-27)
 
 - Fix frozen standalone builds launching native system tools such as `journalctl` with PyInstaller's private `_MEI` library path; external system subprocesses now restore the host loader environment so systemd/OpenSSL ABI versions cannot be shadowed by bundled libraries.
