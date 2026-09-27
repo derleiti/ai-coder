@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Sequence
 
+from .subprocess_env import external_system_env
+
 SEVERITY_ORDER = {"ignore": 0, "info": 1, "warning": 2, "security": 3, "critical": 4}
 _SECURITY = re.compile(r"\b(authentication failure|failed password|invalid user|unauthorized|permission denied|access denied|apparmor.*denied|selinux.*denied|brute[ -]?force|intrusion|exploit)\b", re.I)
 _CRITICAL = re.compile(r"\b(kernel panic|kernel bug|oops:|segfault|out of memory|oom killer|killed process|i/o error|filesystem.*(?:error|corrupt)|smart.*(?:fail|critical)|temperature.*critical)\b", re.I)
@@ -140,7 +142,10 @@ class JournalctlSource:
         else:
             args += ["--since", f"-{max(10, int(since_seconds or 300))} seconds"]
         args += ["--lines", str(max(1, min(2000, int(max_events))))]
-        proc = subprocess.run(args, capture_output=True, text=True, timeout=15, check=False)
+        proc = subprocess.run(
+            args, capture_output=True, text=True, timeout=15, check=False,
+            env=external_system_env(),
+        )
         if proc.returncode:
             raise RuntimeError(f"journalctl failed ({proc.returncode}): {redact_text(proc.stderr, 500)}")
         events: list[LogEvent] = []

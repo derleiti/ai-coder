@@ -7,6 +7,8 @@ import platform
 import re
 import shutil
 import subprocess
+
+from .subprocess_env import external_system_env
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +35,7 @@ def _run(argv: list[str], *, timeout: int = 10, stdin: str | None = None) -> tup
     try:
         completed = subprocess.run(
             argv, input=stdin, capture_output=True, text=True, timeout=timeout, check=False,
+            env=external_system_env(),
         )
     except FileNotFoundError:
         return json.dumps({"error": f"command not found: {argv[0]}"}), True
