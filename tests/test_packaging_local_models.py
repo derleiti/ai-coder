@@ -15,3 +15,6 @@ def test_pyinstaller_bundles_gui_design_tokens_on_linux_and_windows():
     assert expected in linux_spec
     assert expected in windows_spec
     assert "datas=platform_datas + gui_datas" in windows_spec
+
+    workflow = Path(".github/workflows/build-release.yml").read_text(encoding="utf-8")
+    assert '--add-data "aicoder/gui/design_tokens.json;aicoder/gui"' in workflow
