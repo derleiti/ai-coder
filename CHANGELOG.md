@@ -1,3 +1,10 @@
+## v1.4.2 (2026-09-27)
+
+- Fix frozen standalone builds launching native system tools such as `journalctl` with PyInstaller's private `_MEI` library path; external system subprocesses now restore the host loader environment so systemd/OpenSSL ABI versions cannot be shadowed by bundled libraries.
+- Apply the sanitized subprocess environment to the system-log monitor and Local OS command provider, with regression coverage for `LD_LIBRARY_PATH` / `LD_LIBRARY_PATH_ORIG` handling.
+- Ensure the GitHub Actions Windows onefile build explicitly bundles `aicoder/gui/design_tokens.json`, matching the Linux/macOS and Windows spec-file hotfix from 1.4.1.
+- Verify the frozen Linux binary end to end: GUI reaches the Qt event loop and `aicoder systemlog analyze` successfully executes host `journalctl` without the previous `libcrypto.so.3` / `OPENSSL_3.4.0` error.
+
 ## v1.4.1 (2026-09-27)
 
 - Fix standalone GUI startup on Linux and Windows by bundling `aicoder/gui/design_tokens.json` into the PyInstaller application image.
