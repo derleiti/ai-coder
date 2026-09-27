@@ -1,3 +1,12 @@
+## v1.4.0 (2026-09-27)
+
+- Fix Team Runtime coding candidates getting trapped in read-only inspection loops before they could mutate the workspace; implementation nudges now happen before semantic-stall pauses.
+- Keep write/repair capabilities available through candidate recovery and progressively disclose large tool catalogues without starving coding tools.
+- Serialize parallel Team workers per provider while preserving cross-provider concurrency, preventing avoidable rate-limit collisions during research, brainstorm and coding stages.
+- Treat project-level `AGENTS.md` as greenfield metadata correctly so fresh repositories do not inherit the wrong project assumptions.
+- Persist Teamrun lifecycle checkpoints automatically into Project Memory and sync accepted revisions through TriForce into Claude-Mem history, fail-open so memory outages never abort the run.
+- Verify the full Candidate -> Test -> Merge -> Atomic Write path end to end with provider-aware role placement and deterministic final verification.
+
 ## v1.3.0 (2026-09-26)
 
 - Add local-first synchronized Project Memory backed by the existing evidence database, with offline dirty state, cursor sync, conflict preservation and tombstones.
