@@ -69,8 +69,8 @@ class TeamCandidateAutoResumeTests(unittest.TestCase):
         self.assertIn("GEGEBEN", calls[1]["initial_prompt"])
         self.assertIn("FERTIG", calls[1]["initial_prompt"])
         self.assertIn("GESUCHT_ZU_MACHEN", calls[1]["initial_prompt"])
-        self.assertIn("AUTHORITATIVE CODER RUN 1 ROLE: IMPLEMENTER", calls[0]["system_prompt"])
-        self.assertIn("AUTHORITATIVE CODER RUN 2 ROLE: TEST ENGINEER + REPAIR CODER", calls[1]["system_prompt"])
+        self.assertIn("AUTHORITATIVE CODER RUN 1 ROLE: IMPLEMENTER", calls[0]["system_prompt_suffix"])
+        self.assertIn("AUTHORITATIVE CODER RUN 2 ROLE: TEST ENGINEER + REPAIR CODER", calls[1]["system_prompt_suffix"])
 
 
     def test_directory_only_delta_does_not_trigger_implementer_to_finisher_handoff(self):
@@ -427,8 +427,8 @@ class TeamCandidateTokenPhaseBoundaryTests(unittest.TestCase):
         self.assertIn('GEGEBEN', calls[1]['initial_prompt'])
         self.assertIn('FERTIG', calls[1]['initial_prompt'])
         self.assertIn('GESUCHT_ZU_MACHEN', calls[1]['initial_prompt'])
-        self.assertIn('AUTHORITATIVE CODER RUN 1 ROLE: IMPLEMENTER', calls[0]['system_prompt'])
-        self.assertIn('AUTHORITATIVE CODER RUN 2 ROLE: TEST ENGINEER + REPAIR CODER', calls[1]['system_prompt'])
+        self.assertIn('AUTHORITATIVE CODER RUN 1 ROLE: IMPLEMENTER', calls[0]['system_prompt_suffix'])
+        self.assertIn('AUTHORITATIVE CODER RUN 2 ROLE: TEST ENGINEER + REPAIR CODER', calls[1]['system_prompt_suffix'])
         transfer = [payload for kind, payload in events if kind == 'team_worker_event' and payload.get('category') == 'handoff' and payload.get('status') == 'transferred']
         self.assertTrue(transfer)
         self.assertEqual(transfer[-1]['implementer_usage']['total_tokens'], 126000)
