@@ -9,6 +9,6 @@ pkgbase = aicoder
 	optdepends = git: workspace support
 	optdepends = python-pyqt6: GUI mode (aicoder gui)
 	source = aicoder-1.4.3::https://github.com/derleiti/ai-coder/releases/download/v1.4.3/aicoder-1.4.3-x86_64-linux
-	sha256sums = e64e8a6bbf6fea3255c4fd29192496a0ea7bc8d989d6ad1d412f997c8cfcd0ff
+	sha256sums = 0fd52cb5cef9c53aeabfbd2e551397fa25daff4a5ea9968fb5fc61b0ab20810f
 
 pkgname = aicoder
