@@ -9,7 +9,7 @@ license=('custom:AILinux-Proprietary-Source-License')
 depends=('glibc')
 optdepends=('git: workspace support' 'python-pyqt6: GUI mode (aicoder gui)')
 source=("aicoder-${pkgver}::https://github.com/derleiti/ai-coder/releases/download/v${pkgver}/aicoder-${pkgver}-x86_64-linux")
-sha256sums=('a2ea33e864af145633213093014479fcba42d01985d14b6701bc5f43258140df')
+sha256sums=('f3438a302ea41653f74bd24cebae696db689a716b3fcfe29bc22317a25937aa6')
 
 package() {
     install -Dm755 "$srcdir/aicoder-${pkgver}" "$pkgdir/usr/bin/aicoder"
