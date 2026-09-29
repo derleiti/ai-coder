@@ -2230,6 +2230,8 @@ def _activate_startup_workspace(argv: list[str] | None = None) -> Path:
 
 def main() -> int:
     from .team_orchestrator import reset_team_debug_log
+    from .bug_reporter import install as install_bug_reporter
+    install_bug_reporter(app="AICoder CLI", repo="ai-coder", version=__version__, channel="cli")
     # First startup establishes the shared workspace and cross-app recovery store.
     ensure_workspace_layout()
     reset_team_debug_log()

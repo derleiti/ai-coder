@@ -170,6 +170,7 @@ _INSTALL_RECIPES: dict[str, tuple[str, ...]] = {
     "claude": ("claude-native-installer",),
     "gemini": ("antigravity-installer",),
     "mistral": ("uv", "tool", "install", "--upgrade", "mistral-vibe"),
+    "grok": ("grok-installer",),
 }
 
 
@@ -244,6 +245,102 @@ def _claude_account_env(*, base: dict[str, str] | None = None) -> dict[str, str]
     return env
 
 
+def _provider_client_version(executable: str) -> str:
+    try:
+        proc = subprocess.run(
+            [executable, "--version"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, timeout=15, env=_external_cli_env(),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return (proc.stdout or "").strip().splitlines()[0] if proc.returncode == 0 else ""
+
+
+def provider_client_diagnostics(provider: str) -> dict[str, Any]:
+    """Describe the effective official CLI and obvious shadow/broken installs."""
+    spec = provider_spec(provider)
+    path = _which_executable(spec.executable)
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for directory in _augmented_path().split(os.pathsep):
+        candidate = Path(directory) / spec.executable
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        if candidate.is_symlink() or candidate.exists():
+            candidates.append({
+                "path": key,
+                "symlink": candidate.is_symlink(),
+                "broken": candidate.is_symlink() and not candidate.exists(),
+                "target": str(candidate.resolve(strict=False)) if candidate.is_symlink() else key,
+                "effective": bool(path and os.path.abspath(path) == os.path.abspath(key)),
+            })
+    live = [item for item in candidates if not item["broken"]]
+    warnings = [
+        f"broken CLI symlink: {item['path']} -> {item['target']}"
+        for item in candidates if item["broken"]
+    ]
+    if len(live) > 1:
+        warnings.append(f"multiple {spec.executable} installations are visible; effective path is {path}")
+    return {
+        "provider": spec.id, "executable": spec.executable, "path": path,
+        "version": _provider_client_version(path) if path else "",
+        "candidates": candidates, "warnings": warnings,
+    }
+
+
+def update_provider_client(provider: str, *, executable: str | None = None) -> dict[str, str]:
+    """Update one official account-provider CLI using its documented stable update path.
+
+    This is intentionally invoked by the explicit Connect/Repair flow, never by
+    normal chat requests. After the update the executable is re-resolved from the
+    preferred PATH and must report a version successfully.
+    """
+    spec = provider_spec(provider)
+    exe = executable or _which_executable(spec.executable)
+    if not exe:
+        exe = ensure_provider_client(spec.id)
+    before = _provider_client_version(exe)
+    env = _external_cli_env()
+
+    if spec.id == "chatgpt":
+        npm = _which_executable("npm")
+        if not npm:
+            raise ClientError("Node.js/npm is required to update the official Codex CLI")
+        argv = [npm, "install", "-g", "--prefix", str(Path.home() / ".local"), "@openai/codex@latest"]
+    elif spec.id == "claude":
+        argv = [exe, "update"]
+    elif spec.id == "mistral":
+        uv = _which_executable("uv")
+        if not uv:
+            raise ClientError("uv is required to update Mistral Vibe")
+        argv = [uv, "tool", "upgrade", "mistral-vibe"]
+    elif spec.id == "gemini":
+        argv = [exe, "update"]
+    elif spec.id == "grok":
+        argv = [exe, "update", "--stable"]
+    else:
+        raise ClientError(f"No supported updater is configured for {spec.display_name}")
+
+    try:
+        proc = subprocess.run(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300, env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ClientError(f"Could not update the official {spec.display_name} client") from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()[-1:]
+        suffix = f": {detail[0][:240]}" if detail else ""
+        raise ClientError(f"Official {spec.display_name} client update failed{suffix}")
+
+    resolved = _which_executable(spec.executable) or exe
+    after = _provider_client_version(resolved)
+    if not after:
+        raise ClientError(f"{spec.display_name} client updated but version verification failed")
+    return {"provider": spec.id, "path": resolved, "before": before, "after": after}
+
+
 def ensure_provider_client(provider: str) -> str:
     """Install a missing official provider CLI into the user's normal tool path.
 
@@ -283,6 +380,29 @@ def ensure_provider_client(provider: str) -> str:
         installed = _which_executable(spec.executable)
         if not installed:
             raise ClientError("Claude Code installed but 'claude' is not on PATH")
+        return installed
+
+    if recipe[0] == "grok-installer":
+        curl = _which_executable("curl")
+        bash = _which_executable("bash")
+        if not curl or not bash:
+            raise ClientError("curl and bash are required to install the official Grok CLI")
+        try:
+            download = subprocess.run(
+                [curl, "-fsSL", "https://x.ai/cli/install.sh"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, env=_external_cli_env(),
+            )
+            proc = subprocess.run(
+                [bash], input=download.stdout if download.returncode == 0 else b"",
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300, env=_external_cli_env(),
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ClientError("Could not install the official Grok CLI") from exc
+        if download.returncode != 0 or proc.returncode != 0:
+            raise ClientError("Official Grok CLI installation failed")
+        installed = _which_executable(spec.executable)
+        if not installed:
+            raise ClientError("Grok CLI installed but 'grok' is not on PATH")
         return installed
 
     if recipe[0] == "antigravity-installer":
@@ -654,6 +774,31 @@ def _chatgpt_status() -> dict[str, Any]:
     return {"provider": spec.id, "display": spec.display_name, "installed": True,
             "linked": linked, "authenticated": authenticated, "detail": detail, "plan": plan, "email": email,
             **quota}
+
+
+def _claude_server_auth_valid(executable: str, *, timeout: int = 30) -> bool:
+    """Verify that Claude's locally stored OAuth session is accepted server-side.
+
+    `claude auth status` is intentionally local state and can remain loggedIn=true
+    after Anthropic has revoked the access token. This bounded no-tools probe is
+    used only by the explicit Connect flow, not by passive status refreshes.
+    """
+    args = [
+        executable, "--print", "--output-format", "text", "--model", "haiku",
+        "--tools", "", "--disallowed-tools", "*", "--disable-slash-commands",
+        "--no-chrome", "--no-session-persistence",
+        "--system-prompt", "Reply with exactly OK.",
+    ]
+    try:
+        proc = subprocess.run(
+            args, input="Reply with exactly OK.", stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=max(5, min(60, int(timeout))), env=_claude_account_env(),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if proc.returncode != 0:
+        return False
+    return bool((proc.stdout or "").strip())
 
 
 def _claude_status() -> dict[str, Any]:
@@ -1324,6 +1469,8 @@ def connect_account(provider: str, *, open_browser: bool = True) -> dict[str, An
 def _connect_account_once(provider: str, *, open_browser: bool = True) -> dict[str, Any]:
     spec = provider_spec(provider)
     executable = ensure_provider_client(spec.id)
+    update = update_provider_client(spec.id, executable=executable)
+    executable = update["path"]
     if spec.id == "chatgpt":
         # Reuse a valid official Codex/ChatGPT session without forcing another
         # browser round-trip. Otherwise start the App Server OAuth flow.
@@ -1373,28 +1520,33 @@ def _connect_account_once(provider: str, *, open_browser: bool = True) -> dict[s
             pass
         set_provider_linked(spec.id, False)
 
-        # This integration is explicitly the Claude subscription account path,
-        # not Anthropic Console/API billing. Current Claude Code exposes
-        # `--claudeai`; select it explicitly instead of relying on a default that
-        # could change between CLI releases.
-        _launch_terminal(
-            [executable, "auth", "login", "--claudeai"],
+        # On Linux, current Claude Code releases can report `claude auth login`
+        # success without persisting a refreshed OAuth credential. The interactive
+        # `/login` command uses the session auth path that does persist the account
+        # credential. Launch it in the provider-owned TTY and verify the result
+        # server-side before linking AICoder.
+        exit_code = _launch_terminal(
+            [executable, "/login"],
             title="AICoder · Claude Login",
-            wait=False,
+            wait=True,
+            timeout=300,
             env=_claude_account_env(),
         )
-        deadline = time.monotonic() + 300
-        status: dict[str, Any] = {}
-        while time.monotonic() < deadline:
-            status = _claude_status()
-            if status.get("authenticated"):
-                set_provider_linked(spec.id, True)
-                return {"provider": spec.id, "started": True, "authenticated": True, "account": status}
-            time.sleep(1.0)
-        set_provider_linked(spec.id, False)
-        raise ClientError(
-            "Claude login timed out after 5 minutes. Finish the browser login and press Connect again."
-        )
+        if exit_code not in (0, None):
+            set_provider_linked(spec.id, False)
+            raise ClientError("Claude login did not complete successfully")
+        status = _claude_status()
+        if not status.get("authenticated"):
+            set_provider_linked(spec.id, False)
+            raise ClientError("Claude login finished without an authenticated subscription session")
+        if not _claude_server_auth_valid(executable, timeout=30):
+            set_provider_linked(spec.id, False)
+            raise ClientError(
+                "Claude OAuth was rejected server-side. Revoke the stale Claude Code authorization in "
+                "claude.ai Settings > Claude Code, then reconnect Claude in AICoder."
+            )
+        set_provider_linked(spec.id, True)
+        return {"provider": spec.id, "started": True, "authenticated": True, "account": status}
     if spec.id == "mistral":
         if _mistral_authenticated():
             set_provider_linked(spec.id, True)

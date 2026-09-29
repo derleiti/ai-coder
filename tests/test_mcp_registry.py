@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import aicoder.executor as executor
+import aicoder.mcp_registry as mcp_registry_module
 from aicoder.cli import build_parser, cmd_mcp
 from aicoder.mcp_registry import (
     MCPRegistry, MCPRegistryError, MCPServerConfig, call_external_tool,
@@ -170,6 +171,40 @@ class _HTTPHandler(BaseHTTPRequestHandler):
 
 
 class MCPStreamableHTTPTests(unittest.TestCase):
+    def test_public_http_session_skips_unauthenticated_delete(self):
+        config = MCPServerConfig(
+            name="public",
+            transport="streamable-http",
+            url="https://example.test/v1/mcp",
+            auth_type="none",
+        )
+        session = mcp_registry_module._HttpSession(config)
+        session.session_id = "public-session"
+        with patch("aicoder.mcp_registry.urlopen") as open_url:
+            session.__exit__(None, None, None)
+        open_url.assert_not_called()
+
+    def test_authenticated_http_session_keeps_delete_cleanup(self):
+        config = MCPServerConfig(
+            name="secured",
+            transport="streamable-http",
+            url="https://example.test/v1/mcp",
+            auth_type="bearer",
+        )
+        session = mcp_registry_module._HttpSession(config)
+        session.session_id = "secured-session"
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        with patch("aicoder.mcp_registry._HttpSession._headers", return_value={
+            "Authorization": "Bearer redacted",
+            "Mcp-Session-Id": "secured-session",
+        }), patch("aicoder.mcp_registry.urlopen", return_value=response) as open_url:
+            session.__exit__(None, None, None)
+        request = open_url.call_args.args[0]
+        self.assertEqual(request.get_method(), "DELETE")
+        self.assertEqual(request.get_header("Authorization"), "Bearer redacted")
+
     def test_http_initialize_session_tools_auth_env_and_call(self):
         _HTTPHandler.seen_session=False; _HTTPHandler.seen_auth=""
         try:

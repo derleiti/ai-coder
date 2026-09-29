@@ -309,6 +309,13 @@ class _HttpSession:
     def __exit__(self, *_):
         if not self.session_id:
             return None
+        # Anonymous/public MCP sessions cannot be safely deleted: TriForce keeps
+        # DELETE credential-protected so a guessed session id is never enough to
+        # tear down somebody else's transport. Let the server expire public
+        # sessions normally instead of generating a misleading 401 on every
+        # short-lived probe/session.
+        if str(self.config.auth_type or "none").lower() == "none":
+            return None
         try:
             headers = self._headers()
             request = Request(self.config.url, headers=headers, method="DELETE")

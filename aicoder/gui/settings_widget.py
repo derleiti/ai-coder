@@ -829,13 +829,23 @@ class SettingsWidget(QWidget):
         self._load_models()
 
     def _account_action(self, provider: str, action: str):
+        existing = self._account_workers.get(provider)
+        if existing is not None and existing.isRunning():
+            label = self._account_status_labels.get(provider)
+            if label is not None:
+                label.setText("Anmeldung läuft bereits · Browser/Provider-Fenster abschließen")
+                label.setStyleSheet("color: #00d4ff; font-size: 11px;")
+            return
         buttons = self._account_buttons.get(provider)
         if buttons:
             for button in buttons:
                 button.setEnabled(False)
         label = self._account_status_labels.get(provider)
         if label is not None:
-            label.setText("Client wird geprüft/installiert · danach Login..." if action == "connect" else "Verknüpfung wird entfernt...")
+            if action == "connect":
+                label.setText("Client wird aktualisiert · danach offizieller Browser-Login...")
+            else:
+                label.setText("Verknüpfung wird entfernt...")
             label.setStyleSheet("color: #00d4ff; font-size: 11px;")
         worker = _AccountWorker(provider, action)
         self._account_workers[provider] = worker
@@ -849,11 +859,13 @@ class SettingsWidget(QWidget):
         self._load_models()
 
     def _on_account_action_error(self, provider: str, error: str):
+        # Preserve the actionable provider error instead of immediately replacing
+        # it with a passive local-status message such as "Claude lokal angemeldet".
         label = self._account_status_labels.get(provider)
         if label is not None:
-            label.setText(f"Fehler: {error[:120]}")
+            label.setText(f"Fehler: {error[:160]}")
             label.setStyleSheet("color: #ff6b6b; font-size: 11px;")
-        self._refresh_account_statuses()
+        self._load_models()
 
     def _refresh_provider_credentials(self):
         for provider, label in self._provider_status_labels.items():

@@ -90,7 +90,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip setuptools wheel pyinstaller
-          pip install -e .
+          pip install -e '.[voice]'
 
       - name: Build Linux binary
         run: |

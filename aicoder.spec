@@ -74,6 +74,7 @@ a = Analysis(
         'json',
         'shutil',
         *collect_submodules('keyring'),
+        *collect_submodules('vosk'),
         *collect_submodules('huggingface_hub'),
         *collect_submodules('secretstorage'),
         *collect_submodules('jeepney'),

@@ -5,6 +5,7 @@ runtime events, so future skills/subagents can extend one loop instead of two.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import queue
 import re
@@ -439,6 +440,7 @@ class NativeLightRuntime:
     hooks: HookBus = field(default_factory=HookBus)
     _tool_capability_warned: bool = False
     _tool_catalog: list[dict] = field(default_factory=list, init=False, repr=False)
+    _system_prompt_extras: list[str] = field(default_factory=list, init=False, repr=False)
     _expansion_rounds: int = field(default=0, init=False, repr=False)
     _run_id: str = field(default="", init=False, repr=False)
 
@@ -550,10 +552,14 @@ class NativeLightRuntime:
 
     def _render_system_prompt(self, tools: list[dict], workspace: str) -> str:
         if self.system_prompt is not None:
-            return self.system_prompt
-        base = build_system_prompt(tools, workspace)
-        suffix = str(self.system_prompt_suffix or "").strip()
-        return base.rstrip() + (("\n\n" + suffix) if suffix else "")
+            base = self.system_prompt
+        else:
+            base = build_system_prompt(tools, workspace)
+            suffix = str(self.system_prompt_suffix or "").strip()
+            if suffix:
+                base = base.rstrip() + "\n\n" + suffix
+        extras = [str(item or "").strip() for item in self._system_prompt_extras if str(item or "").strip()]
+        return base.rstrip() + (("\n\n" + "\n\n".join(extras)) if extras else "")
 
     def _plan_workspace(self) -> str:
         return str(Path(self.plan_workspace_root or self.workspace_root or ".").expanduser().resolve(strict=False))
@@ -928,6 +934,70 @@ class NativeLightRuntime:
                 verification=verification, lessons=lessons, future_features=future,
             )
             self._emit("feature_memory_saved", memory_id=memory_id, architecture=architecture[:1000])
+
+            # Promote the verified local experience into synchronized Project Memory.
+            # Project Memory is the current-state authority for project knowledge; the
+            # TriForce server mirrors accepted revisions into Claude-Mem as append-only
+            # episodic history. Every layer remains fail-open so a sync outage never
+            # turns a successful coding run into a failure.
+            from .project_memory import LocalProjectMemory
+
+            def bounded(value: str, limit: int) -> str:
+                return " ".join(str(value or "").split())[:limit]
+
+            task_text = bounded(self.initial_prompt, 1200)
+            summary_text = bounded(response, 3000)
+            architecture_text = bounded(architecture, 2200)
+            verification_text = bounded(verification, 1400)
+            lessons_text = bounded(lessons, 1200)
+            future_text = bounded(future, 1200)
+            fingerprint = hashlib.sha256(
+                (task_text + "\n" + summary_text + "\n" + architecture_text).encode(
+                    "utf-8", errors="replace"
+                )
+            ).hexdigest()[:32]
+            payload = json.dumps({
+                "schema": "aicoder-feature-experience-v1",
+                "task": task_text,
+                "summary": summary_text,
+                "architecture": architecture_text,
+                "verification": verification_text,
+                "lessons": lessons_text,
+                "future_features": future_text,
+                "verification_kind": "regression_test" if test_verification_seen else "executable_check",
+                "status": "completed",
+                "local_feature_id": memory_id,
+            }, ensure_ascii=False, separators=(",", ":"))
+            project_memory = LocalProjectMemory(self.workspace_root)
+            project_row = project_memory.store(
+                kind="feature",
+                title=f"Feature experience: {task_text[:180] or 'verified change'}",
+                content=payload,
+                status="completed",
+                entity_id=f"feature-experience:{fingerprint}",
+                source="aicoder-feature-experience",
+            )
+            self._emit(
+                "feature_project_memory_saved",
+                entity_id=project_row.get("entity_id", ""),
+                project_key=project_memory.project_key,
+            )
+            try:
+                sync_result = project_memory.sync(self.client)
+                self._emit(
+                    "feature_project_memory_synced",
+                    entity_id=project_row.get("entity_id", ""),
+                    project_key=project_memory.project_key,
+                    accepted=int(sync_result.get("accepted") or 0),
+                    conflicts=int(sync_result.get("conflicts") or 0),
+                )
+            except Exception as sync_exc:
+                self._emit(
+                    "feature_project_memory_sync_degraded",
+                    entity_id=project_row.get("entity_id", ""),
+                    project_key=project_memory.project_key,
+                    error=f"{type(sync_exc).__name__}: {sync_exc}",
+                )
         except Exception as exc:
             self._emit("evidence_record_failed", evidence_kind="feature", error=f"{type(exc).__name__}: {exc}")
 
@@ -1020,9 +1090,7 @@ class NativeLightRuntime:
                 part for part in (memory_context, feature_context) if part
             )
             if bounded_memory:
-                self.system_prompt = (
-                    self._render_system_prompt(tools, workspace)
-                ).rstrip() + "\n\n## Relevant project memory\n" + bounded_memory
+                self._system_prompt_extras.append("## Relevant project memory\n" + bounded_memory)
         session_hook = self.hooks.emit("SessionStart", {
             "workspace": workspace, "prompt": self.initial_prompt,
             "model": self.model or "", "tool_count": len(tools),
@@ -1030,8 +1098,8 @@ class NativeLightRuntime:
         for diagnostic in session_hook.diagnostics:
             self._emit("hook_diagnostic", event="SessionStart", message=diagnostic)
         if session_hook.context:
-            self.system_prompt = (self._render_system_prompt(tools, workspace)).rstrip() + (
-                "\n\n## Session hook context\n" + "\n".join(session_hook.context)
+            self._system_prompt_extras.append(
+                "## Session hook context\n" + "\n".join(session_hook.context)
             )
         if self.tools_unavailable_reason:
             reason = self.tools_unavailable_reason

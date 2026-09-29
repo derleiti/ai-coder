@@ -14,6 +14,9 @@ from .. import shared_notify as shared
 from ..account_providers import linked_account_catalog
 
 
+_BACKGROUND_WORKERS: set[QThread] = set()
+
+
 class _NetworkWorker(QThread):
     success = pyqtSignal(object)
     error = pyqtSignal(str)
@@ -42,6 +45,8 @@ class SharedNotifyWidget(QWidget):
         self._directory_rows: list[dict[str, Any]] = []
         self._conversation_rows: list[dict[str, Any]] = []
         self._active_conversation_id = ""
+        self._model_worker: _NetworkWorker | None = None
+        self._models_loaded_once = False
         self._build()
         self._load_local_state()
         self._timer = QTimer(self)
@@ -183,15 +188,34 @@ class SharedNotifyWidget(QWidget):
         self.accept_human.setChecked(state.accept_human_chat)
         self.accept_ai.setChecked(state.accept_ai_chat)
         self.accept_tasks.setChecked(state.accept_tasks)
-        self._load_models()
+        if self.isVisible():
+            self._load_models_async()
 
-    def _load_models(self):
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._models_loaded_once:
+            self._load_models_async()
+
+    def _load_models_async(self):
+        if self._model_worker is not None and self._model_worker.isRunning():
+            return
         current = self.ai_model.currentText()
-        try:
-            rows = linked_account_catalog().get("models", [])
-            models = sorted({str(row.get("id") or "") for row in rows if row.get("id")})
-        except Exception:
-            models = []
+        worker = _NetworkWorker(linked_account_catalog)
+        self._model_worker = worker
+        _BACKGROUND_WORKERS.add(worker)
+        worker.success.connect(lambda payload, current=current: self._apply_models(payload, current))
+        worker.error.connect(lambda _message, current=current: self._apply_models({"models": []}, current))
+        worker.finished.connect(lambda w=worker: _BACKGROUND_WORKERS.discard(w))
+        worker.finished.connect(self._model_load_finished)
+        worker.start()
+
+    def _model_load_finished(self):
+        self._models_loaded_once = True
+        self._model_worker = None
+
+    def _apply_models(self, payload: object, current: str = ""):
+        rows = payload.get("models", []) if isinstance(payload, dict) else []
+        models = sorted({str(row.get("id") or "") for row in rows if isinstance(row, dict) and row.get("id")})
         self.ai_model.clear()
         self.ai_model.addItems(models)
         if current:

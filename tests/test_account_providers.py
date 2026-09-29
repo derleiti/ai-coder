@@ -27,6 +27,8 @@ from aicoder.account_providers import (
     connect_account,
     disconnect_account,
     ensure_provider_client,
+    update_provider_client,
+    provider_client_diagnostics,
     _external_cli_env,
     _claude_account_env,
 )
@@ -92,6 +94,51 @@ class ClaudeInstallPreferenceTests(unittest.TestCase):
         self.assertEqual(run.call_args_list[0].args[0], ["/usr/bin/curl", "-fsSL", "https://claude.ai/install.sh"])
         self.assertEqual(run.call_args_list[1].args[0], ["/usr/bin/bash", "-s", "latest"])
         self.assertTrue(path.endswith("/.local/bin/claude"))
+
+
+class ProviderClientUpdateTests(unittest.TestCase):
+    def test_chatgpt_update_uses_latest_official_codex_package(self):
+        completed = MagicMock(returncode=0, stdout="ok", stderr="")
+        with patch("aicoder.account_providers._which_executable", side_effect=lambda name: {"npm":"/usr/bin/npm", "codex":"/home/test/.local/bin/codex"}.get(name)), \
+             patch("aicoder.account_providers._provider_client_version", side_effect=["codex-cli 0.1", "codex-cli 0.2"]), \
+             patch("aicoder.account_providers.subprocess.run", return_value=completed) as run:
+            result = update_provider_client("chatgpt", executable="/home/test/.local/bin/codex")
+        self.assertEqual(run.call_args.args[0], ["/usr/bin/npm", "install", "-g", "--prefix", str(Path.home() / ".local"), "@openai/codex@latest"])
+        self.assertEqual(result["after"], "codex-cli 0.2")
+
+    def test_claude_update_uses_native_cli_updater(self):
+        completed = MagicMock(returncode=0, stdout="ok", stderr="")
+        with patch("aicoder.account_providers._which_executable", return_value="/home/test/.local/bin/claude"), \
+             patch("aicoder.account_providers._provider_client_version", side_effect=["2.1.1", "2.1.2"]), \
+             patch("aicoder.account_providers.subprocess.run", return_value=completed) as run:
+            update_provider_client("claude", executable="/home/test/.local/bin/claude")
+        self.assertEqual(run.call_args.args[0], ["/home/test/.local/bin/claude", "update"])
+
+    def test_mistral_update_uses_uv_tool_upgrade(self):
+        completed = MagicMock(returncode=0, stdout="ok", stderr="")
+        def which(name):
+            return {"uv":"/usr/bin/uv", "vibe":"/home/test/.local/bin/vibe"}.get(name)
+        with patch("aicoder.account_providers._which_executable", side_effect=which), \
+             patch("aicoder.account_providers._provider_client_version", side_effect=["vibe 1", "vibe 2"]), \
+             patch("aicoder.account_providers.subprocess.run", return_value=completed) as run:
+            update_provider_client("mistral", executable="/home/test/.local/bin/vibe")
+        self.assertEqual(run.call_args.args[0], ["/usr/bin/uv", "tool", "upgrade", "mistral-vibe"])
+
+    def test_gemini_update_uses_official_cli_update(self):
+        completed = MagicMock(returncode=0, stdout="ok", stderr="")
+        with patch("aicoder.account_providers._which_executable", return_value="/home/test/.local/bin/agy"), \
+             patch("aicoder.account_providers._provider_client_version", side_effect=["1.0", "1.1"]), \
+             patch("aicoder.account_providers.subprocess.run", return_value=completed) as run:
+            update_provider_client("gemini", executable="/home/test/.local/bin/agy")
+        self.assertEqual(run.call_args.args[0], ["/home/test/.local/bin/agy", "update"])
+
+    def test_grok_update_uses_stable_channel(self):
+        completed = MagicMock(returncode=0, stdout="ok", stderr="")
+        with patch("aicoder.account_providers._which_executable", return_value="/home/test/.local/bin/grok"), \
+             patch("aicoder.account_providers._provider_client_version", side_effect=["1.0", "1.1"]), \
+             patch("aicoder.account_providers.subprocess.run", return_value=completed) as run:
+            update_provider_client("grok", executable="/home/test/.local/bin/grok")
+        self.assertEqual(run.call_args.args[0], ["/home/test/.local/bin/grok", "update", "--stable"])
 
 
 class AccountProviderIdTests(unittest.TestCase):
@@ -613,35 +660,59 @@ class ClaudeAccountStatusTests(unittest.TestCase):
         self.assertIn("Nicht angemeldet", status["detail"])
         set_linked.assert_called_once_with("claude", False)
 
-    def test_claude_login_keeps_terminal_open_and_polls_official_status(self):
-        logged_out = {
-            "provider": "claude", "linked": False, "installed": True,
-            "authenticated": False, "detail": "Nicht angemeldet",
-        }
+
+    def test_claude_connect_rejects_locally_logged_in_but_server_revoked_session(self):
         logged_in = {
-            "provider": "claude", "linked": True, "installed": True,
+            "provider": "claude", "linked": False, "installed": True,
+            "authenticated": True, "detail": "Claude lokal angemeldet",
+        }
+        logout = MagicMock(returncode=0)
+        with patch("aicoder.account_providers.ensure_provider_client", return_value="/home/test/.local/bin/claude"), \
+             patch("aicoder.account_providers.update_provider_client", return_value={"path":"/home/test/.local/bin/claude"}), \
+             patch("aicoder.account_providers._claude_status", return_value=logged_in), \
+             patch("aicoder.account_providers._claude_server_auth_valid", return_value=False), \
+             patch("aicoder.account_providers._launch_terminal", return_value=None), \
+             patch("aicoder.account_providers.subprocess.run", return_value=logout), \
+             patch("aicoder.account_providers.set_provider_linked") as linked:
+            with self.assertRaisesRegex(ClientError, "Settings > Claude Code"):
+                connect_account("claude")
+        self.assertEqual(linked.call_args_list[-1].args, ("claude", False))
+
+    def test_claude_login_waits_for_official_cli_then_verifies_server_auth(self):
+        logged_in = {
+            "provider": "claude", "linked": False, "installed": True,
             "authenticated": True, "detail": "Verbunden · claude.ai",
         }
         logout = MagicMock(returncode=0)
         with patch("aicoder.account_providers.ensure_provider_client", return_value="/home/test/.local/bin/claude"), \
-             patch("aicoder.account_providers._claude_status", side_effect=[logged_out, logged_in]), \
-             patch("aicoder.account_providers._launch_terminal", return_value=None) as terminal, \
+             patch("aicoder.account_providers.update_provider_client", return_value={"path": "/home/test/.local/bin/claude"}), \
+             patch("aicoder.account_providers._claude_status", return_value=logged_in), \
+             patch("aicoder.account_providers._launch_terminal", return_value=0) as terminal, \
              patch("aicoder.account_providers.subprocess.run", return_value=logout) as run, \
-             patch("aicoder.account_providers.time.sleep"), \
+             patch("aicoder.account_providers._claude_server_auth_valid", return_value=True) as server_auth, \
              patch("aicoder.account_providers.set_provider_linked") as linked:
             result = connect_account("claude")
-        terminal.assert_called_once()
-        args, kwargs = terminal.call_args
-        self.assertEqual(args[0], ["/home/test/.local/bin/claude", "auth", "login", "--claudeai"])
-        self.assertEqual(kwargs["title"], "AICoder · Claude Login")
-        self.assertFalse(kwargs["wait"])
-        self.assertNotIn("ANTHROPIC_API_KEY", kwargs["env"])
-        self.assertNotIn("ANTHROPIC_AUTH_TOKEN", kwargs["env"])
+        terminal.assert_called_once_with(
+            ["/home/test/.local/bin/claude", "/login"],
+            title="AICoder · Claude Login", wait=True, timeout=300,
+            env=terminal.call_args.kwargs["env"],
+        )
         self.assertEqual(run.call_args.args[0], ["/home/test/.local/bin/claude", "auth", "logout"])
+        server_auth.assert_called_once_with("/home/test/.local/bin/claude", timeout=30)
         self.assertTrue(result["authenticated"])
         self.assertTrue(result["started"])
         self.assertEqual(linked.call_args_list[0].args, ("claude", False))
         self.assertEqual(linked.call_args_list[-1].args, ("claude", True))
+
+    def test_claude_login_cli_failure_does_not_link(self):
+        with patch("aicoder.account_providers.ensure_provider_client", return_value="/home/test/.local/bin/claude"), \
+             patch("aicoder.account_providers.update_provider_client", return_value={"path": "/home/test/.local/bin/claude"}), \
+             patch("aicoder.account_providers._launch_terminal", return_value=1), \
+             patch("aicoder.account_providers.subprocess.run", return_value=MagicMock(returncode=0)), \
+             patch("aicoder.account_providers.set_provider_linked") as linked:
+            with self.assertRaisesRegex(ClientError, "did not complete successfully"):
+                connect_account("claude")
+        self.assertEqual(linked.call_args_list[-1].args, ("claude", False))
 
     def test_authenticated_claude_exposes_latest_alias_models(self):
         with patch("aicoder.account_providers.account_status", return_value={
@@ -788,6 +859,7 @@ class AccountInstallAndLoginTests(unittest.TestCase):
         fourth.__exit__.return_value = None
         fourth.account_read.return_value = {"account": {"type": "chatgpt", "planType": "plus"}}
         with patch("aicoder.account_providers.ensure_provider_client", return_value="/home/test/.local/bin/codex"), \
+             patch("aicoder.account_providers.update_provider_client", return_value={"path":"/home/test/.local/bin/codex"}), \
              patch("aicoder.account_providers.CodexAppServer", side_effect=[first, second, third, fourth]), \
              patch("aicoder.account_providers._launch_terminal", return_value=0) as terminal, \
              patch("aicoder.account_providers.set_provider_linked") as linked:
@@ -813,6 +885,7 @@ class AccountInstallAndLoginTests(unittest.TestCase):
         third.__exit__.return_value = None
         third.account_read.return_value = {"account": {"type": "chatgpt", "planType": "plus"}}
         with patch("aicoder.account_providers.ensure_provider_client", return_value="/home/test/.local/bin/codex"), \
+             patch("aicoder.account_providers.update_provider_client", return_value={"path":"/home/test/.local/bin/codex"}), \
              patch("aicoder.account_providers.CodexAppServer", side_effect=[first, second, third]), \
              patch("aicoder.account_providers._launch_terminal") as terminal, \
              patch("aicoder.account_providers.set_provider_linked") as linked:
@@ -879,6 +952,9 @@ class AccountInstallAndLoginTests(unittest.TestCase):
         with patch("aicoder.account_providers._which", return_value="/home/test/.local/bin/agy"), \
              patch("aicoder.account_providers.linked_provider_ids", return_value=[]), \
              patch("aicoder.account_providers._antigravity_authenticated", return_value=True), \
+             patch("aicoder.account_providers.antigravity_quota_status", return_value={
+                 "quota_exhausted": False, "quota_retry_after_seconds": 0, "quota_reset_at": "",
+             }), \
              patch("aicoder.account_providers.set_provider_linked") as set_linked:
             status = account_status("gemini")
         self.assertFalse(status["linked"])
@@ -899,6 +975,7 @@ class AccountInstallAndLoginTests(unittest.TestCase):
 
     def test_gemini_is_linked_only_after_login_verification(self):
         with patch("aicoder.account_providers.ensure_provider_client", return_value="/home/test/.local/bin/agy"), \
+             patch("aicoder.account_providers.update_provider_client", return_value={"path":"/home/test/.local/bin/agy"}), \
              patch("aicoder.account_providers._launch_terminal", return_value=None) as terminal, \
              patch("aicoder.account_providers._antigravity_authenticated", side_effect=[False, True]), \
              patch("aicoder.account_providers.set_provider_linked") as linked:
@@ -911,6 +988,7 @@ class AccountInstallAndLoginTests(unittest.TestCase):
 
     def test_gemini_login_does_not_wait_for_long_lived_tui_to_exit(self):
         with patch("aicoder.account_providers.ensure_provider_client", return_value="/home/test/.local/bin/agy"), \
+             patch("aicoder.account_providers.update_provider_client", return_value={"path":"/home/test/.local/bin/agy"}), \
              patch("aicoder.account_providers._launch_terminal", return_value=None) as terminal, \
              patch("aicoder.account_providers._antigravity_authenticated", side_effect=[False, False, True]), \
              patch("aicoder.account_providers.time.sleep"), \

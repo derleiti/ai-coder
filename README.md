@@ -3,7 +3,7 @@
 [![CI](https://github.com/derleiti/ai-coder/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/derleiti/ai-coder/actions/workflows/ci.yml)
 [![Security](https://github.com/derleiti/ai-coder/actions/workflows/security.yml/badge.svg?branch=master)](https://github.com/derleiti/ai-coder/actions/workflows/security.yml)
 
-**Current release: 1.4.3** · AILinux coding/DevOps agent for TriForce, Project Memory and the Loom capability fabric.
+**Current release: 1.5.0** · AILinux coding/DevOps agent for TriForce, Project Memory and the Loom capability fabric.
 
 AICoder combines a terminal agent, PyQt6 desktop UI, provider/model routing, a guarded MCP/local-tool loop, transactional coding workflows, multi-agent Team Runtime and local-first project memory. It is designed to inspect real system state, create a rollback path before risky changes, implement the smallest correct change and verify the result with executable evidence.
 
@@ -13,6 +13,9 @@ AICoder combines a terminal agent, PyQt6 desktop UI, provider/model routing, a g
 - **Canonical TriForce MCP fabric** with progressive semantic tool disclosure instead of loading a giant static catalogue into every prompt.
 - **Typed local workspace capabilities** for files, code search/editing, Git, diagnostics and selected OS operations under one privilege/approval policy.
 - **Provider-neutral model routing** with account-backed providers, BYOK credentials, OS-keyring storage and explicit provider availability/error handling.
+- **Nova Voice on Linux** with local Vosk wake-word/STT, normal AICoder prompt routing and local Speech Dispatcher TTS; microphone capture pauses during playback to prevent self-triggering.
+- **Hardened provider account lifecycle** with official CLI update/verification before reconnect, duplicate/broken CLI diagnostics, single-flight login and server-side Claude auth verification.
+- **Redacted crash/manual diagnostics** with offline queueing and a desktop tray reporting action.
 - **Autonomous agent runtime** with persistent plans, resumable states, structured tool results and evidence-aware continuation.
 - **Team Runtime** with research, brainstorm, planning, multiple coding candidates, merge planning, test planning and deterministic final verification.
 - **Transactional candidate workspaces** with backup, conflict checks, atomic persistent writes and rollback on failed commit.
@@ -211,7 +214,7 @@ Team Runtime also writes lifecycle checkpoints to Project Memory, allowing long-
 
 ## Models, accounts and BYOK
 
-AICoder supports both backend/account-backed routing and direct provider credentials where implemented.
+AICoder supports both backend/account-backed routing and direct provider credentials where implemented. Explicit reconnect/repair flows update the official provider CLI first, re-resolve the effective executable, and verify authentication before the account is marked connected. Claude subscription recovery on Linux uses the interactive `/login` path plus a real server-side probe so stale local OAuth state cannot masquerade as a healthy connection.
 
 Current security model includes:
 
@@ -234,6 +237,19 @@ aicoder credentials set <provider>
 aicoder status
 ```
 
+
+
+### Nova Voice (Linux)
+
+Nova Voice is local-first: microphone PCM is transcribed on-device with Vosk, only recognized text enters the normal AICoder model pipeline, and responses are spoken locally with Speech Dispatcher (`spd-say`). Audio itself is not sent to the model provider.
+
+The default German Vosk model path is `~/.local/share/ailinux/aicoder/voice/vosk-model-small-de-0.15`. Set `AICODER_VOICE_MODEL` to use another compatible model. Capture prefers `parec`, then `pw-record`, then `arecord`. The Linux standalone release bundles the Vosk Python/native runtime; the language model remains separate local data.
+
+For a source checkout install the voice extra:
+
+```bash
+.venv/bin/python -m pip install -e '.[voice]'
+```
 
 ## System diagnostics and frozen-build safety
 
@@ -302,6 +318,8 @@ aicoder systemlog status
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -e .
+# Optional Linux voice runtime:
+.venv/bin/python -m pip install -e '.[voice]'
 .venv/bin/aicoder --help
 ```
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import platform
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 # Windows: Console-Fenster verstecken wenn GUI startet
 if platform.system() == "Windows":
@@ -14,12 +15,14 @@ if platform.system() == "Windows":
     except Exception:
         pass
 
-from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
+from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QDialog, QVBoxLayout, QLabel, QPlainTextEdit, QPushButton
 from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QAction
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 
 from .autostart import is_autostart_enabled, toggle_autostart
 from ..helper_control import helper_status, open_helper, start_helper, stop_managed_helper
+from ..bug_reporter import install as install_bug_reporter, submit_manual
+from .. import __version__
 
 
 def _make_icon() -> QIcon:
@@ -41,6 +44,7 @@ def _make_icon() -> QIcon:
 
 
 def run_gui() -> int:
+    install_bug_reporter(app="AICoder", repo="ai-coder", version=__version__, channel="desktop")
     app = QApplication(sys.argv)
     app.setApplicationName("ai-coder")
     app.setOrganizationName("AILinux")
@@ -126,11 +130,63 @@ def run_gui() -> int:
     autostart_action.triggered.connect(_toggle_autostart)
     tray_menu.addAction(autostart_action)
 
+    report_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="aicoder-bug-report")
+
+    def _open_bug_report():
+        dialog = QDialog(window)
+        dialog.setWindowTitle("AICoder · Problem melden")
+        dialog.setMinimumWidth(560)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("Redigierte AICoder-Diagnosen werden an bugs@ailinux.me gesendet. Tokens, Passwörter und Pair-Codes werden entfernt."))
+        message = QPlainTextEdit(dialog)
+        message.setPlaceholderText("Was ist passiert? Was hast du direkt davor gemacht? (optional)")
+        layout.addWidget(message)
+        submit = QPushButton("Submit diagnostics", dialog)
+        layout.addWidget(submit)
+        state = QLabel("", dialog)
+        layout.addWidget(state)
+        timer = QTimer(dialog)
+        timer.setInterval(120)
+        future = {"value": None}
+
+        def _submit():
+            submit.setEnabled(False)
+            state.setText("Wird gesendet…")
+            future["value"] = report_pool.submit(submit_manual, message.toPlainText())
+            timer.start()
+
+        def _poll():
+            job = future.get("value")
+            if job is None or not job.done():
+                return
+            timer.stop()
+            submit.setEnabled(True)
+            try:
+                result = job.result()
+                if result.get("ok"):
+                    state.setText("Report gesendet.")
+                    message.clear()
+                elif result.get("queued"):
+                    state.setText("Offline/Server nicht erreichbar – Report wurde lokal für Retry gespeichert.")
+                else:
+                    state.setText("Report konnte nicht gesendet werden.")
+            except Exception as exc:
+                state.setText(f"Reportfehler: {exc}")
+
+        submit.clicked.connect(_submit)
+        timer.timeout.connect(_poll)
+        dialog.exec()
+
+    report_action = QAction("Problem melden…", tray)
+    report_action.triggered.connect(_open_bug_report)
+    tray_menu.addAction(report_action)
+
     tray_menu.addSeparator()
 
     # Quit
     quit_action = QAction("Beenden", tray)
     quit_action.triggered.connect(app.quit)
+    app.aboutToQuit.connect(lambda: report_pool.shutdown(wait=False, cancel_futures=True))
     tray_menu.addAction(quit_action)
 
     tray.setContextMenu(tray_menu)

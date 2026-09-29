@@ -1,3 +1,16 @@
+## v1.5.0 (2026-09-29)
+
+- Add local **Nova Voice** for the Linux desktop: offline Vosk wake-word/speech recognition, command routing through the normal AICoder pipeline, local Speech Dispatcher TTS, and mic pause/resume around playback to prevent self-triggering.
+- Add a `voice` install extra and include the Vosk runtime in the Linux standalone release while keeping language models external/local.
+- Harden account-provider reconnects around the official CLIs: update to the current stable client before explicit connect/repair, re-resolve the effective executable, report broken/shadow installations, and keep provider updates out of normal chat requests.
+- Fix Claude Pro/Max account recovery on Linux by using the interactive Claude `/login` flow, single-flight connect workers, preserved actionable errors, and a real server-side auth probe before AICoder marks Claude connected.
+- Distinguish provider authentication, quota/rate-limit and timeout failures in the GUI instead of collapsing them into generic runtime errors.
+- Add redacted automatic/manual bug reporting with an offline retry queue and a desktop tray action.
+- Mirror verified feature experiences into synchronized Project Memory so accepted revisions can be mirrored by TriForce into Claude-Mem, fail-open and fingerprint-deduplicated.
+- Keep progressive capability expansion live after Project Memory/session-hook context injection by separating dynamic prompt extras from the regenerable tool-system prompt.
+- Skip unauthenticated DELETE teardown for public streamable-HTTP MCP sessions while retaining cleanup for authenticated sessions.
+- Keep Shared Notify account-model discovery off the GUI thread so provider CLI health checks cannot freeze tab construction or startup.
+
 ## v1.4.3 (2026-09-27)
 
 - Classify AppArmor status diagnostics (`aa-status` / `apparmor_status`) as read-only `binary_exec` operations so log-analysis checks no longer request write approval or create huge fallback workspace backups.

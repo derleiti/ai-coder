@@ -13,7 +13,7 @@ except ImportError:
     _HAS_MD = False
 
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout,
+    QWidget, QVBoxLayout, QHBoxLayout, QApplication,
     QTextEdit, QPlainTextEdit, QPushButton, QLabel, QMessageBox,
     QMenu, QInputDialog,
 )
@@ -31,6 +31,7 @@ from ..workspace import active_workspace
 from ..workspace_backend import open_workspace_for_run, preserve_workspace_for_resume
 from ..client import TriForceClient
 from .. import chat_history
+from ..voice import VoskVoiceListener, cancel_speech, runtime_status, speak_text
 from ..executor import (
     build_system_prompt, is_destructive, is_short_confirmation, is_simple_chat_message, should_load_tools,
 )
@@ -45,6 +46,16 @@ def _runtime_error_code(text: str, *, event: str = "", category: str = "") -> st
         return "E_LIVENESS_TIMEOUT"
     if "empty_ollama_response" in value or "empty response" in value or "no assistant content" in value:
         return "E_EMPTY_MODEL_RESPONSE"
+    if any(token in value for token in (
+        "oauth session is expired", "oauth access token has been revoked",
+        "account login required", "account is not linked", "authentication is no longer valid",
+        "failed to authenticate", "unauthorized",
+    )):
+        return "E_PROVIDER_AUTH"
+    if any(token in value for token in (
+        "usage/rate limit reached", "quota exhausted", "usage limit", "rate limit", "http 429",
+    )):
+        return "E_PROVIDER_QUOTA"
     if "readtimeout" in value or "timed out" in value or "timeout" in value:
         return "E_PROVIDER_TIMEOUT"
     if "overloaded" in value or "service temporarily overloaded" in value or "http 503" in value:
@@ -604,11 +615,59 @@ class PromptEdit(QPlainTextEdit):
         super().keyPressEvent(event)
 
 
+
+
+class _TtsWorker(QThread):
+    error = pyqtSignal(str)
+
+    def __init__(self, text: str, parent=None):
+        super().__init__(parent)
+        self._text = text
+
+    def run(self):
+        try:
+            speak_text(self._text)
+        except Exception as exc:
+            self.error.emit(f"{type(exc).__name__}: {exc}")
+
+    def stop(self):
+        cancel_speech()
+
+
+class _VoiceWorker(QThread):
+    state = pyqtSignal(str)
+    partial = pyqtSignal(str)
+    command = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._stop_event = threading.Event()
+        self._listener = VoskVoiceListener()
+
+    def run(self):
+        try:
+            self._listener.run(
+                self._stop_event,
+                on_state=self.state.emit,
+                on_partial=self.partial.emit,
+                on_command=self.command.emit,
+            )
+        except Exception as exc:
+            self.error.emit(f"{type(exc).__name__}: {exc}")
+
+    def stop(self):
+        self._stop_event.set()
+        self._listener.stop()
+
 class ChatWidget(QWidget):
     def __init__(self, settings_ref=None, parent=None):
         super().__init__(parent)
         self.settings_ref = settings_ref
         self._worker = None
+        self._voice_worker = None
+        self._tts_worker = None
+        self._resume_voice_after_tts = False
         self._tools = None
         self._system = None
         self._messages = []
@@ -623,6 +682,9 @@ class ChatWidget(QWidget):
         self._activity_timer.timeout.connect(self._tick_activity)
         self._build_ui()
         self.setAcceptDrops(True)
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self._shutdown_voice)
         if self.settings_ref and hasattr(self.settings_ref, "tools_changed"):
             self.settings_ref.tools_changed.connect(self._on_tools_changed)
 
@@ -730,6 +792,12 @@ class ChatWidget(QWidget):
         self.input.setFixedHeight(68)
         self.input.submitted.connect(self._send)
         input_row.addWidget(self.input, stretch=1)
+
+        self.voice_btn = QPushButton("🎙 Nova")
+        self.voice_btn.setToolTip("Lokale Voice-Steuerung: 'Nova' sagen, dann den Befehl sprechen")
+        self.voice_btn.setMinimumHeight(40)
+        self.voice_btn.clicked.connect(self._toggle_voice)
+        input_row.addWidget(self.voice_btn)
 
         self.send_btn = QPushButton("Send")
         self.send_btn.setObjectName("PrimaryButton")
@@ -959,6 +1027,111 @@ class ChatWidget(QWidget):
         if approval_worker:
             approval_worker.set_approval(True, strategy)
 
+
+    def _toggle_voice(self):
+        if self._voice_worker and self._voice_worker.isRunning():
+            self._resume_voice_after_tts = False
+            self._shutdown_voice()
+            self._update_status_idle("Nova Voice aus")
+            return
+        self._start_voice()
+
+    def _start_voice(self) -> bool:
+        if self._voice_worker and self._voice_worker.isRunning():
+            return True
+        status = runtime_status()
+        if not status.get("ready"):
+            missing = []
+            if not status.get("vosk"):
+                missing.append("Vosk")
+            if not status.get("model_exists"):
+                missing.append(f"Modell {status.get('model')}")
+            if not status.get("capture_command"):
+                missing.append("Audio-Capture (parec/pw-record/arecord)")
+            self._append_msg("error", "Nova Voice nicht bereit: " + ", ".join(missing))
+            return False
+        self._voice_worker = _VoiceWorker(self)
+        self._voice_worker.state.connect(self._on_voice_state)
+        self._voice_worker.partial.connect(self._on_voice_partial)
+        self._voice_worker.command.connect(self._on_voice_command)
+        self._voice_worker.error.connect(self._on_voice_error)
+        self._voice_worker.finished.connect(self._on_voice_finished)
+        self.voice_btn.setText("■ Nova")
+        self._voice_worker.start()
+        return True
+
+    def _shutdown_voice(self):
+        worker = self._voice_worker
+        if worker is not None:
+            worker.stop()
+            if worker.isRunning():
+                worker.wait(1500)
+        self._voice_worker = None
+        if self._tts_worker is not None and self._tts_worker.isRunning() and not self._resume_voice_after_tts:
+            self._tts_worker.stop()
+            self._tts_worker.wait(1500)
+        if hasattr(self, "voice_btn"):
+            self.voice_btn.setText("🎙 Nova")
+
+    def _on_voice_state(self, state: str):
+        labels = {
+            "loading": "Nova Voice lädt lokales Modell…",
+            "listening": "🎙 Nova hört lokal zu",
+            "armed": "🎙 Nova erkannt – sprich deinen Befehl",
+            "stopped": "Nova Voice aus",
+        }
+        label = labels.get(state, f"Nova Voice: {state}")
+        if not (self._worker and self._worker.isRunning()):
+            self._update_status_idle(label)
+
+    def _on_voice_partial(self, text: str):
+        if self._worker and self._worker.isRunning():
+            return
+        if text:
+            self.status.setText(f"🎙 {text}")
+
+    def _on_voice_command(self, text: str):
+        command = str(text or "").strip()
+        if not command:
+            return
+        self.input.setPlainText(command)
+        if self._worker and self._worker.isRunning():
+            self._append_msg("system", f"🎙 Nova erkannt: {command}", "Agent läuft noch – Befehl steht im Eingabefeld")
+            return
+        self._send()
+
+    def _on_voice_error(self, error: str):
+        self._append_msg("error", f"Nova Voice: {error}")
+        self._shutdown_voice()
+
+
+    def _speak_voice_response(self, text: str):
+        voice_active = bool(self._voice_worker and self._voice_worker.isRunning())
+        if not voice_active:
+            return
+        self._resume_voice_after_tts = True
+        self._shutdown_voice()
+        self._tts_worker = _TtsWorker(text, self)
+        self._tts_worker.error.connect(self._on_tts_error)
+        self._tts_worker.finished.connect(self._on_tts_finished)
+        self._tts_worker.start()
+
+    def _on_tts_error(self, error: str):
+        self._append_msg("error", f"Nova TTS: {error}")
+
+    def _on_tts_finished(self):
+        self._tts_worker = None
+        resume = self._resume_voice_after_tts
+        self._resume_voice_after_tts = False
+        if resume:
+            self._start_voice()
+
+    def _on_voice_finished(self):
+        if self._voice_worker and not self._voice_worker.isRunning():
+            self._voice_worker = None
+        if hasattr(self, "voice_btn"):
+            self.voice_btn.setText("🎙 Nova")
+
     def _send(self):
         if self._worker and self._worker.isRunning():
             self._append_msg("system", "Agent already running; duplicate send ignored.", "")
@@ -1105,6 +1278,7 @@ class ChatWidget(QWidget):
             self._tools = self._worker.tools
             self._system = self._worker.system
         self._append_msg("assistant", text, model_used)
+        self._speak_voice_response(text)
         if self._session_id:
             chat_history.save_message(self._session_id, "assistant", text, model_used)
         self.send_btn.setEnabled(True)
