@@ -1,3 +1,8 @@
+## Unreleased
+
+- Route `ask`, `chat`, `task`, and `review` through the shared AICoder runtime so every selected provider, including linked Mistral Vibe accounts, gets the same enabled tool catalogue, workspace policy, approval handling, and continuation loop.
+- Preserve CLI-specific controls on the shared runtime: `--no-agents`, temperature/token/timeout overrides, multi-turn chat history, and read-only enforcement for non-apply tasks and reviews.
+
 ## v1.5.0 (2026-09-29)
 
 - Add local **Nova Voice** for the Linux desktop: offline Vosk wake-word/speech recognition, command routing through the normal AICoder pipeline, local Speech Dispatcher TTS, and mic pause/resume around playback to prevent self-triggering.

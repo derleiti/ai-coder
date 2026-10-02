@@ -1221,17 +1221,11 @@ def _print_response(result: dict) -> None:
 
 
 def cmd_ask(args: argparse.Namespace) -> int:
-    """Single-shot prompt. Reads AGENTS.md as system_prompt if present."""
-    session = load_session()
-    _timeout = getattr(args, "timeout", 90)
-    client = TriForceClient(session.base_url, token=session.token, timeout=_timeout)
+    """Single-shot prompt through the shared AICoder tool runtime."""
+    from .agent import run_agent
+
     state = get_state()
     model = _resolve_model(state, getattr(args, "model", None))
-    from .model_transport import native_model_transport_from_env
-    client, configured_model = native_model_transport_from_env(client, default_model=model)
-    model = configured_model or model
-
-    # Collect prompt: args.prompt (joined) or stdin
     if args.prompt:
         message = " ".join(args.prompt)
     else:
@@ -1243,64 +1237,32 @@ def cmd_ask(args: argparse.Namespace) -> int:
         except EOFError:
             pass
         message = "\n".join(lines).strip()
-
     if not message:
         print("Fehler: kein Prompt angegeben.", file=sys.stderr)
         return 1
-
-    # System prompt: AGENTS.md from workspace
-    workspace = str(active_workspace(state.get("workspace_root")))
-    system_prompt = None
-    if not getattr(args, "no_agents", False):
-        system_prompt = read_agents_md(workspace)
-
-    _print_header(state, model)
-
-    label = phase_label("work")
-
-    with Spinner(label):
-        result = client.chat(
-            message=message,
-            model=model,
-            system_prompt=system_prompt,
-            temperature=getattr(args, "temperature", 0.7),
-            max_tokens=getattr(args, "max_tokens", 4096),
-            fallback_model=None,
-        )
-
-    _print_response(result)
-    try:
-        history_record(
-            kind="ask", prompt=message,
-            response=result.get("response",""),
-            model=result.get("model"),
-            latency_ms=result.get("latency_ms") or result.get("latency"),
-        )
-    except Exception:
-        pass
-    return 0
+    return run_agent(
+        initial_prompt=message,
+        model=model,
+        fallback_model=None,
+        runtime_mode="classic",
+        team_overrides={"team_runtime_mode": "off"},
+        include_agents=not bool(getattr(args, "no_agents", False)),
+        temperature=float(getattr(args, "temperature", 0.7)),
+        max_output_tokens=int(getattr(args, "max_tokens", 4096)),
+        request_timeout=int(getattr(args, "timeout", 90)),
+        history_kind="ask",
+    )
 
 
 def cmd_chat(args: argparse.Namespace) -> int:
-    """Interactive multi-turn chat session. Type /exit or /quit to stop."""
-    session = load_session()
-    client = TriForceClient(session.base_url, token=session.token, timeout=120)
+    """Interactive multi-turn chat through the shared AICoder tool runtime."""
+    from .agent import run_agent
+
     state = get_state()
     model = _resolve_model(state, getattr(args, "model", None))
-    from .model_transport import native_model_transport_from_env
-    client, configured_model = native_model_transport_from_env(client, default_model=model)
-    model = configured_model or model
-
-    workspace = str(active_workspace(state.get("workspace_root")))
-    system_prompt = None
-    if not getattr(args, "no_agents", False):
-        system_prompt = read_agents_md(workspace)
-
-    agents_hint = " [AGENTS.md loaded]" if system_prompt else ""
-    print(f"ai-coder chat · model={model or 'backend default'}{agents_hint}")
-    print("Commands: /exit  /model <name>  /models  /status")
+    print(f"ai-coder chat · model={model or 'backend default'}")
+    print("Commands: /exit  /model <name>  /status  /clear")
     print("─" * 50)
-
     history: list[dict] = []
 
     while True:
@@ -1309,11 +1271,8 @@ def cmd_chat(args: argparse.Namespace) -> int:
         except (EOFError, KeyboardInterrupt):
             print("\nSession ended.")
             break
-
         if not user_input:
             continue
-
-        # Slash-commands in session
         if user_input.startswith("/"):
             parts = user_input.split(None, 1)
             cmd = parts[0].lower()
@@ -1321,93 +1280,81 @@ def cmd_chat(args: argparse.Namespace) -> int:
             if cmd in ("/exit", "/quit", "/q"):
                 print("Session ended.")
                 break
-            elif cmd == "/model" and val:
+            if cmd == "/model" and val:
                 model = val
                 set_model(val)
-                state = get_state()
                 print(f"model → {val}")
             elif cmd == "/status":
-                print(f"model={model or 'backend default'}  turns={len(history)}")
-            elif cmd == "/help":
-                print("  /model <n>  /models  /status  /clear  /exit")
+                print(f"model={model or 'backend default'}  turns={len(history) // 2}")
             elif cmd == "/clear":
                 history.clear()
                 print("History cleared.")
+            elif cmd == "/help":
+                print("  /model <n>  /status  /clear  /exit")
             else:
                 print(f"Unknown command: {cmd}")
             continue
 
-        # Build proper messages array for multi-turn context
-        # Limit: keep last 6 turns but cap each response to 2000 chars
-        # to avoid context window explosion on long sessions
-        chat_messages = []
-        if history:
-            for turn in history[-6:]:
-                chat_messages.append({"role": "user", "content": turn["user"][:2000]})
-                resp_trimmed = turn["assistant"]
-                if len(resp_trimmed) > 2000:
-                    resp_trimmed = resp_trimmed[:1900] + "\n[...truncated for context]"
-                chat_messages.append({"role": "assistant", "content": resp_trimmed})
-        chat_messages.append({"role": "user", "content": user_input})
+        captured = {}
+        def _capture(result):
+            captured["response"] = str(result.response or "")
 
-        label = phase_label("work")
-        with Spinner(label):
-            try:
-                result = client.chat(
-                    messages=chat_messages,
-                    model=model,
-                    system_prompt=system_prompt,
-                    temperature=0.7,
-                    max_tokens=4096,
-                    fallback_model=None,
-                )
-            except (ClientError, RuntimeError) as e:
-                print(f"\nFehler: {e}", file=sys.stderr)
-                continue
-
-        resp = result.get("response", "")
-        model_used = result.get("model", model or "?")
-        latency = result.get("latency_ms")
-
-        print(f"\n{resp}\n")
-        meta = f"[{model_used}"
-        if latency:
-            meta += f" · {latency}ms"
-        meta += "]"
-        print(meta)
-        print()
-
-        history.append({"user": user_input, "assistant": resp})
-        try:
-            history_record(
-                kind="chat", prompt=user_input,
-                response=resp, model=model_used, latency_ms=latency,
-            )
-        except Exception:
-            pass
-
+        rc = run_agent(
+            initial_prompt=user_input,
+            model=model,
+            fallback_model=None,
+            conversation=history[-12:],
+            runtime_mode="classic",
+            team_overrides={"team_runtime_mode": "off"},
+            include_agents=not bool(getattr(args, "no_agents", False)),
+            history_kind="chat",
+            result_callback=_capture,
+        )
+        if rc != 0:
+            continue
+        response = captured.get("response", "")
+        history.append({"role": "user", "content": user_input})
+        history.append({"role": "assistant", "content": response})
     return 0
 
 
 # ── Task ─────────────────────────────────────────────────────────────────────
 
 def cmd_task(args: argparse.Namespace) -> int:
-    """File-aware coding task: read file → LLM → diff → optional apply."""
-    from .task import run_task
+    """Coding task through the shared AICoder tool runtime."""
+    from .agent import run_agent
+
     task = " ".join(args.task) if args.task else ""
     if not task:
         print("Fehler: Kein Task angegeben.", file=sys.stderr)
         return 1
-    rc = run_task(
-        task=task,
-        file_paths=args.files or [],
-        model=args.model,
-        apply=args.apply,
-        dry_run=args.dry_run,
-        no_agents=args.no_agents,
-        temperature=args.temperature,
+    files = args.files or []
+    file_text = ", ".join(files) if files else "the active workspace"
+    apply = bool(getattr(args, "apply", False)) and not bool(getattr(args, "dry_run", False))
+    if apply:
+        mode = (
+            f"Work on {file_text}. You may modify the requested files using AICoder tools. "
+            "Make the smallest correct change and verify it with an appropriate check."
+        )
+    else:
+        mode = (
+            f"Inspect {file_text} using AICoder tools. Do not modify files or system state. "
+            "Return the requested analysis or proposed patch only."
+        )
+    prompt = f"{task}\n\nCLI task contract: {mode}"
+    state = get_state()
+    return run_agent(
+        initial_prompt=prompt,
+        model=getattr(args, "model", None) or state.get("selected_model"),
+        fallback_model=None,
+        runtime_mode="classic",
+        team_overrides={"team_runtime_mode": "off"},
+        include_agents=not bool(getattr(args, "no_agents", False)),
+        temperature=float(getattr(args, "temperature", 0.3)),
+        request_timeout=int(getattr(args, "timeout", 90)),
+        read_only=not apply,
+        history_kind="task",
     )
-    return rc
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -2139,29 +2086,30 @@ def cmd_mcp_list(_: argparse.Namespace) -> int:
 
 
 def cmd_review(args: argparse.Namespace) -> int:
-    """Code review: analyze file → structured review."""
-    from .task import run_task
+    """Structured code review through the shared AICoder tool runtime."""
+    from .agent import run_agent
+
     files = args.files or []
     if not files:
         print("Error: specify at least one file with -f.", file=sys.stderr)
         return 1
-    review_prompt = (
-        "Perform a structured code review. Cover: "
-        "1) Bugs or logic errors "
-        "2) Security issues "
-        "3) Performance problems "
-        "4) Code quality / readability "
-        "5) Top 3 concrete improvement suggestions. "
-        "Be direct and specific. No padding."
+    targets = ", ".join(files)
+    prompt = (
+        f"Review these files using AICoder read-only tools: {targets}. "
+        "Do not modify files or system state. Cover: 1) bugs or logic errors, "
+        "2) security issues, 3) performance problems, 4) code quality/readability, "
+        "5) top 3 concrete improvement suggestions. Be direct and specific."
     )
-    return run_task(
-        task=review_prompt,
-        file_paths=files,
-        model=args.model,
-        apply=False,
-        dry_run=False,
-        no_agents=args.no_agents,
-        temperature=0.3,
+    state = get_state()
+    return run_agent(
+        initial_prompt=prompt,
+        model=getattr(args, "model", None) or state.get("selected_model"),
+        fallback_model=None,
+        runtime_mode="classic",
+        team_overrides={"team_runtime_mode": "off"},
+        include_agents=not bool(getattr(args, "no_agents", False)),
+        read_only=True,
+        history_kind="review",
     )
 
 

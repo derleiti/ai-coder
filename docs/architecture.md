@@ -31,7 +31,7 @@ User prompt
   → nächster Operator-Turn
 ```
 
-GUI, CLI-Agent und direkte `aicoder mcp`-Aufrufe verwenden dieselbe Policy.
+GUI, CLI-Agent sowie die CLI-Frontends `ask`, `chat`, `task` und `review` verwenden dieselbe Agent-/Tool-Runtime und Policy. Direkte `aicoder mcp`-Aufrufe verwenden dieselbe zentrale Tool-Policy ohne einen separaten Modell-Loop.
 Lokale typisierte Workspace-Tools, progressive Capability-Discovery und der
 Local-OS-Provider und lokale Runtime-Tools laufen clientseitig. Backend-Tools werden aus dem authentisierten TriForce-Katalog übernommen statt durch eine zusätzliche Coding-only-Allowlist beschnitten.
 TriForce ist dabei ausschließlich Backend-Service und niemals Operator-Ziel: Host-/Repository-/Service-/Container-/Remote-Admin-Fähigkeiten des TriForce-Hosts werden aus dem AICoder-Katalog entfernt und am MCP-Transport nochmals blockiert. Lokale gleichnamige Workspace-Tools bleiben verfügbar.

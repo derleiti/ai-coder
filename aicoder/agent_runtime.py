@@ -401,6 +401,8 @@ class NativeLightRuntime:
     resume_plan_id: str | None = None
     base_timeout: int = 300
     max_output_tokens: int = 16384
+    temperature: float = 0.3
+    include_agents: bool = True
     # Optional per-runtime soft cap for conversation history. Team planning and
     # research stages use this to stay compact even when the selected model has
     # a very large advertised context window. The system prompt and newest turn
@@ -554,7 +556,7 @@ class NativeLightRuntime:
         if self.system_prompt is not None:
             base = self.system_prompt
         else:
-            base = build_system_prompt(tools, workspace)
+            base = build_system_prompt(tools, workspace, include_agents=self.include_agents)
             suffix = str(self.system_prompt_suffix or "").strip()
             if suffix:
                 base = base.rstrip() + "\n\n" + suffix
@@ -1340,7 +1342,7 @@ class NativeLightRuntime:
                     messages=messages,
                     model=active_model,
                     fallback_model=active_fallback,
-                    temperature=0.3,
+                    temperature=self.temperature,
                     max_tokens=256 if self.quick_chat else self.max_output_tokens,
                     tools=request_tools,
                     tool_choice="auto",

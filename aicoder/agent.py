@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from .client import TriForceClient
 from .config import load_session
@@ -109,11 +109,18 @@ def _run_native_light_agent(
     json_output: bool = False,
     json_events: bool = False,
     persistent_plan: bool = True,
+    include_agents: bool = True,
+    temperature: float = 0.3,
+    max_output_tokens: int | None = None,
+    request_timeout: int | None = None,
+    read_only: bool = False,
+    history_kind: str = "ask",
+    result_callback: Callable[[Any], None] | None = None,
 ) -> int:
     from .agent_runtime import NativeLightRuntime
 
     session = load_session()
-    request_timeout = int(state.get("request_timeout", 300))
+    request_timeout = int(request_timeout or state.get("request_timeout", 300))
     client = TriForceClient(session.base_url, token=session.token, timeout=request_timeout)
     ws_path = active_workspace(state.get("workspace_root"))
     resume_requested = persistent_plan and (
@@ -277,6 +284,19 @@ def _run_native_light_agent(
             detail += f" · fallback: {info.fallback_reason}"
         print(f"  {C.DIM}⚙ {detail}{C.RESET}", file=sys.stderr, flush=True)
 
+    approval_fn = _headless_approval if (json_output or json_events) else _cli_approval
+    if read_only:
+        base_approval = approval_fn
+
+        def read_only_approval(tool_name: str, args: dict) -> bool:
+            cmd = args.get("command", "")
+            risk = assess_execution(tool_name, args, destructive=is_destructive(cmd))
+            if risk.needs_approval or risk.elevation:
+                return False
+            return base_approval(tool_name, args)
+
+        approval_fn = read_only_approval
+
     runtime = NativeLightRuntime(
         client=client,
         initial_prompt=initial_prompt,
@@ -290,14 +310,16 @@ def _run_native_light_agent(
         load_tools_on_start=should_load_tools_now,
         enabled_tool_names=enabled_tool_names,
         quick_chat=quick_chat,
-        approval_fn=_headless_approval if (json_output or json_events) else _cli_approval,
+        approval_fn=approval_fn,
         event_fn=on_event,
         conversation=conversation,
         persistent_plan=persistent_plan,
         resume=resume_requested,
         resume_plan_id=resume_plan_id if persistent_plan else None,
         base_timeout=request_timeout,
-        max_output_tokens=int(state.get("max_output_tokens", 16384)),
+        max_output_tokens=int(max_output_tokens or state.get("max_output_tokens", 16384)),
+        temperature=float(temperature),
+        include_agents=bool(include_agents),
         tools_unavailable_reason=tools_unavailable_reason,
         progressive_tool_disclosure=(tool_mode == "on_demand"),
         native_openrouter_tool_calling=bool(state.get("native_openrouter_tool_calling", False)),
@@ -325,11 +347,13 @@ def _run_native_light_agent(
 
     try:
         history_record(
-            kind="ask", prompt=initial_prompt, response=result.response,
+            kind=history_kind, prompt=initial_prompt, response=result.response,
             model=result.model, latency_ms=result.latency_ms,
         )
     except Exception:
         pass
+    if result_callback is not None:
+        result_callback(result)
     if json_output or json_events:
         print(json.dumps({
             "type": "result",
@@ -358,6 +382,13 @@ def _run_agent_impl(
     json_output: bool = False,
     json_events: bool = False,
     team_overrides: Optional[dict[str, Any]] = None,
+    include_agents: bool = True,
+    temperature: float = 0.3,
+    max_output_tokens: int | None = None,
+    request_timeout: int | None = None,
+    read_only: bool = False,
+    history_kind: str = "ask",
+    result_callback: Callable[[Any], None] | None = None,
 ) -> int:
     from .team_runtime import (
         config_from_state, reroute_unavailable_account_models,
@@ -483,6 +514,13 @@ def _run_agent_impl(
         json_output=json_output,
         json_events=json_events,
         persistent_plan=(effective_runtime == "native-light"),
+        include_agents=include_agents,
+        temperature=temperature,
+        max_output_tokens=max_output_tokens,
+        request_timeout=request_timeout,
+        read_only=read_only,
+        history_kind=history_kind,
+        result_callback=result_callback,
     )
 
 def _shared_presence_best_effort(**updates: Any) -> None:
@@ -507,6 +545,13 @@ def run_agent(
     json_output: bool = False,
     json_events: bool = False,
     team_overrides: Optional[dict[str, Any]] = None,
+    include_agents: bool = True,
+    temperature: float = 0.3,
+    max_output_tokens: int | None = None,
+    request_timeout: int | None = None,
+    read_only: bool = False,
+    history_kind: str = "ask",
+    result_callback: Callable[[Any], None] | None = None,
 ) -> int:
     """Public agent boundary with fail-open host-authoritative Shared Presence."""
     task_id = f"aicoder-{int(time.time())}-{threading.get_ident()}"
@@ -531,6 +576,10 @@ def run_agent(
             effective_prompt, model, fallback_model, verbose=verbose, conversation=conversation,
             runtime_mode=runtime_mode, resume_plan_id=resume_plan_id, json_output=json_output,
             json_events=json_events, team_overrides=team_overrides,
+            include_agents=include_agents, temperature=temperature,
+            max_output_tokens=max_output_tokens, request_timeout=request_timeout,
+            read_only=read_only, history_kind=history_kind,
+            result_callback=result_callback,
         )
     finally:
         _shared_presence_best_effort(

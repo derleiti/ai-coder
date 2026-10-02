@@ -40,6 +40,8 @@ Erstellt Git-Repo-Snapshot. Persistiert `workspace_root` in state.json.
 
 ### LLM — ask / chat / task / review
 
+All four commands use the same AICoder agent/tool runtime. The selected provider therefore receives the same enabled tool catalogue and local policy instead of a separate chat-only path. `task` without `--apply` and `review` are read-only; `task --apply` may mutate through the normal approval/backup policy.
+
 ```bash
 # Single-shot
 aicoder ask "Frage"
@@ -55,8 +57,8 @@ aicoder chat --model groq/llama-3.3-70b-versatile
 
 # File-aware task
 aicoder task "Füge Docstrings hinzu" -f datei.py
-aicoder task "Refactor X" -f datei.py --apply       # Diff + y/N → schreiben
-aicoder task "Refactor X" -f datei.py --dry-run     # Diff, nicht schreiben
+aicoder task "Refactor X" -f datei.py --apply       # Tool-runtime may modify + verify
+aicoder task "Refactor X" -f datei.py --dry-run     # read-only analysis/proposed patch
 aicoder task "..." -f a.py -f b.py                  # mehrere Dateien (kein apply)
 
 # Code Review

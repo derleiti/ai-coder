@@ -1154,7 +1154,9 @@ def build_tool_desc(tools: list[dict]) -> str:
     return "\n".join(out)
 
 
-def build_system_prompt(tools: list[dict], workspace_root: Optional[str] = None) -> str:
+def build_system_prompt(
+    tools: list[dict], workspace_root: Optional[str] = None, *, include_agents: bool = True
+) -> str:
     """Build the system prompt with tools, workspace, and OS info."""
     ws_path = Path(workspace_root or ".").resolve()
     try:
@@ -1176,7 +1178,7 @@ def build_system_prompt(tools: list[dict], workspace_root: Optional[str] = None)
     except Exception:
         pass
 
-    agents_md = read_agents_md(str(ws_path)) or ""
+    agents_md = (read_agents_md(str(ws_path)) or "") if include_agents else ""
     from .guidelines import render_guidelines
     from .skills import render_skill_catalog
     guideline_text = render_guidelines(str(ws_path))
