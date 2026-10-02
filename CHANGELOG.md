@@ -1,4 +1,4 @@
-## Unreleased
+## v1.5.1 (2026-10-02)
 
 - Route `ask`, `chat`, `task`, and `review` through the shared AICoder runtime so every selected provider, including linked Mistral Vibe accounts, gets the same enabled tool catalogue, workspace policy, approval handling, and continuation loop.
 - Preserve CLI-specific controls on the shared runtime: `--no-agents`, temperature/token/timeout overrides, multi-turn chat history, and read-only enforcement for non-apply tasks and reviews.

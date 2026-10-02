@@ -1,6 +1,6 @@
 # Maintainer: Markus Leitermann <admin@ailinux.me>
 pkgname=aicoder
-pkgver=1.5.0
+pkgver=1.5.1
 pkgrel=1
 pkgdesc="Terminal Coding & DevOps Agent for AILinux/TriForce — 659+ models, GUI, System Tray"
 arch=('x86_64')
@@ -9,7 +9,7 @@ license=('custom:AILinux-Proprietary-Source-License')
 depends=('glibc')
 optdepends=('git: workspace support' 'python-pyqt6: GUI mode (aicoder gui)')
 source=("aicoder-${pkgver}::https://github.com/derleiti/ai-coder/releases/download/v${pkgver}/aicoder-${pkgver}-x86_64-linux")
-sha256sums=('f3438a302ea41653f74bd24cebae696db689a716b3fcfe29bc22317a25937aa6')
+sha256sums=('81a7340f3ef3fccc31de945334c2ac0b7b12790082ef26289a3fbcfb4126f083')
 
 package() {
     install -Dm755 "$srcdir/aicoder-${pkgver}" "$pkgdir/usr/bin/aicoder"

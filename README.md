@@ -3,7 +3,7 @@
 [![CI](https://github.com/derleiti/ai-coder/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/derleiti/ai-coder/actions/workflows/ci.yml)
 [![Security](https://github.com/derleiti/ai-coder/actions/workflows/security.yml/badge.svg?branch=master)](https://github.com/derleiti/ai-coder/actions/workflows/security.yml)
 
-**Current release: 1.5.0** · AILinux coding/DevOps agent for TriForce, Project Memory and the Loom capability fabric.
+**Current release: 1.5.1** · AILinux coding/DevOps agent for TriForce, Project Memory and the Loom capability fabric.
 
 AICoder combines a terminal agent, PyQt6 desktop UI, provider/model routing, a guarded MCP/local-tool loop, transactional coding workflows, multi-agent Team Runtime and local-first project memory. It is designed to inspect real system state, create a rollback path before risky changes, implement the smallest correct change and verify the result with executable evidence.
 
