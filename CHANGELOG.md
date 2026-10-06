@@ -36,6 +36,7 @@
 - Fix standalone GUI startup on Linux and Windows by bundling `aicoder/gui/design_tokens.json` into the PyInstaller application image.
 - Add packaging regression coverage for the shared GUI design-token asset in both release specs.
 - Verify the Linux onefile binary contains the token file and that `aicoder gui` reaches the Qt event loop in an offscreen smoke test.
+- Mirror verified single-agent feature experiences from local `evidence.db` into synchronized Project Memory after successful mutation + verification; accepted revisions are then mirrored by TriForce into Claude-Mem. Sync remains fail-open and deduplicated by an experience fingerprint.
 
 ## v1.4.0 (2026-09-27)
 
