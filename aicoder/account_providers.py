@@ -290,6 +290,71 @@ def provider_client_diagnostics(provider: str) -> dict[str, Any]:
     }
 
 
+def _ensure_uv_for_mistral() -> str:
+    """Resolve uv, bootstrapping it only during an explicit Mistral action.
+
+    AICoder itself does not need uv.  Linux uses Astral's official installer,
+    without sudo or changing any system-wide packages. Android/Termux and
+    Windows need their own package managers instead of a Linux binary.
+    """
+    uv = _which_executable("uv")
+    if uv:
+        return uv
+
+    prefix = os.environ.get("PREFIX", "")
+    if sys.platform == "android" or prefix.startswith("/data/data/com.termux/"):
+        raise ClientError(
+            "Mistral Vibe needs uv. In Termux run: pkg install uv; "
+            "then reopen AICoder. Android compatibility depends on uv and Vibe."
+        )
+    if os.name == "nt":
+        raise ClientError(
+            "Mistral Vibe needs uv. Install with 'winget install --id astral-sh.uv -e' "
+            "and restart AICoder."
+        )
+
+    curl, sh = _which_executable("curl"), _which_executable("sh")
+    if not curl or not sh:
+        raise ClientError(
+            "Mistral Vibe needs uv and curl/sh are missing. Install uv from "
+            "https://docs.astral.sh/uv/getting-started/installation/"
+        )
+
+    try:
+        download = subprocess.run(
+            [curl, "-fsSL", "https://astral.sh/uv/install.sh"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=60, env=_external_cli_env(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ClientError("Could not download the official uv installer") from exc
+    if download.returncode != 0 or not download.stdout:
+        raise ClientError("Official uv installer download failed")
+    # The app already searches ~/.local/bin; never rewrite the user's shell
+    # startup files as a side effect of clicking Mistral -> Connect.
+    install_env = _external_cli_env()
+    install_env["UV_NO_MODIFY_PATH"] = "1"
+    try:
+        install = subprocess.run(
+            [sh], input=download.stdout, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=180, env=install_env,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ClientError("Could not install uv for Mistral Vibe") from exc
+    if install.returncode != 0:
+        raise ClientError(
+            "Official uv installation failed. Install manually from "
+            "https://docs.astral.sh/uv/getting-started/installation/"
+        )
+    uv = _which_executable("uv")
+    if not uv:
+        raise ClientError(
+            "uv installed but is not available. Ensure ~/.local/bin is on PATH "
+            "and restart AICoder."
+        )
+    return uv
+
+
 def update_provider_client(provider: str, *, executable: str | None = None) -> dict[str, str]:
     """Update one official account-provider CLI using its documented stable update path.
 
@@ -312,9 +377,7 @@ def update_provider_client(provider: str, *, executable: str | None = None) -> d
     elif spec.id == "claude":
         argv = [exe, "update"]
     elif spec.id == "mistral":
-        uv = _which_executable("uv")
-        if not uv:
-            raise ClientError("uv is required to update Mistral Vibe")
+        uv = _ensure_uv_for_mistral()
         argv = [uv, "tool", "upgrade", "mistral-vibe"]
     elif spec.id == "gemini":
         argv = [exe, "update"]
@@ -433,10 +496,12 @@ def ensure_provider_client(provider: str) -> str:
             raise ClientError("Google Antigravity CLI installed but 'agy' is not on PATH")
         return installed
 
-    runner = _which_executable(recipe[0])
+    runner = (
+        _ensure_uv_for_mistral() if spec.id == "mistral"
+        else _which_executable(recipe[0])
+    )
     if not runner:
-        dependency = "Node.js/npm" if recipe[0] == "npm" else "uv"
-        raise ClientError(f"{dependency} is required to install the official {spec.display_name} client")
+        raise ClientError(f"Node.js/npm is required to install the official {spec.display_name} client")
     if recipe[0] == "npm":
         argv = [runner, "install", "-g", "--prefix", str(Path.home() / ".local"), recipe[-1]]
     else:

@@ -8,6 +8,7 @@ pkgbase = aicoder
 	depends = glibc
 	optdepends = git: workspace support
 	optdepends = python-pyqt6: GUI mode (aicoder gui)
+	optdepends = uv: Mistral Vibe account provider
 	source = aicoder-1.5.3::https://github.com/derleiti/ai-coder/releases/download/v1.5.3/aicoder-1.5.3-x86_64-linux
 	sha256sums = 9a65548dbd9310136bfc084af12db5ba53759068f35447cf1a88b4310102266e
 

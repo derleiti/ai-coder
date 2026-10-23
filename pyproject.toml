@@ -25,6 +25,9 @@ dependencies = [
 
 [project.optional-dependencies]
 voice = ["vosk>=0.3.45,<0.4"]
+# Only the Mistral Vibe account integration needs the external uv tool.
+# Keep the default AICoder install usable without this provider.
+mistral = ["uv>=0.8.0"]
 
 [project.scripts]
 aicoder = "aicoder.cli:main"

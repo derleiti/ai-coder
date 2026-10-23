@@ -21,6 +21,16 @@ echo -e "${CYAN}[1/4] Pakete installieren...${NC}"
 pkg update -y -q
 pkg install -y python git curl openssl-tool
 
+# Optional official Mistral Vibe runtime. AICoder itself works without uv;
+# Termux uses its native uv package, never a glibc Linux bootstrap binary.
+if ! command -v uv >/dev/null 2>&1; then
+    if pkg install -y uv && uv --version >/dev/null 2>&1; then
+        echo -e "${GREEN}uv: Mistral-Vibe-Abhaengigkeit installiert.${NC}"
+    else
+        echo -e "${RED}Hinweis: uv nicht verfuegbar; nur Mistral Vibe bleibt deaktiviert.${NC}"
+    fi
+fi
+
 # ai-coder deps (kein pip upgrade — kaputt in Termux)
 echo -e "${CYAN}[2/4] Python-Deps installieren...${NC}"
 PYTHONPATH="" pip3 install --quiet httpx rich typer certifi urllib3 markdown prompt-toolkit 2>/dev/null || \

@@ -1001,5 +1001,99 @@ class AccountInstallAndLoginTests(unittest.TestCase):
 
 
 
+
+
+
+class UvBootstrapTests(unittest.TestCase):
+    def test_existing_uv_is_reused_without_network_or_install(self):
+        from aicoder.account_providers import _ensure_uv_for_mistral
+        with patch("aicoder.account_providers._which_executable", return_value="/usr/bin/uv"), \
+             patch("aicoder.account_providers.subprocess.run") as run:
+            self.assertEqual(_ensure_uv_for_mistral(), "/usr/bin/uv")
+        run.assert_not_called()
+
+    def test_missing_uv_bootstraps_only_user_local_astral_installer(self):
+        from aicoder.account_providers import _ensure_uv_for_mistral
+        seen = {"uv": 0}
+        def fake_which(name):
+            if name == "uv":
+                seen["uv"] += 1
+                return "" if seen["uv"] == 1 else str(Path.home() / ".local/bin/uv")
+            if name in ("sh", "curl"):
+                return "/usr/bin/" + name
+            return ""
+        download = MagicMock(returncode=0, stdout=b"#!/bin/sh\\nexit 0\\n", stderr=b"")
+        install = MagicMock(returncode=0, stdout=b"", stderr=b"")
+        with patch("aicoder.account_providers._which_executable", side_effect=fake_which), \
+             patch("aicoder.account_providers.subprocess.run", side_effect=[download, install]) as run, \
+             patch.dict(os.environ, {"PREFIX": "/usr"}, clear=False):
+            self.assertEqual(_ensure_uv_for_mistral(), str(Path.home() / ".local/bin/uv"))
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_args_list[0].args[0],
+                         ["/usr/bin/curl", "-fsSL", "https://astral.sh/uv/install.sh"])
+        self.assertEqual(run.call_args_list[1].args[0], ["/usr/bin/sh"])
+        self.assertEqual(run.call_args_list[1].kwargs["input"], download.stdout)
+        self.assertEqual(run.call_args_list[1].kwargs["env"]["UV_NO_MODIFY_PATH"], "1")
+        self.assertNotIn("sudo", str(run.call_args_list))
+
+    def test_failed_download_never_executes_empty_script(self):
+        from aicoder.account_providers import _ensure_uv_for_mistral
+        def which(name):
+            return {"curl": "/usr/bin/curl", "sh": "/usr/bin/sh"}.get(name, "")
+        failed = MagicMock(returncode=22, stdout=b"", stderr=b"failed")
+        with patch("aicoder.account_providers._which_executable", side_effect=which), \
+             patch("aicoder.account_providers.subprocess.run", return_value=failed) as run:
+            with self.assertRaisesRegex(ClientError, "installer download failed"):
+                _ensure_uv_for_mistral()
+        self.assertEqual(run.call_count, 1)
+
+    def test_termux_requires_native_uv_package_instead_of_linux_script(self):
+        from aicoder.account_providers import _ensure_uv_for_mistral
+        with patch("aicoder.account_providers._which_executable", return_value=""), \
+             patch.dict(os.environ, {"PREFIX": "/data/data/com.termux/files/usr"}), \
+             patch("aicoder.account_providers.subprocess.run") as run:
+            with self.assertRaisesRegex(ClientError, "pkg install uv"):
+                _ensure_uv_for_mistral()
+        run.assert_not_called()
+
+    def test_missing_uv_during_mistral_connect_runs_uv_install(self):
+        state = {"uv": 0, "vibe": 0}
+        def fake_which(name):
+            if name == "vibe":
+                state["vibe"] += 1
+                return "" if state["vibe"] == 1 else str(Path.home() / ".local/bin/vibe")
+            if name == "uv":
+                state["uv"] += 1
+                return "" if state["uv"] == 1 else str(Path.home() / ".local/bin/uv")
+            return {"curl": "/usr/bin/curl", "sh": "/usr/bin/sh"}.get(name, "")
+        install_download = MagicMock(returncode=0, stdout=b"#!/bin/sh\\nexit 0\\n", stderr=b"")
+        success = MagicMock(returncode=0, stdout=b"", stderr=b"")
+        with patch("aicoder.account_providers._which_executable", side_effect=fake_which), \
+             patch("aicoder.account_providers.subprocess.run",
+                   side_effect=[install_download, success, success]) as run, \
+             patch.dict(os.environ, {"PREFIX": "/usr"}):
+            path = ensure_provider_client("mistral")
+        self.assertTrue(path.endswith("/.local/bin/vibe"))
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(run.call_args_list[2].args[0],
+                         [str(Path.home() / ".local/bin/uv"),
+                          "tool", "install", "--upgrade", "mistral-vibe"])
+
+    def test_optional_dependency_declared_for_all_installers(self):
+        try:
+            import tomllib
+        except ModuleNotFoundError:  # Python 3.10 CI uses the declared tomli dependency
+            import tomli as tomllib
+        root = Path(__file__).resolve().parents[1]
+        py = tomllib.loads((root / "pyproject.toml").read_text())
+        self.assertTrue(any(x.startswith("uv") for x in py["project"]["optional-dependencies"]["mistral"]))
+        deb = (root / "packaging/debian/aicoder/DEBIAN/control").read_text()
+        self.assertIn("Suggests: uv", deb)
+        self.assertNotIn("Depends: libc6, uv", deb)
+        self.assertIn("uv: Mistral Vibe", (root / "packaging/aur/PKGBUILD").read_text())
+        self.assertIn("optdepends = uv:", (root / "packaging/aur/.SRCINFO").read_text())
+        self.assertIn("pkg install -y uv", (root / "packaging/termux/install.sh").read_text())
+
+
 if __name__ == "__main__":
     unittest.main()

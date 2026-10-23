@@ -311,6 +311,27 @@ aicoder providers
 aicoder systemlog status
 ```
 
+## Mistral Vibe / uv (optional dependency)
+
+AICoder does **not** require `uv` for ordinary TriForce chat or other
+providers. The official **Mistral Vibe** account integration uses `uv tool
+install mistral-vibe`. On Linux, clicking **Mistral → Verbinden** bootstraps
+the official Astral `uv` installer into `~/.local/bin` when needed, then
+installs Vibe. No root access is required. The same check runs on explicit
+Mistral client updates, not during application startup.
+
+- Linux (manual): `curl -LsSf https://astral.sh/uv/install.sh | sh`.
+- Termux: `pkg install uv` (attempted optionally by the Termux installer;
+  upstream Android support varies and Vibe is not guaranteed to work).
+- Windows: `winget install --id astral-sh.uv -e`.
+- Python source install: `pip install 'aicoder[mistral]'` to include `uv`.
+- Debian/Ubuntu binary: `uv` is a suggested optional package, not a hard
+  dependency (it is not guaranteed to exist in every distro repository).
+- Arch/AUR: `uv` is an optional dependency.
+
+If Mistral is still not connected after `uv --version` succeeds, run
+`uv tool install mistral-vibe`, then retry the Mistral connection.
+
 ## Install / run
 
 ### Development checkout
