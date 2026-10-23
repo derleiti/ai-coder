@@ -73,6 +73,7 @@ class _ModelLoader(QThread):
     def __init__(self, client=None):
         super().__init__()
         self.client = client
+        self.model_details: dict[str, dict] = {}
 
     def run(self):
         models: list[str] = []
@@ -81,10 +82,13 @@ class _ModelLoader(QThread):
         if self.client is not None:
             try:
                 data = self.client.model_catalog()
-                models.extend(
-                    model_id for item in data.get("models", [])
-                    if (model_id := model_identifier(item))
-                )
+                # TriForce sends one authoritative, tier-scoped model catalog.
+                # Details are not a second source of unrestricted models.
+                allowed = {model_identifier(item) for item in data.get("models", [])}
+                details = {item.get("id"): item for item in data.get("model_details", [])
+                           if isinstance(item, dict) and item.get("id") in allowed}
+                self.model_details = details
+                models.extend(sorted(allowed - {""}))
                 labels.append(f"TriForce {data.get('tier', '?')}")
             except Exception as exc:
                 errors.append(f"TriForce: {exc}")
@@ -960,9 +964,10 @@ class SettingsWidget(QWidget):
 
     def _on_models_loaded(self, models: list, tier: str):
         self._models = sorted(models)
+        self._model_details = dict(getattr(self._loader, "model_details", {}))
 
         # Save current selection
-        cur_model = self.model_combo.currentText()
+        cur_model = str(self.model_combo.currentData() or self.model_combo.currentText())
 
         # Populate dropdowns
         self.model_combo.clear()
@@ -971,7 +976,9 @@ class SettingsWidget(QWidget):
         backend_models = [m for m in self._models if not str(m).startswith("account:")]
         account_models = [m for m in self._models if str(m).startswith("account:")]
         for m in backend_models:
-            self.model_combo.addItem(m)
+            detail = self._model_details.get(m, {})
+            free_label = " [Free]" if detail.get("free_badge") is True else ""
+            self.model_combo.addItem(m + free_label, m)
         self._populate_account_picker(account_models)
         state = get_state()
         for key, combo in self._team_model_combos.items():
@@ -988,7 +995,11 @@ class SettingsWidget(QWidget):
 
         # Restore selection
         if cur_model:
-            self.model_combo.setCurrentText(cur_model)
+            idx = self.model_combo.findData(cur_model)
+            if idx >= 0:
+                self.model_combo.setCurrentIndex(idx)
+            else:
+                self.model_combo.setCurrentText(cur_model)
 
         self.model_status.setText(f"{len(models)} Modelle ({tier})")
         self.model_status.setStyleSheet("color: #00ff88; font-size: 11px;")
@@ -999,7 +1010,7 @@ class SettingsWidget(QWidget):
         self.model_status.setStyleSheet("color: #ff6b6b; font-size: 11px;")
 
     def _test_model(self):
-        model = self.model_combo.currentText().strip()
+        model = str(self.model_combo.currentData() or self.model_combo.currentText()).strip()
         timeout = min(30, self.timeout_spin.value())
         try:
             if model.startswith("account:"):
@@ -1259,7 +1270,7 @@ class SettingsWidget(QWidget):
         self.selection_changed.emit(model)
 
     def _save_model_config(self):
-        model = self.model_combo.currentText().strip()
+        model = str(self.model_combo.currentData() or self.model_combo.currentText()).strip()
         set_model(model)
         set_request_timeout(self.timeout_spin.value())
         self.model_status.setText("Gespeichert.")
@@ -1268,7 +1279,7 @@ class SettingsWidget(QWidget):
         self.selection_changed.emit(model)
 
     def get_current_model(self) -> str:
-        return self.model_combo.currentText().strip()
+        return str(self.model_combo.currentData() or self.model_combo.currentText()).strip()
 
     def get_tool_mode(self) -> str:
         return self.tool_mode_combo.currentData() or "on_demand"
