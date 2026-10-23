@@ -1,3 +1,10 @@
+## v1.5.3 (2026-10-23)
+
+- Require CI verification that the tier-scoped TriForce model catalog is authoritative in AICoder.
+- Explicitly reject using NVIDIA Build's `Free Endpoint` label as an end-user Free entitlement.
+- Verify model metadata cannot introduce extra models outside the authenticated tier's allowed IDs.
+- Continue to show the already implemented verified Free badges without altering inference model identifiers.
+
 ## v1.5.2 (2026-10-23)
 
 - Consume the tier-scoped TriForce model catalog and preserve provider capability metadata.
