@@ -70,11 +70,39 @@ jobs:
           fi
           echo "::notice::Validated ai-coder $PROJECT_VERSION"
 
+  # Verify the release contents before consuming costly platform runners
+  # or publishing any tag-triggered release artifacts.
+  verify:
+    name: Release test gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install GUI libraries and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libxcb-cursor0 libxkbcommon-x11-0
+          python -m pip install --upgrade pip
+          python -m pip install -e . pytest ruff
+      - name: Compile and lint
+        run: |
+          python -m compileall -q aicoder tests
+          ruff check aicoder tests --select E9,F63,F7,F82
+      - name: Verify model catalog and full regression suite
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python -m pytest -q tests/test_model_catalog_metadata.py
+          python -m pytest -q
+
   # ════════════════════════════════════════════════════════════
   # LINUX — Binary + .deb
   # ════════════════════════════════════════════════════════════
   build-linux:
-    needs: metadata
+    needs: [metadata, verify]
     runs-on: ubuntu-latest
     outputs:
       linux_sha: ${{ steps.sha.outputs.linux_sha }}
@@ -174,7 +202,7 @@ jobs:
   # WINDOWS — .exe + NSIS Installer
   # ════════════════════════════════════════════════════════════
   build-windows:
-    needs: metadata
+    needs: [metadata, verify]
     runs-on: windows-latest
     outputs:
       exe_sha: ${{ steps.sha.outputs.exe_sha }}
@@ -264,7 +292,7 @@ jobs:
   # MACOS — standalone CLI/GUI-capable executable
   # ════════════════════════════════════════════════════════════
   build-macos:
-    needs: metadata
+    needs: [metadata, verify]
     runs-on: macos-15
     outputs:
       mac_sha: ${{ steps.sha.outputs.mac_sha }}
@@ -304,7 +332,7 @@ jobs:
   # PyInstaller Linux binaries target glibc and cannot run on Android's Bionic.
   # ════════════════════════════════════════════════════════════
   build-android:
-    needs: metadata
+    needs: [metadata, verify]
     runs-on: ubuntu-latest
     outputs:
       android_sha: ${{ steps.sha.outputs.android_sha }}
@@ -354,7 +382,7 @@ jobs:
   # RELEASE — Upload + AUR PKGBUILD
   # ════════════════════════════════════════════════════════════
   release:
-    needs: [metadata, build-linux, build-windows, build-macos, build-android]
+    needs: [metadata, verify, build-linux, build-windows, build-macos, build-android]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
