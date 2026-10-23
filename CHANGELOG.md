@@ -1,3 +1,9 @@
+## v1.5.2 (2026-10-23)
+
+- Consume the tier-scoped TriForce model catalog and preserve provider capability metadata.
+- Display verified Free labels without modifying the model IDs used for inference.
+- Add regression tests preventing unlisted models from being injected through metadata.
+
 ## v1.5.1 (2026-10-02)
 
 - Route `ask`, `chat`, `task`, and `review` through the shared AICoder runtime so every selected provider, including linked Mistral Vibe accounts, gets the same enabled tool catalogue, workspace policy, approval handling, and continuation loop.
