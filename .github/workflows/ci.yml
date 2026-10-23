@@ -46,6 +46,11 @@ jobs:
       - name: Critical Ruff checks
         run: ruff check aicoder tests --select E9,F63,F7,F82
 
+      - name: Verify authoritative TriForce model catalog contract
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q tests/test_model_catalog_metadata.py
+
       - name: Unit tests
         env:
           QT_QPA_PLATFORM: offscreen
