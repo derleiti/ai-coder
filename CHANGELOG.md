@@ -1,3 +1,9 @@
+## v1.5.4 (2026-11-11)
+
+- Update build dependency to setuptools >=84.2.1 after successful CI and security checks.
+- Include previously merged Termux installer permission preservation and Mistral Vibe bootstrap fixes.
+- Keep the release version consistent across Python, Debian, AUR and command-line metadata.
+
 ## v1.5.3 (2026-10-23)
 
 - Require CI verification that the tier-scoped TriForce model catalog is authoritative in AICoder.
