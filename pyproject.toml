@@ -10,16 +10,16 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "rich>=15.0.0",
-  "typer>=0.27.2",
-  "PyQt6>=6.11.0",
-  "certifi>=2026.7.22",
+  "typer>=0.29.1",
+  "PyQt6>=6.12.1",
+  "certifi>=2026.10.23",
   "urllib3>=2.8.0",
   "markdown>=3.10.3",
   "prompt-toolkit>=3.0.53",
   "pyte>=0.8.2",
   "websockets>=16.1.1",
   "keyring>=25.7.0",
-  "huggingface_hub>=2.1.1",
+  "huggingface_hub>=2.4.0",
   "tomli>=2.1.0; python_version < '3.11'",
 ]
 
@@ -27,7 +27,7 @@ dependencies = [
 voice = ["vosk>=0.3.45,<0.4"]
 # Only the Mistral Vibe account integration needs the external uv tool.
 # Keep the default AICoder install usable without this provider.
-mistral = ["uv>=0.8.0"]
+mistral = ["uv>=0.13.9"]
 
 [project.scripts]
 aicoder = "aicoder.cli:main"
