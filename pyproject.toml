@@ -11,7 +11,7 @@ requires-python = ">=3.10"
 dependencies = [
   "rich>=15.0.0",
   "typer>=0.29.1",
-  "PyQt6>=6.11.0",
+  "PyQt6>=6.12.1",
   "certifi>=2026.10.23",
   "urllib3>=2.8.0",
   "markdown>=3.10.3",
